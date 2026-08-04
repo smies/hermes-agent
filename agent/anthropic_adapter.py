@@ -1354,8 +1354,18 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
+def _is_anthropic_source_suppressed(source: str) -> bool:
+    """Return whether Hermes credential management disabled an Anthropic source."""
+    try:
+        from hermes_cli.auth import is_source_suppressed
+
+        return is_source_suppressed("anthropic", source)
+    except Exception:
+        return False
+
+
 def resolve_anthropic_token() -> Optional[str]:
-    """Resolve an Anthropic token from all available sources.
+    """Resolve an Anthropic token from all enabled credential sources.
 
     Priority:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
@@ -1365,13 +1375,18 @@ def resolve_anthropic_token() -> Optional[str]:
          — with automatic refresh if expired and a refresh token is available
       5. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
 
-    Returns the token string or None.
+    Sources suppressed through ``hermes auth remove`` are skipped, including
+    externally auto-discovered Claude Code credentials. Returns the first
+    enabled token, or None.
     """
+    claude_code_suppressed = _is_anthropic_source_suppressed("claude_code")
     creds: Optional[Dict[str, Any]] = None
     creds_loaded = False
 
     def _read_creds() -> Optional[Dict[str, Any]]:
         nonlocal creds, creds_loaded
+        if claude_code_suppressed:
+            return None
         if not creds_loaded:
             creds = read_claude_code_credentials()
             creds_loaded = True
@@ -1379,7 +1394,7 @@ def resolve_anthropic_token() -> Optional[str]:
 
     # 1. Hermes-managed OAuth/setup token env var
     token = _getenv("ANTHROPIC_TOKEN").strip()
-    if token:
+    if token and not _is_anthropic_source_suppressed("env:ANTHROPIC_TOKEN"):
         preferred = _prefer_refreshable_claude_code_token(token, _read_creds())
         if preferred:
             return preferred
@@ -1387,7 +1402,7 @@ def resolve_anthropic_token() -> Optional[str]:
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
     cc_token = _getenv("CLAUDE_CODE_OAUTH_TOKEN").strip()
-    if cc_token:
+    if cc_token and not _is_anthropic_source_suppressed("env:CLAUDE_CODE_OAUTH_TOKEN"):
         preferred = _prefer_refreshable_claude_code_token(cc_token, _read_creds())
         if preferred:
             return preferred
@@ -1396,13 +1411,14 @@ def resolve_anthropic_token() -> Optional[str]:
     # 3. Regular API key. An explicit user-configured key must not be shadowed
     # by auto-discovered Claude Code or credential-pool OAuth credentials.
     api_key = _getenv("ANTHROPIC_API_KEY").strip()
-    if api_key:
+    if api_key and not _is_anthropic_source_suppressed("env:ANTHROPIC_API_KEY"):
         return api_key
 
-    # 4. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
-    if resolved_claude_token:
-        return resolved_claude_token
+    # 4. Claude Code credential file / Keychain
+    if not claude_code_suppressed:
+        resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
+        if resolved_claude_token:
+            return resolved_claude_token
 
     # 5. Hermes credential_pool OAuth entry.
     resolved_pool_token = _resolve_anthropic_pool_token()

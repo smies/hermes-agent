@@ -33,6 +33,7 @@ from tools.registry import (
     CHECK_FN_CACHE_BYPASS,
     check_fn_cache_scope,
     discover_builtin_tools,
+    get_availability_generation,
     registry,
     tool_error,
 )
@@ -338,6 +339,7 @@ def get_tool_definitions(
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
                 registry._generation,
+                get_availability_generation(),
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
@@ -1057,6 +1059,7 @@ def _emit_post_tool_call_hook(
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    redact_errors: bool = False,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
 
@@ -1090,7 +1093,10 @@ def _emit_post_tool_call_hook(
             middleware_trace=list(middleware_trace or []),
         )
     except Exception as _hook_err:
-        logger.debug("post_tool_call hook error: %s", _hook_err)
+        if redact_errors:
+            logger.debug("post_tool_call hook failed during terminal tool processing")
+        else:
+            logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
 def handle_function_call(
@@ -1109,7 +1115,10 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
-) -> str:
+    terminal_invocation=None,
+    session_scope=None,
+    tool_search_scope=None,
+) -> Any:
     """
     Main function call dispatcher that routes calls to the tool registry.
 
@@ -1217,6 +1226,9 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                terminal_invocation=terminal_invocation,
+                session_scope=session_scope,
+                tool_search_scope=tool_search_scope,
             )
 
     _tool_original_args = dict(function_args)
@@ -1341,16 +1353,28 @@ def handle_function_call(
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
+                        tool_call_id=tool_call_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        terminal_invocation=terminal_invocation,
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
+                        session_scope=session_scope,
+                        tool_search_scope=tool_search_scope,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
+                        tool_call_id=tool_call_id,
                         session_id=session_id,
                         user_task=user_task,
+                        terminal_invocation=terminal_invocation,
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
+                        session_scope=session_scope,
+                        tool_search_scope=tool_search_scope,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
@@ -1367,6 +1391,7 @@ def handle_function_call(
                     tool_call_id=tool_call_id or "",
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
+                    _terminal_invocation=terminal_invocation,
                 )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
@@ -1376,10 +1401,27 @@ def handle_function_call(
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
+        # Host control never enters hooks.  Observers and transforms receive
+        # only the ordinary model-visible content channel.
+        from agent.tool_outcomes import (
+            bounded_terminal_error,
+            split_tool_execution_result,
+        )
+        visible_result, terminal_directive = split_tool_execution_result(result)
+        if terminal_invocation is None and terminal_directive is not None:
+            # Typed control is authoritative only inside an invocation that
+            # the host created from an exact pre-execution registry snapshot.
+            # Ordinary execution middleware (and every other untrusted return
+            # producer) can otherwise manufacture the Python type directly.
+            visible_result = bounded_terminal_error(
+                "terminal control requires a trusted host invocation"
+            )
+            terminal_directive = None
+
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
-            result=result,
+            result=visible_result,
             task_id=task_id,
             session_id=session_id,
             tool_call_id=tool_call_id,
@@ -1387,6 +1429,10 @@ def handle_function_call(
             api_request_id=api_request_id,
             duration_ms=duration_ms,
             middleware_trace=list(_tool_middleware_trace),
+            redact_errors=bool(
+                terminal_invocation is not None
+                and getattr(terminal_invocation, "handler_entered", False)
+            ),
         )
 
         # Generic tool-result canonicalization seam: plugins receive the
@@ -1400,12 +1446,12 @@ def handle_function_call(
         try:
             from hermes_cli.lifecycle import has_hook, invoke_hook
             if has_hook("transform_tool_result"):
-                status, error_type, error_message = _tool_result_observer_fields(result)
+                status, error_type, error_message = _tool_result_observer_fields(visible_result)
                 hook_results = invoke_hook(
                     "transform_tool_result",
                     tool_name=function_name,
                     args=function_args,
-                    result=result,
+                    result=visible_result,
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
@@ -1418,14 +1464,39 @@ def handle_function_call(
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
-                        result = hook_result
+                        visible_result = hook_result
                         break
         except Exception as _hook_err:
-            logger.debug("transform_tool_result hook error: %s", _hook_err)
+            if (
+                terminal_invocation is not None
+                and getattr(terminal_invocation, "handler_entered", False)
+            ):
+                logger.debug(
+                    "transform_tool_result hook failed during terminal tool processing"
+                )
+            else:
+                logger.debug("transform_tool_result hook error: %s", _hook_err)
 
-        return result
+        # Return only visible content.  The executor's invocation-local seal
+        # restores the handler's recorded directive after all middleware has
+        # completed, so middleware never needs to receive host control.
+        return visible_result
 
     except Exception as e:
+        if (
+            terminal_invocation is not None
+            and getattr(terminal_invocation, "handler_entered", False)
+        ):
+            terminal_invocation.record_error(e)
+            logger.warning(
+                "Terminal tool %s processing failed after handler entry",
+                function_name,
+            )
+            from agent.tool_outcomes import bounded_terminal_error
+
+            return bounded_terminal_error(
+                "terminal tool processing failed after handler entry"
+            )
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return tool_error(_sanitize_tool_error(error_msg))

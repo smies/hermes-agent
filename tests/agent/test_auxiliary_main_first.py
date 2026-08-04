@@ -116,6 +116,80 @@ class TestResolveAutoMainFirst:
         mock_main_chain.assert_not_called()
         mock_openrouter.assert_not_called()
 
+    def test_strict_main_provider_stops_before_any_fallback(self):
+        """Strict auto routing must fail closed instead of crossing providers."""
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="anthropic",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="claude-opus-5",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+        ) as mock_task_chain, patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+        ) as mock_main_chain, patch(
+            "agent.auxiliary_client._get_provider_chain",
+        ) as mock_builtin_chain:
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto(
+                task="compression",
+                strict_main_provider=True,
+            )
+
+        assert client is None
+        assert model is None
+        mock_task_chain.assert_not_called()
+        mock_main_chain.assert_not_called()
+        mock_builtin_chain.assert_not_called()
+
+    def test_compression_config_threads_strict_policy_into_auto_router(self):
+        """The task-level flag must reach resolve_provider_client unchanged."""
+        mock_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._task_strict_main_provider", return_value=True,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "claude-opus-5"),
+        ) as mock_resolve:
+            from agent.auxiliary_client import get_text_auxiliary_client
+
+            client, model = get_text_auxiliary_client(
+                "compression",
+                main_runtime={"provider": "anthropic", "model": "claude-opus-5"},
+            )
+
+        assert client is mock_client
+        assert model == "claude-opus-5"
+        assert mock_resolve.call_args.kwargs["task"] == "compression"
+        assert mock_resolve.call_args.kwargs["strict_main_provider"] is True
+
+    def test_auto_keeps_live_runtime_model_over_global_default(self):
+        """An Opus session must not be relabelled with the global Codex model."""
+        mock_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._read_main_model", return_value="gpt-5.6-sol",
+        ), patch(
+            "agent.auxiliary_client._resolve_auto",
+            return_value=(mock_client, "claude-opus-5"),
+        ):
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client(
+                "auto",
+                main_runtime={"provider": "anthropic", "model": "claude-opus-5"},
+                task="compression",
+                strict_main_provider=True,
+            )
+
+        assert client is mock_client
+        assert model == "claude-opus-5"
+
 
 
 

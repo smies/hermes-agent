@@ -53,6 +53,25 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def test_initial_blocked_task_is_sticky_without_worker_round_trip(kanban_home: Path) -> None:
+    """A task created directly in blocked for human review must not be
+    auto-promoted before an operator has had a chance to inspect it."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="governance review pointer",
+            initial_status="blocked",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        latest = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert latest["kind"] == "blocked"
+
+
 def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
     """A standalone task that a worker explicitly blocks for review
     must stay blocked across an arbitrary number of dispatcher ticks.

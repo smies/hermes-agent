@@ -16,6 +16,7 @@ Import chain (circular-import safe):
 
 import ast
 import importlib
+import inspect
 import json
 import logging
 import sys
@@ -26,25 +27,33 @@ from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+_DISCOVERY_CACHE_VERSION = 2
+_BUILTIN_REGISTRATION_METHODS = frozenset(
+    {"register", "_register_host_terminal_tool"}
+)
+
 
 def _is_registry_register_call(node: ast.AST) -> bool:
-    """Return True when *node* is a ``registry.register(...)`` call expression."""
+    """Return True for a reviewed top-level registry registration call."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
         return False
     func = node.value.func
     return (
         isinstance(func, ast.Attribute)
-        and func.attr == "register"
+        and func.attr in _BUILTIN_REGISTRATION_METHODS
         and isinstance(func.value, ast.Name)
         and func.value.id == "registry"
     )
 
 
 def _module_registers_tools(module_path: Path) -> bool:
-    """Return True when the module contains a top-level ``registry.register(...)`` call.
+    """Return True when a module contains a top-level built-in registration.
 
     Only inspects module-body statements so that helper modules which happen
-    to call ``registry.register()`` inside a function are not picked up.
+    to register inside a function are not picked up. Both ordinary
+    ``registry.register(...)`` and the reviewed host-only
+    ``registry._register_host_terminal_tool(...)`` path are registrations;
+    neither requires a second, fake ordinary registration for discovery.
 
     A cheap text prefilter avoids the ``ast.parse`` cost for files that do not
     mention both ``registry`` and ``register`` — a necessary condition for a
@@ -138,7 +147,12 @@ def _load_discovery_cache() -> Dict[str, list]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        if data.get("version") != _DISCOVERY_CACHE_VERSION:
+            return {}
+        files = data.get("files")
+        return files if isinstance(files, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -152,7 +166,11 @@ def _save_discovery_cache(cache: Dict[str, list]) -> None:
         from utils import atomic_json_write  # stdlib+yaml only; no cycle
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(path, cache, indent=0)
+        atomic_json_write(
+            path,
+            {"version": _DISCOVERY_CACHE_VERSION, "files": cache},
+            indent=0,
+        )
     except Exception as e:
         logger.debug("Could not write tool discovery cache %s: %s", path, e)
 
@@ -164,11 +182,14 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "registration_token", "terminal_eligible", "terminal_handler",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 registration_token=None, terminal_eligible=False,
+                 terminal_handler=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +208,9 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.registration_token = registration_token or object()
+        self.terminal_eligible = bool(terminal_eligible)
+        self.terminal_handler = terminal_handler
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +248,13 @@ _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
 _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
+_availability_generation = 0
+
+
+def get_availability_generation() -> int:
+    """Return the process-wide monotonic tool-availability epoch."""
+    with _check_fn_cache_lock:
+        return _availability_generation
 
 
 def _prune_check_fn_caches(now: float) -> None:
@@ -271,10 +302,11 @@ def check_fn_cache_scope() -> Optional[str]:
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
-    Exceptions are swallowed as False. A transient False/exception within
-    ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
-    last-good True is returned and the failure is NOT cached, so the next call
-    re-probes) to keep flaky external checks (Docker daemon busy, socket
+    Ordinary ``Exception`` failures are swallowed as False. Shutdown and
+    cancellation ``BaseException`` subclasses propagate. A transient failure
+    within ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed
+    (the last-good True is returned and the failure is NOT cached, so the next
+    call re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
     now = time.monotonic()
@@ -298,6 +330,10 @@ def _check_fn_cached(fn: Callable) -> bool:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
                 return value
+        # The probe deliberately runs without this lock. Bind it to the exact
+        # availability epoch so invalidation cannot be undone when an older
+        # in-flight probe eventually completes.
+        probe_generation = _availability_generation
 
     raised = False
     try:
@@ -307,6 +343,10 @@ def _check_fn_cached(fn: Callable) -> bool:
         raised = True
 
     with _check_fn_cache_lock:
+        if _availability_generation != probe_generation:
+            # Publish neither stale True nor stale False into the new epoch.
+            # Callers can retry normally; this racing attempt fails closed.
+            return False
         _prune_check_fn_caches(now)
         if value:
             _check_fn_last_good[cache_key] = now
@@ -341,9 +381,23 @@ def _check_fn_cached(fn: Callable) -> bool:
 def invalidate_check_fn_cache() -> None:
     """Drop all cached ``check_fn`` results. Call after config changes that
     affect tool availability (e.g. ``hermes tools enable``)."""
+    global _availability_generation
     with _check_fn_cache_lock:
+        _availability_generation += 1
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+    # Availability is also memoized in model_tools.  Rollback/config changes
+    # must hide a tool from newly-built conversations synchronously rather
+    # than waiting for a registry mutation or the definition cache to age out.
+    try:
+        import sys
+
+        model_tools = sys.modules.get("model_tools")
+        clear = getattr(model_tools, "_clear_tool_defs_cache", None)
+        if callable(clear):
+            clear()
+    except Exception:
+        logger.debug("Could not clear model tool-definition cache", exc_info=True)
 
 
 def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
@@ -394,6 +448,23 @@ class ToolRegistry:
         # long as the generation hasn't changed.
         self._generation: int = 0
 
+    def _bump_registration_generation_locked(self) -> None:
+        """Revoke every availability verdict tied to prior registrations.
+
+        Caller must hold ``self._lock``.  The lock order is deliberately
+        registry -> availability everywhere a registration identity and its
+        cached check verdict change together.  Availability probes still run
+        outside both locks; an already-running probe observes the generation
+        change at publication time and discards its result.
+        """
+        global _availability_generation
+
+        self._generation += 1
+        with _check_fn_cache_lock:
+            _availability_generation += 1
+            _check_fn_cache.clear()
+            _check_fn_last_good.clear()
+
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
@@ -431,6 +502,119 @@ class ToolRegistry:
         """Return a registered tool entry by name, or None."""
         with self._lock:
             return self._tools.get(name)
+
+    def snapshot_terminal_capability(
+        self,
+        name: str,
+        *,
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+        session_scope=None,
+        tool_search_scope=None,
+    ):
+        """Return authority for the exact current trusted local handler.
+
+        This metadata is deliberately separate from schemas.  The consistency
+        checks also make unsupported direct ``ToolEntry`` mutation revoke
+        classification instead of transferring authority to a replacement.
+        """
+        from agent.tool_outcomes import TerminalToolCapability
+
+        normalized_enabled = (
+            frozenset(enabled_toolsets) if enabled_toolsets is not None else None
+        )
+        normalized_disabled = frozenset(disabled_toolsets or ())
+        normalized_session_scope = (
+            frozenset(session_scope) if session_scope is not None else None
+        )
+        normalized_tool_search_scope = (
+            frozenset(tool_search_scope)
+            if tool_search_scope is not None
+            else None
+        )
+
+        # Capture identity and epoch under the registry lock, but never run a
+        # potentially expensive availability probe while holding it.
+        with self._lock:
+            entry = self._tools.get(name)
+            if not entry or not (
+                entry.name == name
+                and entry.terminal_eligible
+                and entry.terminal_handler is entry.handler
+                and not entry.toolset.startswith("mcp-")
+            ):
+                return None
+            captured = (
+                entry,
+                entry.handler,
+                entry.registration_token,
+                entry.is_async,
+                entry.terminal_handler,
+                entry.toolset,
+                entry.check_fn,
+            )
+            availability_generation = get_availability_generation()
+
+        if (
+            normalized_tool_search_scope is None
+            and normalized_session_scope is not None
+            and name not in normalized_session_scope
+        ):
+            return None
+        if (
+            normalized_tool_search_scope is not None
+            and name not in normalized_tool_search_scope
+        ):
+            return None
+        check_fn = captured[6]
+        try:
+            available = check_fn is None or _check_fn_cached(check_fn)
+        except Exception:
+            available = False
+        if not available:
+            return None
+
+        # Revalidate after the out-of-lock probe. An invalidation racing the
+        # probe revokes this planning attempt instead of blessing stale state.
+        with self._lock:
+            current = self._tools.get(name)
+            if current is not captured[0]:
+                return None
+            with _check_fn_cache_lock:
+                if _availability_generation != availability_generation:
+                    return None
+                if not self._terminal_entry_matches_capture(current, name, captured):
+                    return None
+            return TerminalToolCapability(
+                name=name,
+                handler=entry.handler,
+                registration_token=entry.registration_token,
+                is_async=entry.is_async,
+                terminal_handler=entry.terminal_handler,
+                toolset=entry.toolset,
+                check_fn=entry.check_fn,
+                availability_generation=availability_generation,
+                enabled_toolsets=normalized_enabled,
+                disabled_toolsets=normalized_disabled,
+                session_scope=normalized_session_scope,
+                tool_search_scope=normalized_tool_search_scope,
+            )
+
+    @staticmethod
+    def _terminal_entry_matches_capture(entry, name: str, captured) -> bool:
+        return bool(
+            entry
+            and entry is captured[0]
+            and entry.name == name
+            and entry.handler is captured[1]
+            and entry.registration_token is captured[2]
+            and entry.is_async is captured[3]
+            and entry.terminal_handler is captured[4] is captured[1]
+            and entry.toolset == captured[5]
+            and entry.check_fn is captured[6]
+            and entry.terminal_eligible
+            and not entry.toolset.startswith("mcp-")
+        )
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -533,6 +717,77 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
     ):
+        """Register an ordinary tool with no host terminal authority."""
+        return self._register(
+            name=name,
+            toolset=toolset,
+            schema=schema,
+            handler=handler,
+            check_fn=check_fn,
+            requires_env=requires_env,
+            is_async=is_async,
+            description=description,
+            emoji=emoji,
+            max_result_size_chars=max_result_size_chars,
+            dynamic_schema_overrides=dynamic_schema_overrides,
+            override=override,
+            terminal_eligible=False,
+        )
+
+    def _register_host_terminal_tool(
+        self,
+        name: str,
+        toolset: str,
+        schema: dict,
+        handler: Callable,
+        check_fn: Callable = None,
+        requires_env: list = None,
+        is_async: bool = False,
+        description: str = "",
+        emoji: str = "",
+        max_result_size_chars: int | float | None = None,
+        dynamic_schema_overrides: Callable = None,
+        override: bool = False,
+    ):
+        """Reviewed host-only registration path for Phase 1 consumers.
+
+        Public ``PluginContext.register_tool`` never exposes this authority.
+        A later plugin consumer must add its own separately-reviewed allowlist.
+        """
+        if toolset.startswith("mcp-"):
+            raise ValueError("remote MCP tools cannot receive terminal authority")
+        return self._register(
+            name=name,
+            toolset=toolset,
+            schema=schema,
+            handler=handler,
+            check_fn=check_fn,
+            requires_env=requires_env,
+            is_async=is_async,
+            description=description,
+            emoji=emoji,
+            max_result_size_chars=max_result_size_chars,
+            dynamic_schema_overrides=dynamic_schema_overrides,
+            override=override,
+            terminal_eligible=True,
+        )
+
+    def _register(
+        self,
+        name: str,
+        toolset: str,
+        schema: dict,
+        handler: Callable,
+        check_fn: Callable = None,
+        requires_env: list = None,
+        is_async: bool = False,
+        description: str = "",
+        emoji: str = "",
+        max_result_size_chars: int | float | None = None,
+        dynamic_schema_overrides: Callable = None,
+        override: bool = False,
+        terminal_eligible: bool = False,
+    ):
         """Register a tool.  Called at module-import time by each tool file.
 
         ``override=True`` is an explicit opt-in for plugins that intend to
@@ -591,6 +846,9 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                registration_token=object(),
+                terminal_eligible=terminal_eligible,
+                terminal_handler=handler if terminal_eligible else None,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -600,7 +858,7 @@ class ToolRegistry:
             # write path for that classification.
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
-            self._generation += 1
+            self._bump_registration_generation_locked()
 
     def deregister(self, name: str) -> None:
         """Remove a tool from the registry.
@@ -666,7 +924,7 @@ class ToolRegistry:
                     for alias, target in self._toolset_aliases.items()
                     if target != entry.toolset
                 }
-            self._generation += 1
+            self._bump_registration_generation_locked()
         logger.debug("Deregistered tool: %s", name)
 
     # ------------------------------------------------------------------
@@ -757,6 +1015,29 @@ class ToolRegistry:
             result_type=result_type,
         )
 
+    @staticmethod
+    def _handler_accepts_host_keyword(handler: Callable, keyword: str) -> bool:
+        """Whether a handler can receive a new host-only keyword safely.
+
+        Terminal handlers predate host ``tool_call_id`` forwarding, and some
+        intentionally accept only the model-argument dictionary. Signature
+        inspection preserves those handlers without a catch-and-retry that
+        could execute side effects twice.
+        """
+        try:
+            parameters = inspect.signature(handler).parameters
+        except (TypeError, ValueError):
+            return False
+        parameter = parameters.get(keyword)
+        return bool(
+            parameter is not None
+            and parameter.kind
+            in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+        ) or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD
+            for item in parameters.values()
+        )
+
     def dispatch(self, name: str, args: dict, **kwargs) -> str | dict:
         """Execute a tool handler by name.
 
@@ -766,17 +1047,158 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
-        entry = self.get_entry(name)
-        if not entry:
-            return tool_error(f"Unknown tool: {name}")
-        try:
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
+        terminal_invocation = kwargs.pop("terminal_invocation", None)
+        # This value is supplied by the provider/host dispatch context. It is
+        # deliberately separate from ``args`` (the model-controlled object)
+        # and is forwarded only to reviewed terminal handlers that can accept
+        # it. Ordinary handler call signatures remain unchanged.
+        host_tool_call_id = kwargs.pop("tool_call_id", None)
+        current_enabled_toolsets = kwargs.pop("enabled_toolsets", None)
+        current_disabled_toolsets = kwargs.pop("disabled_toolsets", None)
+        current_session_scope = kwargs.pop("session_scope", None)
+        current_tool_search_scope = kwargs.pop("tool_search_scope", None)
+        from agent.tool_outcomes import (
+            TerminalToolInvocation,
+            bounded_terminal_error,
+        )
+
+        # Ordinary tools retain the historical one-lock dispatch. Terminal
+        # tools use a two-phase gate below so check_fn never runs under this
+        # lock, then identity+epoch are revalidated atomically with entry.
+        with self._lock:
+            entry = self._tools.get(name)
+            if not entry:
+                return tool_error(f"Unknown tool: {name}")
+            if terminal_invocation is None:
+                if entry.terminal_eligible:
+                    return bounded_terminal_error(
+                        "terminal-capable tool requires an exact host invocation"
+                    )
             else:
-                result = entry.handler(args, **kwargs)
+                if not isinstance(terminal_invocation, TerminalToolInvocation):
+                    return bounded_terminal_error("invalid terminal invocation")
+                capability = terminal_invocation.capability
+                captured = (
+                    entry,
+                    capability.handler,
+                    capability.registration_token,
+                    capability.is_async,
+                    capability.terminal_handler,
+                    capability.toolset,
+                    capability.check_fn,
+                )
+                normalized_enabled = (
+                    frozenset(current_enabled_toolsets)
+                    if current_enabled_toolsets is not None
+                    else None
+                )
+                normalized_disabled = frozenset(current_disabled_toolsets or ())
+                normalized_session_scope = (
+                    frozenset(current_session_scope)
+                    if current_session_scope is not None
+                    else None
+                )
+                normalized_tool_search_scope = (
+                    frozenset(current_tool_search_scope)
+                    if current_tool_search_scope is not None
+                    else None
+                )
+                if not self._terminal_entry_matches_capture(entry, name, captured) or not (
+                    name == capability.name
+                    and normalized_enabled == capability.enabled_toolsets
+                    and normalized_disabled == capability.disabled_toolsets
+                    and normalized_session_scope == capability.session_scope
+                    and normalized_tool_search_scope == capability.tool_search_scope
+                    and (
+                        (
+                            normalized_tool_search_scope is not None
+                            and name in normalized_tool_search_scope
+                        )
+                        or (
+                            normalized_tool_search_scope is None
+                            and (
+                                normalized_session_scope is None
+                                or name in normalized_session_scope
+                            )
+                        )
+                    )
+                ):
+                    return bounded_terminal_error(
+                        "terminal invocation no longer matches current registration"
+                    )
+                check_fn = capability.check_fn
+                planned_availability_generation = capability.availability_generation
+                handler = entry.handler
+                is_async = entry.is_async
+                entry = None
+            if terminal_invocation is None:
+                # Capture the ordinary implementation while the same lock
+                # protects name lookup. Ordinary mutation behavior is unchanged.
+                handler = entry.handler
+                is_async = entry.is_async
+        if terminal_invocation is not None:
+            try:
+                available = check_fn is None or _check_fn_cached(check_fn)
+            except Exception:
+                available = False
+            if not available:
+                return bounded_terminal_error(
+                    "terminal tool is no longer available in this session"
+                )
+
+            # Final commitment: registry metadata and availability epoch are
+            # checked together. invalidate_check_fn_cache() cannot interleave
+            # between this verdict and marking the trusted entry as entered.
+            with self._lock:
+                entry = self._tools.get(name)
+                with _check_fn_cache_lock:
+                    if (
+                        _availability_generation != planned_availability_generation
+                        or not self._terminal_entry_matches_capture(
+                            entry, name, captured
+                        )
+                    ):
+                        return bounded_terminal_error(
+                            "terminal invocation availability or registration changed"
+                        )
+                    try:
+                        terminal_invocation.enter(
+                            entry.handler, entry.registration_token
+                        )
+                    except (RuntimeError, TypeError, ValueError):
+                        return bounded_terminal_error(
+                            "terminal invocation is invalid or has already been used"
+                        )
+                    handler = entry.handler
+                    is_async = entry.is_async
+        try:
+            handler_kwargs = kwargs
+            if (
+                terminal_invocation is not None
+                and self._handler_accepts_host_keyword(handler, "tool_call_id")
+            ):
+                handler_kwargs = dict(kwargs)
+                handler_kwargs["tool_call_id"] = host_tool_call_id
+            if is_async:
+                from model_tools import _run_async
+                result = _run_async(handler(args, **handler_kwargs))
+            else:
+                result = handler(args, **handler_kwargs)
+            if terminal_invocation is not None:
+                terminal_invocation.record_result(result)
+                return result
             return self._normalize_handler_result(name, result)
-        except Exception as e:
+        except BaseException as e:
+            if terminal_invocation is not None and terminal_invocation.handler_entered:
+                terminal_invocation.record_error(e)
+                # Never format or log exception text from a trusted terminal
+                # side-effect boundary; it may contain private provider data.
+                logger.warning("Terminal tool %s failed after handler entry", name)
+                return bounded_terminal_error(
+                    "terminal-capable handler failed after it started"
+                )
+            if not isinstance(e, Exception):
+                raise
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences
             # in exception strings don't reach the model as structural noise.

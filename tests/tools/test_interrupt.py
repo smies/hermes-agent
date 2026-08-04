@@ -109,6 +109,91 @@ class TestPreToolCheck:
         # No actual tool handlers should have been called
         # (handle_function_call should NOT have been invoked)
 
+    @pytest.mark.parametrize(
+        "tool_names",
+        [
+            pytest.param(["preflight_terminal"], id="terminal"),
+            pytest.param(["ordinary_tool"], id="ordinary"),
+            pytest.param(
+                ["ordinary_tool", "preflight_terminal"], id="mixed"
+            ),
+            pytest.param(
+                ["ordinary_one", "ordinary_two", "ordinary_three"],
+                id="multiple",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("agent_kind", ["namespace", "magic-mock"])
+    def test_top_level_interrupt_precedes_all_planning_and_classification(
+        self, tool_names, agent_kind
+    ):
+        """Cancellation is projected before registry or Tool Search preflight."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from run_agent import AIAgent
+        from tools.registry import registry
+
+        checks = []
+        entered = []
+
+        def check_fn():
+            checks.append("classified")
+            return True
+
+        registry._register_host_terminal_tool(
+            name="preflight_terminal",
+            toolset="interrupt-preflight-test",
+            schema={
+                "name": "preflight_terminal",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args, **_kwargs: entered.append("handler") or "unused",
+            check_fn=check_fn,
+        )
+        try:
+            calls = []
+            for index, name in enumerate(tool_names):
+                calls.append(
+                    SimpleNamespace(
+                        id=f"interrupt-{index}",
+                        function=SimpleNamespace(name=name, arguments="{}"),
+                    )
+                )
+            assistant = SimpleNamespace(tool_calls=calls)
+            if agent_kind == "magic-mock":
+                agent = MagicMock()
+                agent._interrupt_requested = True
+            else:
+                agent = SimpleNamespace(_interrupt_requested=True)
+            agent._execute_tool_calls_sequential = MagicMock()
+            agent._execute_tool_calls_concurrent = MagicMock()
+            messages = []
+
+            with patch("agent.tool_executor.plan_tool_batch") as planner:
+                early_plan = AIAgent._plan_tool_batch(agent, calls)
+                outcome = AIAgent._execute_tool_calls(
+                    agent, assistant, messages, "default"
+                )
+
+            assert early_plan.calls == ()
+            assert outcome.terminal is None
+            planner.assert_not_called()
+            agent._execute_tool_calls_sequential.assert_not_called()
+            agent._execute_tool_calls_concurrent.assert_not_called()
+            assert checks == []
+            assert entered == []
+            assert [message["tool_call_id"] for message in messages] == [
+                call.id for call in calls
+            ]
+            assert all(message["role"] == "tool" for message in messages)
+            assert all(
+                "cancelled" in message["content"].lower()
+                for message in messages
+            )
+        finally:
+            registry.deregister("preflight_terminal")
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: message combining
@@ -166,6 +251,7 @@ class TestMessageCombining:
 class TestSIGKILLEscalation:
     """Test that SIGTERM-resistant processes get SIGKILL'd."""
 
+    @pytest.mark.live_system_guard_bypass
     @pytest.mark.skipif(
         not __import__("shutil").which("bash"),
         reason="Requires bash"

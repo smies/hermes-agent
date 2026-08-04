@@ -1,11 +1,14 @@
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
-from gateway.config import Platform, PlatformConfig, load_gateway_config
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
-                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
+                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
+                  group_sessions_per_user=None):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     extra = {}
@@ -23,6 +26,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_policy"] = group_policy
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if group_sessions_per_user is not None:
+        extra["group_sessions_per_user"] = group_sessions_per_user
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -30,6 +35,7 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
     adapter._message_handler = AsyncMock()
     adapter._dm_policy = str(extra.get("dm_policy", "pairing")).strip().lower()
     adapter._allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("allow_from"))
+    adapter._dm_allowlist_source = "config" if allow_from is not None else None
     adapter._group_policy = str(extra.get("group_policy", "pairing")).strip().lower()
     adapter._group_allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("group_allow_from"))
     adapter._mention_patterns = adapter._compile_mention_patterns()
@@ -150,6 +156,122 @@ def test_dm_policy_disabled_still_allows_groups():
     assert adapter._should_process_message(_group_message("hello")) is True
 
 
+# --- Sender + group double-gate regression ---
+
+
+_TRUSTED_SENDER = "15550101001@s.whatsapp.net"
+_TRUSTED_GROUP = "120363000000000001@g.us"
+_BOT_ID = "15550101999@s.whatsapp.net"
+
+
+def _trusted_group_payload(**overrides):
+    payload = _group_message(
+        body="ordinary synthetic group message",
+        chatId=_TRUSTED_GROUP,
+        senderId=_TRUSTED_SENDER,
+        senderName="Synthetic sender",
+        chatName="Synthetic group",
+        botIds=[_BOT_ID, "15550101999@lid"],
+        messageId="provider-message-001",
+        hasMedia=False,
+        mediaUrls=[],
+    )
+    payload.update(overrides)
+    return payload
+
+
+def _make_authorization_runner(adapter):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.WHATSAPP: adapter.config})
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    adapter.gateway_runner = runner
+    return runner
+
+
+async def _deliver_through_double_gate(adapter, runner, payload, agent_turn):
+    """Exercise the real adapter intake and gateway sender authorization gates."""
+    event = await adapter._build_message_event(payload)
+    if event is not None and runner._is_user_authorized(event.source):
+        await agent_turn(event)
+    return event
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_group_ingress_requires_exact_sender_and_group(
+    monkeypatch, tmp_path
+):
+    """Only the configured sender in the configured group reaches an agent turn."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "synthetic-hermes"))
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", _TRUSTED_SENDER)
+    for name in (
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "WHATSAPP_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    adapter = _make_adapter(
+        dm_policy="disabled",
+        allow_from=[_TRUSTED_SENDER],
+        group_policy="allowlist",
+        group_allow_from=[_TRUSTED_GROUP],
+        require_mention=True,
+        free_response_chats=[_TRUSTED_GROUP],
+        group_sessions_per_user=True,
+    )
+    runner = _make_authorization_runner(adapter)
+    agent_turn = AsyncMock()
+
+    accepted = await _deliver_through_double_gate(
+        adapter, runner, _trusted_group_payload(), agent_turn
+    )
+    assert accepted is not None
+    agent_turn.assert_awaited_once_with(accepted)
+
+    other_sender_event = await adapter._build_message_event(
+        _trusted_group_payload(senderId="15550101002@s.whatsapp.net")
+    )
+    assert other_sender_event is not None
+    assert adapter._text_batch_key(accepted) != adapter._text_batch_key(other_sender_event)
+
+    rejected_payloads = [
+        # Allowed group, wrong actual sender.
+        _trusted_group_payload(senderId="15550101002@s.whatsapp.net"),
+        # Allowed sender, wrong group.
+        _trusted_group_payload(chatId="120363000000000002@g.us"),
+        # DMs remain disabled even for the allowlisted sender.
+        _dm_message(
+            senderId=_TRUSTED_SENDER,
+            chatId=_TRUSTED_SENDER,
+            messageId="provider-message-dm",
+            hasMedia=False,
+            mediaUrls=[],
+        ),
+        # Malformed, unrelated LID, and unrelated PN aliases have no mapping
+        # in the isolated synthetic Hermes home and cannot match the sender.
+        _trusted_group_payload(senderId="../../15550101001@s.whatsapp.net"),
+        _trusted_group_payload(senderId="777000000000001@lid"),
+        _trusted_group_payload(senderId="15550101003@s.whatsapp.net"),
+        # Quoted authorship is reply context, never the current sender's
+        # authorization identity.
+        _trusted_group_payload(
+            senderId="15550101004@s.whatsapp.net",
+            hasQuotedMessage=True,
+            quotedParticipant=_TRUSTED_SENDER,
+            quotedMessageId="quoted-provider-message",
+        ),
+    ]
+
+    for payload in rejected_payloads:
+        await _deliver_through_double_gate(adapter, runner, payload, agent_turn)
+
+    assert agent_turn.await_count == 1
+
+
 # --- New group_policy tests ---
 
 
@@ -228,5 +350,3 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-
-

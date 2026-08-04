@@ -61,6 +61,22 @@ logger = logging.getLogger(__name__)
 # transcripts stay disambiguated even if downstream plugins fail before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
+# Provider message IDs become reply/authorization anchors through
+# ``SessionSource.message_id``.  Keep the bridge value byte-for-byte, but only
+# admit the bounded string shape shared by the downstream source contracts.
+_MAX_INBOUND_MESSAGE_ID_BYTES = 256
+
+
+def _validated_inbound_message_id(value: Any) -> Optional[str]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or len(value.encode("utf-8")) > _MAX_INBOUND_MESSAGE_ID_BYTES
+    ):
+        return None
+    return value
+
 
 def _listener_pids_on_port(port: int) -> list:
     """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
@@ -1408,6 +1424,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         else:
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            # The retained event represents the whole burst at the point the
+            # final message arrived.  Its reply/authorization anchor must
+            # therefore be the final provider message ID, not the first
+            # fragment's ID (or an empty source field).
+            existing.message_id = event.message_id
+            existing.source.message_id = event.message_id
+            if isinstance(existing.raw_message, dict):
+                existing.raw_message = dict(existing.raw_message)
+                if event.message_id is None:
+                    existing.raw_message.pop("messageId", None)
+                else:
+                    existing.raw_message["messageId"] = event.message_id
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -1467,6 +1495,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Determine chat type
             is_group = data.get("isGroup", False)
             chat_type = "group" if is_group else "dm"
+            message_id = _validated_inbound_message_id(data.get("messageId"))
             
             # Build source
             source = self.build_source(
@@ -1475,6 +1504,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 chat_type=chat_type,
                 user_id=data.get("senderId"),
                 user_name=data.get("senderName"),
+                message_id=message_id,
             )
             
             # Download media URLs to the local cache so agent tools
@@ -1628,7 +1658,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 message_type=msg_type,
                 source=source,
                 raw_message=data,
-                message_id=data.get("messageId"),
+                message_id=message_id,
                 media_urls=cached_urls,
                 media_types=media_types,
                 metadata=metadata,

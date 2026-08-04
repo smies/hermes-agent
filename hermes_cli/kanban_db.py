@@ -3270,6 +3270,21 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "blocked":
+                    # ``recompute_ready`` treats an untyped blocked row as a
+                    # recoverable circuit-breaker state. Initial blocked is an
+                    # explicit human-review gate, so record the same sticky
+                    # event that operator/worker blocking uses.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial-status: blocked",
+                            "kind": "needs_input",
+                            "actor": created_by,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:

@@ -29,6 +29,19 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
+@pytest.fixture(autouse=True)
+def _isolate_machine_anthropic_auth(monkeypatch):
+    """Keep adapter tests independent of the developer's Keychain/auth.json."""
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_source_suppressed",
+        lambda _provider, _source: False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -78,6 +91,18 @@ class TestBuildAnthropicClient:
             assert kwargs["default_headers"] == {
                 "anthropic-beta": "interleaved-thinking-2025-05-14"
             }
+
+    def test_setup_token_does_not_inherit_api_key_from_environment(self, monkeypatch):
+        """OAuth must not silently add a billable X-Api-Key from the SDK env fallback."""
+        oauth_token = "sk-" + "ant-oat01-" + "o" * 60
+        billable_key = "sk-" + "ant-api03-" + "k" * 60
+        monkeypatch.setenv("ANTHROPIC_API_KEY", billable_key)
+
+        client = build_anthropic_client(oauth_token)
+
+        assert client.auth_token == oauth_token
+        assert client.api_key != billable_key
+        assert billable_key not in client.auth_headers.values()
 
 
     def test_azure_foundry_anthropic_endpoint_uses_bearer_auth(self):
@@ -184,6 +209,26 @@ class TestIsClaudeCodeTokenValid:
 class TestResolveAnthropicToken:
     def _assert_not_called(*_args, **_kwargs):
         raise AssertionError("should not be called when API key is present")
+
+    def test_suppressed_sources_disable_api_key_and_oauth(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant...ykey")
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant...oken")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "cc-env-token")
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: {
+                "accessToken": "cc-file-token",
+                "refreshToken": "refresh",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_source_suppressed",
+            lambda provider, source: provider == "anthropic",
+        )
+
+        assert resolve_anthropic_token() is None
 
     def test_prefers_oauth_token_over_api_key(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-mykey")

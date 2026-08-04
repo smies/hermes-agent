@@ -210,18 +210,46 @@ def run_tool_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run tool execution through registered tool execution middleware."""
+    terminal_invocation = context.pop("_terminal_invocation", None)
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(args)
-    return _run_execution_chain(
-        TOOL_EXECUTION_MIDDLEWARE,
-        callbacks,
-        next_call,
-        tool_name=tool_name,
-        args=args,
-        original_args=context.pop("original_args", args),
-        **context,
-    )
+
+    terminal_call = next_call
+    if terminal_invocation is not None:
+        def terminal_call(next_args: Dict[str, Any]) -> Any:
+            from agent.tool_outcomes import split_tool_execution_result
+
+            raw_result = next_call(next_args)
+            visible_result, _directive = split_tool_execution_result(raw_result)
+            return visible_result
+    try:
+        return _run_execution_chain(
+            TOOL_EXECUTION_MIDDLEWARE,
+            callbacks,
+            terminal_call,
+            tool_name=tool_name,
+            args=args,
+            original_args=context.pop("original_args", args),
+            _fail_open_before_next=terminal_invocation is None,
+            _fail_open_after_next=terminal_invocation is None,
+            **context,
+        )
+    except BaseException as exc:
+        if terminal_invocation is None:
+            raise
+        from agent.tool_outcomes import bounded_terminal_error
+
+        if terminal_invocation.handler_entered:
+            terminal_invocation.record_error(exc)
+            return bounded_terminal_error(
+                "terminal tool processing failed after handler entry"
+            )
+        if not isinstance(exc, Exception):
+            raise
+        return bounded_terminal_error(
+            "terminal tool processing failed before handler entry"
+        )
 
 
 def run_api_execution_middleware(
@@ -258,6 +286,8 @@ def _run_execution_chain(
     **kwargs: Any,
 ) -> Any:
     payload_key = "request" if "request" in kwargs else "args"
+    fail_open_before_next = bool(kwargs.pop("_fail_open_before_next", True))
+    fail_open_after_next = bool(kwargs.pop("_fail_open_after_next", True))
 
     class _DownstreamExecutionError(Exception):
         def __init__(self, original: BaseException) -> None:
@@ -301,15 +331,28 @@ def _run_execution_chain(
         except _DownstreamExecutionError as exc:
             raise exc.original
         except Exception as exc:
-            logger.warning(
-                "Middleware '%s' callback %s raised: %s",
-                kind,
-                getattr(callback, "__name__", repr(callback)),
-                exc,
-            )
+            if fail_open_before_next and fail_open_after_next:
+                logger.warning(
+                    "Middleware '%s' callback %s raised: %s",
+                    kind,
+                    getattr(callback, "__name__", repr(callback)),
+                    exc,
+                )
+            else:
+                # A terminal invocation may already have crossed its trusted
+                # side-effect boundary.  Do not leak private exception text
+                # from processing around that boundary into logs.
+                logger.warning(
+                    "Middleware '%s' callback failed during terminal tool processing",
+                    kind,
+                )
             if next_succeeded:
-                return next_result
+                if fail_open_after_next:
+                    return next_result
+                raise
             if next_called:
+                raise
+            if not fail_open_before_next:
                 raise
             return call_at(index + 1, payload)
 

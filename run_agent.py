@@ -3748,11 +3748,9 @@ class AIAgent:
         except Exception:
             # Never let durable heartbeat I/O break the agent loop. The
             # heartbeat is an observation-only projection; the next due
-            # window retries naturally.
-            logger.debug(
-                "session activity heartbeat write failed (ignored)",
-                exc_info=True,
-            )
+            # window retries naturally.  Do not persist exception text: DB
+            # drivers may include paths, SQL fragments, or provider data.
+            logger.debug("session activity heartbeat write failed (ignored)")
 
     def _reset_activity_labels_after_turn(self) -> None:
         """Drop mid-turn activity labels once the turn is no longer running.
@@ -6150,7 +6148,9 @@ class AIAgent:
                 where, _n,
             )
 
-    def _fire_stream_delta(self, text: str) -> None:
+    def _fire_stream_delta(
+        self, text: str, *, contain_base_exceptions: bool = False
+    ) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
@@ -6203,8 +6203,9 @@ class AIAgent:
             try:
                 cb(text)
                 delivered = True
-            except Exception:
-                pass
+            except BaseException as exc:
+                if not contain_base_exceptions and not isinstance(exc, Exception):
+                    raise
         if delivered:
             self._record_streamed_assistant_text(text)
 
@@ -7408,7 +7409,30 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _plan_tool_batch(self, tool_calls):
+        """Resolve one host-owned dispatch snapshot before tool side effects."""
+        if getattr(self, "_interrupt_requested", False) is True:
+            # The conversation loop may request its immutable mixed-batch plan
+            # before it reaches _execute_tool_calls.  Cooperative cancellation
+            # must remain earlier than that planning surface too: return an
+            # empty, authority-free sentinel that the top-level executor will
+            # consume only to project ordered cancellation rows.
+            from agent.tool_outcomes import ToolBatchPlan
+
+            return ToolBatchPlan(calls=())
+        from agent.tool_executor import plan_tool_batch
+
+        return plan_tool_batch(self, tool_calls)
+
+    def _execute_tool_calls(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        *,
+        batch_plan=None,
+    ):
         """Execute tool calls from the assistant message and append results to messages.
 
         The segment planner splits the batch into maximal contiguous runs of
@@ -7420,13 +7444,27 @@ class AIAgent:
         while side-effect ordering is preserved.
         """
         tool_calls = assistant_message.tool_calls
+        from agent.tool_executor import cancel_tool_batch_for_interrupt
+
+        interrupted = cancel_tool_batch_for_interrupt(self, tool_calls, messages)
+        if interrupted is not None:
+            return interrupted
+        if batch_plan is None:
+            from agent.tool_outcomes import get_active_tool_batch_plan
+
+            batch_plan = get_active_tool_batch_plan()
+        if batch_plan is None:
+            from agent.tool_executor import plan_tool_batch
+
+            batch_plan = plan_tool_batch(self, tool_calls)
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
+                    assistant_message, messages, effective_task_id, api_call_count,
+                    batch_plan=batch_plan,
                 )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
@@ -7438,16 +7476,18 @@ class AIAgent:
                 kind = segments[0][0]
                 if kind == "parallel":
                     return self._execute_tool_calls_concurrent(
-                        assistant_message, messages, effective_task_id, api_call_count
+                        assistant_message, messages, effective_task_id, api_call_count,
+                        batch_plan=batch_plan,
                     )
                 return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
+                    assistant_message, messages, effective_task_id, api_call_count,
+                    batch_plan=batch_plan,
                 )
 
             from agent.tool_executor import execute_tool_calls_segmented
             return execute_tool_calls_segmented(
                 self, assistant_message, messages, effective_task_id, api_call_count,
-                segments=segments,
+                segments=segments, batch_plan=batch_plan,
             )
         finally:
             self._executing_tools = False
@@ -7530,15 +7570,27 @@ class AIAgent:
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
 
-    def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls_concurrent(
+        self, assistant_message, messages: list, effective_task_id: str,
+        api_call_count: int = 0, *, batch_plan=None,
+    ):
         """Forwarder — see ``agent.tool_executor.execute_tool_calls_concurrent``."""
         from agent.tool_executor import execute_tool_calls_concurrent
-        return execute_tool_calls_concurrent(self, assistant_message, messages, effective_task_id, api_call_count)
+        return execute_tool_calls_concurrent(
+            self, assistant_message, messages, effective_task_id, api_call_count,
+            batch_plan=batch_plan,
+        )
 
-    def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls_sequential(
+        self, assistant_message, messages: list, effective_task_id: str,
+        api_call_count: int = 0, *, batch_plan=None,
+    ):
         """Forwarder — see ``agent.tool_executor.execute_tool_calls_sequential``."""
         from agent.tool_executor import execute_tool_calls_sequential
-        return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
+        return execute_tool_calls_sequential(
+            self, assistant_message, messages, effective_task_id, api_call_count,
+            batch_plan=batch_plan,
+        )
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""

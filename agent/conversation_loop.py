@@ -1371,6 +1371,7 @@ def run_conversation(
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
     _pending_verification_response_previewed = False
+    _terminal_tool_outcome = None
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -5949,7 +5950,19 @@ def run_conversation(
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
-                invalid_tool_calls = [
+
+                # Classify terminal authority before any per-call recovery,
+                # checkpoint, callback, worker, or handler.  In particular, a
+                # malformed sibling cannot bypass the all-or-nothing batch
+                # rule and a later dedup/cap pass cannot make a mixed batch
+                # appear single-call.
+                _early_tool_batch_plan = agent._plan_tool_batch(
+                    assistant_message.tool_calls
+                )
+                _terminal_batch_rejected = (
+                    _early_tool_batch_plan.reject_for_terminal_exclusivity
+                )
+                invalid_tool_calls = [] if _terminal_batch_rejected else [
                     tc.function.name for tc in assistant_message.tool_calls
                     if tc.function.name not in agent.valid_tool_names
                 ]
@@ -6034,7 +6047,7 @@ def run_conversation(
                 # Validate tool call arguments are valid JSON
                 # Handle empty strings as empty objects (common model quirk)
                 invalid_json_args = []
-                for tc in assistant_message.tool_calls:
+                for tc in ([] if _terminal_batch_rejected else assistant_message.tool_calls):
                     args = tc.function.arguments
                     if isinstance(args, (dict, list)):
                         tc.function.arguments = json.dumps(args)
@@ -6137,11 +6150,25 @@ def run_conversation(
                 agent._invalid_json_retries = 0
 
                 # ── Post-call guardrails ──────────────────────────
-                assistant_message.tool_calls = agent._cap_delegate_task_calls(
-                    assistant_message.tool_calls
-                )
-                assistant_message.tool_calls = agent._deduplicate_tool_calls(
-                    assistant_message.tool_calls
+                if not _terminal_batch_rejected:
+                    assistant_message.tool_calls = agent._cap_delegate_task_calls(
+                        assistant_message.tool_calls
+                    )
+                    assistant_message.tool_calls = agent._deduplicate_tool_calls(
+                        assistant_message.tool_calls
+                    )
+
+                # Resolve Tool Search indirection and exact registry authority
+                # before any tool checkpoint/callback/worker/handler.  The
+                # same snapshot is consumed by dispatch, preventing later
+                # resolution or registry drift from changing classification.
+                _tool_batch_plan = (
+                    agent._plan_tool_batch(assistant_message.tool_calls)
+                    if not _terminal_batch_rejected and any(
+                        call.parse_error is not None
+                        for call in _early_tool_batch_plan.calls
+                    )
+                    else _early_tool_batch_plan
                 )
 
                 # Mixed-batch invalid-name handling: collect the invalid
@@ -6314,33 +6341,71 @@ def run_conversation(
                     failed = True
                     break
 
+                def _execute_current_tool_batch():
+                    # Keep the long-standing positional executor call contract
+                    # for embedders/tests while making the immutable plan
+                    # available to the native AIAgent implementation.
+                    from agent.tool_outcomes import bind_tool_batch_plan
+
+                    with bind_tool_batch_plan(_tool_batch_plan):
+                        return agent._execute_tool_calls(
+                            assistant_message,
+                            messages,
+                            effective_task_id,
+                            api_call_count,
+                        )
+
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
                 # commentary only after the canonical SessionDB append above.
-                if not duplicate_previous_interim:
-                    agent._emit_interim_assistant_message(assistant_msg)
+                if _tool_batch_plan.reject_for_terminal_exclusivity:
+                    # Rejection itself appends and incrementally persists one
+                    # ordinary result per original id.  It runs before UI/tool
+                    # callbacks as well as before every execution surface.
+                    _tool_batch_outcome = _execute_current_tool_batch()
+                else:
+                    if not duplicate_previous_interim:
+                        agent._emit_interim_assistant_message(assistant_msg)
 
-                # Close any open streaming display (response box, reasoning
-                # box) before tool execution begins.  Intermediate turns may
-                # have streamed early content that opened the response box;
-                # flushing here prevents it from wrapping tool feed lines.
-                # Only signal the display callback — TTS (_stream_callback)
-                # should NOT receive None (it uses None as end-of-stream).
-                if agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(None)
-                    except Exception:
-                        pass
+                    # Close any open streaming display (response box, reasoning
+                    # box) before tool execution begins.  Intermediate turns may
+                    # have streamed early content that opened the response box;
+                    # flushing here prevents it from wrapping tool feed lines.
+                    # Only signal the display callback — TTS (_stream_callback)
+                    # should NOT receive None (it uses None as end-of-stream).
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(None)
+                        except Exception:
+                            pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    _tool_batch_outcome = _execute_current_tool_batch()
 
-                if getattr(agent, "_incremental_persistence_failed", False):
+                if (
+                    getattr(agent, "_incremental_persistence_failed", False)
+                    and getattr(_tool_batch_outcome, "terminal", None) is None
+                ):
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any
                     # later events from this turn.
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                if getattr(_tool_batch_outcome, "terminal", None) is not None:
+                    _terminal_tool_outcome = _tool_batch_outcome
+                    final_response = _tool_batch_outcome.terminal.final_response
+                    _turn_exit_reason = (
+                        "terminal_tool_outcome:"
+                        f"{_tool_batch_outcome.terminal.reason}"
+                    )
+                    messages.append(
+                        {"role": "assistant", "content": final_response}
+                    )
+                    # Terminal persistence, post-turn hooks, and the single
+                    # host-final projection are centralized in finalize_turn.
+                    # No fallible post-entry boundary may discard control here.
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:
@@ -7299,6 +7364,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        terminal_tool_outcome=_terminal_tool_outcome,
     )
 
 

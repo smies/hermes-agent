@@ -66,6 +66,281 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _finalize_terminal_turn(
+    agent,
+    *,
+    terminal_tool_outcome,
+    messages,
+    conversation_history,
+    effective_task_id,
+    turn_id,
+    user_message,
+    original_user_message,
+    api_call_count,
+    interrupted,
+    failed,
+    _should_review_memory,
+    _turn_exit_reason,
+):
+    """Contain every post-entry boundary and deliver one sealed host final.
+
+    This path is intentionally separate from ordinary turn finalization.
+    Catching ``BaseException`` is correct only after a trusted terminal handler
+    has entered; nonterminal KeyboardInterrupt/SystemExit semantics continue
+    through the historical finalizer unchanged.
+    """
+    from agent.conversation_loop import (
+        _notify_context_engine_turn_complete,
+        logger,
+    )
+    from agent.tool_outcomes import ToolBatchOutcome, terminal_safe_failure
+
+    cleanup_errors: list[str] = []
+
+    def boundary(label, callback):
+        try:
+            return True, callback()
+        except BaseException:
+            cleanup_errors.append(label)
+            logger.warning(
+                "Terminal turn finalization boundary failed: %s", label
+            )
+            return False, None
+
+    directive = terminal_tool_outcome.terminal
+    final_response = directive.final_response
+
+    # The conversation loop appends this row before handing off, but keep the
+    # finalizer independently safe for direct callers and partial failures.
+    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "assistant":
+        messages[-1]["content"] = final_response
+    else:
+        messages.append({"role": "assistant", "content": final_response})
+
+    boundary(
+        "cleanup_task_resources",
+        lambda: agent._cleanup_task_resources(effective_task_id),
+    )
+    apply_override = getattr(agent, "_apply_persist_user_message_override", None)
+    if callable(apply_override):
+        boundary("persist_user_message_override", lambda: apply_override(messages))
+
+    # This explicit append is the sole authority for terminal-final content.
+    # Once it succeeds, its exact row is committed and no later bookkeeping
+    # failure may rewrite the live/returned/streamed value or clear its marker.
+    final_append_ok, final_append_result = boundary(
+        "terminal_final_persistence",
+        lambda: agent._flush_messages_to_session_db(
+            messages, conversation_history
+        ),
+    )
+    final_append_ok = final_append_ok and final_append_result is not False
+    persistence_failed = not final_append_ok
+    if persistence_failed:
+        safe = terminal_safe_failure(
+            "terminal_persistence_error",
+            metadata=directive.metadata,
+        )
+        directive = safe.terminal
+        final_response = directive.final_response
+        terminal_tool_outcome = ToolBatchOutcome(
+            terminal=directive,
+            tool_name=terminal_tool_outcome.tool_name,
+            tool_call_id=terminal_tool_outcome.tool_call_id,
+        )
+        messages[-1]["content"] = final_response
+        messages[-1].pop("_db_persisted", None)
+        agent._db_flush_scan_prefix = None
+        failed = True
+        _turn_exit_reason = "terminal_tool_outcome:terminal_persistence_error"
+
+    # The final outcome is now immutable. Trajectory persistence observes the
+    # same content/status that hooks, streaming, and the caller will receive.
+    boundary(
+        "save_trajectory",
+        lambda: agent._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            not failed,
+        ),
+    )
+
+    # JSON-log/token/session bookkeeping is ancillary after a successful
+    # authoritative append. It may retry the marker-aware flush internally,
+    # but cannot append the terminal final twice or reverse committed content.
+    if final_append_ok:
+        ancillary_ok, ancillary_result = boundary(
+            "persist_session",
+            lambda: agent._persist_session(messages, conversation_history),
+        )
+        if ancillary_ok and ancillary_result is False:
+            cleanup_errors.append("persist_session")
+            logger.warning(
+                "Terminal turn ancillary persistence bookkeeping returned false"
+            )
+
+    def post_llm_call():
+        from hermes_cli.lifecycle import invoke_hook
+
+        invoke_hook(
+            "post_llm_call",
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=original_user_message,
+            assistant_response=final_response,
+            conversation_history=list(messages),
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        )
+
+    boundary("post_llm_call", post_llm_call)
+    boundary(
+        "context_engine_finalization",
+        lambda: _notify_context_engine_turn_complete(
+            agent,
+            messages,
+            usage=getattr(agent, "_last_turn_usage", None),
+            logger=logger,
+            turn_id=turn_id,
+            task_id=effective_task_id,
+            api_call_count=api_call_count,
+            interrupted=interrupted,
+            failed=failed,
+            turn_exit_reason=_turn_exit_reason,
+        ),
+    )
+    boundary(
+        "external_memory_finalization",
+        lambda: agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        ),
+    )
+
+    should_review_skills = False
+    if (
+        agent._skill_nudge_interval > 0
+        and agent._iters_since_skill >= agent._skill_nudge_interval
+        and "skill_manage" in agent.valid_tool_names
+    ):
+        should_review_skills = True
+        agent._iters_since_skill = 0
+    if (
+        final_response
+        and not interrupted
+        and (_should_review_memory or should_review_skills)
+    ):
+        boundary(
+            "background_review",
+            lambda: agent._spawn_background_review(
+                messages_snapshot=list(messages),
+                review_memory=_should_review_memory,
+                review_skills=should_review_skills,
+            ),
+        )
+
+    def on_session_end():
+        from hermes_cli.lifecycle import invoke_hook
+
+        invoke_hook(
+            "on_session_end",
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            completed=not failed,
+            failed=failed,
+            interrupted=interrupted,
+            turn_exit_reason=_turn_exit_reason,
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        )
+
+    boundary("on_session_end", on_session_end)
+
+    # Terminal final projection happens once, after the outcome can no longer
+    # be changed by persistence/finalizer failures.
+    boundary(
+        "stream_final",
+        lambda: agent._fire_stream_delta(
+            final_response, contain_base_exceptions=True
+        ),
+    )
+    if getattr(agent, "stream_delta_callback", None):
+        boundary("stream_close", lambda: agent.stream_delta_callback(None))
+
+    last_reasoning = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            break
+        if msg.get("role") == "assistant" and msg.get("reasoning"):
+            last_reasoning = msg["reasoning"]
+            break
+
+    result = {
+        "final_response": final_response,
+        "last_reasoning": last_reasoning,
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": not failed,
+        "turn_exit_reason": _turn_exit_reason,
+        "failed": failed,
+        "partial": False,
+        "interrupted": interrupted,
+        "response_transformed": False,
+        "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "model": agent.model,
+        "provider": agent.provider,
+        "base_url": agent.base_url,
+        "input_tokens": agent.session_input_tokens,
+        "output_tokens": agent.session_output_tokens,
+        "cache_read_tokens": agent.session_cache_read_tokens,
+        "cache_write_tokens": agent.session_cache_write_tokens,
+        "reasoning_tokens": agent.session_reasoning_tokens,
+        "prompt_tokens": agent.session_prompt_tokens,
+        "completion_tokens": agent.session_completion_tokens,
+        "total_tokens": agent.session_total_tokens,
+        "last_prompt_tokens": getattr(
+            agent.context_compressor, "last_prompt_tokens", 0
+        ) or 0,
+        "estimated_cost_usd": agent.session_estimated_cost_usd,
+        "cost_status": agent.session_cost_status,
+        "cost_source": agent.session_cost_source,
+        "service_tier": (
+            (getattr(agent, "request_overrides", {}) or {}).get("extra_body")
+            or {}
+        ).get("service_tier"),
+        "session_id": agent.session_id,
+        "terminal_tool": {
+            "status": directive.status,
+            "reason": directive.reason,
+            "metadata": dict(directive.metadata),
+            "tool_name": terminal_tool_outcome.tool_name,
+            "tool_call_id": terminal_tool_outcome.tool_call_id,
+        },
+    }
+    if persistence_failed:
+        result["error"] = (
+            "The terminal outcome could not be durably persisted."
+        )
+    if cleanup_errors:
+        result["cleanup_errors"] = cleanup_errors
+    if interrupted and agent._interrupt_message:
+        result["interrupt_message"] = agent._interrupt_message
+
+    ok, pending_steer = boundary("drain_pending_steer", agent._drain_pending_steer)
+    if ok and pending_steer:
+        result["pending_steer"] = pending_steer
+    boundary("clear_interrupt", agent.clear_interrupt)
+    agent._response_was_previewed = False
+    agent._stream_callback = None
+    agent._turn_preflight_display_snapshot = None
+    agent._turn_received_provider_response = False
+    return result
+
+
 def finalize_turn(
     agent,
     *,
@@ -83,6 +358,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    terminal_tool_outcome=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -90,6 +366,26 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+    terminal_turn = bool(
+        terminal_tool_outcome is not None
+        and getattr(terminal_tool_outcome, "terminal", None) is not None
+    )
+    if terminal_turn:
+        return _finalize_terminal_turn(
+            agent,
+            terminal_tool_outcome=terminal_tool_outcome,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            api_call_count=api_call_count,
+            interrupted=interrupted,
+            failed=failed,
+            _should_review_memory=_should_review_memory,
+            _turn_exit_reason=_turn_exit_reason,
+        )
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -361,7 +657,7 @@ def finalize_turn(
         # persisted, run micro-compaction to absorb the oldest uncompacted
         # exchange into the rolling summary.  This amortizes compression
         # across turns rather than batching it into one big pause.
-        if not interrupted and not failed:
+        if not interrupted and not failed and not terminal_turn:
             try:
                 _compressor = getattr(agent, "context_compressor", None)
                 # Strict `is True` + isinstance gates: plugin context engines
@@ -471,7 +767,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not terminal_turn:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -497,7 +793,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not terminal_turn:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -544,7 +840,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not terminal_turn:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -663,6 +959,15 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if terminal_turn:
+        directive = terminal_tool_outcome.terminal
+        result["terminal_tool"] = {
+            "status": directive.status,
+            "reason": directive.reason,
+            "metadata": dict(directive.metadata),
+            "tool_name": terminal_tool_outcome.tool_name,
+            "tool_call_id": terminal_tool_outcome.tool_call_id,
+        }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

@@ -5374,6 +5374,7 @@ def _resolve_single_provider(
 def _resolve_auto(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
+    strict_main_provider: bool = False,
 ) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain.
 
@@ -5513,6 +5514,14 @@ def _resolve_auto(
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
                 return client, resolved or main_model
+
+    if strict_main_provider:
+        logger.warning(
+            "Auxiliary %s: active main provider %s (%s) is unavailable; "
+            "strict_main_provider prevents cross-provider fallback",
+            task or "call", main_provider or "unknown", main_model or "unknown",
+        )
+        return None, None
 
     # ── Step 2: user-configured fallback policy ─────────────────────────
     # In auto mode, respect the task-specific fallback chain first, then the
@@ -5664,6 +5673,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    strict_main_provider: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -5828,7 +5838,11 @@ def resolve_provider_client(
 
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
-        client, resolved = _resolve_auto(main_runtime=main_runtime, task=task)
+        client, resolved = _resolve_auto(
+            main_runtime=main_runtime,
+            task=task,
+            strict_main_provider=strict_main_provider,
+        )
         if client is None:
             return None, None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
@@ -6448,6 +6462,14 @@ def resolve_provider_client(
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+def _task_strict_main_provider(task: str) -> bool:
+    """Whether an auxiliary task must fail closed on the active provider."""
+    if not task:
+        return False
+    value = _get_auxiliary_task_config(task).get("strict_main_provider", False)
+    return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_text_auxiliary_client(
     task: str = "",
     *,
@@ -6470,6 +6492,8 @@ def get_text_auxiliary_client(
         explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        task=task or None,
+        strict_main_provider=_task_strict_main_provider(task),
     )
 
 
@@ -6489,6 +6513,8 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
         explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        task=task or None,
+        strict_main_provider=_task_strict_main_provider(task),
     )
 
 

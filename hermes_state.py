@@ -640,6 +640,7 @@ def apply_wal_with_fallback(
     *,
     db_label: str = "state.db",
     require_wal: bool = False,
+    journal_mode: Optional[str] = None,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
@@ -676,6 +677,10 @@ def apply_wal_with_fallback(
     current callers deliberately keep the default ``require_wal=False`` so
     NFS-homed installs keep working.
 
+    Host-neutral stores may pass an already-resolved ``journal_mode``.  When
+    omitted, the established profile-aware config resolution is unchanged;
+    when supplied, ambient active-profile config is never consulted.
+
     The ERROR is deduplicated per ``db_label``: repeated connections to the
     same underlying DB (e.g. kanban_db.connect() which is called on every
     kanban operation) log once per process, not once per call.  Different
@@ -689,7 +694,12 @@ def apply_wal_with_fallback(
     _on_disk_journal_mode.  That holds for both the NFS path and the
     WAL-reset vulnerability path.
     """
-    configured = resolve_journal_mode()
+    if journal_mode is None:
+        configured = resolve_journal_mode()
+    elif journal_mode in {"wal", "delete"}:
+        configured = journal_mode
+    else:
+        raise ValueError("journal_mode must be an already-resolved 'wal' or 'delete'")
 
     # Vulnerable SQLite: do not enable WAL on new/non-WAL files. Resolve the
     # operator setting first so an explicit DELETE request still verifies that

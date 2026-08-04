@@ -1,0 +1,17 @@
+{
+  "name": "hermes-whatsapp-sensitive-bridge",
+  "version": "1.0.0",
+  "description": "Isolated one-shot WhatsApp sensitive-delivery transport",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node sensitive_bridge.js",
+    "test": "node --test --test-concurrency=1 *.test.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "WhiskeySockets/Baileys#01047debd81beb20da7b7779b08edcb06aa03770"
+  },
+  "overrides": {
+    "protobufjs": "^7.5.5"
+  }
+}

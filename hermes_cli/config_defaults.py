@@ -878,6 +878,7 @@ DEFAULT_CONFIG = {
         },
         "compression": {
             "provider": "auto",
+            "strict_main_provider": False,  # true = never cross providers if the live main provider is unavailable
             "model": "",
             "base_url": "",
             "api_key": "",

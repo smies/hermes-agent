@@ -117,6 +117,11 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
         return False
     if agent_result.get("failed"):
         return False
+    if agent_result.get("terminal_tool"):
+        # A host-owned terminal directive is an explicit delivery decision,
+        # not model-emitted silence syntax.  Its final response must pass the
+        # gateway boundary unchanged even if its text equals a model marker.
+        return False
     return is_intentional_silence_response(response)
 
 
