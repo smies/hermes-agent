@@ -32,6 +32,7 @@ import { tmpdir } from 'os';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { computeTransportIdentity } from './transport_identity.js';
 import { verifyLidBootstrap } from '../whatsapp-sensitive-bridge/provisioning_core.js';
 import {
   buildPollPayload,
@@ -47,6 +48,11 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
+// Verify the exact npm artifact and all reviewed source bytes before any auth
+// load, listener registration, HTTP listen, or WhatsApp socket creation.
+const TRANSPORT_IDENTITY = computeTransportIdentity(PACKAGE_ROOT);
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -1084,6 +1090,7 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    transportManifestHash: TRANSPORT_IDENTITY.manifest_sha256,
     sendReadReceipts: SEND_READ_RECEIPTS,
   });
 });

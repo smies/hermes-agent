@@ -2,7 +2,9 @@ import path from 'node:path';
 
 const ACCOUNT_RE = /^\d{1,32}@(s\.whatsapp\.net|lid)$/;
 const PHONE_RE = /^\d{7,15}$/;
-const CODE_RE = /^[A-Z0-9-]{4,32}$/;
+// WhatsApp phone-number linking returns eight Crockford Base32 characters.
+// Reject separators and ambiguous I/L/O/U glyphs at the operator boundary.
+const CODE_RE = /^[0-9A-HJKMNP-TV-Z]{8}$/;
 
 export function normalizePhone(value) {
   if (typeof value !== 'string') throw new Error('phone_input_invalid');
@@ -103,10 +105,7 @@ export async function verifyLidBootstrap({ auth, sock, phoneJid, canonicalizeJid
       // Pinned Baileys persists lid-mapping with a bare numeric PN key and a
       // bare numeric LID value.  Full JIDs here silently miss real stores.
       const records = await auth.state.keys.get('lid-mapping', [pnUser]);
-      const mapped = records?.[pnUser]?.lidUser
-        ?? records?.[pnUser]?.lid
-        ?? records?.[pnUser]
-        ?? null;
+      const mapped = records?.[pnUser] ?? null;
       lidUser = /^\d{1,32}$/.test(String(mapped || '')) ? String(mapped) : null;
     } catch {}
   }

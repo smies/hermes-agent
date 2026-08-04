@@ -23,7 +23,7 @@ from hermes_constants import find_node_executable, get_hermes_dir, get_hermes_ho
 
 _MAX_EVENT_BYTES = 4096
 _ROLES = frozenset({"ordinary", "sensitive"})
-_PAIRING_CODE_RE = re.compile(r"^[A-Z0-9-]{4,32}$")
+_PAIRING_CODE_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
 
 
 class WhatsAppProvisioningError(RuntimeError):
@@ -143,15 +143,22 @@ def _ensure_provisioner_dependencies(node: str, script: Path) -> None:
         raise WhatsAppProvisioningError(
             "provisioner dependency metadata is invalid"
         ) from exc
-    commit = "01047debd81beb20da7b7779b08edcb06aa03770"
+    version = "7.0.0-rc14"
+    resolved = (
+        "https://registry.npmjs.org/@whiskeysockets/baileys/"
+        "-/baileys-7.0.0-rc14.tgz"
+    )
+    integrity = (
+        "sha512-WK+X8ju8TPGxvWIsP8hrY6JB6FltYuFe+vsqKfjOYX25JObij9qLf2c3ZGdl1Q+"
+        "vhFwbnT+AZmWAB5pTvzmSiQ=="
+    )
     if (
-        type(requested) is not str
-        or not requested.endswith("#" + commit)
+        requested != version
         or locked_requested != requested
-        or type(locked.get("resolved")) is not str
-        or not locked["resolved"].endswith("#" + commit)
-        or type(locked.get("integrity")) is not str
-        or not locked["integrity"].startswith("sha512-")
+        or lock.get("lockfileVersion") != 3
+        or locked.get("version") != version
+        or locked.get("resolved") != resolved
+        or locked.get("integrity") != integrity
     ):
         raise WhatsAppProvisioningError(
             "provisioner dependency metadata is invalid"
@@ -185,8 +192,8 @@ def _ensure_provisioner_dependencies(node: str, script: Path) -> None:
     except (OSError, ValueError) as exc:
         raise WhatsAppProvisioningError("provisioner dependencies are invalid") from exc
     if (
-        installed_package.get("name") not in {"baileys", "@whiskeysockets/baileys"}
-        or installed_package.get("version") != locked.get("version")
+        installed_package.get("name") != "@whiskeysockets/baileys"
+        or installed_package.get("version") != version
     ):
         raise WhatsAppProvisioningError("provisioner dependencies are invalid")
     # Exercise the same exact package/lock/source/installed-tree identity code
@@ -333,19 +340,19 @@ def run_whatsapp_provisioning(
     ordinary = None
     sensitive = None
     try:
-        popen_kwargs: dict[str, object] = {
-            "stdin": subprocess.PIPE,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE if not validate_only else subprocess.DEVNULL,
-            "text": True,
-            "encoding": "utf-8",
-            "errors": "strict",
-            "env": _minimal_node_environment(node),
-        }
-        popen_kwargs["start_new_session"] = True
-        process = subprocess.Popen(
+        # Native Windows returned before this point. Keep the POSIX-only
+        # process-group option as an explicit keyword so static typing does
+        # not lose all Popen overload information through dict[str, object].
+        process: subprocess.Popen[str] = subprocess.Popen(
             child_args,
-            **popen_kwargs,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if not validate_only else subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=_minimal_node_environment(node),
+            start_new_session=True,
         )
     except BaseException:
         request = ""

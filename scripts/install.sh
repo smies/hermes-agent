@@ -2458,7 +2458,7 @@ maybe_start_gateway() {
     fi
     WHATSAPP_STATE=""
     if [ -n "$WHATSAPP_PROBE_PY" ] && [ -x "$WHATSAPP_PROBE_PY" ]; then
-        WHATSAPP_STATE=$(cd "$INSTALL_DIR" && "$WHATSAPP_PROBE_PY" -m hermes_cli.whatsapp_runtime 2>/dev/null || true)
+        WHATSAPP_STATE=$(cd "$INSTALL_DIR" && HERMES_HOME="$HERMES_HOME" "$WHATSAPP_PROBE_PY" -m hermes_cli.whatsapp_runtime 2>/dev/null || true)
     fi
     case "$WHATSAPP_STATE" in
         enabled=true*) HAS_MESSAGING=true ;;

@@ -50,10 +50,15 @@ def _config(root: Path) -> dict:
         "lock_sha256": "d" * 64,
         "package_name": "fixture-package",
         "package_version": "fixture-version",
-        "baileys_commit": "fixture-commit",
+        "baileys_spec": "fixture-spec",
+        "baileys_lock_version": "fixture-lock-version",
+        "baileys_lock_resolved": "fixture-lock-resolved",
         "baileys_version": "fixture-provider-version",
         "baileys_lock_integrity": "fixture-lock-integrity",
+        "baileys_installed_name": "fixture-installed-name",
+        "baileys_package_sha256": "f" * 64,
         "baileys_tree_sha256": "e" * 64,
+        "baileys_reviewed_release_git_head": "fixture-reviewed-head",
     }
     _write_owner_json(key_file, keys)
     _write_owner_json(

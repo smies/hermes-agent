@@ -21,7 +21,7 @@ function fakeSocket({ phoneJid, lidJid, update, onPairingCode }) {
     signalRepository: { lidMapping: { getLIDForPN: async () => lidJid } },
     requestPairingCode: async () => {
       onPairingCode();
-      return 'A1B2-C3D4';
+      return 'A1B2C3D4';
     },
     endCalled: false,
     end() { this.endCalled = true; },
@@ -87,7 +87,7 @@ test('offline provisioning uses only requestPairingCode and persists canonical L
         queueMicrotask(() => socket.ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
-      emitCode: (code) => assert.equal(code, 'A1B2-C3D4'),
+      emitCode: (code) => assert.equal(code, 'A1B2C3D4'),
       timeoutMs: 2_000,
     });
     assert.deepEqual(result, { account_namespace: 's.whatsapp.net', lid_ready: true });
@@ -180,7 +180,7 @@ test('reprovision stages fresh auth, requests a fresh code, and preserves existi
         const socket = {
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
-          requestPairingCode: async () => { pairingCalls += 1; return 'R3PR-0V1S'; },
+          requestPairingCode: async () => { pairingCalls += 1; return 'R3PR0V1S'; },
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
@@ -253,14 +253,14 @@ test('explicit reprovision replaces unsafe legacy auth with fresh owner-only sta
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => `${lid}@lid` } },
-          requestPairingCode: async () => { pairingCalls += 1; return 'L3GY-C0DE'; },
+          requestPairingCode: async () => { pairingCalls += 1; return 'M3GYC0DE'; },
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
         queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
-      emitCode: (code) => assert.equal(code, 'L3GY-C0DE'),
+      emitCode: (code) => assert.equal(code, 'M3GYC0DE'),
       timeoutMs: 2_000,
     });
     assert.deepEqual(result, { account_namespace: 's.whatsapp.net', lid_ready: true });
@@ -323,7 +323,7 @@ test('post-install staged failure restores the exact unsafe legacy tree', async 
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => '818181818@lid' } },
-          requestPairingCode: async () => 'R0LL-B4CK',
+          requestPairingCode: async () => 'R0MMB4CK',
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
@@ -434,7 +434,7 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => '777777777@lid' } },
-          requestPairingCode: async () => 'R4CE-C0DE',
+          requestPairingCode: async () => 'R4CEC0DE',
           end() {},
         };
         queueMicrotask(async () => {

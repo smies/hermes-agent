@@ -94,7 +94,7 @@ def test_valid_existing_session_returns_ready_without_pairing_code(tmp_path: Pat
 
 
 def test_pairing_code_is_only_written_to_explicit_operator_channel(tmp_path: Path) -> None:
-    code = "ABCD-EFGH"
+    code = "ABCD3FGH"
     process = _Process(
         json.dumps(
             {"event": "complete", "state": "ready_for_production", "lid_ready": True}

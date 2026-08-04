@@ -32,7 +32,7 @@ WhatsApp 会定期更新其 Web 协议，这可能导致第三方桥接暂时失
 
 ## 前置条件
 
-- **Node.js v18+** 和 **npm**——WhatsApp 桥接作为 Node.js 进程运行
+- **Node.js v20+** 和 **npm**——WhatsApp 桥接作为 Node.js 进程运行
 - **已安装 WhatsApp 的手机**（用于输入关联设备配对码）
 
 与旧版浏览器驱动的桥接不同，当前基于 Baileys 的桥接**不**需要本地 Chromium 或 Puppeteer 依赖栈。
@@ -51,7 +51,7 @@ hermes whatsapp
 hermes whatsapp provision --role ordinary
 ```
 
-原生 Windows 不支持此离线预配命令；请在 macOS、Linux 或 WSL2 上预配后迁移会话，或改用 WhatsApp Cloud。命令不会回退到二维码流程。
+原生 Windows **不支持 Baileys 离线预配**；请在 macOS、Linux 或 WSL2 上预配后迁移会话，或改用独立的官方 WhatsApp Business Cloud API 集成。Cloud API 不是 Baileys 的配对备用路径。原生 Windows 命令会在依赖安装、路径或会话访问之前退出，任何平台都不会回退到二维码流程。
 
 该命令会先验证当前 profile 的普通会话。有效会话会就地复用，不会复制或修改凭据。否则，命令仅在交互式终端中询问手机号并显示一个短配对码。
 
@@ -137,7 +137,8 @@ Gateway 会使用已保存的会话自动启动 WhatsApp 桥接。
 
 ## 会话持久化
 
-Baileys 桥接将会话保存在 `~/.hermes/platforms/whatsapp/session` 目录下。这意味着：
+新 Baileys 会话保存在 `~/.hermes/platforms/whatsapp/session`。如果旧版
+`~/.hermes/whatsapp/session` 已有内容，则为兼容性继续优先使用旧路径；此规则也适用于命名 profile。这意味着：
 
 - **会话在重启后仍然有效**——无需每次重新输入配对码
 - 会话数据包含加密密钥和设备凭证

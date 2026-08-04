@@ -216,8 +216,11 @@ class TrustedPrivateReadHostConfig:
         identity = allowlist.get("transport_identity")
         identity_fields = {
             "manifest_sha256", "source_sha256", "package_sha256", "lock_sha256",
-            "package_name", "package_version", "baileys_commit", "baileys_version",
-            "baileys_lock_integrity", "baileys_tree_sha256",
+            "package_name", "package_version", "baileys_spec",
+            "baileys_lock_version", "baileys_lock_resolved",
+            "baileys_lock_integrity", "baileys_installed_name", "baileys_version",
+            "baileys_package_sha256", "baileys_tree_sha256",
+            "baileys_reviewed_release_git_head",
         }
         if allowlist["version"] != 1 or type(identity) is not dict or set(identity) != identity_fields:
             raise TrustedPrivateReadConfigurationError("transport allowlist is invalid")

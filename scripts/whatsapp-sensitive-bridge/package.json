@@ -10,7 +10,7 @@
     "test": "node --test --test-concurrency=1 *.test.mjs"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "WhiskeySockets/Baileys#01047debd81beb20da7b7779b08edcb06aa03770"
+    "@whiskeysockets/baileys": "7.0.0-rc14"
   },
   "overrides": {
     "protobufjs": "^7.5.5"

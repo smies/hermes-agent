@@ -72,12 +72,17 @@ test('socket config explicitly disables own events, history/offline sync, retry/
   assert.equal(config.emitOwnEvents, false);
   assert.equal(config.enableRecentMessageCache, false);
   assert.equal(config.maxMsgRetryCount, 0);
+  assert.equal(config.retryRequestDelayMs, 0);
   assert.equal(config.enableAutoSessionRecreation, false);
   assert.equal(await config.getMessage({ id: 'sensitive-id' }), undefined);
+  assert.equal(await config.cachedGroupMetadata('synthetic@g.us'), undefined);
   assert.equal(config.syncFullHistory, false);
   assert.equal(config.fireInitQueries, false);
   assert.equal(config.shouldSyncHistoryMessage({ syncType: 0 }), false);
-  assert.equal(Object.hasOwn(config, 'mediaCache'), false);
+  for (const cache of ['mediaCache', 'msgRetryCounterCache', 'userDevicesCache', 'callOfferCache', 'placeholderResendCache']) {
+    assert.equal(Object.hasOwn(config, cache), true);
+    assert.equal(config[cache], undefined);
+  }
   assert.equal(config.markOnlineOnConnect, false);
 });
 
@@ -181,6 +186,35 @@ test('loaded auth identity must match the expected sensitive account before sock
     ordinaryAccountJid: ORDINARY_ACCOUNT,
     useAuthState: async () => ({
       state: { creds: { me: { id: `${ORDINARY_ACCOUNT.split('@')[0]}:4@s.whatsapp.net` } } },
+      saveCreds() {},
+    }),
+    makeSocket: () => { madeSocket = true; return fakeSocket(); },
+    canonicalizeJid: (jid) => jid.replace(/:\d+@/, '@'),
+    onFatal: (code) => fatal.push(code),
+  });
+  await lifecycle.start();
+  assert.equal(madeSocket, false);
+  assert.deepEqual(fatal, ['sensitive_account_mismatch']);
+  assert.equal(lifecycle.running, false);
+});
+
+test('loaded auth cannot hide the ordinary account behind a matching sensitive identity', async () => {
+  const { sessionPathGuard } = freshSessionPaths();
+  let madeSocket = false;
+  const fatal = [];
+  const lifecycle = new SensitiveSocketLifecycle({
+    sessionPathGuard,
+    expectedSensitiveAccountJid: SENSITIVE_ACCOUNT,
+    ordinaryAccountJid: ORDINARY_ACCOUNT,
+    useAuthState: async () => ({
+      state: {
+        creds: {
+          me: {
+            id: `${SENSITIVE_ACCOUNT.split('@')[0]}:4@s.whatsapp.net`,
+            lid: `${ORDINARY_ACCOUNT.split('@')[0]}:8@s.whatsapp.net`,
+          },
+        },
+      },
       saveCreds() {},
     }),
     makeSocket: () => { madeSocket = true; return fakeSocket(); },

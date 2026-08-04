@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "package_name": "hermes-whatsapp-bridge",
+  "package_version": "1.0.0",
+  "package_sha256": "caf5f82530f462e93192876124338c249d7bb0d3d89b8b21773ff95281a60618",
+  "lock_sha256": "2e62d7c1fe53747fd3148e374b639e23af120cdad295ca57a426d38384f72913",
+  "source_sha256": "68eb337f118735c8ee2e8f727b1c792d294b5806f89c611831119227d06ea512",
+  "baileys": {
+    "spec": "7.0.0-rc14",
+    "lock_version": "7.0.0-rc14",
+    "lock_resolved": "https://registry.npmjs.org/@whiskeysockets/baileys/-/baileys-7.0.0-rc14.tgz",
+    "lock_integrity": "sha512-WK+X8ju8TPGxvWIsP8hrY6JB6FltYuFe+vsqKfjOYX25JObij9qLf2c3ZGdl1Q+vhFwbnT+AZmWAB5pTvzmSiQ==",
+    "installed_name": "@whiskeysockets/baileys",
+    "installed_version": "7.0.0-rc14",
+    "reviewed_release_git_head": "7e7b0757e3f9f3c7789fb1cfd2f241d5002a199a",
+    "package_sha256": "b5f4f2d1a8af27239e0e9869594345b5d99ecc102193b98117332cadffcebc0d",
+    "tree_sha256": "bdb0b02cb790daa88421bf29700b43b1e449378a77f51edcfd8d524e9b9f0112"
+  }
+}

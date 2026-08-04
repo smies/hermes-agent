@@ -15,7 +15,14 @@ export function buildSensitiveSocketConfig({ auth, logger }) {
     emitOwnEvents: false,
     enableRecentMessageCache: false,
     maxMsgRetryCount: 0,
+    retryRequestDelayMs: 0,
     enableAutoSessionRecreation: false,
+    mediaCache: undefined,
+    msgRetryCounterCache: undefined,
+    userDevicesCache: undefined,
+    callOfferCache: undefined,
+    placeholderResendCache: undefined,
+    cachedGroupMetadata: async () => undefined,
     // Receipt-triggered retransmission must never recover sensitive plaintext.
     getMessage: async () => undefined,
   };
@@ -150,11 +157,9 @@ export class SensitiveSocketLifecycle {
       auth?.state?.creds?.me?.id,
       auth?.state?.creds?.me?.lid,
     ].map((value) => this.#canonicalAccount(value)).filter(Boolean);
-    const storedAccount = storedAccounts.includes(this.expectedSensitiveAccountJid)
-      ? this.expectedSensitiveAccountJid
-      : storedAccounts[0] || null;
-    if (storedAccount && (storedAccount !== this.expectedSensitiveAccountJid
-        || storedAccount === this.ordinaryAccountJid)) {
+    if (storedAccounts.length > 0
+        && (!storedAccounts.includes(this.expectedSensitiveAccountJid)
+          || storedAccounts.includes(this.ordinaryAccountJid))) {
       this.#fatal('sensitive_account_mismatch');
       return;
     }

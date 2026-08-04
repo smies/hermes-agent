@@ -50,6 +50,7 @@ def test_shell_and_powershell_installers_use_the_same_profile_safe_session() -> 
     assert "-m hermes_cli.whatsapp_runtime" in powershell
     assert "whatsapp provision --role ordinary" not in powershell
     assert 'WHATSAPP_STATE" = "enabled=true;ready=false"' in shell
+    assert 'HERMES_HOME="$HERMES_HOME" "$WHATSAPP_PROBE_PY" -m hermes_cli.whatsapp_runtime' in shell
     assert '$whatsappState -eq "enabled=true;ready=false"' in powershell
 
     # The shared probe owns legacy/canonical precedence; neither installer

@@ -42,7 +42,7 @@ bot stops working after a WhatsApp update, pull the latest Hermes version and re
 
 ## Prerequisites
 
-- **Node.js v18+** and **npm** — the WhatsApp bridge runs as a Node.js process
+- **Node.js v20+** and **npm** — the WhatsApp bridge runs as a Node.js process
 - **A phone with WhatsApp** installed (for entering a linked-device code)
 
 Unlike older browser-driven bridges, the current Baileys-based bridge does **not** require a local Chromium or Puppeteer dependency stack.

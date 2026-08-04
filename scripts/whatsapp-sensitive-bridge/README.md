@@ -36,8 +36,10 @@ Before enablement, process spawn, any send, and acceptance of any evidence, the
 trusted host must compare the complete returned transport identity to immutable,
 reviewed allowlisted expected values. That comparison includes
 `manifest_sha256`, `source_sha256`, `package_sha256`, `lock_sha256`, the exact
-package/lock identity fields, and the Baileys commit, version, lock integrity,
-and `baileys_tree_sha256`. Self-reported hashes only describe the running tree;
+npm spec, lock version/resolved/integrity, installed name/version/package bytes,
+and `baileys_tree_sha256`. The published Git head is recorded only as reviewed
+release metadata because the npm package does not claim a `gitHead`; it is not
+artifact ancestry proof. Self-reported hashes only describe the running tree;
 they are not their own trust anchor, and neither is npm's git-dependency
 integrity warning. The host integration supplies and protects the allowlist.
 
@@ -78,8 +80,9 @@ Only an exact destination `DELIVERY_ACK`, `READ`, or `PLAYED` update can produce
 the internal `provider_accepted` outcome. Send and acknowledgement timeouts are
 never retried and remain post-submission ambiguous.
 
-The audited dependency is
-`@whiskeysockets/baileys@01047debd81beb20da7b7779b08edcb06aa03770`.
+The audited dependency is exactly
+`@whiskeysockets/baileys@7.0.0-rc14`, resolved from its npm tarball with the
+integrity recorded in `transport-manifest.json`.
 Reproduce the install from this directory with:
 
 ```sh

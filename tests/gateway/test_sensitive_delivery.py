@@ -2766,10 +2766,15 @@ def _synthetic_host_config(root: Path) -> TrustedPrivateReadHostConfig:
         "lock_sha256": "d" * 64,
         "package_name": "synthetic-package",
         "package_version": "synthetic-version",
-        "baileys_commit": "synthetic-commit",
+        "baileys_spec": "synthetic-spec",
+        "baileys_lock_version": "synthetic-lock-version",
+        "baileys_lock_resolved": "synthetic-lock-resolved",
         "baileys_version": "synthetic-provider-version",
         "baileys_lock_integrity": "synthetic-lock-integrity",
+        "baileys_installed_name": "synthetic-installed-name",
+        "baileys_package_sha256": "f" * 64,
         "baileys_tree_sha256": "e" * 64,
+        "baileys_reviewed_release_git_head": "synthetic-reviewed-head",
     }
     allowlist.write_text(json.dumps({
         "version": 1,

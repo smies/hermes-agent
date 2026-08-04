@@ -14,9 +14,9 @@ const RUNTIME = 'runtime-01HZX7M6Y2PE5F8K9W3R4T6V7X';
 const EPOCH = 'epoch-01HZX7M6Y2PE5F8K9W3R4T6V7X';
 const PRIVATE = 'PRIVATE-CANARY-é-7b5031';
 const TRANSPORT_IDENTITY = Object.freeze({
-  version: 1,
   manifest_sha256: 'a'.repeat(64),
-  baileys_commit: '01047debd81beb20da7b7779b08edcb06aa03770',
+  baileys_spec: '7.0.0-rc14',
+  baileys_reviewed_release_git_head: '7e7b0757e3f9f3c7789fb1cfd2f241d5002a199a',
 });
 const BINDINGS = Object.freeze({
   authorization_task_id: 'task-01HZX7M6Y2PE5F8K9W3R4T6V7X',

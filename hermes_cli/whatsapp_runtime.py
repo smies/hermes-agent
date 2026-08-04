@@ -11,9 +11,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 import os
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable, cast
 
-from hermes_constants import get_hermes_dir, get_hermes_home
+from hermes_constants import (
+    get_hermes_dir,
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -32,19 +37,26 @@ def _coerce_explicit_bool(value: object) -> bool:
     return bool(value)
 
 
+def _object_mapping(value: object) -> Mapping[object, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return cast(Mapping[object, object], value)
+
+
 def _explicit_yaml_value(config: object) -> tuple[bool, object]:
-    if isinstance(config, Mapping):
-        platforms = config.get("platforms")
-        if isinstance(platforms, Mapping):
-            whatsapp = platforms.get("whatsapp")
-            if isinstance(whatsapp, Mapping) and "enabled" in whatsapp:
+    config_mapping = _object_mapping(config)
+    if config_mapping is not None:
+        platforms = _object_mapping(config_mapping.get("platforms"))
+        if platforms is not None:
+            whatsapp = _object_mapping(platforms.get("whatsapp"))
+            if whatsapp is not None and "enabled" in whatsapp:
                 return True, whatsapp["enabled"]
-        gateway = config.get("gateway")
-        if isinstance(gateway, Mapping):
-            gateway_platforms = gateway.get("platforms")
-            if isinstance(gateway_platforms, Mapping):
-                whatsapp = gateway_platforms.get("whatsapp")
-                if isinstance(whatsapp, Mapping) and "enabled" in whatsapp:
+        gateway = _object_mapping(config_mapping.get("gateway"))
+        if gateway is not None:
+            gateway_platforms = _object_mapping(gateway.get("platforms"))
+            if gateway_platforms is not None:
+                whatsapp = _object_mapping(gateway_platforms.get("whatsapp"))
+                if whatsapp is not None and "enabled" in whatsapp:
                     return True, whatsapp["enabled"]
     try:
         from gateway.config import Platform
@@ -52,8 +64,10 @@ def _explicit_yaml_value(config: object) -> tuple[bool, object]:
         platform_config = getattr(config, "platforms", {}).get(Platform.WHATSAPP)
     except Exception:
         platform_config = None
-    extra = getattr(platform_config, "extra", {}) if platform_config is not None else {}
-    if isinstance(extra, Mapping) and extra.get("_enabled_explicit") is True:
+    extra = _object_mapping(
+        getattr(platform_config, "extra", {}) if platform_config is not None else {}
+    )
+    if extra is not None and extra.get("_enabled_explicit") is True:
         return True, getattr(platform_config, "enabled", False)
     return False, None
 
@@ -100,21 +114,22 @@ def resolve_whatsapp_session_dir(*, home: Path | None = None) -> Path:
 def installer_probe(*, home: Path | None = None) -> tuple[bool, bool]:
     """Return enablement/readiness without parsing any credential content."""
     selected_home = home or get_hermes_home()
+    token = set_hermes_home_override(selected_home)
     try:
-        import yaml
+        # The probe is a short-lived subprocess, so loading the selected
+        # profile's dotenv is safe and mirrors gateway startup expansion.
+        from hermes_cli.env_loader import load_hermes_dotenv
 
-        raw = yaml.safe_load((selected_home / "config.yaml").read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeError, ValueError, TypeError):
-        raw = {}
-    try:
-        from hermes_cli.config import get_env_value
+        load_hermes_dotenv(hermes_home=selected_home)
+        from hermes_cli.config import get_env_value, load_config_readonly
 
+        config = load_config_readonly()
         legacy_value = get_env_value("WHATSAPP_ENABLED")
-    except Exception:
-        legacy_value = os.getenv("WHATSAPP_ENABLED")
-    enabled = resolve_whatsapp_enabled(raw, legacy_value=legacy_value)
-    ready = (resolve_whatsapp_session_dir(home=selected_home) / "creds.json").is_file()
-    return enabled, ready
+        enabled = resolve_whatsapp_enabled(config, legacy_value=legacy_value)
+        ready = (resolve_whatsapp_session_dir(home=selected_home) / "creds.json").is_file()
+        return enabled, ready
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _main() -> int:

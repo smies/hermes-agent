@@ -56,7 +56,7 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 | 依赖            | Hermes 需要它的原因                                                                             |
 | --------------- | ----------------------------------------------------------------------------------------------- |
 | **PortableGit** | 为终端工具提供 `bash.exe`，为会话内克隆提供 `git`。在安装时配置，而非由 `dep_ensure` 负责。     |
-| **Node.js 22**  | 浏览器工具（`agent-browser`）、TUI 的 web 桥接以及 WhatsApp 桥接所必需。                        |
+| **Node.js 26**  | 浏览器工具（`agent-browser`）、TUI 的 web 桥接以及 WhatsApp 桥接所必需。                        |
 | **ffmpeg**      | TTS / 语音消息的音频格式转换。                                                                  |
 | **ripgrep**     | 快速文件搜索——不可用时回退到 `grep`。                                                           |
 | **npm 包**      | `agent-browser`、Playwright Chromium 以及各工具集的 Node 依赖，在首次使用浏览器工具时安装一次。 |
@@ -69,11 +69,11 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 
 1. **引导 `uv`** — Astral 的快速 Python 管理器。安装到 `%USERPROFILE%\.local\bin`。
 2. **通过 `uv` 安装 Python 3.11**。无需预先安装 Python。
-3. **安装 Node.js 22**（优先使用 winget，否则将便携式 Node 压缩包解压到 `%LOCALAPPDATA%\hermes\node`）。用于浏览器工具和 WhatsApp 桥接。
+3. **安装 Node.js 26**（优先使用 winget，否则将便携式 Node 压缩包解压到 `%LOCALAPPDATA%\hermes\node`）。用于浏览器工具和 WhatsApp 桥接。
 4. **安装便携式 Git** — 如果 `git` 已在 PATH 中，安装程序直接使用；否则从官方 `git-for-windows` 发布版下载精简的自包含 **PortableGit**（约 45 MB）到 `%LOCALAPPDATA%\hermes\git`。无需管理员权限，不写入 Windows 安装程序注册表，不干扰系统上的其他任何内容。
 5. **将仓库克隆**到 `%LOCALAPPDATA%\hermes\hermes-agent` 并在其中创建 virtualenv。
 6. **分层 `uv pip install`** — 先尝试 `.[all]`，如果 `git+https` 依赖在 GitHub 限速时失败，则逐步回退到更小的集合（`[messaging,dashboard,ext]` → `[messaging]` → `.`）。防止"单次失败导致裸安装"的故障模式。
-7. **根据 `.env` 自动安装消息 SDK** — 如果存在 `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` / `WHATSAPP_ENABLED`，则运行 `python -m ensurepip --upgrade` 并针对性地调用 `pip install`，确保各平台 SDK 可正常导入。
+7. **按已配置平台自动安装消息 SDK**。WhatsApp 启用状态以 `config.yaml` 的 `platforms.whatsapp.enabled` 为准；仅当该 YAML 键不存在时才读取旧版 `WHATSAPP_ENABLED`。原生 Windows 不支持 Baileys 离线预配，也不会创建会话或显示二维码；请从 macOS/Linux/WSL2 迁移已预配会话，或使用独立的官方 WhatsApp Cloud 集成。
 8. **设置 `HERMES_GIT_BASH_PATH`** 为解析后的 `bash.exe` 路径，使 Hermes 在新 shell 中能确定性地找到它。
 9. **将 `%LOCALAPPDATA%\hermes\bin` 添加到用户 PATH** — 打开新终端后即可使用 `hermes` 命令。
 10. **运行 `hermes setup`** — 正常的首次运行向导（模型、提供商、工具集）。使用 `-SkipSetup` 跳过。
@@ -91,6 +91,8 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 | CLI（`hermes chat`、`hermes setup`、`hermes gateway` 等）    | ✓                   | ✓                  |
 | 交互式 TUI（`hermes --tui`）                                 | ✓                   | ✓                  |
 | 消息 gateway（Telegram、Discord、Slack、WhatsApp，15+ 平台） | ✓                   | ✓                  |
+| WhatsApp Baileys gateway（已迁移的预配会话）                | ✓                   | ✓                  |
+| WhatsApp Baileys 离线预配                                   | ✗（使用 POSIX/WSL2 或 Cloud） | ✓         |
 | Cron 调度器                                                  | ✓                   | ✓                  |
 | 浏览器工具（通过 Node 驱动 Chromium）                        | ✓                   | ✓                  |
 | MCP 服务器（stdio 和 HTTP）                                  | ✓                   | ✓                  |

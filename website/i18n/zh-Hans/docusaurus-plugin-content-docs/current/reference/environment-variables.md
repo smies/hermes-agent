@@ -292,7 +292,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `GOOGLE_CHAT_MAX_BYTES` | Pub/Sub FlowControl 最大在途字节数（默认：`16777216`，16 MiB） |
 | `GOOGLE_CHAT_BOOTSTRAP_SPACES` | 启动时探测以解析 bot 自身 `users/{id}` 的逗号分隔额外空间 ID |
 | `GOOGLE_CHAT_DEBUG_RAW` | 设置任意值可在 DEBUG 级别记录脱敏的 Pub/Sub 信封（仅用于调试） |
-| `WHATSAPP_ENABLED` | 启用 WhatsApp 桥接（`true`/`false`） |
+| `WHATSAPP_ENABLED` | 旧版兼容开关（`true`/`false`）。仅当 `config.yaml` 中没有 `platforms.whatsapp.enabled` 时生效；规范 YAML 值始终优先，包括显式 `false` 和 `${VAR}` 展开后的值。 |
 | `WHATSAPP_MODE` | `bot`（独立号码）或 `self-chat`（给自己发消息） |
 | `WHATSAPP_ALLOWED_USERS` | 逗号分隔的手机号码（含国家代码，不含 `+`），或 `*` 允许所有发送者 |
 | `WHATSAPP_ALLOW_ALL_USERS` | 无需白名单允许所有 WhatsApp 发送者（`true`/`false`） |
