@@ -14,8 +14,55 @@ function copyPackage() {
   const root = realpathSync.native(
     mkdtempSync(path.join(tmpdir(), 'hermes-sensitive-preimport-')),
   );
-  cpSync(HERE, root, { recursive: true });
+  cpSync(HERE, root, { recursive: true, verbatimSymlinks: true });
   return root;
+}
+
+function prependMarker(root, relative, marker) {
+  const target = path.join(root, relative);
+  writeFileSync(
+    target,
+    `process.getBuiltinModule('node:fs').writeFileSync(${JSON.stringify(marker)}, 'x');\n${readFileSync(target, 'utf8')}`,
+  );
+}
+
+function packageEntrypoint(root, packageName) {
+  const packageRoot = path.join(root, 'node_modules', ...packageName.split('/'));
+  const pkg = JSON.parse(readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
+  return path.relative(root, path.join(packageRoot, pkg.main || 'index.js'));
+}
+
+function runRejected(root, launcher) {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(root, launcher), '--verify-only'],
+    { cwd: root, encoding: 'utf8', env: {} },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
+}
+
+for (const launcher of ['launcher.js', 'provision_launcher.js']) {
+  test(`${launcher} pre-hashes the verifier before its marker can execute`, () => {
+    const root = copyPackage();
+    const marker = path.join(root, `${launcher}-verifier-evaluated`);
+    prependMarker(root, 'transport_identity.js', marker);
+    runRejected(root, launcher);
+    assert.equal(existsSync(marker), false);
+  });
+
+  for (const packageName of ['libsignal', 'pino', 'protobufjs']) {
+    test(`${launcher} rejects tampered ${packageName} before evaluation`, () => {
+      const root = copyPackage();
+      const marker = path.join(
+        root, `${launcher}-${packageName.replaceAll('/', '-')}-evaluated`,
+      );
+      prependMarker(root, packageEntrypoint(root, packageName), marker);
+      runRejected(root, launcher);
+      assert.equal(existsSync(marker), false);
+    });
+  }
 }
 
 for (const launcher of ['launcher.js', 'provision_launcher.js']) {

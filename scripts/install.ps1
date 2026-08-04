@@ -1324,11 +1324,20 @@ function Test-Node {
             $ErrorActionPreference = $prevEAP
             # Refresh PATH
             $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
-            if (Get-Command node -ErrorAction SilentlyContinue) {
-                $version = node --version
-                Write-Success "Node.js $version installed via winget"
-                $script:HasNode = $true
-                return $true
+            $resolvedNode = Get-Command node -CommandType Application -ErrorAction SilentlyContinue
+            if ($resolvedNode) {
+                # Validate the exact executable the refreshed PATH will use.
+                # A stale Node earlier on PATH must not turn winget's success
+                # into a false-positive that later reaches npm/EBADENGINE.
+                $version = & $resolvedNode.Source --version
+                if (Test-NodeVersionOk $version) {
+                    Ensure-NodeExeOnPath | Out-Null
+                    Write-Success "Node.js $version installed via winget"
+                    $script:HasNode = $true
+                    return $true
+                }
+                Write-Warn "winget completed, but PATH still resolves unsupported Node.js $version (Hermes requires Node >=22.22.0)."
+                Write-Info "Remove or move the stale Node installation earlier on PATH, then rerun the installer."
             }
         } catch {
             if ($prevEAP) { $ErrorActionPreference = $prevEAP }

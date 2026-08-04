@@ -50,7 +50,7 @@ from tools.private_read_request_tool import configure_private_read_request_runti
 
 
 SENSITIVE_VERIFIED_LAUNCHER_SHA256 = (
-    "7747ec8aa319f8430314daaba5fdc2584da26226dbefeaa678aea41d9109397e"
+    "04a5a598423042a2ab7dfe347a149a00dd5ad8e41eeddbbb2afc78d63eed8964"
 )
 
 
@@ -220,7 +220,8 @@ class TrustedPrivateReadHostConfig:
         allowlist = _closed_json_file(allowlist_file, {"version", "transport_identity"})
         identity = allowlist.get("transport_identity")
         identity_fields = {
-            "manifest_sha256", "source_sha256", "package_sha256", "lock_sha256",
+            "manifest_sha256", "verifier_sha256", "source_sha256",
+            "node_modules_tree_sha256", "package_sha256", "lock_sha256",
             "launcher_sha256",
             "package_name", "package_version", "baileys_spec",
             "baileys_lock_version", "baileys_lock_resolved",

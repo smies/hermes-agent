@@ -619,7 +619,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     # to accommodate slower systems like Unraid NAS
                     npm_install_timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
                     install_result = subprocess.run(
-                        [_npm_bin, "install", "--silent"],
+                        [
+                            _npm_bin,
+                            "ci",
+                            "--silent",
+                            "--no-fund",
+                            "--no-audit",
+                            "--progress=false",
+                        ],
                         cwd=str(bridge_dir),
                         capture_output=True,
                         text=True, encoding='utf-8', errors='replace',
@@ -627,7 +634,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         env=with_hermes_node_path(),
                     )
                     if install_result.returncode != 0:
-                        print(f"[{self.name}] npm install failed: {install_result.stderr}")
+                        print(f"[{self.name}] npm ci failed: {install_result.stderr}")
                         return False
                     print(f"[{self.name}] Dependencies installed")
                     if _pkg_hash:

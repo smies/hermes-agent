@@ -214,12 +214,19 @@ class TestConnectCleanup:
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch.object(Path, "exists", autospec=True, side_effect=_path_exists), \
-             patch("subprocess.run", return_value=install_result), \
+             patch("subprocess.run", return_value=install_result) as mock_run, \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("gateway.status.release_scoped_lock") as mock_release:
             result = await adapter.connect()
 
         assert result is False
+        assert mock_run.call_args.args[0][1:] == [
+            "ci",
+            "--silent",
+            "--no-fund",
+            "--no-audit",
+            "--progress=false",
+        ]
         mock_release.assert_called_once_with("whatsapp-session", str(adapter._session_path))
         assert adapter._platform_lock_identity is None
 

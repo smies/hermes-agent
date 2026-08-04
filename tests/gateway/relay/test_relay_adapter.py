@@ -96,7 +96,7 @@ class _CaptureTransport:
         return {"success": True, "message_id": "m1"}
 
 
-def _make_event(chat_id="chan-1", scope_id="scope-9"):
+def _make_event(chat_id="chan-1", scope_id="scope-9", user_id="user-42"):
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource
 
@@ -105,6 +105,7 @@ def _make_event(chat_id="chan-1", scope_id="scope-9"):
         chat_id=chat_id,
         chat_type="channel",
         scope_id=scope_id,
+        user_id=user_id,
     )
     return MessageEvent(text="hi", source=src, message_type=MessageType.TEXT)
 
@@ -198,10 +199,11 @@ async def test_stop_typing_forwards_explicit_clear_with_routing_context():
         "op": "typing",
         "chat_id": "channel-1",
         "content": "",
-        "metadata": {
-            "thread_id": "thread-1",
-            "scope_id": "workspace-1",
-        },
+            "metadata": {
+                "thread_id": "thread-1",
+                "scope_id": "workspace-1",
+                "user_id": "user-42",
+            },
     }
     assert t.sent_platform == "slack"
 
@@ -224,6 +226,7 @@ async def test_send_typing_tags_egress_platform():
         chat_id="chan-2",
         chat_type="channel",
         scope_id="scope-1",
+        user_id="user-42",
     )
     a._capture_scope(MessageEvent(text="hi", source=src, message_type=MessageType.TEXT))
 

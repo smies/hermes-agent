@@ -12,6 +12,7 @@ import pytest
 from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner
 from gateway.trusted_private_read_host import (
+    SENSITIVE_VERIFIED_LAUNCHER_SHA256,
     TrustedPrivateReadConfigurationError,
     TrustedPrivateReadGatewayHost,
     TrustedPrivateReadHostConfig,
@@ -45,10 +46,10 @@ def _config(root: Path) -> dict:
     }
     identity = {
         "manifest_sha256": "a" * 64,
-        "launcher_sha256": (
-            "7747ec8aa319f8430314daaba5fdc2584da26226dbefeaa678aea41d9109397e"
-        ),
+        "verifier_sha256": "f" * 64,
+        "launcher_sha256": SENSITIVE_VERIFIED_LAUNCHER_SHA256,
         "source_sha256": "b" * 64,
+        "node_modules_tree_sha256": "1" * 64,
         "package_sha256": "c" * 64,
         "lock_sha256": "d" * 64,
         "package_name": "fixture-package",

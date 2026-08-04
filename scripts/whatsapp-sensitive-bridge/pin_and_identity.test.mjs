@@ -53,7 +53,7 @@ test('package, lock, installed metadata, and deterministic tree bind the exact n
   assert.equal(identity.baileys_version, installed.version);
   assert.equal(identity.baileys_reviewed_release_git_head, BAILEYS_REVIEWED_RELEASE_GIT_HEAD);
   assert.equal(installed.gitHead, undefined, 'reviewed Git head is metadata, not artifact ancestry');
-  for (const key of ['manifest_sha256', 'source_sha256', 'package_sha256', 'lock_sha256', 'baileys_package_sha256', 'baileys_tree_sha256']) {
+  for (const key of ['manifest_sha256', 'verifier_sha256', 'source_sha256', 'node_modules_tree_sha256', 'package_sha256', 'lock_sha256', 'baileys_package_sha256', 'baileys_tree_sha256']) {
     assert.match(identity[key], /^[a-f0-9]{64}$/);
   }
   assert.deepEqual(computeTransportIdentity(HERE, EXPECTED_MANIFEST_SHA256), identity);
@@ -61,7 +61,11 @@ test('package, lock, installed metadata, and deterministic tree bind the exact n
 
 test('transport identity fails closed after source or installed package tampering', () => {
   const copy = mkdtempSync(path.join(tmpdir(), 'hermes-sensitive-identity-'));
-  cpSync(HERE, copy, { recursive: true, filter: (source) => !source.includes(`${path.sep}.git`) });
+  cpSync(HERE, copy, {
+    recursive: true,
+    verbatimSymlinks: true,
+    filter: (source) => !source.split(path.sep).includes('.git'),
+  });
   const before = computeTransportIdentity(copy, EXPECTED_MANIFEST_SHA256);
   const modulePath = path.join(copy, 'session_paths.js');
   writeFileSync(modulePath, `${readFileSync(modulePath, 'utf8')}\n// tamper\n`);

@@ -27,12 +27,11 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     SendResult,
-    build_session_key,
 )
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +58,11 @@ _LEN_FNS: Dict[str, Callable[[str], int]] = {
 
 class RelayAdapter(BasePlatformAdapter):
     """Generic relay adapter advertising a connector-negotiated capability profile."""
+
+    # Relay multiplexes shared chats and exposes structured control frames.
+    # Every busy event must therefore match the owner bound to the active
+    # session guard, independent of private-read configuration.
+    _require_active_principal_match = True
 
     def __init__(
         self,
@@ -343,7 +347,6 @@ class RelayAdapter(BasePlatformAdapter):
         # (the command-shaped text then behaves like a typed reply).
         if await self._consume_prompt_response(event):
             return
-        self._capture_scope(event)
         await self._localize_inbound_media(event)
         await self.handle_message(event)
 
@@ -493,7 +496,47 @@ class RelayAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - media localization must never break inbound
             logger.debug("relay inbound media localization failed", exc_info=True)
 
-    def _capture_scope(self, event) -> None:
+    def _canonical_event_identity(
+        self, event
+    ) -> Optional[Tuple[SessionSource, Tuple[str, ...], str]]:
+        """Return trusted source, principal, and production-canonical key."""
+        source = getattr(event, "source", None)
+        principal = self._authenticated_principal(event)
+        if source is None or principal is None:
+            return None
+        try:
+            session_key = self._canonical_session_key(source)
+        except Exception:
+            return None
+        if not session_key:
+            return None
+        return source, principal, session_key
+
+    def _canonical_session_key(self, source: SessionSource) -> str:
+        """Resolve relay keys through production, or its trusted envelope."""
+        runner = getattr(self, "gateway_runner", None)
+        if callable(getattr(runner, "_session_key_for_source", None)):
+            return super()._canonical_session_key(source)
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+            profile=getattr(source, "profile", None),
+        )
+
+    def _on_message_accepted(self, event, session_key: str) -> bool:
+        """Capture identity/egress scope only after the common gate accepts."""
+        identity = self._canonical_event_identity(event)
+        if identity is None or identity[2] != str(session_key):
+            return False
+        self._capture_scope(event, session_key=session_key)
+        return True
+
+    def _capture_scope(self, event, *, session_key: Optional[str] = None) -> None:
         """Remember a chat_id's egress discriminator from an inbound event so our
         outbound (the agent's reply) can re-assert it for the connector's egress
         tenant resolution. Never raises — scope tracking must not break inbound.
@@ -517,6 +560,12 @@ class RelayAdapter(BasePlatformAdapter):
             discordTenant.ts (makeDiscordTenantOf).
         """
         try:
+            identity = self._canonical_event_identity(event)
+            if identity is None:
+                return
+            _, principal, canonical_key = identity
+            if session_key is not None and canonical_key != str(session_key):
+                return
             src = getattr(event, "source", None)
             if not src:
                 return
@@ -565,45 +614,9 @@ class RelayAdapter(BasePlatformAdapter):
             )
             if message_id:
                 self._last_inbound_ts_by_chat[str(chat)] = str(message_id)
-            principal = self._authenticated_principal(event)
-            if principal is not None:
-                session_key = build_session_key(
-                    src,
-                    group_sessions_per_user=self.config.extra.get(
-                        "group_sessions_per_user", True
-                    ),
-                    thread_sessions_per_user=self.config.extra.get(
-                        "thread_sessions_per_user", False
-                    ),
-                )
-                self._principal_by_session[session_key] = principal
+            self._principal_by_session[canonical_key] = principal
         except Exception:  # noqa: BLE001 - scope tracking must never break inbound
             pass
-
-    @staticmethod
-    def _authenticated_principal(event) -> Optional[Tuple[str, ...]]:
-        """Return only connector-authenticated source identity fields."""
-        source = getattr(event, "source", None)
-        if source is None:
-            return None
-        platform = getattr(getattr(source, "platform", None), "value", None)
-        sender = getattr(source, "user_id", None)
-        sender_alt = getattr(source, "user_id_alt", None)
-        chat = getattr(source, "chat_id", None)
-        if not platform or not chat or not (sender or sender_alt):
-            return None
-        return (
-            str(platform),
-            str(getattr(source, "profile", None) or "default"),
-            str(getattr(source, "scope_id", None) or ""),
-            str(getattr(source, "chat_type", None) or ""),
-            str(getattr(source, "parent_chat_id", None) or ""),
-            str(getattr(source, "chat_id_alt", None) or ""),
-            str(chat),
-            str(sender_alt or ""),
-            str(sender or ""),
-            str(getattr(source, "thread_id", None) or ""),
-        )
 
     def _with_scope(
         self, chat_id: str, metadata: Optional[Dict[str, Any]]
@@ -670,27 +683,18 @@ class RelayAdapter(BasePlatformAdapter):
         ``_active_sessions[session_key]`` Event and clears typing), cancelling
         the right turn without touching sibling sessions.
         """
-        source = getattr(event, "source", None)
-        principal = self._authenticated_principal(event)
-        if source is None or principal is None:
+        identity = self._canonical_event_identity(event)
+        if identity is None:
             return
-        try:
-            authenticated_session = build_session_key(
-                source,
-                group_sessions_per_user=self.config.extra.get(
-                    "group_sessions_per_user", True
-                ),
-                thread_sessions_per_user=self.config.extra.get(
-                    "thread_sessions_per_user", False
-                ),
-            )
-        except Exception:
-            return
+        source, principal, authenticated_session = identity
         if (
             not session_key
             or authenticated_session != str(session_key)
             or str(getattr(source, "chat_id", "")) != str(chat_id)
         ):
+            return
+        active_owner = self._active_principal_by_session.get(authenticated_session)
+        if active_owner is None or active_owner != principal:
             return
         principal_gate = getattr(self, "_busy_principal_gate", None)
         if principal_gate is not None:
@@ -743,7 +747,6 @@ class RelayAdapter(BasePlatformAdapter):
                     # gate as _on_inbound's prompt_response arm).
                     if await self._consume_prompt_response(event):
                         return
-                    self._capture_scope(event)
                     await self.handle_message(event)
                     return
             logger.info(
@@ -806,8 +809,17 @@ class RelayAdapter(BasePlatformAdapter):
         )
         channel_id = str(payload.get("channel_id") or "")
         guild_id = payload.get("guild_id")  # real Discord interaction wire field
+        try:
+            underlying_platform = Platform(str(getattr(forward, "platform", "")))
+        except ValueError:
+            return None
+        if underlying_platform == Platform.RELAY:
+            return None
         source = SessionSource(
-            platform=Platform.RELAY,
+            # The authenticated passthrough envelope is authoritative.  A
+            # caller-controlled platform field inside the interaction body is
+            # deliberately ignored.
+            platform=underlying_platform,
             chat_id=channel_id,
             chat_type="channel" if guild_id else "dm",
             user_id=str(user.get("id"))
@@ -820,7 +832,15 @@ class RelayAdapter(BasePlatformAdapter):
             if guild_id
             else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
+            delivered_via_upstream_relay=True,
         )
+        runner = getattr(self, "gateway_runner", None)
+        profile_resolver = getattr(runner, "_profile_name_for_source", None)
+        if callable(profile_resolver):
+            try:
+                source.profile = profile_resolver(source)
+            except Exception:
+                return None
         event = MessageEvent(text=text, message_type=message_type, source=source)
         if itype == 3:
             # Phase 3: a component press whose custom_id is a Hermes prompt
@@ -1959,34 +1979,10 @@ class RelayAdapter(BasePlatformAdapter):
         # even consulting the prompt registry.  The session is derived only
         # from the normalized authenticated source; prompt payload fields are
         # never trusted for ownership.
-        source = getattr(event, "source", None)
-        incoming_principal = self._authenticated_principal(event)
-        if source is None or incoming_principal is None:
+        identity = self._canonical_event_identity(event)
+        if identity is None:
             return True
-        try:
-            incoming_session = build_session_key(
-                source,
-                group_sessions_per_user=self.config.extra.get(
-                    "group_sessions_per_user", True
-                ),
-                thread_sessions_per_user=self.config.extra.get(
-                    "thread_sessions_per_user", False
-                ),
-            )
-        except Exception:
-            return True
-        principal_gate = getattr(self, "_busy_principal_gate", None)
-        if principal_gate is not None:
-            try:
-                if principal_gate(event, incoming_session) is not True:
-                    return True
-            except BaseException:
-                logger.error(
-                    "relay structured-response principal gate failed closed",
-                    exc_info=True,
-                )
-                return True
-
+        _source, incoming_principal, incoming_session = identity
         # Read-only ownership check precedes the consuming pop.  The owner was
         # captured from the authenticated triggering event when this prompt was
         # minted; a response cannot nominate or replace it.

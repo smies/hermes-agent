@@ -126,6 +126,10 @@ async def test_adapter_stamps_per_frame_platform_from_inbound(monkeypatch):
     # This gateway fronts both discord and telegram.
     stub._identities = [("discord", "app-1"), ("telegram", "bot-9")]
     adapter = RelayAdapter(PlatformConfig(), descriptor, transport=stub)
+    async def _handler(_event):
+        return None
+
+    adapter.set_message_handler(_handler)
     await adapter.connect()
 
     # A telegram inbound for chat "tg-1".
@@ -145,10 +149,9 @@ async def test_adapter_stamps_per_frame_platform_from_inbound(monkeypatch):
         MessageEvent(
             text="yo",
             message_type=MessageType.TEXT,
-            source=SessionSource(platform=Platform.DISCORD, chat_id="dc-1", chat_type="channel", scope_id="g-1"),
+            source=SessionSource(platform=Platform.DISCORD, chat_id="dc-1", chat_type="channel", scope_id="g-1", user_id="u-2"),
         )
     )
     await adapter.send("dc-1", "a discord reply")
     assert stub.sent_platforms[-1] == "discord"
-
 

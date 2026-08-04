@@ -2811,6 +2811,11 @@ class BasePlatformAdapter(ABC):
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         self._busy_principal_gate: Optional[Callable[[MessageEvent, str], bool]] = None
+        # Authenticated owner bound to the task currently holding each session
+        # guard.  This is established synchronously with the guard (before the
+        # background task can run) and released with that exact guard.  Relay's
+        # structured control lane uses it even when no private-read host exists.
+        self._active_principal_by_session: Dict[str, tuple[str, ...]] = {}
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3353,6 +3358,60 @@ class BasePlatformAdapter(ABC):
     ) -> None:
         """Install the authenticated-principal fence for every busy bypass."""
         self._busy_principal_gate = gate
+
+    @staticmethod
+    def _authenticated_principal(event: MessageEvent) -> Optional[tuple[str, ...]]:
+        """Canonical authenticated identity used by live-session controls."""
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+        platform = getattr(getattr(source, "platform", None), "value", None)
+        sender = getattr(source, "user_id", None)
+        sender_alt = getattr(source, "user_id_alt", None)
+        chat = getattr(source, "chat_id", None)
+        if not platform or not chat or not (sender or sender_alt):
+            return None
+        return (
+            str(platform),
+            str(getattr(source, "profile", None) or "default"),
+            str(getattr(source, "scope_id", None) or ""),
+            str(getattr(source, "chat_type", None) or ""),
+            str(getattr(source, "parent_chat_id", None) or ""),
+            str(getattr(source, "chat_id_alt", None) or ""),
+            str(chat),
+            str(sender_alt or ""),
+            str(sender or ""),
+            str(getattr(source, "thread_id", None) or ""),
+        )
+
+    def _canonical_session_key(self, source: SessionSource) -> str:
+        """Use the production runner/session-store key resolver when attached."""
+        runner = getattr(self, "gateway_runner", None)
+        resolver = getattr(runner, "_session_key_for_source", None)
+        if callable(resolver):
+            return str(resolver(source))
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+            # Standalone native adapters preserve the legacy main namespace;
+            # multiplexing is a runner/session-store decision.
+            profile=None,
+        )
+
+    def _on_message_accepted(self, event: MessageEvent, session_key: str) -> bool:
+        """Post-principal-gate acceptance hook for adapter-owned metadata."""
+        return True
+
+    def _active_principal_matches(self, event: MessageEvent, session_key: str) -> bool:
+        """Fail closed unless a busy session has the exact authenticated owner."""
+        active = self._active_principal_by_session.get(str(session_key))
+        incoming = self._authenticated_principal(event)
+        return active is not None and incoming is not None and active == incoming
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -5336,6 +5395,7 @@ class BasePlatformAdapter(ABC):
         if guard is not None and current_guard is not guard:
             return
         del self._active_sessions[session_key]
+        self._active_principal_by_session.pop(session_key, None)
 
     def _session_task_is_stale(self, session_key: str) -> bool:
         """Return True if the owner task for ``session_key`` is done/cancelled.
@@ -5376,6 +5436,7 @@ class BasePlatformAdapter(ABC):
             session_key,
         )
         self._active_sessions.pop(session_key, None)
+        self._active_principal_by_session.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
@@ -5396,6 +5457,11 @@ class BasePlatformAdapter(ABC):
         session lock.
         """
         guard = interrupt_event or asyncio.Event()
+        principal = self._authenticated_principal(event)
+        if principal is None:
+            self._active_principal_by_session.pop(session_key, None)
+        else:
+            self._active_principal_by_session[session_key] = principal
         self._active_sessions[session_key] = guard
 
         task = asyncio.create_task(self._process_message_background(event, session_key))
@@ -5583,11 +5649,7 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._canonical_session_key(event.source)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -5602,6 +5664,17 @@ class BasePlatformAdapter(ABC):
             # This is the earliest common busy-session chokepoint.  It must run
             # before direct command dispatch and the clarify resolver because
             # both paths bypass the normal runner busy handler.
+            if getattr(self, "_require_active_principal_match", False):
+                try:
+                    if not self._active_principal_matches(event, session_key):
+                        return
+                except BaseException:
+                    logger.error(
+                        "[%s] Active-session principal match failed closed",
+                        self.name,
+                        exc_info=True,
+                    )
+                    return
             _principal_gate = getattr(self, "_busy_principal_gate", None)
             if _principal_gate is not None:
                 try:
@@ -5614,6 +5687,17 @@ class BasePlatformAdapter(ABC):
                         exc_info=True,
                     )
                     return
+
+            try:
+                if self._on_message_accepted(event, session_key) is not True:
+                    return
+            except BaseException:
+                logger.error(
+                    "[%s] Accepted-message hook failed closed",
+                    self.name,
+                    exc_info=True,
+                )
+                return
 
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
@@ -5778,6 +5862,16 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
+        try:
+            if self._on_message_accepted(event, session_key) is not True:
+                return
+        except BaseException:
+            logger.error(
+                "[%s] Accepted-message hook failed closed",
+                self.name,
+                exc_info=True,
+            )
+            return
         self._start_session_processing(event, session_key)
     
     @staticmethod

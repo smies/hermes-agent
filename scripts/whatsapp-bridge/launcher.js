@@ -4,14 +4,43 @@
 // byte-qualified.  This file is bound independently by the Python host/release
 // source identity and is deliberately excluded from the manifest it anchors.
 import { createHash } from 'node:crypto';
-import { readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const EXPECTED_MANIFEST_SHA256 = '55ad7f331c7695ed4390fde153ca4713e0e250b881d9b65ea4c570bb70ef6e2b';
+export const EXPECTED_MANIFEST_SHA256 = '221720bbefcdb43b7d3b1be8a296a84321861496d3c593d0e39ec97d00ae1fb7';
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function parseAnchoredManifest(manifestBytes) {
+  const manifest = JSON.parse(manifestBytes.toString('utf8'));
+  const keys = [
+    'version', 'package_name', 'package_version', 'package_sha256',
+    'lock_sha256', 'verifier_sha256', 'source_sha256',
+    'node_modules_tree_sha256', 'baileys',
+  ];
+  const baileysKeys = [
+    'spec', 'lock_version', 'lock_resolved', 'lock_integrity',
+    'installed_name', 'installed_version', 'reviewed_release_git_head',
+    'package_sha256', 'tree_sha256',
+  ];
+  const exact = (value, expected) => value
+    && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).sort().join('\0') === [...expected].sort().join('\0');
+  const digest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  if (!exact(manifest, keys) || manifest.version !== 3
+      || typeof manifest.package_name !== 'string' || !manifest.package_name
+      || typeof manifest.package_version !== 'string' || !manifest.package_version
+      || !['package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256',
+        'node_modules_tree_sha256'].every((name) => digest(manifest[name]))
+      || !exact(manifest.baileys, baileysKeys)
+      || !digest(manifest.baileys.package_sha256)
+      || !digest(manifest.baileys.tree_sha256)) {
+    throw new Error('ordinary transport manifest schema mismatch');
+  }
+  return manifest;
 }
 
 export async function launchOrdinaryBridge(argv = process.argv.slice(2)) {
@@ -20,7 +49,17 @@ export async function launchOrdinaryBridge(argv = process.argv.slice(2)) {
   if (sha256(manifestBytes) !== EXPECTED_MANIFEST_SHA256) {
     throw new Error('ordinary transport manifest anchor mismatch');
   }
-  const verifier = await import('./transport_identity.js');
+  const manifest = parseAnchoredManifest(manifestBytes);
+  const verifierPath = path.join(root, 'transport_identity.js');
+  const verifierStat = lstatSync(verifierPath);
+  const verifierBytes = readFileSync(verifierPath);
+  if (!verifierStat.isFile() || verifierStat.isSymbolicLink()
+      || sha256(verifierBytes) !== manifest.verifier_sha256) {
+    throw new Error('ordinary transport verifier mismatch');
+  }
+  const verifier = await import(
+    `data:text/javascript;base64,${verifierBytes.toString('base64')}`
+  );
   const verified = verifier.computeTransportIdentity(
     root, EXPECTED_MANIFEST_SHA256,
   );

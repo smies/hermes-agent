@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, readdirSync } from 'node:fs';
+import {
+  lstatSync, readFileSync, readlinkSync, readdirSync,
+} from 'node:fs';
 import path from 'node:path';
 
 export const BAILEYS_SPEC = '7.0.0-rc14';
@@ -16,7 +18,6 @@ export const CANONICAL_SOURCE_FILES = Object.freeze([
   'provisioning_core.js',
   'session_paths.js',
   'sensitive_bridge.js',
-  'transport_identity.js',
 ]);
 
 function sha256(value) {
@@ -55,6 +56,34 @@ function treeEntries(root, relative = '') {
   return entries;
 }
 
+function dependencyTreeEntries(root, relative = '') {
+  const directory = path.join(root, relative);
+  const entries = [];
+  for (const name of readdirSync(directory).sort()) {
+    const childRelative = relative
+      ? path.posix.join(relative.split(path.sep).join('/'), name)
+      : name;
+    const child = path.join(root, ...childRelative.split('/'));
+    const stat = lstatSync(child);
+    if (stat.isDirectory()) {
+      entries.push(...dependencyTreeEntries(root, childRelative));
+    } else if (stat.isSymbolicLink()) {
+      entries.push([
+        childRelative,
+        sha256(Buffer.from(`symlink\0${readlinkSync(child)}`, 'utf8')),
+      ]);
+    } else if (stat.isFile()) {
+      entries.push([
+        childRelative,
+        sha256(Buffer.concat([Buffer.from('file\0'), readFileSync(child)])),
+      ]);
+    } else {
+      throw new Error('transport identity found unsupported dependency entry');
+    }
+  }
+  return entries;
+}
+
 function exactObject(value, keys, label) {
   if (!value || Object.getPrototypeOf(value) !== Object.prototype
       || Object.keys(value).sort().join('\0') !== [...keys].sort().join('\0')) {
@@ -80,7 +109,7 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   const lock = JSON.parse(lockBytes.toString('utf8'));
   const manifest = exactObject(
     JSON.parse(manifestBytes.toString('utf8')),
-    ['version', 'package_name', 'package_version', 'package_sha256', 'lock_sha256', 'source_sha256', 'baileys'],
+    ['version', 'package_name', 'package_version', 'package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256', 'node_modules_tree_sha256', 'baileys'],
     'transport manifest',
   );
   const expected = exactObject(
@@ -88,7 +117,7 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
     ['spec', 'lock_version', 'lock_resolved', 'lock_integrity', 'installed_name', 'installed_version', 'reviewed_release_git_head', 'package_sha256', 'tree_sha256'],
     'transport manifest Baileys identity',
   );
-  if (manifest.version !== 2
+  if (manifest.version !== 3
       || manifest.package_name !== pkg.name
       || manifest.package_version !== pkg.version
       || pkg.dependencies?.['@whiskeysockets/baileys'] !== BAILEYS_SPEC
@@ -122,11 +151,17 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   );
   const packageSha256 = sha256(packageBytes);
   const lockSha256 = sha256(lockBytes);
+  const verifierSha256 = fileHash(path.join(root, 'transport_identity.js'));
+  const nodeModulesTreeSha256 = framedManifest(
+    dependencyTreeEntries(path.join(root, 'node_modules')),
+  );
   const baileysPackageSha256 = sha256(installedPackageBytes);
   const baileysTreeSha256 = framedManifest(treeEntries(baileysRoot));
   if (manifest.package_sha256 !== packageSha256
       || manifest.lock_sha256 !== lockSha256
+      || manifest.verifier_sha256 !== verifierSha256
       || manifest.source_sha256 !== sourceSha256
+      || manifest.node_modules_tree_sha256 !== nodeModulesTreeSha256
       || expected.package_sha256 !== baileysPackageSha256
       || expected.tree_sha256 !== baileysTreeSha256) {
     throw new Error('sensitive transport bytes do not match reviewed manifest');
@@ -136,6 +171,8 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
     source_sha256: sourceSha256,
     package_sha256: packageSha256,
     lock_sha256: lockSha256,
+    verifier_sha256: verifierSha256,
+    node_modules_tree_sha256: nodeModulesTreeSha256,
     package_name: pkg.name,
     package_version: pkg.version,
     baileys_spec: BAILEYS_SPEC,

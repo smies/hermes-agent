@@ -136,6 +136,10 @@ async def test_adapter_resolves_per_chat_limits_from_inbound_platform():
     stub = MultiDescriptorStub(TELEGRAM, DISCORD)
     stub._identities = [("telegram", "bot-9"), ("discord", "app-1")]
     adapter = RelayAdapter(PlatformConfig(), TELEGRAM, transport=stub)
+    async def _handler(_event):
+        return None
+
+    adapter.set_message_handler(_handler)
     await adapter.connect()
 
     await _push(stub, Platform.DISCORD, "dc-1")
@@ -153,5 +157,4 @@ async def test_adapter_resolves_per_chat_limits_from_inbound_platform():
 
 
 # ───────────────────── stream consumer integration ─────────────────────
-
 

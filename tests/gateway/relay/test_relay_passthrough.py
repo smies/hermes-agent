@@ -95,6 +95,8 @@ async def test_discord_interaction_routes_through_handle_message(adapter, monkey
 
     async def fake_handle(event):
         seen.append(event)
+        session_key = adapter._canonical_session_key(event.source)
+        assert adapter._on_message_accepted(event, session_key) is True
 
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
 
@@ -164,5 +166,4 @@ async def test_application_command_subcommand_nesting_renders_names_then_values(
     assert ev.is_command() is True
     assert ev.get_command() == "skill"
     assert ev.get_command_args() == "run deploy"
-
 

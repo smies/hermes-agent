@@ -76,15 +76,21 @@ def _event(
     text: str = "/once",
     chat_id: str = "c1",
     user_id: str = "u1",
+    platform: Platform = Platform.TELEGRAM,
+    chat_type: str = "dm",
+    thread_id: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.COMMAND,
         source=SessionSource(
-            platform=Platform.TELEGRAM,
+            platform=platform,
             chat_id=chat_id,
-            chat_type="dm",
+            chat_type=chat_type,
             user_id=user_id,
+            thread_id=thread_id,
+            profile=profile,
         ),
         prompt_response=prompt_response,
     )
@@ -260,7 +266,9 @@ async def test_cross_principal_structured_clarify_and_slash_are_fenced_before_mu
         }
         assert await adapter._consume_prompt_response(attacker) is True
 
-        assert gate_calls == [(attacker, session), (attacker, session)]
+        # Structured ownership is decided read-only from the prompt record;
+        # the busy gate is not invoked because it may queue ordinary text.
+        assert gate_calls == []
         assert adapter._pending_prompts == before_prompts
         assert clarify_entry.event.is_set() is False
         assert clarify_entry.response is None
@@ -290,6 +298,7 @@ def test_discord_component_interaction_decodes_prompt_token():
 
     event = adapter._discord_interaction_to_event(Forward())
     assert event is not None
+    assert event.source.platform == Platform.DISCORD
     assert event.prompt_response == {
         "prompt_id": "a1b2c3d4",
         "option_id": "deny",
@@ -297,6 +306,224 @@ def test_discord_component_interaction_decodes_prompt_token():
     }
     assert event.text == "/deny"
     assert event.message_type == MessageType.COMMAND
+
+
+@pytest.mark.asyncio
+async def test_rejected_shared_thread_event_cannot_poison_later_prompt_owner(monkeypatch):
+    """A active, B rejected, then A's later prompt remains A-owned."""
+    adapter, stub = _adapter(platform="discord", label="Discord")
+    owner = _event(
+        text="start",
+        user_id="principal-a",
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    attacker = _event(
+        text="ordinary inbound",
+        user_id="principal-b",
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    session = adapter._canonical_session_key(owner.source)
+    assert adapter._on_message_accepted(owner, session) is True
+    adapter._active_sessions[session] = __import__("asyncio").Event()
+    adapter._active_principal_by_session[session] = adapter._authenticated_principal(owner)
+    handled: list[MessageEvent] = []
+
+    async def handler(event):
+        handled.append(event)
+
+    adapter.set_message_handler(handler)
+    before = deepcopy(
+        {
+            "principal": adapter._principal_by_session,
+            "platform": adapter._platform_by_chat,
+            "scope": adapter._scope_by_chat,
+            "dm_user": adapter._dm_user_by_chat,
+            "chat_type": adapter._chat_type_by_chat,
+            "pending": adapter._pending_prompts,
+            "active": {key: id(value) for key, value in adapter._active_sessions.items()},
+            "active_principal": adapter._active_principal_by_session,
+        }
+    )
+    await adapter._on_inbound(attacker)
+    assert handled == []
+    assert {
+        "principal": adapter._principal_by_session,
+        "platform": adapter._platform_by_chat,
+        "scope": adapter._scope_by_chat,
+        "dm_user": adapter._dm_user_by_chat,
+        "chat_type": adapter._chat_type_by_chat,
+        "pending": adapter._pending_prompts,
+        "active": {key: id(value) for key, value in adapter._active_sessions.items()},
+        "active_principal": adapter._active_principal_by_session,
+    } == before
+
+    resolved: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_gateway_clarify",
+        lambda clarify_id, response: resolved.append((clarify_id, response)) or True,
+    )
+    await adapter.send_clarify("thread-1", "Which?", ["alpha"], "clarify-a", session)
+    prompt_id = stub.sent[-1]["prompt_id"]
+    assert adapter._pending_prompts[prompt_id]["owner_principal"] == adapter._authenticated_principal(owner)
+
+    attacker.prompt_response = {"prompt_id": prompt_id, "option_id": "c0"}
+    assert await adapter._consume_prompt_response(attacker) is True
+    assert prompt_id in adapter._pending_prompts
+    owner.prompt_response = {"prompt_id": prompt_id, "option_id": "c0"}
+    assert await adapter._consume_prompt_response(owner) is True
+    assert resolved == [("clarify-a", "alpha")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("platform", "chat_type", "thread_id"),
+    [
+        (Platform.TELEGRAM, "dm", None),
+        (Platform.DISCORD, "group", None),
+        (Platform.DISCORD, "thread", "thread-1"),
+    ],
+)
+async def test_idle_first_turn_captures_owner_after_acceptance(
+    monkeypatch, platform, chat_type, thread_id
+):
+    adapter, _stub = _adapter(platform=platform.value, label=platform.value.title())
+    event = _event(
+        text="first",
+        platform=platform,
+        chat_type=chat_type,
+        thread_id=thread_id,
+        chat_id="thread-1" if thread_id else "c1",
+        user_id="owner-a",
+    )
+    started: list[str] = []
+
+    async def handler(_event):
+        return None
+
+    adapter.set_message_handler(handler)
+    monkeypatch.setattr(
+        adapter,
+        "_start_session_processing",
+        lambda _event, key: started.append(key) or True,
+    )
+    await adapter.handle_message(event)
+    expected = adapter._canonical_session_key(event.source)
+    assert started == [expected]
+    assert adapter._principal_by_session[expected] == adapter._authenticated_principal(event)
+
+
+@pytest.mark.asyncio
+async def test_multiplex_profiles_isolate_prompt_owners_and_same_profile_resolves(monkeypatch):
+    adapter, stub = _adapter()
+    main = _event(text="main", user_id="owner", profile="default")
+    coder = _event(text="coder", user_id="owner", profile="coder")
+    main_key = adapter._canonical_session_key(main.source)
+    coder_key = adapter._canonical_session_key(coder.source)
+    assert main_key == "agent:main:telegram:dm:c1"
+    assert coder_key == "agent:coder:telegram:dm:c1"
+    assert adapter._on_message_accepted(main, main_key) is True
+    assert adapter._on_message_accepted(coder, coder_key) is True
+    await adapter.send_clarify("c1", "Which?", ["alpha"], "coder-clarify", coder_key)
+    prompt_id = stub.sent[-1]["prompt_id"]
+    before = deepcopy(adapter._pending_prompts[prompt_id])
+
+    main.prompt_response = {"prompt_id": prompt_id, "option_id": "c0"}
+    assert await adapter._consume_prompt_response(main) is True
+    assert adapter._pending_prompts[prompt_id] == before
+
+    resolved: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_gateway_clarify",
+        lambda clarify_id, response: resolved.append((clarify_id, response)) or True,
+    )
+    coder.prompt_response = {"prompt_id": prompt_id, "option_id": "c0"}
+    assert await adapter._consume_prompt_response(coder) is True
+    assert resolved == [("coder-clarify", "alpha")]
+
+
+@pytest.mark.asyncio
+async def test_discord_component_preserves_platform_profile_and_prompt_owner(monkeypatch):
+    adapter, stub = _adapter(platform="discord", label="Discord")
+
+    class Runner:
+        @staticmethod
+        def _profile_name_for_source(_source):
+            return "coder"
+
+        @staticmethod
+        def _session_key_for_source(source):
+            return build_session_key(source, profile=source.profile)
+
+    adapter.gateway_runner = Runner()
+    owner = _event(
+        text="start",
+        platform=Platform.DISCORD,
+        chat_id="ch1",
+        chat_type="channel",
+        user_id="u1",
+        profile="coder",
+    )
+    owner.source.scope_id = "g1"
+    session = adapter._canonical_session_key(owner.source)
+    assert adapter._on_message_accepted(owner, session) is True
+    await adapter.send_clarify("ch1", "Which?", ["alpha"], "discord-c", session)
+    prompt_id = stub.sent[-1]["prompt_id"]
+
+    class Forward:
+        platform = "discord"
+        body = (
+            b'{"type":3,"platform":"telegram","profile":"main",'
+            b'"id":"i1","channel_id":"ch1","guild_id":"g1",'
+            b'"member":{"user":{"id":"u1"}},'
+            + f'"data":{{"custom_id":"hp1:{prompt_id}:c0"}}}}'.encode()
+        )
+
+    response = adapter._discord_interaction_to_event(Forward())
+    assert response.source.platform == Platform.DISCORD
+    assert response.source.profile == "coder"
+    assert adapter._canonical_event_identity(response)[1:] == (
+        adapter._authenticated_principal(owner),
+        session,
+    )
+    resolved: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_gateway_clarify",
+        lambda clarify_id, answer: resolved.append((clarify_id, answer)) or True,
+    )
+    attacker_payload = Forward.body.replace(b'"id":"u1"', b'"id":"u2"')
+
+    class AttackerForward:
+        platform = "discord"
+        body = attacker_payload
+
+    attacker = adapter._discord_interaction_to_event(AttackerForward())
+    before_prompt = deepcopy(adapter._pending_prompts[prompt_id])
+    assert await adapter._consume_prompt_response(attacker) is True
+    assert adapter._pending_prompts[prompt_id] == before_prompt
+    assert resolved == []
+    assert await adapter._consume_prompt_response(response) is True
+    assert resolved == [("discord-c", "alpha")]
+
+
+def test_passthrough_conversion_preserves_other_authenticated_underlying_platform():
+    adapter, _stub = _adapter()
+
+    class Forward:
+        platform = "telegram"
+        body = (
+            b'{"type":3,"platform":"relay","id":"i1","channel_id":"c1",'
+            b'"user":{"id":"u1"},"data":{"custom_id":"foreign"}}'
+        )
+
+    event = adapter._discord_interaction_to_event(Forward())
+    assert event is not None
+    assert event.source.platform == Platform.TELEGRAM
 
 
 # ── react ack lifecycle ──────────────────────────────────────────────────

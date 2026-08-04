@@ -2762,8 +2762,10 @@ def _synthetic_host_config(root: Path) -> TrustedPrivateReadHostConfig:
     }), encoding="utf-8")
     identity = {
         "manifest_sha256": "a" * 64,
+        "verifier_sha256": "f" * 64,
         "launcher_sha256": SENSITIVE_VERIFIED_LAUNCHER_SHA256,
         "source_sha256": "b" * 64,
+        "node_modules_tree_sha256": "1" * 64,
         "package_sha256": "c" * 64,
         "lock_sha256": "d" * 64,
         "package_name": "synthetic-package",
