@@ -284,23 +284,37 @@ async def test_cross_principal_structured_clarify_and_slash_are_fenced_before_mu
 
 def test_discord_component_interaction_decodes_prompt_token():
     adapter, _stub = _adapter()
+    owner = _event(
+        text="start",
+        platform=Platform.DISCORD,
+        chat_id="ch1",
+        chat_type="channel",
+        user_id="u1",
+    )
+    owner.source.scope_id = "g1"
+    session = adapter._canonical_session_key(owner.source)
+    assert adapter._on_message_accepted(owner, session) is True
+    prompt_id = adapter._mint_prompt(
+        "clarify", {"session_key": session, "chat_id": "ch1"}
+    )
 
     class Forward:
         platform = "discord"
+        authenticated_user_id = "u1"
         method = "POST"
         path = "/interactions/bot1"
         body = (
             b'{"type": 3, "id": "i1", "channel_id": "ch1", "guild_id": "g1",'
             b' "message": {"id": "pm55"},'
             b' "member": {"user": {"id": "u1", "username": "ben"}},'
-            b' "data": {"custom_id": "hp1:a1b2c3d4:deny"}}'
+            + f' "data": {{"custom_id": "hp1:{prompt_id}:deny"}}}}'.encode()
         )
 
     event = adapter._discord_interaction_to_event(Forward())
     assert event is not None
     assert event.source.platform == Platform.DISCORD
     assert event.prompt_response == {
-        "prompt_id": "a1b2c3d4",
+        "prompt_id": prompt_id,
         "option_id": "deny",
         "prompt_message_id": "pm55",
     }
@@ -331,7 +345,9 @@ async def test_rejected_shared_thread_event_cannot_poison_later_prompt_owner(mon
     session = adapter._canonical_session_key(owner.source)
     assert adapter._on_message_accepted(owner, session) is True
     adapter._active_sessions[session] = __import__("asyncio").Event()
-    adapter._active_principal_by_session[session] = adapter._authenticated_principal(owner)
+    owner_principal = adapter._authenticated_principal(owner)
+    assert owner_principal is not None
+    adapter._active_principal_by_session[session] = owner_principal
     handled: list[MessageEvent] = []
 
     async def handler(event):
@@ -450,6 +466,7 @@ async def test_multiplex_profiles_isolate_prompt_owners_and_same_profile_resolve
 @pytest.mark.asyncio
 async def test_discord_component_preserves_platform_profile_and_prompt_owner(monkeypatch):
     adapter, stub = _adapter(platform="discord", label="Discord")
+    assert await adapter.connect() is True
 
     class Runner:
         @staticmethod
@@ -477,6 +494,7 @@ async def test_discord_component_preserves_platform_profile_and_prompt_owner(mon
 
     class Forward:
         platform = "discord"
+        authenticated_user_id = "u1"
         body = (
             b'{"type":3,"platform":"telegram","profile":"main",'
             b'"id":"i1","channel_id":"ch1","guild_id":"g1",'
@@ -485,9 +503,12 @@ async def test_discord_component_preserves_platform_profile_and_prompt_owner(mon
         )
 
     response = adapter._discord_interaction_to_event(Forward())
+    assert response is not None
     assert response.source.platform == Platform.DISCORD
     assert response.source.profile == "coder"
-    assert adapter._canonical_event_identity(response)[1:] == (
+    response_identity = adapter._canonical_event_identity(response)
+    assert response_identity is not None
+    assert response_identity[1:] == (
         adapter._authenticated_principal(owner),
         session,
     )
@@ -500,15 +521,96 @@ async def test_discord_component_preserves_platform_profile_and_prompt_owner(mon
 
     class AttackerForward:
         platform = "discord"
+        authenticated_user_id = "u2"
         body = attacker_payload
 
     attacker = adapter._discord_interaction_to_event(AttackerForward())
+    assert attacker is not None
     before_prompt = deepcopy(adapter._pending_prompts[prompt_id])
-    assert await adapter._consume_prompt_response(attacker) is True
+    # Exercise the transport-registered passthrough callback, not only the
+    # conversion helper: the authenticated envelope identity reaches the same
+    # ownership fence used by the live WS transport.
+    await stub.push_passthrough(AttackerForward())
     assert adapter._pending_prompts[prompt_id] == before_prompt
     assert resolved == []
-    assert await adapter._consume_prompt_response(response) is True
+    await stub.push_passthrough(Forward())
     assert resolved == [("discord-c", "alpha")]
+
+
+@pytest.mark.parametrize(
+    ("profile", "chat_id", "chat_type", "thread_id", "parent_chat_id", "scope_id"),
+    [
+        ("main", "channel-1", "channel", None, None, "guild-1"),
+        ("coder", "thread-1", "thread", "thread-1", "channel-1", "guild-1"),
+        ("coder", "dm-1", "dm", None, None, None),
+    ],
+)
+def test_discord_component_uses_immutable_prompt_scope_and_envelope_responder(
+    profile, chat_id, chat_type, thread_id, parent_chat_id, scope_id
+):
+    adapter, _stub = _adapter(platform="discord", label="Discord")
+    owner = _event(
+        text="start",
+        platform=Platform.DISCORD,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
+        user_id="owner-a",
+        profile=profile,
+    )
+    owner.source.parent_chat_id = parent_chat_id
+    owner.source.scope_id = scope_id
+    session = adapter._canonical_session_key(owner.source)
+    assert adapter._on_message_accepted(owner, session) is True
+    prompt_id = adapter._mint_prompt(
+        "clarify", {"session_key": session, "chat_id": chat_id}
+    )
+
+    class Forward:
+        platform = "discord"
+        authenticated_user_id = "owner-a"
+        body = (
+            b'{"type":3,"profile":"attacker","channel_id":"payload-channel",'
+            b'"guild_id":"payload-guild","member":{"user":{"id":"payload-user"}},'
+            + f'"data":{{"custom_id":"hp1:{prompt_id}:c0"}}}}'.encode()
+        )
+
+    response = adapter._discord_interaction_to_event(Forward())
+    assert response is not None
+    assert response.source.platform is Platform.DISCORD
+    assert response.source.profile == profile
+    assert response.source.chat_id == chat_id
+    assert response.source.chat_type == chat_type
+    assert response.source.thread_id == thread_id
+    assert response.source.parent_chat_id == parent_chat_id
+    assert response.source.scope_id == scope_id
+    assert response.source.user_id == "owner-a"
+    identity = adapter._canonical_event_identity(response)
+    assert identity is not None
+    assert identity[1:] == (adapter._authenticated_principal(owner), session)
+
+    Forward.authenticated_user_id = "owner-b"
+    attacker = adapter._discord_interaction_to_event(Forward())
+    assert attacker is not None
+    attacker_identity = adapter._canonical_event_identity(attacker)
+    assert attacker_identity is not None
+    assert attacker_identity[1] != identity[1]
+    assert attacker_identity[1:] != identity[1:]
+
+
+def test_unknown_discord_prompt_component_does_not_trust_payload_scope():
+    adapter, _stub = _adapter(platform="discord", label="Discord")
+
+    class Forward:
+        platform = "discord"
+        authenticated_user_id = "owner-a"
+        body = (
+            b'{"type":3,"channel_id":"nominated","guild_id":"nominated",'
+            b'"member":{"user":{"id":"nominated"}},'
+            b'"data":{"custom_id":"hp1:deadbeef:c0"}}'
+        )
+
+    assert adapter._discord_interaction_to_event(Forward()) is None
 
 
 def test_passthrough_conversion_preserves_other_authenticated_underlying_platform():

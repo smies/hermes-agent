@@ -19,6 +19,7 @@ deprecation cycle until >=2 Class-1 platforms validate them.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
@@ -54,6 +55,53 @@ _LEN_FNS: Dict[str, Callable[[str], int]] = {
     "chars": len,
     "utf16": _utf16_len,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedPromptSource:
+    """Immutable, plaintext-free source coordinates captured at acceptance."""
+
+    platform: Platform
+    profile: Optional[str]
+    chat_id: str
+    chat_type: str
+    thread_id: Optional[str]
+    parent_chat_id: Optional[str]
+    scope_id: Optional[str]
+    chat_id_alt: Optional[str]
+    user_id_alt: Optional[str]
+
+    @classmethod
+    def capture(cls, source: SessionSource) -> "_TrustedPromptSource":
+        platform = source.platform
+        if type(platform) is not Platform:
+            platform = Platform(str(platform))
+        return cls(
+            platform=platform,
+            profile=getattr(source, "profile", None),
+            chat_id=str(source.chat_id),
+            chat_type=str(source.chat_type),
+            thread_id=getattr(source, "thread_id", None),
+            parent_chat_id=getattr(source, "parent_chat_id", None),
+            scope_id=getattr(source, "scope_id", None),
+            chat_id_alt=getattr(source, "chat_id_alt", None),
+            user_id_alt=getattr(source, "user_id_alt", None),
+        )
+
+    def source_for_responder(self, user_id: str) -> SessionSource:
+        return SessionSource(
+            platform=self.platform,
+            profile=self.profile,
+            chat_id=self.chat_id,
+            chat_type=self.chat_type,
+            thread_id=self.thread_id,
+            parent_chat_id=self.parent_chat_id,
+            scope_id=self.scope_id,
+            chat_id_alt=self.chat_id_alt,
+            user_id_alt=self.user_id_alt,
+            user_id=user_id,
+            delivered_via_upstream_relay=True,
+        )
 
 
 class RelayAdapter(BasePlatformAdapter):
@@ -122,6 +170,7 @@ class RelayAdapter(BasePlatformAdapter):
         # and copied into a prompt record when the prompt is minted.  Prompt
         # ownership is never inferred from prompt_response payload fields.
         self._principal_by_session: Dict[str, Tuple[str, ...]] = {}
+        self._trusted_source_by_session: Dict[str, _TrustedPromptSource] = {}
         self.supports_code_blocks = descriptor.markdown_dialect not in ("", "plain")
         # Phase 7 Unit 7d-B: watches the transport for a terminal auth revocation
         # (a 4401 close after a successful handshake = the operator opted this
@@ -615,6 +664,9 @@ class RelayAdapter(BasePlatformAdapter):
             if message_id:
                 self._last_inbound_ts_by_chat[str(chat)] = str(message_id)
             self._principal_by_session[canonical_key] = principal
+            self._trusted_source_by_session[canonical_key] = _TrustedPromptSource.capture(
+                src
+            )
         except Exception:  # noqa: BLE001 - scope tracking must never break inbound
             pass
 
@@ -815,32 +867,57 @@ class RelayAdapter(BasePlatformAdapter):
             return None
         if underlying_platform == Platform.RELAY:
             return None
-        source = SessionSource(
-            # The authenticated passthrough envelope is authoritative.  A
-            # caller-controlled platform field inside the interaction body is
-            # deliberately ignored.
-            platform=underlying_platform,
-            chat_id=channel_id,
-            chat_type="channel" if guild_id else "dm",
-            user_id=str(user.get("id"))
-            if isinstance(user, dict) and user.get("id")
-            else None,
-            user_name=str(user.get("username"))
-            if isinstance(user, dict) and user.get("username")
-            else None,
-            scope_id=str(guild_id)
-            if guild_id
-            else None,  # Discord guild → generic scope slot
-            message_id=str(payload.get("id")) if payload.get("id") else None,
-            delivered_via_upstream_relay=True,
-        )
-        runner = getattr(self, "gateway_runner", None)
-        profile_resolver = getattr(runner, "_profile_name_for_source", None)
-        if callable(profile_resolver):
-            try:
-                source.profile = profile_resolver(source)
-            except Exception:
+        decoded_prompt = self._decode_prompt_token(text) if itype == 3 else None
+        if decoded_prompt is not None:
+            prompt_id, _option_id = decoded_prompt
+            pending = self._pending_prompts.get(prompt_id)
+            trusted_source = (
+                pending.get("trusted_source") if isinstance(pending, dict) else None
+            )
+            responder = getattr(forward, "authenticated_user_id", None)
+            if (
+                type(trusted_source) is not _TrustedPromptSource
+                or trusted_source.platform is not underlying_platform
+                or type(responder) is not str
+                or not responder
+            ):
+                # Unknown prompt ids and components without connector-authenticated
+                # responder identity fail closed.  Provider-body channel/profile/
+                # user fields never become an ownership nomination.
                 return None
+            source = trusted_source.source_for_responder(responder)
+        else:
+            authenticated_user = getattr(forward, "authenticated_user_id", None)
+            source = SessionSource(
+                # The authenticated passthrough envelope is authoritative.  A
+                # caller-controlled platform field inside the interaction body is
+                # deliberately ignored.
+                platform=underlying_platform,
+                chat_id=channel_id,
+                chat_type="channel" if guild_id else "dm",
+                user_id=(
+                    authenticated_user
+                    if isinstance(authenticated_user, str) and authenticated_user
+                    else str(user.get("id"))
+                    if isinstance(user, dict) and user.get("id")
+                    else None
+                ),
+                user_name=str(user.get("username"))
+                if isinstance(user, dict) and user.get("username")
+                else None,
+                scope_id=str(guild_id)
+                if guild_id
+                else None,  # Discord guild → generic scope slot
+                message_id=str(payload.get("id")) if payload.get("id") else None,
+                delivered_via_upstream_relay=True,
+            )
+            runner = getattr(self, "gateway_runner", None)
+            profile_resolver = getattr(runner, "_profile_name_for_source", None)
+            if callable(profile_resolver):
+                try:
+                    source.profile = profile_resolver(source)
+                except Exception:
+                    return None
         event = MessageEvent(text=text, message_type=message_type, source=source)
         if itype == 3:
             # Phase 3: a component press whose custom_id is a Hermes prompt
@@ -849,7 +926,7 @@ class RelayAdapter(BasePlatformAdapter):
             # the waiting approval/confirm/clarify, replacing the bare-
             # custom_id-as-text stub. Foreign custom_ids keep the legacy
             # best-effort TEXT shape.
-            decoded = self._decode_prompt_token(text)
+            decoded = decoded_prompt
             if decoded:
                 prompt_id, option_id = decoded
                 msg = payload.get("message") or {}
@@ -1711,6 +1788,7 @@ class RelayAdapter(BasePlatformAdapter):
             **state,
             "kind": kind,
             "owner_principal": self._principal_by_session.get(session_key),
+            "trusted_source": self._trusted_source_by_session.get(session_key),
             "expires_at": time.time() + timeout_s,
         }
         # Opportunistic sweep so abandoned prompts can't accumulate: drop

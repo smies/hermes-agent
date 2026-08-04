@@ -67,12 +67,14 @@ def test_passthrough_from_wire_byte_preserves_body():
         "path": "/interactions/discord/appShared",
         "headers": [["content-type", "application/json"]],
         "bodyB64": base64.b64encode(original).decode("ascii"),
+        "authenticatedUserId": "user-3",
     }
     fwd = _passthrough_from_wire(wire)
     assert fwd.platform == "discord"
     assert fwd.bot_id == "appShared"
     assert fwd.body == original
     assert fwd.headers == [("content-type", "application/json")]
+    assert fwd.authenticated_user_id == "user-3"
 
 
 @pytest.mark.asyncio
@@ -166,4 +168,3 @@ async def test_application_command_subcommand_nesting_renders_names_then_values(
     assert ev.is_command() is True
     assert ev.get_command() == "skill"
     assert ev.get_command_args() == "run deploy"
-

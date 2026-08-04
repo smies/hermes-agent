@@ -12,11 +12,13 @@ import pytest
 from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner
 from gateway.trusted_private_read_host import (
+    SENSITIVE_RUNTIME_LAUNCHER_PATH,
     SENSITIVE_VERIFIED_LAUNCHER_SHA256,
     TrustedPrivateReadConfigurationError,
     TrustedPrivateReadGatewayHost,
     TrustedPrivateReadHostConfig,
     TrustedPrivateReadHostServices,
+    _sensitive_launcher_seal,
 )
 from tools.private_read_request_tool import (
     check_private_read_request_runtime,
@@ -122,7 +124,6 @@ def test_arbitrary_services_module_is_not_a_configuration_surface(tmp_path: Path
     with pytest.raises(TrustedPrivateReadConfigurationError):
         TrustedPrivateReadHostConfig.parse(raw)
 
-
 @pytest.mark.asyncio
 async def test_gateway_rejects_external_service_factory_and_keeps_runtime_unavailable(
     tmp_path: Path,
@@ -179,6 +180,70 @@ def test_symlinked_key_and_transport_allowlist_drift_are_rejected(tmp_path: Path
     with pytest.raises(TrustedPrivateReadConfigurationError):
         TrustedPrivateReadHostConfig.parse(raw)
 
+
+def _copy_sensitive_launcher(target: Path) -> Path:
+    target.write_bytes(SENSITIVE_RUNTIME_LAUNCHER_PATH.read_bytes())
+    target.chmod(0o600)
+    return target
+
+
+def test_actual_sensitive_launcher_positive_and_tampered_marker_rejected(
+    tmp_path: Path,
+) -> None:
+    launcher = _copy_sensitive_launcher(tmp_path / "launcher.js")
+    seal = _sensitive_launcher_seal(launcher)
+    assert seal[-1] == SENSITIVE_VERIFIED_LAUNCHER_SHA256
+
+    marker = tmp_path / "tampered-launcher-executed"
+    launcher.write_text(
+        launcher.read_text(encoding="utf-8")
+        + f"\nprocess.getBuiltinModule('node:fs').writeFileSync({str(marker)!r}, 'x');\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(TrustedPrivateReadConfigurationError) as raised:
+        _sensitive_launcher_seal(launcher)
+    assert not marker.exists()
+    assert str(tmp_path) not in str(raised.value)
+
+
+def test_sensitive_launcher_symlink_and_symlinked_ancestor_rejected(
+    tmp_path: Path,
+) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir(mode=0o700)
+    launcher = _copy_sensitive_launcher(real_dir / "launcher.js")
+    alias = tmp_path / "launcher-alias.js"
+    alias.symlink_to(launcher)
+    with pytest.raises(TrustedPrivateReadConfigurationError):
+        _sensitive_launcher_seal(alias)
+
+    directory_alias = tmp_path / "directory-alias"
+    directory_alias.symlink_to(real_dir, target_is_directory=True)
+    with pytest.raises(TrustedPrivateReadConfigurationError):
+        _sensitive_launcher_seal(directory_alias / "launcher.js")
+
+
+def test_sensitive_launcher_inode_swap_during_hash_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launcher = _copy_sensitive_launcher(tmp_path / "launcher.js")
+    replacement = _copy_sensitive_launcher(tmp_path / "replacement.js")
+    real_read = os.read
+    swapped = False
+
+    def swap_after_first_read(descriptor: int, size: int) -> bytes:
+        nonlocal swapped
+        chunk = real_read(descriptor, size)
+        if chunk and not swapped:
+            swapped = True
+            os.replace(replacement, launcher)
+        return chunk
+
+    monkeypatch.setattr(os, "read", swap_after_first_read)
+    with pytest.raises(TrustedPrivateReadConfigurationError):
+        _sensitive_launcher_seal(launcher)
+    assert swapped is True
 
 @pytest.mark.asyncio
 async def test_gateway_host_installs_only_while_healthy_and_reconciles_restart(

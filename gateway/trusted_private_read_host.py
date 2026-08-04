@@ -52,6 +52,12 @@ from tools.private_read_request_tool import configure_private_read_request_runti
 SENSITIVE_VERIFIED_LAUNCHER_SHA256 = (
     "04a5a598423042a2ab7dfe347a149a00dd5ad8e41eeddbbb2afc78d63eed8964"
 )
+SENSITIVE_RUNTIME_LAUNCHER_PATH = (
+    Path(__file__).absolute().parent.parent
+    / "scripts"
+    / "whatsapp-sensitive-bridge"
+    / "launcher.js"
+)
 
 
 class TrustedPrivateReadConfigurationError(RuntimeError):
@@ -118,6 +124,113 @@ def _owner_directory(path: Path) -> Path:
     return path
 
 
+def _sensitive_launcher_seal(
+    path: Path = SENSITIVE_RUNTIME_LAUNCHER_PATH,
+) -> tuple[int, int, int, int, int, str]:
+    """Verify the actual canonical sensitive launcher through an open fd.
+
+    The allowlist's reported digest remains receipt evidence; this seal is the
+    trusted host's independent pre-spawn proof.  Error text is deliberately
+    path- and identity-free.
+    """
+    if not path.is_absolute() or Path(os.path.abspath(path)) != path:
+        raise TrustedPrivateReadConfigurationError(
+            "sensitive runtime launcher is unsafe"
+        )
+    cursor = path.parent
+    try:
+        for ancestor in tuple(cursor.parents)[::-1] + (cursor,):
+            item = ancestor.lstat()
+            bits = stat.S_IMODE(item.st_mode)
+            if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
+                raise TrustedPrivateReadConfigurationError(
+                    "sensitive runtime launcher path is unsafe"
+                )
+            if hasattr(os, "getuid") and item.st_uid not in {0, os.getuid()}:
+                raise TrustedPrivateReadConfigurationError(
+                    "sensitive runtime launcher path is unsafe"
+                )
+            if bits & 0o022 and not (
+                item.st_uid == 0 and bits & stat.S_ISVTX
+            ):
+                raise TrustedPrivateReadConfigurationError(
+                    "sensitive runtime launcher path is unsafe"
+                )
+        before = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except TrustedPrivateReadConfigurationError:
+        raise
+    except OSError as exc:
+        raise TrustedPrivateReadConfigurationError(
+            "sensitive runtime launcher is unavailable"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_dev != opened.st_dev
+            or before.st_ino != opened.st_ino
+            or before.st_nlink != 1
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or (
+                hasattr(os, "getuid")
+                and opened.st_uid not in {0, os.getuid()}
+            )
+        ):
+            raise TrustedPrivateReadConfigurationError(
+                "sensitive runtime launcher is unsafe"
+            )
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 1024 * 1024:
+                raise TrustedPrivateReadConfigurationError(
+                    "sensitive runtime launcher is oversized"
+                )
+            digest.update(chunk)
+        observed_digest = digest.hexdigest()
+        after = path.lstat()
+        if (
+            after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+            or after.st_size != total
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+            or after.st_uid != opened.st_uid
+            or after.st_nlink != opened.st_nlink
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(opened.st_mode)
+            or not hmac.compare_digest(
+                observed_digest, SENSITIVE_VERIFIED_LAUNCHER_SHA256
+            )
+        ):
+            raise TrustedPrivateReadConfigurationError(
+                "sensitive runtime launcher identity is invalid"
+            )
+        return (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            stat.S_IMODE(opened.st_mode),
+            observed_digest,
+        )
+    except TrustedPrivateReadConfigurationError:
+        raise
+    except OSError as exc:
+        raise TrustedPrivateReadConfigurationError(
+            "sensitive runtime launcher is unavailable"
+        ) from exc
+    finally:
+        os.close(descriptor)
+
+
 def _path_seal(path: Path) -> tuple[int, int, int, int, str]:
     info = path.lstat()
     digest = ""
@@ -170,6 +283,8 @@ class TrustedPrivateReadHostConfig:
     state_seal: tuple[int, int, int, int, str]
     key_seal: tuple[int, int, int, int, str]
     allowlist_seal: tuple[int, int, int, int, str]
+    sensitive_launcher_path: Path
+    sensitive_launcher_seal: tuple[int, int, int, int, int, str]
 
     def __repr__(self) -> str:
         return "<TrustedPrivateReadHostConfig redacted>"
@@ -184,6 +299,11 @@ class TrustedPrivateReadHostConfig:
                 and hmac.compare_digest(repr(_path_seal(self.key_file)), repr(self.key_seal))
                 and hmac.compare_digest(
                     repr(_path_seal(self.allowlist_file)), repr(self.allowlist_seal)
+                )
+                and self.sensitive_launcher_path == SENSITIVE_RUNTIME_LAUNCHER_PATH
+                and hmac.compare_digest(
+                    repr(_sensitive_launcher_seal(self.sensitive_launcher_path)),
+                    repr(self.sensitive_launcher_seal),
                 )
             )
         except BaseException:
@@ -207,6 +327,7 @@ class TrustedPrivateReadHostConfig:
         state_dir = _owner_directory(Path(raw["state_dir"]))
         key_file = _owner_file(Path(raw["key_file"]))
         allowlist_file = _owner_file(Path(raw["allowlist_file"]))
+        launcher_seal = _sensitive_launcher_seal()
         if raw["openfga_version"] != "1.18.2":
             raise TrustedPrivateReadConfigurationError(
                 "trusted host policy service version is invalid"
@@ -279,6 +400,8 @@ class TrustedPrivateReadHostConfig:
             state_seal=_path_seal(state_dir),
             key_seal=_path_seal(key_file),
             allowlist_seal=_path_seal(allowlist_file),
+            sensitive_launcher_path=SENSITIVE_RUNTIME_LAUNCHER_PATH,
+            sensitive_launcher_seal=launcher_seal,
         )
 
 

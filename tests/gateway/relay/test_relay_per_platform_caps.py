@@ -118,7 +118,7 @@ async def test_transport_descriptor_map_resets_on_redial(monkeypatch):
     monkeypatch.setattr(wst, "websockets", type("M", (), {"connect": staticmethod(_fake_connect)}))
     monkeypatch.setattr(t, "_send", _fake_send)
     monkeypatch.setattr(
-        t, "_read_loop", lambda: asyncio.sleep(0)
+        t, "_read_loop", lambda *_args: asyncio.sleep(0)
     )  # substitute a no-op coroutine factory
     await t._dial_and_start()
 
@@ -157,4 +157,3 @@ async def test_adapter_resolves_per_chat_limits_from_inbound_platform():
 
 
 # ───────────────────── stream consumer integration ─────────────────────
-

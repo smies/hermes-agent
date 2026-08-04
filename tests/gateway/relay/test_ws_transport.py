@@ -137,6 +137,162 @@ async def test_inbound_frame_reaches_handler(server):
         await t.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_reentrant_inbound_ack_does_not_deadlock_the_protocol_reader():
+    """A callback may await egress while the sole reader resolves its result."""
+    callback_order: list[str] = []
+    ack_completed = asyncio.Event()
+    sentinel_delivered = asyncio.Event()
+
+    async def connector(ws):
+        async for raw in ws:
+            for line in str(raw).split("\n"):
+                if not line.strip():
+                    continue
+                frame = json.loads(line)
+                if frame["type"] == "hello":
+                    await ws.send(
+                        json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR})
+                        + "\n"
+                        + json.dumps(
+                            {
+                                "type": "inbound",
+                                "event": {
+                                    "text": "prompt",
+                                    "message_type": "text",
+                                    "source": {
+                                        "platform": "discord",
+                                        "chat_id": "thread-1",
+                                        "chat_type": "thread",
+                                        "thread_id": "thread-1",
+                                        "user_id": "owner-a",
+                                    },
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                elif frame["type"] == "outbound":
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "outbound_result",
+                                "requestId": frame["requestId"],
+                                "result": {"success": True, "message_id": "ack-1"},
+                            }
+                        )
+                        + "\n"
+                        + json.dumps(
+                            {
+                                "type": "inbound",
+                                "event": {
+                                    "text": "sentinel",
+                                    "message_type": "text",
+                                    "source": {
+                                        "platform": "discord",
+                                        "chat_id": "thread-1",
+                                        "chat_type": "thread",
+                                        "thread_id": "thread-1",
+                                        "user_id": "owner-a",
+                                    },
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+
+    socket_server = await websockets.serve(connector, "127.0.0.1", 0)
+    port = next(iter(socket_server.sockets)).getsockname()[1]
+    transport = WebSocketRelayTransport(
+        f"ws://127.0.0.1:{port}", "discord", "appShared"
+    )
+
+    async def on_inbound(event):
+        callback_order.append(event.text)
+        if event.text == "prompt":
+            result = await transport.send_outbound({"op": "send", "content": "ack"})
+            assert result == {"success": True, "message_id": "ack-1"}
+            ack_completed.set()
+        else:
+            sentinel_delivered.set()
+
+    transport.set_inbound_handler(on_inbound)
+    await transport.connect()
+    try:
+        await transport.handshake()
+        await asyncio.wait_for(ack_completed.wait(), timeout=2)
+        await asyncio.wait_for(sentinel_delivered.wait(), timeout=2)
+        assert callback_order == ["prompt", "sentinel"]
+        assert transport._pending == {}
+        assert transport._reader is not None and not transport._reader.done()
+    finally:
+        await transport.disconnect()
+        socket_server.close()
+        await socket_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_callback_exception_isolated_and_disconnect_inside_callback_is_safe():
+    delivered: list[str] = []
+    callback_finished = asyncio.Event()
+
+    async def connector(ws):
+        async for raw in ws:
+            if '"type": "hello"' not in str(raw):
+                continue
+            frames = [
+                {"type": "descriptor", "descriptor": DESCRIPTOR},
+                *[
+                    {
+                        "type": "inbound",
+                        "event": {
+                            "text": text,
+                            "message_type": "text",
+                            "source": {
+                                "platform": "discord",
+                                "chat_id": "c1",
+                                "chat_type": "dm",
+                                "user_id": "u1",
+                            },
+                        },
+                    }
+                    for text in ("boom", "disconnect")
+                ],
+            ]
+            await ws.send("".join(json.dumps(frame) + "\n" for frame in frames))
+
+    socket_server = await websockets.serve(connector, "127.0.0.1", 0)
+    port = next(iter(socket_server.sockets)).getsockname()[1]
+    transport = WebSocketRelayTransport(
+        f"ws://127.0.0.1:{port}", "discord", "appShared"
+    )
+
+    async def on_inbound(event):
+        delivered.append(event.text)
+        if event.text == "boom":
+            raise RuntimeError("synthetic callback failure")
+        await transport.disconnect()
+        callback_finished.set()
+
+    transport.set_inbound_handler(on_inbound)
+    await transport.connect()
+    try:
+        await transport.handshake()
+        await asyncio.wait_for(callback_finished.wait(), timeout=2)
+        for _ in range(100):
+            if transport._callback_worker is None:
+                break
+            await asyncio.sleep(0.01)
+        assert delivered == ["boom", "disconnect"]
+        assert transport._callback_worker is None
+        assert transport._callback_queue is None
+        assert transport._pending == {}
+    finally:
+        await transport.disconnect()
+        socket_server.close()
+        await socket_server.wait_closed()
+
+
 # ── Phase 7 Unit 7d-B: terminal 4401 (opt-out revocation) ────────────────────
 
 
@@ -206,5 +362,3 @@ async def test_4401_after_handshake_is_terminal_no_reconnect():
     finally:
         await t.disconnect()
         await srv.stop()
-
-

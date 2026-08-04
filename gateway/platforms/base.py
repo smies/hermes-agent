@@ -26,6 +26,8 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+_BACKGROUND_TASK_CANCEL_TIMEOUT_S = 5.0
+
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Keep Telegram's narrower attachment/voice sets below separate: formats such
 # as MPEG-2 Layer II are audio to Hermes but unsupported by sendAudio/sendVoice.
@@ -5464,19 +5466,40 @@ class BasePlatformAdapter(ABC):
             self._active_principal_by_session[session_key] = principal
         self._active_sessions[session_key] = guard
 
-        task = asyncio.create_task(self._process_message_background(event, session_key))
-        self._session_tasks[session_key] = task
+        coroutine = self._process_message_background(event, session_key)
         try:
-            self._background_tasks.add(task)
-        except TypeError:
-            # Tests stub create_task() with lightweight sentinels that are not
-            # hashable and do not support lifecycle callbacks.
-            self._session_tasks.pop(session_key, None)
+            task = asyncio.create_task(coroutine)
+        except BaseException:
+            coroutine.close()
             self._release_session_guard(session_key, guard=guard)
             return False
-        if hasattr(task, "add_done_callback"):
+        try:
+            self._session_tasks[session_key] = task
+            self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+        except BaseException:
+            # Tests stub create_task() with lightweight sentinels that are not
+            # hashable and do not support lifecycle callbacks.
+            if self._session_tasks.get(session_key) is task:
+                self._session_tasks.pop(session_key, None)
+            try:
+                if not isinstance(task, asyncio.Task):
+                    coroutine.close()
+                try:
+                    self._background_tasks.discard(task)
+                    self._expected_cancelled_tasks.discard(task)
+                except BaseException:
+                    pass
+                cancel = getattr(task, "cancel", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except BaseException:
+                        pass
+            finally:
+                self._release_session_guard(session_key, guard=guard)
+            return False
         return True
 
     async def cancel_session_processing(
@@ -6661,7 +6684,7 @@ class BasePlatformAdapter(ABC):
                         *(asyncio.shield(t) for t in tasks),
                         return_exceptions=True,
                     ),
-                    timeout=5.0,
+                    timeout=_BACKGROUND_TASK_CANCEL_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -6683,6 +6706,7 @@ class BasePlatformAdapter(ABC):
             pass
         self._pending_messages.clear()
         self._active_sessions.clear()
+        self._active_principal_by_session.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():
                 state.task.cancel()

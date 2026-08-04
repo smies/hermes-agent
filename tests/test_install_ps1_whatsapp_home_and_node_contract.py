@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,3 +93,17 @@ def test_simplified_chinese_windows_contract_is_current_and_fail_closed() -> Non
     assert "Node.js 22.22+" in contributing
     assert "原生 Windows 不支持 Baileys 离线预配" in windows
     assert "不会创建会话或显示二维码" in windows
+
+
+def test_simplified_chinese_windows_frontmatter_is_delimited_and_parseable() -> None:
+    path = (
+        ROOT
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/windows-native.md"
+    )
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "---"
+    closing = lines.index("---", 1)
+    assert closing > 1
+    frontmatter = yaml.safe_load("\n".join(lines[1:closing]))
+    assert type(frontmatter) is dict
+    assert frontmatter["title"] == "Windows（原生）指南"

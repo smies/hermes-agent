@@ -57,6 +57,11 @@ _OUTBOUND_TIMEOUT_S = 30.0
 # adapter.disconnect. Three sequential awaits at 1.0s stay under the runner's
 # default 5s adapter disconnect budget (plus the 2s go_idle ACK budget).
 _TEARDOWN_AWAIT_TIMEOUT_S = 1.0
+# Application callbacks are intentionally decoupled from the sole protocol
+# reader.  The bound is per connection generation; overload closes that
+# connection instead of blocking the reader behind frames whose responses it
+# alone can consume.
+_APPLICATION_CALLBACK_QUEUE_MAX = 128
 
 # Phase 7 Unit 7d-B: the application close code the connector sends when it
 # rejects/revokes a gateway's WS upgrade auth (mirrors the connector's
@@ -304,6 +309,9 @@ class PassthroughForward:
     path: str
     headers: list[tuple[str, str]]
     body: bytes
+    # Connector-authenticated responder identity.  This is envelope metadata,
+    # not a field copied from the provider request body.
+    authenticated_user_id: Optional[str] = None
 
 
 def _passthrough_from_wire(raw: Dict[str, Any]) -> PassthroughForward:
@@ -333,6 +341,11 @@ def _passthrough_from_wire(raw: Dict[str, Any]) -> PassthroughForward:
         path=str(raw.get("path", "")),
         headers=headers,
         body=body,
+        authenticated_user_id=(
+            str(raw["authenticatedUserId"])
+            if raw.get("authenticatedUserId")
+            else None
+        ),
     )
 
 
@@ -412,6 +425,10 @@ class WebSocketRelayTransport:
 
         self._ws: Any = None
         self._reader: Optional[asyncio.Task[None]] = None
+        self._callback_worker: Optional[asyncio.Task[None]] = None
+        self._callback_queue: Optional[asyncio.Queue[tuple[int, Dict[str, Any]]]] = None
+        self._connection_generation = 0
+        self._callback_queue_max = _APPLICATION_CALLBACK_QUEUE_MAX
         self._inbound: Optional[InboundHandler] = None
         self._descriptor: Optional[CapabilityDescriptor] = None
         # Phase 1.5 multi-platform: descriptors keyed by the underlying platform
@@ -439,6 +456,7 @@ class WebSocketRelayTransport:
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def connect(self) -> bool:
+        self._closing = False
         await self._dial_and_start()
         return True
 
@@ -458,10 +476,19 @@ class WebSocketRelayTransport:
         self._dormant = False
         headers = self._upgrade_headers()
         if headers:
-            self._ws = await websockets.connect(self._url, additional_headers=headers)  # type: ignore[union-attr]
+            ws = await websockets.connect(self._url, additional_headers=headers)  # type: ignore[union-attr]
         else:
-            self._ws = await websockets.connect(self._url)  # type: ignore[union-attr]
-        self._reader = asyncio.create_task(self._read_loop(), name="relay-ws-reader")
+            ws = await websockets.connect(self._url)  # type: ignore[union-attr]
+        self._ws = ws
+        self._connection_generation += 1
+        generation = self._connection_generation
+        self._callback_queue = asyncio.Queue(maxsize=self._callback_queue_max)
+        self._callback_worker = asyncio.create_task(
+            self._callback_loop(generation), name="relay-ws-callbacks"
+        )
+        self._reader = asyncio.create_task(
+            self._read_loop(ws, generation), name="relay-ws-reader"
+        )
         # Send one hello PER fronted identity (Phase 1.5 Shape A). The connector
         # accumulates them into its advertised set (the first sets the session
         # default; each adds to the egress-allowed set). A single-platform gateway
@@ -502,6 +529,7 @@ class WebSocketRelayTransport:
 
     async def disconnect(self) -> None:
         self._closing = True
+        self._connection_generation += 1
         if self._supervisor is not None:
             self._supervisor.cancel()
             try:
@@ -512,12 +540,12 @@ class WebSocketRelayTransport:
                 pass
             self._supervisor = None
         if self._reader is not None:
-            self._reader.cancel()
-            try:
-                await asyncio.wait_for(self._reader, timeout=_TEARDOWN_AWAIT_TIMEOUT_S)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
-                pass
+            reader = self._reader
+            if reader is not asyncio.current_task():
+                reader.cancel()
+                await self._bounded_task_stop(reader)
             self._reader = None
+        await self._stop_callback_dispatch()
         if self._ws is not None:
             try:
                 await asyncio.wait_for(self._ws.close(), timeout=_TEARDOWN_AWAIT_TIMEOUT_S)
@@ -525,13 +553,63 @@ class WebSocketRelayTransport:
                 pass
             finally:
                 self._ws = None
-        # Fail any in-flight outbound waiters so callers don't hang.
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(RuntimeError("relay transport closed"))
-        self._pending.clear()
+        self._fail_pending("relay transport closed")
         if self._going_idle_ack is not None and not self._going_idle_ack.done():
             self._going_idle_ack.set_exception(RuntimeError("relay transport closed"))
+
+    async def _bounded_task_stop(self, task: asyncio.Task[Any]) -> None:
+        """Bound task teardown without ``wait_for``'s cancellation re-wait."""
+        done, _ = await asyncio.wait({task}, timeout=_TEARDOWN_AWAIT_TIMEOUT_S)
+        if task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - teardown boundary
+                pass
+
+    def _drain_callback_queue(self) -> None:
+        queue = self._callback_queue
+        if queue is None:
+            return
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                queue.task_done()
+
+    async def _stop_callback_dispatch(self, generation: Optional[int] = None) -> None:
+        """Cancel and drain the serial callback worker for one generation.
+
+        A callback is allowed to initiate ``disconnect()``.  In that case this
+        method marks its generation stale and drains queued work, but never
+        cancels or awaits the current task; the worker exits from its own
+        ``finally`` as soon as the callback returns.
+        """
+        worker = self._callback_worker
+        if generation is not None and generation == self._connection_generation:
+            # A current generation is stopped by invalidating it first.  Stale
+            # reader cleanup must never invalidate a replacement generation.
+            self._connection_generation += 1
+        self._drain_callback_queue()
+        if worker is None:
+            self._callback_queue = None
+            return
+        if worker is asyncio.current_task():
+            return
+        worker.cancel()
+        await self._bounded_task_stop(worker)
+        if self._callback_worker is worker:
+            self._callback_worker = None
+            self._callback_queue = None
+
+    def _fail_pending(self, message: str) -> None:
+        for fut in tuple(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(RuntimeError(message))
+        self._pending.clear()
+        if self._going_idle_ack is not None and not self._going_idle_ack.done():
+            self._going_idle_ack.set_exception(RuntimeError(message))
 
     async def handshake(self) -> CapabilityDescriptor:
         if self._descriptor is not None:
@@ -728,17 +806,16 @@ class WebSocketRelayTransport:
             raise RuntimeError("relay transport not connected")
         await self._ws.send(json.dumps(frame) + "\n")
 
-    async def _read_loop(self) -> None:
-        assert self._ws is not None
+    async def _read_loop(self, ws: Any, generation: int) -> None:
         buf = ""
         try:
-            async for chunk in self._ws:
+            async for chunk in ws:
                 buf += chunk if isinstance(chunk, str) else chunk.decode("utf-8")
                 # Newline-delimited frames; keep any trailing partial line.
                 *lines, buf = buf.split("\n")
                 for line in lines:
                     if line.strip():
-                        await self._handle_frame(line)
+                        await self._handle_frame(line, generation)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - log + let the task end; reconnection handled below
@@ -756,6 +833,22 @@ class WebSocketRelayTransport:
                     )
             elif not self._closing:
                 logger.warning("relay ws read loop ended: %s", exc)
+        finally:
+            # A request awaiting a response on this socket can never complete
+            # after its reader exits.  Fail it before cancelling callbacks so a
+            # reentrant callback blocked in send_outbound() can unwind.
+            if generation == self._connection_generation:
+                self._fail_pending("relay connection closed")
+                await self._stop_callback_dispatch(generation)
+                if self._ws is ws:
+                    self._ws = None
+            try:
+                await asyncio.wait_for(
+                    ws.close(), timeout=_TEARDOWN_AWAIT_TIMEOUT_S
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
         # Phase 5 §5.3: the socket closed. If reconnect is enabled and this was
         # NOT a deliberate disconnect(), kick the reconnect supervisor so the
         # gateway re-dials + re-handshakes (which triggers the connector's
@@ -820,7 +913,11 @@ class WebSocketRelayTransport:
                 logger.warning("relay ws reconnect failed: %s", exc)
                 backoff = min(backoff * 2, self._reconnect_max_backoff_s)
 
-    async def _handle_frame(self, line: str) -> None:
+    async def _handle_frame(
+        self, line: str, generation: Optional[int] = None
+    ) -> None:
+        if generation is None:
+            generation = self._connection_generation
         try:
             frame = json.loads(line)
         except json.JSONDecodeError:
@@ -850,16 +947,7 @@ class WebSocketRelayTransport:
             if self._descriptor_ready is not None and not self._descriptor_ready.done():
                 self._descriptor_ready.set_result(descriptor)
         elif ftype == "inbound":
-            if self._inbound is not None:
-                event = _event_from_wire(frame.get("event", {}))
-                await self._inbound(event)
-                # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
-                # a bufferId; ack it after the handler has durably taken it so the
-                # connector advances its delivery-leg buffer cursor (no dup). A live
-                # delivery has no bufferId — nothing to ack.
-                buffer_id = frame.get("bufferId")
-                if buffer_id:
-                    await self._send_inbound_ack(str(buffer_id))
+            self._enqueue_callback(frame, generation)
         elif ftype == "going_idle_ack":
             # Phase 5 §5.3: the connector confirmed our destination is now
             # buffered-only; resolve the waiter go_idle() is blocked on.
@@ -870,31 +958,88 @@ class WebSocketRelayTransport:
             if fut is not None and not fut.done():
                 fut.set_result(frame.get("result", {}))
         elif ftype == "interrupt_inbound":
-            # A structured control event must carry the same authenticated
-            # sender/chat source as ordinary inbound.  Legacy frames without
-            # an event cannot pass the adapter principal fence and are dropped.
-            handler = getattr(self, "_interrupt_inbound_handler", None)
-            if handler is not None:
-                raw_event = frame.get("event")
-                event = _event_from_wire(raw_event) if isinstance(raw_event, dict) else None
-                await handler(
-                    event,
-                    frame.get("session_key", ""),
-                    frame.get("chat_id", ""),
-                )
+            self._enqueue_callback(frame, generation)
         elif ftype == "passthrough_forward":
             # Phase 5 §5.1: a forwarded passthrough-plane request (Discord
             # interaction, Twilio, …) the connector already edge-ACKed. It rides
             # the SAME outbound WS as inbound messages so a hosted gateway needs
             # no public inbound port. Dispatch to the adapter's handler; the
             # bufferId (when present, §5.3 buffered flip) is passed for ack.
-            handler = getattr(self, "_passthrough_handler", None)
-            if handler is not None:
-                fwd = _passthrough_from_wire(frame.get("forward", {}))
-                await handler(fwd, frame.get("bufferId"))
+            self._enqueue_callback(frame, generation)
         else:
             # hello/outbound/interrupt are gateway->connector; ignore if echoed.
             pass
+
+    def _enqueue_callback(self, frame: Dict[str, Any], generation: int) -> None:
+        """Queue application work without ever waiting in the protocol reader."""
+        queue = self._callback_queue
+        if generation != self._connection_generation or queue is None:
+            return
+        try:
+            queue.put_nowait((generation, frame))
+        except asyncio.QueueFull as exc:
+            self._fail_pending("relay callback queue overloaded")
+            self._drain_callback_queue()
+            raise RuntimeError("relay callback queue overloaded") from exc
+
+    async def _callback_loop(self, generation: int) -> None:
+        """Run application callbacks serially, preserving exact frame order."""
+        queue = self._callback_queue
+        if queue is None:
+            return
+        try:
+            while generation == self._connection_generation:
+                item_generation, frame = await queue.get()
+                try:
+                    if item_generation != generation:
+                        continue
+                    await self._dispatch_callback(frame)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    # One bad application callback does not kill the sole
+                    # protocol reader or reorder later callbacks.
+                    logger.warning("relay application callback failed", exc_info=True)
+                finally:
+                    queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._drain_callback_queue()
+            if self._callback_worker is asyncio.current_task():
+                self._callback_worker = None
+                self._callback_queue = None
+
+    async def _dispatch_callback(self, frame: Dict[str, Any]) -> None:
+        ftype = frame.get("type")
+        if ftype == "inbound":
+            if self._inbound is None:
+                return
+            event = _event_from_wire(frame.get("event", {}))
+            await self._inbound(event)
+            buffer_id = frame.get("bufferId")
+            if buffer_id:
+                await self._send_inbound_ack(str(buffer_id))
+            return
+        if ftype == "interrupt_inbound":
+            handler = getattr(self, "_interrupt_inbound_handler", None)
+            if handler is None:
+                return
+            raw_event = frame.get("event")
+            event = _event_from_wire(raw_event) if isinstance(raw_event, dict) else None
+            await handler(
+                event,
+                frame.get("session_key", ""),
+                frame.get("chat_id", ""),
+            )
+            return
+        if ftype == "passthrough_forward":
+            handler = getattr(self, "_passthrough_handler", None)
+            if handler is not None:
+                await handler(
+                    _passthrough_from_wire(frame.get("forward", {})),
+                    frame.get("bufferId"),
+                )
 
     def set_interrupt_inbound_handler(self, handler: Any) -> None:
         """Register the callback for connector->gateway interrupt_inbound frames."""

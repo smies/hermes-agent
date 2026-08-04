@@ -119,12 +119,16 @@ Both absent ⇒ byte-identical to today. A connector that never sends them, or a
 
 `PassthroughForward` is the wire form of a forwarded passthrough-plane request
 (Class-2/3 webhooks — Discord interactions, Twilio): `{platform, botId, method,
-path, headers: [[k,v],…], bodyB64}`. The body is base64-encoded so arbitrary
+path, headers: [[k,v],…], bodyB64, authenticatedUserId?}`. The body is base64-encoded so arbitrary
 bytes survive the newline-delimited-JSON transport; the gateway base64-decodes
 back to the exact bytes the connector forwarded (the connector already verified
 the provider signature and stripped any shared-identity credential at the edge —
 §6 — so the gateway re-processes a sanitized, token-free body and acts on it via
-the token-less `follow_up` path). See §3.1.
+the token-less `follow_up` path). `authenticatedUserId` is connector-envelope
+metadata derived only after provider authentication; Discord prompt components
+require it and combine it with the gateway's immutable prompt-source snapshot.
+Provider-body user/channel/profile/thread fields never nominate prompt ownership.
+See §3.1.
 
 **Trust.** The WS upgrade is authenticated with the gateway's per-gateway secret
 (§6.1), so the channel is trusted end to end — inbound frames are not separately
