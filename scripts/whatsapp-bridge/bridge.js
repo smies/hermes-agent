@@ -32,6 +32,7 @@ import { tmpdir } from 'os';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { verifyLidBootstrap } from '../whatsapp-sensitive-bridge/provisioning_core.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -395,10 +396,14 @@ async function startSocket() {
     process.exitCode = 1;
     return;
   }
-  const storedPhone = String(state?.creds?.me?.id || '')
-    .replace(/:\d+@/, '@')
-    .replace(/@s\.whatsapp\.net$/, '');
-  if (!storedPhone || !Object.values(lidToPhone).includes(storedPhone)) {
+  const phoneJid = jidNormalizedUser(state?.creds?.me?.id || '');
+  const persistedLid = await verifyLidBootstrap({
+    auth: { state },
+    sock: {},
+    phoneJid,
+    canonicalizeJid: jidNormalizedUser,
+  });
+  if (!persistedLid) {
     console.log('❌ WhatsApp session LID bootstrap is incomplete.');
     process.exitCode = 1;
     return;

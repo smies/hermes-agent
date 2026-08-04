@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from gateway.config import GatewayConfig
+from gateway.run import GatewayRunner
 from gateway.trusted_private_read_host import (
     TrustedPrivateReadConfigurationError,
     TrustedPrivateReadGatewayHost,
@@ -64,7 +65,6 @@ def _config(root: Path) -> dict:
         "state_dir": str(state),
         "key_file": str(key_file),
         "allowlist_file": str(allowlist_file),
-        "services_module": "gateway.fixture_private_read_services",
         "openfga_version": "1.18.2",
         "capabilities": [
             {
@@ -90,6 +90,25 @@ def test_default_config_has_no_block_and_schema_is_unavailable() -> None:
     config = GatewayConfig()
     assert config.trusted_private_read is None
     assert "trusted_private_read" not in config.to_dict()
+    assert check_private_read_request_runtime() is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_external_service_factory_and_keeps_runtime_unavailable(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    def untrusted_factory(*_args):
+        nonlocal called
+        called = True
+        raise AssertionError("configuration must not select executable composition")
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig.from_dict({"trusted_private_read": _config(tmp_path)})
+    runner._trusted_private_read_services_factory = untrusted_factory
+    assert await runner._start_trusted_private_read_host() is False
+    assert called is False
     assert check_private_read_request_runtime() is False
 
 

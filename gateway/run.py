@@ -6170,9 +6170,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _start_trusted_private_read_host(self) -> bool:
         """Parse and atomically install the explicit trusted-host runtime.
 
-        The services factory is a narrow gateway-owned composition seam. A
-        production build supplies the concrete provider/PDP/transport host;
-        absence or any invalid prerequisite leaves the service-gated schema
+        Production composition is gateway-owned.  Configuration may select
+        only reviewed data; it cannot import code or inject a factory that
+        self-asserts requester/PDP/account/delivery authority.  Until concrete
+        built-in adapters are available, the service-gated schema stays
         unavailable.
         """
         raw = getattr(self.config, "trusted_private_read", None)
@@ -6184,23 +6185,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 TrustedPrivateReadGatewayHost,
                 TrustedPrivateReadHostConfig,
                 TrustedPrivateReadHostServices,
+                compose_trusted_private_read_services,
             )
 
             parsed = TrustedPrivateReadHostConfig.parse(raw)
             if parsed is None:
                 return False
-            factory = getattr(self, "_trusted_private_read_services_factory", None)
-            if not callable(factory):
-                import importlib
-
-                module = importlib.import_module(parsed.services_module)
-                factory = getattr(module, "build_trusted_private_read_services", None)
-            if not callable(factory):
-                logger.error("Trusted private-read host services are unavailable")
-                return False
-            services = factory(self, parsed)
+            services = compose_trusted_private_read_services(self, parsed)
             if type(services) is not TrustedPrivateReadHostServices:
-                logger.error("Trusted private-read host services failed validation")
+                logger.error("Trusted private-read host services are unavailable")
                 return False
             host = TrustedPrivateReadGatewayHost(parsed, services)
             if not await host.start():
@@ -6645,6 +6638,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    @staticmethod
+    def _private_read_principal(event: MessageEvent) -> tuple[str, ...] | None:
+        """Canonical authenticated identity for live-turn injection checks.
+
+        Only provider-authenticated stable identifiers participate.  Display
+        names and message text are deliberately excluded.  Both primary and
+        provider-specific alternate IDs are retained so an adapter cannot
+        collapse two distinct authenticated principals through a friendly
+        name or a shared thread/session key.
+        """
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+        platform = getattr(getattr(source, "platform", None), "value", None)
+        sender = getattr(source, "user_id", None)
+        sender_alt = getattr(source, "user_id_alt", None)
+        chat = getattr(source, "chat_id", None)
+        if not platform or not chat or not (sender or sender_alt):
+            return None
+        return (
+            str(platform),
+            str(getattr(source, "profile", None) or "default"),
+            str(getattr(source, "scope_id", None) or ""),
+            str(getattr(source, "chat_type", None) or ""),
+            str(getattr(source, "parent_chat_id", None) or ""),
+            str(getattr(source, "chat_id_alt", None) or ""),
+            str(chat),
+            str(sender_alt or ""),
+            str(sender or ""),
+            str(getattr(source, "thread_id", None) or ""),
+        )
+
+    def _private_read_live_injection_allowed(
+        self,
+        session_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        """Allow steer/redirect only for the exact active authenticated user."""
+        if getattr(self, "_trusted_private_read_host", None) is None:
+            return True
+        active = getattr(self, "_private_read_active_principals", {}).get(session_key)
+        incoming = self._private_read_principal(event)
+        return active is not None and incoming is not None and active == incoming
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -8721,6 +8758,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
                 ),
                 metadata=thread_meta,
+            )
+            return True
+
+        # Apply the authenticated-principal fence before approval routing or
+        # any other busy-turn command.  Otherwise another participant sharing
+        # the session could approve, stop, redirect, or steer A's live turn
+        # while A's trusted context remained installed.
+        if not self._private_read_live_injection_allowed(session_key, event):
+            self._queue_or_replace_pending_event(session_key, event)
+            logger.info(
+                "Queued cross-principal follow-up for private-read-capable session %s",
+                session_key,
             )
             return True
 
@@ -14713,6 +14762,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if self._is_session_running(_quick_key):
+            if not self._private_read_live_injection_allowed(_quick_key, event):
+                self._queue_or_replace_pending_event(_quick_key, event)
+                logger.info(
+                    "Queued cross-principal priority follow-up for private-read-capable session %s",
+                    _quick_key,
+                )
+                return None
+
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
@@ -16370,17 +16427,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
-        _private_read_event_token = None
-        _private_read_host = getattr(self, "_trusted_private_read_host", None)
-        if _private_read_host is not None:
-            try:
-                # Bind the exact authenticated event object after ordinary
-                # gateway authorization and propagate it through copy_context
-                # into the agent executor. Model arguments never enter here.
-                _private_read_event_token = _private_read_host.bind_event(event)
-            except BaseException:
-                logger.error("Trusted private-read event binding failed closed")
-        
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
         persist_user_message = None
@@ -17486,6 +17532,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                logical_event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -18216,11 +18263,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
-            if _private_read_host is not None:
-                try:
-                    _private_read_host.unbind_event(_private_read_event_token)
-                except BaseException:
-                    logger.error("Trusted private-read event cleanup failed closed")
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -23964,6 +24006,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        logical_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23974,28 +24017,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
-            )
+        private_host = getattr(self, "_trusted_private_read_host", None)
+        private_token = None
+        private_bound = False
+        active_principals = getattr(self, "_private_read_active_principals", None)
+        if active_principals is None:
+            active_principals = {}
+            self._private_read_active_principals = active_principals
+        previous_principal = active_principals.get(session_key) if session_key else None
+        try:
+            if private_host is not None:
+                # Bind even when this is an internal/non-inbound run.  The
+                # host then installs an explicit empty context, preventing a
+                # nested helper call without a logical event from inheriting
+                # its caller's authenticated private-read authority.
+                private_token = private_host.bind_event(logical_event)
+                private_bound = True
+                if logical_event is not None:
+                    principal = self._private_read_principal(logical_event)
+                    if principal is None:
+                        raise RuntimeError("authenticated private-read principal is unavailable")
+                    if session_key:
+                        active_principals[session_key] = principal
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
-            )
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    message_type=message_type,
+                )
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    message_type=message_type,
+                )
+        except BaseException:
+            # The finally block revokes both task-local capability context and
+            # the live-injection identity on cancellation, SystemExit, and all
+            # ordinary failures before the exception can cross the boundary.
+            raise
+        finally:
+            if session_key:
+                if previous_principal is None:
+                    active_principals.pop(session_key, None)
+                else:
+                    active_principals[session_key] = previous_principal
+            if private_host is not None and private_bound:
+                try:
+                    private_host.unbind_event(private_token)
+                except BaseException:
+                    # A context that cannot be proven cleared must revoke the
+                    # private runtime.  No later tool call may rely on it.
+                    try:
+                        private_host._healthy = False
+                    except BaseException:
+                        pass
+                    logger.error("Trusted private-read event cleanup failed closed")
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -25612,6 +25700,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    logical_event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

@@ -13,8 +13,8 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
-import select
 import re
+import threading
 import time
 from typing import IO
 
@@ -28,6 +28,10 @@ _PAIRING_CODE_RE = re.compile(r"^[A-Z0-9-]{4,32}$")
 
 class WhatsAppProvisioningError(RuntimeError):
     """Content-free provisioning failure safe for an operator boundary."""
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _canonical_owner_directory(path: Path, *, require_existing: bool) -> Path:
@@ -101,9 +105,101 @@ def _provisioner_script() -> Path:
     return script
 
 
+def _ensure_provisioner_dependencies(node: str, script: Path) -> None:
+    """Install and verify the provisioner's exact lockfile dependency tree."""
+    root = script.parent
+    package_file = root / "package.json"
+    lock_file = root / "package-lock.json"
+    try:
+        package = json.loads(package_file.read_text(encoding="utf-8"))
+        lock = json.loads(lock_file.read_text(encoding="utf-8"))
+        requested = package["dependencies"]["@whiskeysockets/baileys"]
+        locked_requested = lock["packages"][""]["dependencies"]["@whiskeysockets/baileys"]
+        locked = lock["packages"]["node_modules/@whiskeysockets/baileys"]
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise WhatsAppProvisioningError(
+            "provisioner dependency metadata is invalid"
+        ) from exc
+    commit = "01047debd81beb20da7b7779b08edcb06aa03770"
+    if (
+        type(requested) is not str
+        or not requested.endswith("#" + commit)
+        or locked_requested != requested
+        or type(locked.get("resolved")) is not str
+        or not locked["resolved"].endswith("#" + commit)
+        or type(locked.get("integrity")) is not str
+        or not locked["integrity"].startswith("sha512-")
+    ):
+        raise WhatsAppProvisioningError(
+            "provisioner dependency metadata is invalid"
+        )
+    installed_file = root / "node_modules" / "@whiskeysockets" / "baileys" / "package.json"
+    if not installed_file.is_file():
+        npm = find_node_executable("npm")
+        if not npm:
+            raise WhatsAppProvisioningError("provisioner dependencies are unavailable")
+        try:
+            installed = subprocess.run(
+                [npm, "ci", "--no-fund", "--no-audit", "--progress=false"],
+                cwd=str(root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_minimal_node_environment(node),
+                timeout=300,
+                check=False,
+            )
+        except BaseException:
+            raise WhatsAppProvisioningError(
+                "provisioner dependency installation failed"
+            ) from None
+        if installed.returncode != 0:
+            raise WhatsAppProvisioningError(
+                "provisioner dependency installation failed"
+            )
+    try:
+        installed_package = json.loads(installed_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise WhatsAppProvisioningError("provisioner dependencies are invalid") from exc
+    if (
+        installed_package.get("name") not in {"baileys", "@whiskeysockets/baileys"}
+        or installed_package.get("version") != locked.get("version")
+    ):
+        raise WhatsAppProvisioningError("provisioner dependencies are invalid")
+    # Exercise the same exact package/lock/source/installed-tree identity code
+    # used by the sensitive transport before launching the provisioner.  This
+    # both catches an incomplete clean install (including ERR_MODULE_NOT_FOUND)
+    # and binds launch to the pinned commit and installed tree digest.
+    identity_script = (
+        "import('./transport_identity.js')"
+        ".then(m=>m.computeTransportIdentity(process.cwd()))"
+        ".catch(()=>process.exitCode=1)"
+    )
+    try:
+        verified = subprocess.run(
+            [node, "--input-type=module", "--eval", identity_script],
+            cwd=str(root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_minimal_node_environment(node),
+            timeout=60,
+            check=False,
+        )
+    except BaseException:
+        raise WhatsAppProvisioningError(
+            "provisioner dependency identity verification failed"
+        ) from None
+    if verified.returncode != 0:
+        raise WhatsAppProvisioningError(
+            "provisioner dependency identity verification failed"
+        )
+
+
 def _minimal_node_environment(node: str) -> dict[str, str]:
-    environment = {"PATH": str(Path(node).resolve().parent)}
-    for name in ("LANG", "LC_ALL", "TZ", "NODE_PATH"):
+    executable_paths = [str(Path(node).resolve().parent), *os.defpath.split(os.pathsep)]
+    environment = {"PATH": os.pathsep.join(dict.fromkeys(executable_paths))}
+    for name in ("LANG", "LC_ALL", "TZ"):
         value = os.environ.get(name)
         if value:
             environment[name] = value
@@ -118,6 +214,7 @@ def run_whatsapp_provisioning(
     machine_output: IO[str],
     timeout_seconds: float = 150.0,
     validate_only: bool = False,
+    reprovision: bool = False,
 ) -> dict[str, object]:
     """Run the separate provisioner and return its non-sensitive final state."""
     if role not in _ROLES:
@@ -128,6 +225,7 @@ def run_whatsapp_provisioning(
     if not node:
         raise WhatsAppProvisioningError("Node.js is unavailable")
     script = _provisioner_script()
+    _ensure_provisioner_dependencies(node, script)
     ordinary, sensitive = resolve_provisioning_roots()
     request_value: dict[str, object] = {
         "version": 1,
@@ -135,6 +233,7 @@ def run_whatsapp_provisioning(
         "role": role,
         "ordinary_session": str(ordinary),
         "sensitive_session": str(sensitive),
+        "reprovision": bool(reprovision),
     }
     if not validate_only:
         if type(phone) is not str:
@@ -148,26 +247,28 @@ def run_whatsapp_provisioning(
     phone = None
     ordinary = None
     sensitive = None
-    operator_read_fd = operator_write_fd = None
     child_args = [node, str(script)]
-    pass_fds: tuple[int, ...] = ()
+    if not validate_only:
+        child_args.append("--operator-stdio")
     try:
-        if not validate_only:
-            operator_read_fd, operator_write_fd = os.pipe()
-            os.set_inheritable(operator_write_fd, True)
-            child_args.extend(("--operator-fd", str(operator_write_fd)))
-            pass_fds = (operator_write_fd,)
+        popen_kwargs: dict[str, object] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE if not validate_only else subprocess.DEVNULL,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "strict",
+            "env": _minimal_node_environment(node),
+        }
+        if _is_windows():
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
             child_args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            env=_minimal_node_environment(node),
-            start_new_session=True,
-            pass_fds=pass_fds,
+            **popen_kwargs,
         )
     except BaseException:
         request = ""
@@ -175,20 +276,41 @@ def run_whatsapp_provisioning(
         phone = None
         ordinary = None
         sensitive = None
-        for descriptor in (operator_read_fd, operator_write_fd):
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
         raise WhatsAppProvisioningError("provisioner could not start") from None
-    if operator_write_fd is not None:
-        os.close(operator_write_fd)
-        operator_write_fd = None
+    operator_stream = process.stderr if not validate_only else None
+    # ``communicate`` must not compete with the dedicated operator reader for
+    # the same pipe.  Retain sole ownership locally and detach it from Popen's
+    # communicate set before either reader starts.
+    if not validate_only:
+        process.stderr = None
     final: dict[str, object] | None = None
     code = None
     code_event = None
-    code_frame = b""
+    code_frame = ""
+    operator_failure: list[BaseException] = []
+
+    def _forward_operator_event() -> None:
+        nonlocal code, code_event, code_frame
+        try:
+            if operator_stream is None:
+                raise WhatsAppProvisioningError("operator channel is unavailable")
+            code_frame = operator_stream.readline(257)
+            if not code_frame or len(code_frame.encode("utf-8")) > 256 or not code_frame.endswith("\n"):
+                raise WhatsAppProvisioningError("provisioner returned an invalid code")
+            code_event = json.loads(code_frame)
+            code = code_event.get("code") if type(code_event) is dict else None
+            if (
+                code_event.get("event") != "pairing_code"
+                or type(code) is not str
+                or _PAIRING_CODE_RE.fullmatch(code) is None
+            ):
+                raise WhatsAppProvisioningError("provisioner returned an invalid code")
+            operator.write(f"WhatsApp pairing code: {code}\n")
+            operator.flush()
+        except BaseException as exc:
+            operator_failure.append(exc)
+
+    operator_thread = None
     try:
         started = time.monotonic()
         if process.stdin is None:
@@ -196,33 +318,23 @@ def run_whatsapp_provisioning(
         process.stdin.write(request)
         process.stdin.close()
         process.stdin = None
-        if operator_read_fd is not None:
-            ready, _, _ = select.select(
-                [operator_read_fd], [], [], timeout_seconds
+        if not validate_only:
+            operator_thread = threading.Thread(
+                target=_forward_operator_event,
+                name="whatsapp-provision-operator",
+                daemon=True,
             )
-            if not ready:
-                raise subprocess.TimeoutExpired(child_args, timeout_seconds)
-            code_frame = os.read(operator_read_fd, 256)
-            if code_frame and (len(code_frame) > 128 or not code_frame.endswith(b"\n")):
-                raise WhatsAppProvisioningError("provisioner returned an invalid code")
-            if code_frame:
-                try:
-                    code_event = json.loads(code_frame.decode("ascii", "strict"))
-                except (ValueError, UnicodeError) as exc:
-                    raise WhatsAppProvisioningError(
-                        "provisioner returned an invalid code"
-                    ) from exc
-                code = code_event.get("code") if type(code_event) is dict else None
-                if (
-                    code_event.get("event") != "pairing_code"
-                    or type(code) is not str
-                    or _PAIRING_CODE_RE.fullmatch(code) is None
-                ):
-                    raise WhatsAppProvisioningError("provisioner returned an invalid code")
-                operator.write(f"WhatsApp pairing code: {code}\n")
-                operator.flush()
+            operator_thread.start()
         remaining = max(0.1, timeout_seconds - (time.monotonic() - started))
         stdout, _ = process.communicate(timeout=remaining)
+        if operator_thread is not None:
+            operator_thread.join(timeout=max(0.1, remaining))
+            if operator_thread.is_alive():
+                raise subprocess.TimeoutExpired(child_args, timeout_seconds)
+            if operator_failure:
+                raise WhatsAppProvisioningError(
+                    "provisioner returned an invalid code"
+                ) from None
         if len(stdout.encode("utf-8")) > _MAX_EVENT_BYTES:
             raise WhatsAppProvisioningError("provisioner output exceeded its bound")
         for line in stdout.splitlines():
@@ -250,22 +362,34 @@ def run_whatsapp_provisioning(
     except BaseException:
         if process.poll() is None:
             try:
-                os.killpg(process.pid, 15)
+                if not _is_windows():
+                    os.killpg(process.pid, 15)
+                else:
+                    process.terminate()
                 process.wait(timeout=3)
             except BaseException:
                 try:
-                    os.killpg(process.pid, 9)
+                    if not _is_windows():
+                        os.killpg(process.pid, 9)
+                    else:
+                        process.kill()
                     process.wait(timeout=3)
                 except BaseException:
                     pass
         raise
     finally:
-        for descriptor in (operator_read_fd, operator_write_fd):
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        if operator_thread is not None and operator_thread.is_alive():
+            try:
+                if operator_stream is not None:
+                    operator_stream.close()
+            except BaseException:
+                pass
+            operator_thread.join(timeout=3)
+        elif operator_stream is not None:
+            try:
+                operator_stream.close()
+            except BaseException:
+                pass
         request = ""
         request_value.clear()
         phone = None
@@ -273,7 +397,8 @@ def run_whatsapp_provisioning(
         sensitive = None
         code = None
         code_event = None
-        code_frame = b""
+        code_frame = ""
+        operator_failure.clear()
 
 
 def command(args) -> int:
@@ -287,15 +412,15 @@ def command(args) -> int:
             operator=sys.stderr,
             machine_output=sys.stdout,
             validate_only=True,
+            reprovision=False,
         )
         return 0 if final["state"] == "ready_for_production" else 1
     phone = None
-    try:
-        operator = open("/dev/tty", "w", encoding="utf-8", buffering=1)
-    except OSError as exc:
+    operator = sys.stderr
+    if not operator.isatty() or not sys.stdin.isatty():
         raise WhatsAppProvisioningError(
             "an interactive operator channel is required"
-        ) from exc
+        )
     try:
         if not reprovision:
             validated = run_whatsapp_provisioning(
@@ -308,16 +433,31 @@ def command(args) -> int:
             if validated["state"] == "ready_for_production":
                 return 0
         try:
-            phone = input("WhatsApp phone number (international format): ")
+            operator.write("WhatsApp phone number (international format): ")
+            operator.flush()
+            phone = sys.stdin.readline(64)
+            if not phone or not phone.endswith("\n"):
+                raise EOFError
+            phone = phone.rstrip("\r\n")
         except (EOFError, KeyboardInterrupt) as exc:
             raise WhatsAppProvisioningError("provisioning cancelled") from exc
         final = run_whatsapp_provisioning(
-            role, phone=phone, operator=operator, machine_output=sys.stdout
+            role,
+            phone=phone,
+            operator=operator,
+            machine_output=sys.stdout,
+            reprovision=reprovision,
         )
+        if role == "ordinary" and final["state"] == "ready_for_production":
+            from cli import save_config_value
+
+            if save_config_value("platforms.whatsapp.enabled", True) is not True:
+                raise WhatsAppProvisioningError(
+                    "ordinary provisioning completed but configuration was not enabled"
+                )
         return 0 if final["state"] == "ready_for_production" else 1
     finally:
         phone = None
-        operator.close()
 
 
 __all__ = [

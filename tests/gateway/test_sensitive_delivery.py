@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import builtins
 import copy
+from contextvars import ContextVar
 from dataclasses import asdict, astuple, fields, is_dataclass, replace
 import fcntl
 import gc
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -44,6 +46,9 @@ from gateway.authorization_sensitive_delivery import (
     AuthorizationSensitiveDeliveryBridge,
 )
 from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import MessageEvent
+from gateway.private_read_authorization import TrustedPrivateReadHostContext
+from gateway.session import SessionSource
 from gateway.sensitive_delivery import (
     MAX_SENSITIVE_EVIDENCE_BYTES,
     MAX_SENSITIVE_PLAINTEXT_BYTES,
@@ -67,6 +72,16 @@ from gateway.sensitive_delivery import (
     SensitiveDeliveryTransportRegistration,
     SensitiveDeliveryTransportRegistry,
 )
+from gateway.trusted_private_read_host import (
+    TrustedPrivateReadGatewayHost,
+    TrustedPrivateReadHostConfig,
+    TrustedPrivateReadHostServices,
+)
+from tools.private_read_request_tool import (
+    PRIVATE_READ_REQUEST_TOOL_NAME,
+    configure_private_read_request_runtime,
+)
+from tools.registry import registry
 
 
 SECRET = "private-content-sentinel-9f2d6n"
@@ -2727,3 +2742,350 @@ async def test_plaintext_echo_then_host_baseexception_leaves_no_traceback_graph(
     assert not _task_frames_contain(SECRET)
     assert not router._active and not router._attempt_tasks
     await router.aclose()
+
+
+def _synthetic_host_config(root: Path) -> TrustedPrivateReadHostConfig:
+    root.mkdir(mode=0o700)
+    state = root / "state"
+    state.mkdir(mode=0o700)
+    keys = root / "keys.json"
+    allowlist = root / "allowlist.json"
+    keys.write_text(json.dumps({
+        "version": 1,
+        "key_version": "synthetic-v1",
+        "audit_hmac": "11" * 32,
+        "request_hmac": "22" * 32,
+        "request_id_hmac": "33" * 32,
+        "authorization_hmac": "44" * 32,
+        "receipt_hmac": "55" * 32,
+    }), encoding="utf-8")
+    identity = {
+        "manifest_sha256": "a" * 64,
+        "source_sha256": "b" * 64,
+        "package_sha256": "c" * 64,
+        "lock_sha256": "d" * 64,
+        "package_name": "synthetic-package",
+        "package_version": "synthetic-version",
+        "baileys_commit": "synthetic-commit",
+        "baileys_version": "synthetic-provider-version",
+        "baileys_lock_integrity": "synthetic-lock-integrity",
+        "baileys_tree_sha256": "e" * 64,
+    }
+    allowlist.write_text(json.dumps({
+        "version": 1,
+        "transport_identity": identity,
+    }), encoding="utf-8")
+    keys.chmod(0o600)
+    allowlist.chmod(0o600)
+    parsed = TrustedPrivateReadHostConfig.parse({
+        "version": 1,
+        "enabled": True,
+        "state_dir": str(state),
+        "key_file": str(keys),
+        "allowlist_file": str(allowlist),
+        "openfga_version": "1.18.2",
+        "capabilities": [{
+            "id": "synthetic-capability",
+            "operation": "synthetic-operation",
+            "resource_type": "synthetic-resource",
+            "fields": ["synthetic-field"],
+        }],
+        "poll_seconds": 0.1,
+        "lease_seconds": 5,
+    })
+    assert parsed is not None
+    return parsed
+
+
+@pytest.mark.asyncio
+async def test_synthetic_authenticated_private_read_e2e_never_persists_plaintext(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    """Exercise the exact durable protocol without a live provider or PDP."""
+    config = _synthetic_host_config(tmp_path / "synthetic-private-host")
+    now_us = time.time_ns() // 1000
+    binder = SensitiveDeliveryAccountBinder(BIND_KEY)
+    destination = _destination(binder)
+    child = _write_child(tmp_path)
+    # The general delivery suite uses a fixed clock. This E2E runs the real
+    # host clock, so make the fake child's provider event use the current one.
+    child.write_text(child.read_text().replace(
+        "provider_observed_us\": 1786363200000000",
+        "provider_observed_us\": int(time.time() * 1000000)",
+    ))
+    child.chmod(0o700)
+    live_probe = _live_probe(binder, observed_at_us=now_us)
+    registration, _, marker = _registration(
+        tmp_path,
+        child=child,
+        account_probe=live_probe,
+    )
+    current_context: ContextVar[TrustedPrivateReadHostContext | None] = ContextVar(
+        "synthetic-private-context", default=None
+    )
+    notification_seen = asyncio.Event()
+    notifications: dict[str, tuple[object, str]] = {}
+    pdp_stages: list[tuple[str, str, bool]] = []
+    private_reads: list[str] = []
+    task_id: str | None = None
+    challenge_nonce: str | None = None
+
+    request_event = MessageEvent(
+        text="request configured capability",
+        message_id="authenticated-request-message",
+        source=SessionSource(
+            platform=Platform.SLACK,
+            profile="ordinary-account@example.test",
+            scope_id="authenticated-workspace",
+            chat_id="authenticated-source-chat",
+            chat_type="thread",
+            thread_id="authenticated-source-thread",
+            user_id="authenticated-source-user",
+        ),
+    )
+    approval_event = MessageEvent(
+        text="approve",
+        message_id="authenticated-owner-reply",
+        reply_to_message_id="placeholder-until-notified",
+        source=SessionSource(
+            platform=Platform.WHATSAPP,
+            profile="owner-account",
+            chat_id="owner-chat",
+            chat_type="thread",
+            thread_id="owner-thread",
+            user_id="owner-user",
+        ),
+    )
+
+    def context_from_event(event: object) -> TrustedPrivateReadHostContext | None:
+        if event is not request_event or type(event) is not MessageEvent:
+            return None
+        source = event.source
+        # Identity comes only from the exact normalized authenticated event;
+        # message text and display names do not participate.
+        if (
+            source.platform is not Platform.SLACK
+            or source.profile != "ordinary-account@example.test"
+            or source.scope_id != "authenticated-workspace"
+            or source.user_id != "authenticated-source-user"
+            or source.chat_id != "authenticated-source-chat"
+            or source.thread_id != "authenticated-source-thread"
+            or event.message_id != "authenticated-request-message"
+        ):
+            return None
+        return TrustedPrivateReadHostContext(
+            requester_profile=source.profile,
+            requester_agent="gateway-agent",
+            source_platform=source.platform.value,
+            source_account=source.profile,
+            source_user=source.user_id,
+            source_chat=source.chat_id,
+            source_thread=source.thread_id,
+            source_message=event.message_id,
+            source_provenance="authenticated_inbound",
+            resource_id="host-configured-resource",
+            approval_profile="owner-profile",
+            approval_account="owner-account",
+            approval_user="owner-user",
+            approval_chat="owner-chat",
+            approval_thread="owner-thread",
+            delivery_profile=destination.profile,
+            delivery_platform=destination.platform.value,
+            delivery_account=ACCOUNT,
+            delivery_chat=destination.chat_id,
+            delivery_thread=destination.thread_id,
+            delivery_transport_implementation=registration.identity.transport_implementation_id,
+            delivery_runtime_identity=registration.identity.runtime_instance_token,
+            delivery_account_binding=destination.account_binding_token,
+            delivery_connection_epoch=registration.identity.connection_epoch,
+            created_at_us=now_us,
+            expires_at_us=now_us + 60_000_000,
+            pdp_identity="synthetic-openfga-1.18.2",
+            policy_identity="synthetic-policy",
+            policy_version="synthetic-policy-v1",
+            policy_hash="f" * 64,
+            model_identity="synthetic-model-attestation",
+        )
+
+    def bind_event(event: object):
+        return current_context.set(context_from_event(event))
+
+    async def pdp_check(context):
+        pdp_stages.append(
+            (context.stage, context.consistency_preference, False)
+        )
+        return ExternalPdpDecisionResult(
+            context_id=context.context_id,
+            pdp_call_id=context.pdp_call_id,
+            decision="allow",
+            checked_at_us=max(time.time_ns() // 1000, context.created_at_us),
+            consistency="strongest",
+            cache_used=False,
+        )
+
+    async def deliver_notification(item, claim):
+        accepted_at = max(time.time_ns() // 1000, item.notification.created_at_us)
+        provider_message = "provider-" + item.attempt_id
+        notifications[item.notification.kind] = (item, provider_message)
+        notification_seen.set()
+        return ProviderAcceptanceEvidence(
+            task_id=item.task_id,
+            correlation_id=item.correlation_id,
+            attempt_id=item.attempt_id,
+            challenge_generation=item.challenge_generation,
+            worker_claim_generation=claim.generation,
+            status="provider_accepted",
+            provider_message_id=provider_message,
+            accepted_at_us=accepted_at,
+            adapter_instance_id="synthetic-approval-adapter",
+            account_binding=item.destination_account,
+            connection_epoch=1,
+            destination_profile=item.destination_profile,
+            destination_account=item.destination_account,
+            destination_chat=item.destination_chat,
+            destination_thread=item.destination_thread,
+        )
+
+    def decision_for_event(event: object):
+        if event is not approval_event or task_id is None or challenge_nonce is None:
+            return None
+        challenge = notifications.get("approval_challenge")
+        if challenge is None:
+            return None
+        item, provider_message = challenge
+        created_at = time.time_ns() // 1000
+        decision = OwnerDecision(
+            decision_id="synthetic-decision-" + task_id,
+            task_id=task_id,
+            correlation_id=item.correlation_id,
+            owner_profile="owner-profile",
+            owner_account="owner-account",
+            owner_user="owner-user",
+            owner_chat="owner-chat",
+            owner_thread="owner-thread",
+            source_message=approval_event.message_id,
+            provenance="authenticated_reply",
+            challenge_attempt_id=item.attempt_id,
+            challenge_generation=item.challenge_generation,
+            challenge_nonce=challenge_nonce,
+            challenge_provider_message_id=provider_message,
+            reply_to_provider_message_id=provider_message,
+            adapter_instance_id="synthetic-approval-adapter",
+            account_binding=item.destination_account,
+            connection_epoch=1,
+        )
+        resolution = NotificationAttemptSpec(
+            attempt_id="synthetic-resolution-" + task_id,
+            challenge_generation=item.challenge_generation,
+            kind="approval_resolution",
+            destination_profile="owner-profile",
+            destination_account="owner-account",
+            destination_chat="owner-chat",
+            destination_thread="owner-thread",
+            created_at_us=created_at,
+            due_at_us=created_at,
+            challenge_nonce="resolution-" + task_id,
+        )
+        return "approve", decision, resolution
+
+    async def private_read(item):
+        private_reads.append(item.task_id)
+        return SECRET
+
+    async def close_services() -> None:
+        return None
+
+    services = TrustedPrivateReadHostServices(
+        healthy=lambda: True,
+        context_for_current_event=current_context.get,
+        pdp_check=pdp_check,
+        transport_registration=lambda _item: asyncio.sleep(0, result=registration),
+        private_read=private_read,
+        deliver_notification=deliver_notification,
+        decision_for_event=decision_for_event,
+        close=close_services,
+        transport_identity=lambda: dict(config.transport_identity),
+        account_state=lambda: (
+            "ordinary-account@example.test",
+            ACCOUNT,
+            "example.test",
+            True,
+        ),
+        bind_event=bind_event,
+        unbind_event=current_context.reset,
+    )
+    host = TrustedPrivateReadGatewayHost(config, services)
+    try:
+        assert await host.start() is True
+        token = host.bind_event(request_event)
+        try:
+            capability = config.capabilities.capabilities[0]
+            material = b"\0".join((
+                capability.canonical_bytes(),
+                current_context.get().canonical_bytes(),
+                b"synthetic-tool-call",
+            ))
+            challenge_nonce = hmac.new(
+                config.request_id_key,
+                b"private-read-request-challenge-v1\0" + material,
+                hashlib.sha256,
+            ).hexdigest()[:64]
+            entry = registry.get_entry(PRIVATE_READ_REQUEST_TOOL_NAME)
+            assert entry is not None and entry.check_fn() is True
+            visible = entry.handler(
+                {"capability_id": "synthetic-capability"},
+                tool_call_id="synthetic-tool-call",
+            )
+        finally:
+            host.unbind_event(token)
+        assert SECRET not in repr(visible)
+        assert visible.terminal is not None
+        task_id = dict(visible.terminal.metadata)["task_id"]
+        assert host.store is not None
+        pending = host.store.load_task_work_item(
+            task_id, now_us=time.time_ns() // 1000
+        )
+        assert pending.task.status == "approval_required"
+        await asyncio.wait_for(notification_seen.wait(), timeout=3)
+        approval_event.reply_to_message_id = notifications["approval_challenge"][1]
+        approval_token = host.bind_event(approval_event)
+        host.unbind_event(approval_token)
+
+        deadline = time.monotonic() + 5
+        terminal = None
+        while time.monotonic() < deadline:
+            terminal = host.store.load_task(task_id, pending.binding)
+            if terminal.status == "consumed":
+                break
+            await asyncio.sleep(0.05)
+        assert terminal is not None and terminal.status == "consumed"
+        assert terminal.receipt_code == "provider_accepted"
+        assert private_reads == [task_id]
+        assert pdp_stages == [
+            ("pre_claim", "HIGHER_CONSISTENCY", False),
+            ("pre_private_read", "HIGHER_CONSISTENCY", False),
+        ]
+        audit = host.store.list_audit_events(task_id=task_id)
+        assert {event.kind for event in audit} >= {
+            "task_created",
+            "task_approved",
+            "task_claimed",
+            "pdp_check_allowed",
+            "send_started",
+            "task_consumed",
+        }
+        state_bytes = b"".join(
+            path.read_bytes()
+            for path in config.state_dir.iterdir()
+            if path.is_file()
+        )
+        assert SECRET.encode() not in state_bytes
+        assert SECRET not in caplog.text
+        assert SECRET not in repr(registration.command)
+        assert all(SECRET not in value for value in os.environ.values())
+        assert not marker.exists()
+        assert not _task_frames_contain(SECRET)
+    finally:
+        await host.stop()
+        configure_private_read_request_runtime(None)

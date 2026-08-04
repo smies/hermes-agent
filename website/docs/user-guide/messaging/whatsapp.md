@@ -97,11 +97,20 @@ After getting the number:
 
 ## Step 3: Configure Hermes
 
-Add the following to your `~/.hermes/.env` file:
+Successful ordinary provisioning atomically enables the existing non-secret
+platform setting in `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  whatsapp:
+    enabled: true
+```
+
+`--validate-only` never writes configuration, and sensitive-role provisioning
+never changes ordinary enablement. Keep account access settings in their
+existing configuration locations:
 
 ```bash
-# Required
-WHATSAPP_ENABLED=true
 WHATSAPP_MODE=bot                          # "bot" or "self-chat"
 
 # Access control — pick ONE of these options:

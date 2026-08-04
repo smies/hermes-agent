@@ -8,8 +8,6 @@ tool out of model schemas.
 The mapping contains only generic host configuration:
 
 - canonical absolute `state_dir`, `key_file`, and `allowlist_file` paths;
-- a reviewed `services_module` exporting
-  `build_trusted_private_read_services(gateway, config)`;
 - the exact `openfga_version: "1.18.2"` target;
 - immutable capability IDs with operation, resource type, and field names;
 - bounded worker poll and lease durations.
@@ -22,16 +20,23 @@ existing authorization-store HMAC authorities. The allowlist binds the full
 reviewed sensitive transport identity, including the manifest, source,
 package, lock, exact Baileys pin/integrity, and installed tree digest.
 
-The reviewed services module returns the closed
-`TrustedPrivateReadHostServices` object. It derives immutable context only from
-the authenticated inbound event, performs uncached policy checks at the
-`HIGHER_CONSISTENCY` request preference with all local/application caches
-disabled, monitors the live ordinary and sensitive
-account identities in one provider namespace, supplies the exact sensitive
-transport registration only after a durable claim, performs the private read,
-and closes all resources. Provider credentials and connection details stay in
-owner-only files or inherited descriptors managed by that module; they do not
-belong in `config.yaml`.
+Configuration cannot import a module or inject a factory. Production
+composition is gateway-owned so an external adapter cannot self-assert the
+requester, approver, requested fields, policy stage, account binding, task or
+claim, destination, or delivery authority. The current tree deliberately has
+no built-in production composition for those authorities, so enabling this
+mapping leaves the private runtime unavailable. Closed synthetic services are
+used only by tests to verify the authorization and isolated-delivery protocol.
+This is a fail-closed service-composition gap, not a production-readiness
+claim.
+
+A future concrete composition must derive immutable requester context from the
+exact authenticated inbound `MessageEvent`, perform two uncached checks using
+the `HIGHER_CONSISTENCY` request preference, monitor distinct live ordinary and
+sensitive accounts in one provider namespace, and supply the exact allowlisted
+sensitive transport only after durable claim. Provider credentials and
+connection details belong in owner-only host-managed files or inherited
+descriptors, never in `config.yaml`.
 
 The persisted `consistency="strongest"` marker records that outbound request
 preference; it is not treated as a server-issued linearizability proof. Every

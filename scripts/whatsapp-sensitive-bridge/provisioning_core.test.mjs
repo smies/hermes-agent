@@ -51,8 +51,8 @@ test('provider-canonical persisted LID bootstrap readiness', async () => {
   assert.equal(await verifyLidBootstrap({
     auth: { state: { keys: { get: async (kind, ids) => {
       assert.equal(kind, 'lid-mapping');
-      assert.deepEqual(ids, [phoneJid]);
-      return { [phoneJid]: { lid: lidJid } };
+      assert.deepEqual(ids, [phoneJid.split('@')[0]]);
+      return { [phoneJid.split('@')[0]]: lidJid.split('@')[0] };
     } } } },
     sock: {},
     phoneJid,

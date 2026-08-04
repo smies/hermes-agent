@@ -18,7 +18,7 @@ WhatsApp **不**官方支持 Business API 以外的第三方机器人。使用�
 :::warning WhatsApp Web 协议更新
 WhatsApp 会定期更新其 Web 协议，这可能导致第三方桥接暂时失效。
 发生这种情况时，Hermes 会更新桥接依赖。如果机器人在 WhatsApp 更新后停止工作，
-请拉取最新版 Hermes 并重新配对。
+请拉取最新版 Hermes 并重新运行离线配置。
 :::
 
 ## 两种模式
@@ -33,38 +33,32 @@ WhatsApp 会定期更新其 Web 协议，这可能导致第三方桥接暂时失
 ## 前置条件
 
 - **Node.js v18+** 和 **npm**——WhatsApp 桥接作为 Node.js 进程运行
-- **已安装 WhatsApp 的手机**（用于扫描二维码）
+- **已安装 WhatsApp 的手机**（用于输入关联设备配对码）
 
 与旧版浏览器驱动的桥接不同，当前基于 Baileys 的桥接**不**需要本地 Chromium 或 Puppeteer 依赖栈。
 
 ---
 
-## 第一步：运行配置向导
+## 第一步：配置并验证
 
 ```bash
 hermes whatsapp
 ```
 
-向导将：
+向导配置模式和依赖。认证使用单独的离线命令：
 
-1. 询问你想要哪种模式（**bot** 或 **self-chat**）
-2. 如有需要，安装桥接依赖
-3. 在终端中显示**二维码**
-4. 等待你扫描
+```bash
+hermes whatsapp provision --role ordinary
+```
 
-**扫描二维码的步骤：**
+该命令会先验证当前 profile 的普通会话。有效会话会就地复用，不会复制或修改凭据。否则，命令仅在交互式终端中询问手机号并显示一个短配对码。
 
 1. 在手机上打开 WhatsApp
 2. 进入**设置 → 已关联设备**
 3. 点击**关联设备**
-4. 将摄像头对准终端中的二维码
+4. 选择手机号配对码选项，然后输入终端显示的代码
 
-配对成功后，向导确认连接并退出。你的会话将自动保存。
-
-:::tip
-如果二维码显示乱码，请确保终端宽度至少为 60 列且支持 Unicode。
-也可以尝试换用其他终端模拟器。
-:::
+不提供二维码备用流程，生产 gateway 启动也不会配置账号。
 
 ---
 
@@ -82,17 +76,24 @@ hermes whatsapp
 
 1. 在手机上安装 WhatsApp（或使用支持双 SIM 的 WhatsApp Business 应用）
 2. 用新号码注册 WhatsApp
-3. 运行 `hermes whatsapp` 并从该 WhatsApp 账号扫描二维码
+3. 运行 `hermes whatsapp provision --role ordinary` 并输入配对码
 
 ---
 
 ## 第三步：配置 Hermes
 
-在 `~/.hermes/.env` 文件中添加以下内容：
+普通角色配置成功后，会通过 Hermes 配置 API 原子启用
+`~/.hermes/config.yaml` 中现有的非敏感平台设置：
+
+```yaml
+platforms:
+  whatsapp:
+    enabled: true
+```
+
+`--validate-only` 不写配置，敏感角色配置也不改变普通启用状态。账号访问设置仍使用现有位置：
 
 ```bash
-# 必填
-WHATSAPP_ENABLED=true
 WHATSAPP_MODE=bot                          # "bot" 或 "self-chat"
 
 # 访问控制——选择以下其中一项：
@@ -136,7 +137,7 @@ Gateway 会使用已保存的会话自动启动 WhatsApp 桥接。
 
 Baileys 桥接将会话保存在 `~/.hermes/platforms/whatsapp/session` 目录下。这意味着：
 
-- **会话在重启后仍然有效**——无需每次重新扫描二维码
+- **会话在重启后仍然有效**——无需每次重新输入配对码
 - 会话数据包含加密密钥和设备凭证
 - **请勿共享或提交此会话目录**——它可授予对 WhatsApp 账号的完整访问权限
 
@@ -147,10 +148,10 @@ Baileys 桥接将会话保存在 `~/.hermes/platforms/whatsapp/session` 目录�
 如果会话中断（手机重置、WhatsApp 更新、手动取消关联），你将在 gateway 日志中看到连接错误。修复方法：
 
 ```bash
-hermes whatsapp
+hermes whatsapp provision --role ordinary --reprovision
 ```
 
-这将生成新的二维码。重新扫描后会话即恢复。Gateway 会通过重连逻辑自动处理**临时**断线（网络抖动、手机短暂离线）。
+这会在保留当前就绪会话的同时暂存新认证，并请求新的字母数字配对码。只有新会话完成 LID、权限、身份和账号分离验证后才会原子替换。
 
 ---
 
@@ -202,10 +203,9 @@ AI 响应中的标准 Markdown 会自动转换为 WhatsApp 的原生格式：
 
 | 问题 | 解决方案 |
 |------|---------|
-| **二维码无法扫描** | 确保终端宽度足够（60 列以上）。尝试换用其他终端。确保从正确的 WhatsApp 账号（机器人号码，而非个人号码）扫描。 |
-| **二维码过期** | 二维码约每 20 秒刷新一次。如果超时，重新运行 `hermes whatsapp`。 |
+| **配对码过期** | 重新运行 `hermes whatsapp provision --role ordinary`。不存在二维码备用流程。 |
 | **会话未持久化** | 检查 `~/.hermes/platforms/whatsapp/session` 是否存在且可写。如在容器中运行，请将其挂载为持久卷。 |
-| **意外退出登录** | WhatsApp 会在长时间不活跃后取消关联设备。保持手机开机并连接网络，如有需要使用 `hermes whatsapp` 重新配对。 |
+| **意外退出登录** | WhatsApp 会在长时间不活跃后取消关联设备。保持手机开机并连接网络，如有需要运行 `hermes whatsapp provision --role ordinary --reprovision`。 |
 | **桥接崩溃或重连循环** | 重启 gateway，更新 Hermes，如会话因 WhatsApp 协议变更而失效则重新配对。 |
 | **WhatsApp 更新后机器人停止工作** | 更新 Hermes 以获取最新桥接版本，然后重新配对。 |
 | **macOS："Node.js not installed"但终端中 node 可用** | launchd 服务不继承你的 shell PATH。运行 `hermes gateway install` 将当前 PATH 重新快照到 plist 中，然后运行 `hermes gateway start`。详见 [Gateway 服务文档](./index.md#macos-launchd)。 |

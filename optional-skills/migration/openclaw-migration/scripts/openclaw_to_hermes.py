@@ -3085,12 +3085,12 @@ class Migrator:
         if has_whatsapp:
             notes.extend([
                 "",
-                "## WhatsApp Requires Re-Pairing",
+                "## WhatsApp Requires Auth Validation",
                 "",
-                "WhatsApp uses QR-code pairing, not token-based auth. Your allowlist",
-                "was migrated, but you must re-pair the device by running:",
+                "WhatsApp auth is not token-based. Your allowlist was migrated,",
+                "but you must validate or provision the device offline by running:",
                 "",
-                "    hermes whatsapp",
+                "    hermes whatsapp provision --role ordinary",
                 "",
             ])
 

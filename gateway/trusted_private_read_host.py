@@ -19,7 +19,6 @@ from pathlib import Path
 import secrets
 import stat
 import time
-import re
 from typing import Awaitable, Callable
 
 from gateway.authorization_contracts import (
@@ -152,7 +151,6 @@ class TrustedPrivateReadHostConfig:
     state_dir: Path
     key_file: Path
     allowlist_file: Path
-    services_module: str
     openfga_version: str
     key_version: str
     audit_key: bytes
@@ -196,7 +194,7 @@ class TrustedPrivateReadHostConfig:
             return None
         required = {
             "version", "enabled", "state_dir", "key_file", "allowlist_file",
-            "services_module", "openfga_version", "capabilities",
+            "openfga_version", "capabilities",
         }
         optional = {"poll_seconds", "lease_seconds"}
         if set(raw) - required - optional or not required.issubset(raw) or raw["version"] != 1:
@@ -204,18 +202,6 @@ class TrustedPrivateReadHostConfig:
         state_dir = _owner_directory(Path(raw["state_dir"]))
         key_file = _owner_file(Path(raw["key_file"]))
         allowlist_file = _owner_file(Path(raw["allowlist_file"]))
-        services_module = raw["services_module"]
-        if (
-            type(services_module) is not str
-            or len(services_module.encode("utf-8", "strict")) > 256
-            or re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+",
-                services_module,
-            ) is None
-        ):
-            raise TrustedPrivateReadConfigurationError(
-                "trusted host services module is invalid"
-            )
         if raw["openfga_version"] != "1.18.2":
             raise TrustedPrivateReadConfigurationError(
                 "trusted host policy service version is invalid"
@@ -263,7 +249,6 @@ class TrustedPrivateReadHostConfig:
             state_dir=state_dir,
             key_file=key_file,
             allowlist_file=allowlist_file,
-            services_module=services_module,
             openfga_version="1.18.2",
             key_version=keys["key_version"],
             audit_key=_hex_key(keys["audit_hmac"]),
@@ -718,9 +703,27 @@ class TrustedPrivateReadGatewayHost:
         self.services.unbind_event(token)
 
 
+def compose_trusted_private_read_services(
+    _runner: object,
+    _config: TrustedPrivateReadHostConfig,
+) -> None:
+    """Gateway-owned production composition boundary.
+
+    The WIP accepted an arbitrary import path whose factory could self-assert
+    requester identity, policy evidence, account separation, and delivery
+    authority.  That is not a trustworthy composition mechanism.  Until the
+    gateway has concrete built-in typed adapters for those authorities, the
+    only safe production composition is unavailable.  Tests may instantiate
+    ``TrustedPrivateReadGatewayHost`` directly with closed synthetic services;
+    the gateway runner never accepts such an injection from configuration.
+    """
+    return None
+
+
 __all__ = [
     "TrustedPrivateReadConfigurationError",
     "TrustedPrivateReadGatewayHost",
     "TrustedPrivateReadHostConfig",
     "TrustedPrivateReadHostServices",
+    "compose_trusted_private_read_services",
 ]

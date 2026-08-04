@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_shipped_ordinary_whatsapp_surfaces_do_not_restore_qr_instructions() -> None:
+    paths = (
+        ROOT / "website/docs/user-guide/messaging/whatsapp.md",
+        ROOT / "website/docs/user-guide/messaging/whatsapp-cloud.md",
+        ROOT / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/whatsapp.md",
+        ROOT / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/cli-commands.md",
+        ROOT / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides/migrate-from-openclaw.md",
+        ROOT / "apps/desktop/src/i18n/zh.ts",
+        ROOT / "optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py",
+    )
+    forbidden = (
+        re.compile(r"(?is)whatsapp.{0,160}(?:scan|scanning).{0,80}qr"),
+        re.compile(r"(?is)(?:scan|scanning).{0,80}qr.{0,160}whatsapp"),
+        re.compile(r"(?is)whatsapp.{0,160}qr[- ]code pairing"),
+        re.compile(r"WhatsApp.{0,160}扫描二维码", re.S),
+        re.compile(r"扫描二维码.{0,160}WhatsApp", re.S),
+    )
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for pattern in forbidden:
+            assert pattern.search(text) is None, (path, pattern.pattern)
+
+
+def test_cloud_api_guide_remains_a_distinct_integration() -> None:
+    cloud = (ROOT / "website/docs/user-guide/messaging/whatsapp-cloud.md").read_text(
+        encoding="utf-8"
+    )
+    ordinary = (ROOT / "website/docs/user-guide/messaging/whatsapp.md").read_text(
+        encoding="utf-8"
+    )
+    assert "official" in cloud.lower()
+    assert "Cloud API" in cloud
+    assert "hermes whatsapp provision --role ordinary" in ordinary
+    assert "There is no QR fallback" in ordinary
+
+
+def test_shell_and_powershell_installers_use_the_same_profile_safe_session() -> None:
+    shell = (ROOT / "scripts/install.sh").read_text(encoding="utf-8")
+    powershell = (ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
+    assert '$HERMES_HOME/platforms/whatsapp/session/creds.json' in shell
+    assert '$HermesHome\\platforms\\whatsapp\\session\\creds.json' in powershell
+    assert '$HERMES_HOME/whatsapp/session/creds.json' not in shell
+    assert '$HermesHome\\whatsapp\\session\\creds.json' not in powershell
+
+    # Both default and named profiles resolve HERMES_HOME/HermesHome first;
+    # the installer then appends exactly the same canonical relative path.
+    relative = Path("platforms/whatsapp/session/creds.json")
+    for profile_root in (Path("/fixture/default"), Path("/fixture/named")):
+        assert profile_root / relative == Path(
+            str(profile_root), "platforms", "whatsapp", "session", "creds.json"
+        )

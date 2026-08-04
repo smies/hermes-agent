@@ -392,7 +392,7 @@ This uses your Nous Portal access token instead of needing a separate OpenAI key
 | | Baileys (`hermes whatsapp`) | Cloud API (`hermes whatsapp-cloud`) |
 |---|---|---|
 | Account type | Personal | Business |
-| Setup | QR code scan | Meta app + WABA + token |
+| Setup | Offline phone-number pairing code | Meta app + WABA + token |
 | Dependencies | Node.js + npm | Pure Python (httpx + aiohttp) |
 | Process | Managed Node subprocess | aiohttp webhook server |
 | Public URL needed? | No | Yes |

@@ -1,8 +1,17 @@
 #!/usr/bin/env node
 
-import { createWriteStream } from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
-import { existsSync, lstatSync, realpathSync, readdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  realpathSync,
+  readdirSync,
+  unlinkSync,
+} from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,6 +28,12 @@ import { prepareSessionPaths } from './session_paths.js';
 
 const MAX_INPUT_BYTES = 4096;
 const DEFAULT_TIMEOUT_MS = 120_000;
+const AUTH_DIRECTORY_MODE = 0o700;
+const AUTH_FILE_MODE = 0o600;
+
+// Set before any call to useMultiFileAuthState.  Baileys otherwise creates
+// auth JSON as 0644 under the usual 0022 umask.
+process.umask(0o077);
 
 function silentLogger() {
   const logger = { level: 'silent', child: () => logger };
@@ -55,14 +70,153 @@ function validateCredentialFile(session) {
 
 function validateAuthFiles(session) {
   validateCredentialFile(session);
-  for (const name of readdirSync(session)) {
-    if (!name.endsWith('.json')) continue;
-    const target = path.join(session, name);
-    const info = lstatSync(target);
-    if (info.isSymbolicLink() || !info.isFile() || info.nlink !== 1
-        || (info.mode & 0o777) !== 0o600
-        || (typeof process.getuid === 'function' && info.uid !== process.getuid())
-        || realpathSync.native(target) !== target) throw new Error('auth_file_unsafe');
+  const validateDirectory = (directory) => {
+    const directoryInfo = lstatSync(directory);
+    if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()
+        || (directoryInfo.mode & 0o777) !== AUTH_DIRECTORY_MODE
+        || (typeof process.getuid === 'function' && directoryInfo.uid !== process.getuid())
+        || realpathSync.native(directory) !== directory) throw new Error('auth_directory_unsafe');
+    for (const name of readdirSync(directory)) {
+      const target = path.join(directory, name);
+      const info = lstatSync(target);
+      if (info.isDirectory() && !info.isSymbolicLink()) {
+        validateDirectory(target);
+        continue;
+      }
+      if (!name.endsWith('.json') || info.isSymbolicLink() || !info.isFile() || info.nlink !== 1
+          || (info.mode & 0o777) !== AUTH_FILE_MODE
+          || (typeof process.getuid === 'function' && info.uid !== process.getuid())
+          || realpathSync.native(target) !== target) throw new Error('auth_file_unsafe');
+    }
+  };
+  validateDirectory(session);
+}
+
+async function normalizeNewAuthTree(session) {
+  const normalizeDirectory = async (directory) => {
+    await chmod(directory, AUTH_DIRECTORY_MODE);
+    for (const name of readdirSync(directory)) {
+      const target = path.join(directory, name);
+      const info = lstatSync(target);
+      if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) {
+        throw new Error('staged_auth_tree_unsafe');
+      }
+      if (info.isDirectory()) await normalizeDirectory(target);
+      else await chmod(target, AUTH_FILE_MODE);
+    }
+  };
+  await normalizeDirectory(session);
+}
+
+function wrapStagedAuth(auth, session) {
+  const keys = auth?.state?.keys;
+  const guardedKeys = keys && typeof keys.get === 'function' && typeof keys.set === 'function'
+    ? {
+      get: (...args) => keys.get(...args),
+      set: async (...args) => {
+        const result = await keys.set(...args);
+        await normalizeNewAuthTree(session);
+        return result;
+      },
+    }
+    : keys;
+  return {
+    state: { ...(auth?.state || {}), keys: guardedKeys },
+    saveCreds: async (...args) => {
+      const result = await auth.saveCreds(...args);
+      await normalizeNewAuthTree(session);
+      return result;
+    },
+  };
+}
+
+function commonOwnerRoot(left, right) {
+  const leftParts = path.resolve(left).split(path.sep);
+  const rightParts = path.resolve(right).split(path.sep);
+  const shared = [];
+  while (leftParts.length && rightParts.length && leftParts[0] === rightParts[0]) {
+    shared.push(leftParts.shift());
+    rightParts.shift();
+  }
+  const root = shared.length === 1 && shared[0] === ''
+    ? path.parse(path.resolve(left)).root
+    : shared.join(path.sep) || path.parse(path.resolve(left)).root;
+  validateOwnerDirectory(root, { required: true });
+  return root;
+}
+
+function acquireProvisioningLock(request) {
+  const ownerRoot = commonOwnerRoot(request.ordinarySession, request.sensitiveSession);
+  const lockPath = path.join(ownerRoot, '.hermes-whatsapp-provision.lock');
+  let descriptor;
+  try {
+    descriptor = openSync(lockPath, 'wx', AUTH_FILE_MODE);
+    const info = fstatSync(descriptor);
+    if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o777) !== AUTH_FILE_MODE
+        || (typeof process.getuid === 'function' && info.uid !== process.getuid())) {
+      throw new Error('provisioning_lock_unsafe');
+    }
+  } catch {
+    if (descriptor !== undefined) closeSync(descriptor);
+    throw new Error('provisioning_lock_unavailable');
+  }
+  const lockInfo = fstatSync(descriptor);
+  return Object.freeze({
+    ownerRoot,
+    release() {
+      closeSync(descriptor);
+      const observed = lstatSync(lockPath);
+      if (observed.dev !== lockInfo.dev || observed.ino !== lockInfo.ino
+          || observed.isSymbolicLink() || !observed.isFile()) {
+        throw new Error('provisioning_lock_identity_changed');
+      }
+      unlinkSync(lockPath);
+    },
+  });
+}
+
+async function ensureNewSessionParent(session) {
+  validateOwnerDirectory(session, { required: false });
+  const parent = path.dirname(session);
+  await mkdir(parent, { recursive: true, mode: AUTH_DIRECTORY_MODE });
+  validateOwnerDirectory(parent, { required: true });
+}
+
+async function commitStagedSession(stage, session, ownerRoot) {
+  await normalizeNewAuthTree(stage);
+  validateAuthFiles(stage);
+  await ensureNewSessionParent(session);
+  const rollback = path.join(ownerRoot, `.whatsapp-provision-rollback-${randomUUID()}`);
+  const failed = path.join(ownerRoot, `.whatsapp-provision-failed-${randomUUID()}`);
+  let movedOriginal = false;
+  let installedStage = false;
+  try {
+    if (existsSync(session)) {
+      validateOwnerDirectory(session, { required: true });
+      validateAuthFiles(session);
+      await rename(session, rollback);
+      movedOriginal = true;
+    }
+    await rename(stage, session);
+    installedStage = true;
+    validateOwnerDirectory(session, { required: true });
+    validateAuthFiles(session);
+    if (movedOriginal) await rm(rollback, { recursive: true, force: false });
+  } catch {
+    // Once the staged tree has taken the canonical name, move it aside before
+    // restoring the old directory.  A validation failure after rename must
+    // still preserve the original files *and inodes* exactly.  With no prior
+    // session, remove only the newly-created failed tree.
+    if (installedStage && existsSync(session)) {
+      try { await rename(session, failed); } catch {}
+    }
+    if (movedOriginal && existsSync(rollback) && !existsSync(session)) {
+      try { await rename(rollback, session); } catch {}
+    }
+    if (existsSync(failed)) {
+      try { await rm(failed, { recursive: true, force: true }); } catch {}
+    }
+    throw new Error('staged_commit_failed');
   }
 }
 
@@ -154,28 +308,12 @@ export async function provisionOffline({
   emitCode,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
+  process.umask(0o077);
   if (typeof emitCode !== 'function') throw new TypeError('operator channel required');
-  if (request.role === 'sensitive') {
-    const ordinaryRequest = Object.freeze({
-      ...request,
-      role: 'ordinary',
-      session: request.ordinarySession,
-    });
-    const ordinaryReady = await validateExistingOffline({
-      request: ordinaryRequest,
-      useAuthState,
-      canonicalizeJid,
-    });
-    if (!ordinaryReady) throw new Error('ordinary_session_not_ready');
-  }
-  const pathGuard = await validateSessionDirectories(request, { create: true });
+  const lock = acquireProvisioningLock(request);
+  let stage = null;
   const otherSession = request.role === 'ordinary' ? request.sensitiveSession : request.ordinarySession;
-  const otherAccount = await existingAccount(otherSession, canonicalizeJid);
-  const auth = await useAuthState(request.session);
-  const storedAccount = canonicalAccount(auth?.state?.creds?.me?.id || '', canonicalizeJid);
-  if (storedAccount && otherAccount && storedAccount === otherAccount) throw new Error('account_separation_required');
-
-  const sock = makeSocket(buildProvisioningSocketConfig({ auth: auth.state, logger: silentLogger() }));
+  let sock;
   let timer;
   let pairedCode = false;
   let done = false;
@@ -190,15 +328,59 @@ export async function provisionOffline({
     try { sock.end?.(); } catch {}
   };
   try {
+    if (request.role === 'sensitive') {
+      const ordinaryRequest = Object.freeze({
+        ...request,
+        action: 'validate',
+        phone: null,
+        role: 'ordinary',
+        session: request.ordinarySession,
+      });
+      const ordinaryReady = await validateExistingOffline({
+        request: ordinaryRequest,
+        useAuthState,
+        canonicalizeJid,
+      });
+      if (!ordinaryReady) throw new Error('ordinary_session_not_ready');
+    }
+    if (existsSync(request.session)) {
+      validateOwnerDirectory(request.session, { required: true });
+      validateAuthFiles(request.session);
+    } else {
+      validateOwnerDirectory(request.session, { required: false });
+    }
+    if (existsSync(otherSession)) {
+      validateOwnerDirectory(otherSession, { required: true });
+      if (existsSync(path.join(otherSession, 'creds.json'))) validateAuthFiles(otherSession);
+    } else {
+      validateOwnerDirectory(otherSession, { required: false });
+    }
+    const otherAccountBeforePairing = await existingAccount(otherSession, canonicalizeJid);
+    stage = await mkdtemp(path.join(lock.ownerRoot, '.whatsapp-provision-stage-'));
+    await chmod(stage, AUTH_DIRECTORY_MODE);
+    const rawAuth = await useAuthState(stage);
+    const auth = wrapStagedAuth(rawAuth, stage);
+    await normalizeNewAuthTree(stage);
+    sock = makeSocket(buildProvisioningSocketConfig({ auth: auth.state, logger: silentLogger() }));
+    let authWriteFailed = false;
+    let authWriteChain = Promise.resolve();
+    let finishing = false;
+    const persistAuth = () => {
+      authWriteChain = authWriteChain
+        .then(() => auth.saveCreds())
+        .catch(() => { authWriteFailed = true; });
+      return authWriteChain;
+    };
+    const onCredsUpdate = () => { void persistAuth(); };
     const outcome = await new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(new Error('provisioning_timeout')), timeoutMs);
       const fail = (code) => reject(new Error(code));
-      sock.ev.on('creds.update', () => { void Promise.resolve(auth.saveCreds?.()).catch(() => {}); });
+      sock.ev.on('creds.update', onCredsUpdate);
       sock.ev.on('connection.update', async (update) => {
         try {
           if (update?.qr) return fail('qr_payload_forbidden');
-          pathGuard.revalidate();
-          if (!pairedCode && !auth.state?.creds?.registered
+          validateOwnerDirectory(stage, { required: true });
+          if (!pairedCode
               && (update?.connection === 'connecting' || update?.connection === undefined)) {
             pairedCode = true;
             const code = normalizePairingCode(await sock.requestPairingCode(request.phone));
@@ -206,12 +388,22 @@ export async function provisionOffline({
           }
           if (update?.connection === 'close') return fail('connection_closed');
           if (update?.connection !== 'open') return;
+          if (finishing) return;
+          finishing = true;
+          // Fence later provider writes, then drain every already-scheduled
+          // write and one final credential snapshot before validation/commit.
+          sock.ev.off?.('creds.update', onCredsUpdate);
+          await persistAuth();
+          if (authWriteFailed) return fail('credential_persistence_failed');
           account = canonicalAccount(sock.user?.id || '', canonicalizeJid);
           if (!account || account !== phoneJid) return fail('account_binding_failed');
-          if (otherAccount && account === otherAccount) return fail('account_separation_required');
+          const otherAccountAfterPairing = await existingAccount(otherSession, canonicalizeJid);
+          if ((otherAccountBeforePairing && otherAccountAfterPairing !== otherAccountBeforePairing)
+              || (otherAccountAfterPairing && account === otherAccountAfterPairing)) {
+            return fail('account_separation_required');
+          }
           lid = await verifyLidBootstrap({ auth, sock, phoneJid, canonicalizeJid });
           if (!lid) return fail('lid_bootstrap_incomplete');
-          await Promise.resolve(auth.saveCreds?.());
           const persistedLid = await verifyLidBootstrap({
             auth,
             sock: {},
@@ -219,7 +411,18 @@ export async function provisionOffline({
             canonicalizeJid,
           });
           if (!persistedLid || persistedLid !== lid) return fail('lid_bootstrap_incomplete');
-          validateAuthFiles(request.session);
+          await normalizeNewAuthTree(stage);
+          validateAuthFiles(stage);
+          // Re-read the other role immediately before commit while the
+          // cross-role lock is still held.  A same-account race therefore has
+          // exactly one possible winner.
+          const otherAccountBeforeCommit = await existingAccount(otherSession, canonicalizeJid);
+          if ((otherAccountAfterPairing && otherAccountBeforeCommit !== otherAccountAfterPairing)
+              || (otherAccountBeforeCommit && account === otherAccountBeforeCommit)) {
+            return fail('account_separation_required');
+          }
+          await commitStagedSession(stage, request.session, lock.ownerRoot);
+          stage = null;
           resolve(Object.freeze({ account_namespace: account.split('@')[1], lid_ready: true }));
         } catch { fail('provisioning_failed'); }
       });
@@ -227,6 +430,10 @@ export async function provisionOffline({
     return outcome;
   } finally {
     close();
+    if (stage) {
+      try { await rm(stage, { recursive: true, force: true }); } catch {}
+    }
+    lock.release();
   }
 }
 
@@ -271,12 +478,8 @@ export async function runProvisioner({
 
 if (path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  const operatorIndex = args.indexOf('--operator-fd');
-  const operatorFd = operatorIndex >= 0 && args.length === 2
-    ? Number(args[operatorIndex + 1])
-    : null;
-  const operatorOutput = Number.isInteger(operatorFd) && operatorFd >= 3
-    ? createWriteStream(null, { fd: operatorFd, autoClose: false })
+  const operatorOutput = args.length === 1 && args[0] === '--operator-stdio'
+    ? process.stderr
     : null;
   process.exitCode = await runProvisioner({ operatorOutput });
 }

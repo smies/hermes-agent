@@ -3521,7 +3521,9 @@ function Start-GatewayIfConfigured {
 
     # Authentication is an explicit offline phone-number-code operation.
     $whatsappEnabled = $content | Where-Object { $_ -match "^WHATSAPP_ENABLED=true" }
-    $whatsappSession = "$HermesHome\whatsapp\session\creds.json"
+    # HermesHome is already the selected default/named profile root; mirror
+    # get_hermes_dir("platforms/whatsapp/session", "whatsapp/session").
+    $whatsappSession = "$HermesHome\platforms\whatsapp\session\creds.json"
     if ($whatsappEnabled -and -not (Test-Path $whatsappSession)) {
         Write-Host ""
         Write-Info "WhatsApp is enabled but its ordinary session is not provisioned."
@@ -3538,7 +3540,7 @@ function Start-GatewayIfConfigured {
                 }
             }
         } else {
-            Write-Info "Skipping WhatsApp pairing prompt (non-interactive)."
+            Write-Info "Skipping WhatsApp provisioning prompt (non-interactive)."
         }
     }
 

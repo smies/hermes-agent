@@ -7,6 +7,8 @@ export const CANONICAL_SOURCE_FILES = Object.freeze([
   'delivery_core.js',
   'http_server.js',
   'lifecycle.js',
+  'offline_provision.js',
+  'provisioning_core.js',
   'session_paths.js',
   'sensitive_bridge.js',
   'transport_identity.js',

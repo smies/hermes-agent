@@ -2460,7 +2460,9 @@ maybe_start_gateway() {
 
     # Authentication is an explicit offline phone-number-code operation.
     WHATSAPP_VAL=$(grep "^WHATSAPP_ENABLED=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-    WHATSAPP_SESSION="$HERMES_HOME/whatsapp/session/creds.json"
+    # HERMES_HOME is already the selected default/named profile root; mirror
+    # get_hermes_dir("platforms/whatsapp/session", "whatsapp/session").
+    WHATSAPP_SESSION="$HERMES_HOME/platforms/whatsapp/session/creds.json"
     if [ "$WHATSAPP_VAL" = "true" ] && [ ! -f "$WHATSAPP_SESSION" ]; then
         if [ "$IS_INTERACTIVE" = true ]; then
             echo ""

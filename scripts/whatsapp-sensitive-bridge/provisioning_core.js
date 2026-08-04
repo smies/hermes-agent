@@ -27,10 +27,16 @@ export function parseProvisioningRequest(value) {
   if (!value || Object.getPrototypeOf(value) !== Object.prototype) {
     throw new Error('request_invalid');
   }
-  const allowed = new Set(['version', 'action', 'role', 'phone', 'ordinary_session', 'sensitive_session']);
+  const allowed = new Set([
+    'version', 'action', 'role', 'phone', 'ordinary_session',
+    'sensitive_session', 'reprovision',
+  ]);
   if (Object.keys(value).some((key) => !allowed.has(key)) || value.version !== 1
       || !['validate', 'provision'].includes(value.action)
-      || !['ordinary', 'sensitive'].includes(value.role)) throw new Error('request_invalid');
+      || !['ordinary', 'sensitive'].includes(value.role)
+      || (value.reprovision !== undefined && typeof value.reprovision !== 'boolean')) {
+    throw new Error('request_invalid');
+  }
   const ordinarySession = canonicalPath(value.ordinary_session, 'ordinary_session');
   const sensitiveSession = canonicalPath(value.sensitive_session, 'sensitive_session');
   if (within(ordinarySession, sensitiveSession) || within(sensitiveSession, ordinarySession)) {
@@ -41,6 +47,7 @@ export function parseProvisioningRequest(value) {
     role: value.role,
     action: value.action,
     phone: value.action === 'provision' ? normalizePhone(value.phone) : null,
+    reprovision: value.reprovision === true,
     ordinarySession,
     sensitiveSession,
     session: value.role === 'ordinary' ? ordinarySession : sensitiveSession,
@@ -71,21 +78,39 @@ export function canonicalAccount(value, canonicalizeJid) {
   return ACCOUNT_RE.test(canonical) ? canonical : null;
 }
 
+export function canonicalAccountUser(value, suffix, canonicalizeJid) {
+  const account = canonicalAccount(value, canonicalizeJid);
+  if (!account || !account.endsWith(`@${suffix}`)) return null;
+  return account.slice(0, -(suffix.length + 1));
+}
+
 export async function verifyLidBootstrap({ auth, sock, phoneJid, canonicalizeJid }) {
   const canonicalPhone = canonicalAccount(phoneJid, canonicalizeJid);
   if (!canonicalPhone || !canonicalPhone.endsWith('@s.whatsapp.net')) return null;
-  let mapped = null;
+  const pnUser = canonicalAccountUser(canonicalPhone, 's.whatsapp.net', canonicalizeJid);
+  if (!pnUser) return null;
+  let lidUser = null;
   const repository = sock?.signalRepository?.lidMapping;
   if (repository && typeof repository.getLIDForPN === 'function') {
-    try { mapped = await repository.getLIDForPN(canonicalPhone); } catch {}
-  }
-  if (!mapped && auth?.state?.keys && typeof auth.state.keys.get === 'function') {
     try {
-      const records = await auth.state.keys.get('lid-mapping', [canonicalPhone]);
-      mapped = records?.[canonicalPhone]?.lid || records?.[canonicalPhone] || null;
+      const mapped = await repository.getLIDForPN(canonicalPhone);
+      lidUser = canonicalAccountUser(mapped, 'lid', canonicalizeJid)
+        || (/^\d{1,32}$/.test(String(mapped || '')) ? String(mapped) : null);
     } catch {}
   }
-  const canonicalLid = canonicalAccount(mapped, canonicalizeJid);
+  if (!lidUser && auth?.state?.keys && typeof auth.state.keys.get === 'function') {
+    try {
+      // Pinned Baileys persists lid-mapping with a bare numeric PN key and a
+      // bare numeric LID value.  Full JIDs here silently miss real stores.
+      const records = await auth.state.keys.get('lid-mapping', [pnUser]);
+      const mapped = records?.[pnUser]?.lidUser
+        ?? records?.[pnUser]?.lid
+        ?? records?.[pnUser]
+        ?? null;
+      lidUser = /^\d{1,32}$/.test(String(mapped || '')) ? String(mapped) : null;
+    } catch {}
+  }
+  const canonicalLid = canonicalAccount(lidUser ? `${lidUser}@lid` : '', canonicalizeJid);
   return canonicalLid?.endsWith('@lid') ? canonicalLid : null;
 }
 

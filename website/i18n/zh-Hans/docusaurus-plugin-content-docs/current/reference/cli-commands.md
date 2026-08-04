@@ -303,7 +303,8 @@ hermes portal [status|open|tools]
 hermes whatsapp
 ```
 
-运行 WhatsApp 配对/设置流程，包括模式选择和二维码配对。
+配置 WhatsApp 桥接。使用 `hermes whatsapp provision --role ordinary|sensitive`
+通过交互式手机号字母数字配对码验证或配置会话；不提供二维码备用流程。
 
 ## `hermes slack`
 
