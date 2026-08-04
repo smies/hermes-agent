@@ -51,6 +51,8 @@ hermes whatsapp
 hermes whatsapp provision --role ordinary
 ```
 
+原生 Windows 不支持此离线预配命令；请在 macOS、Linux 或 WSL2 上预配后迁移会话，或改用 WhatsApp Cloud。命令不会回退到二维码流程。
+
 该命令会先验证当前 profile 的普通会话。有效会话会就地复用，不会复制或修改凭据。否则，命令仅在交互式终端中询问手机号并显示一个短配对码。
 
 1. 在手机上打开 WhatsApp

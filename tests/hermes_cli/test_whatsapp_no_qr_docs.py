@@ -46,15 +46,13 @@ def test_cloud_api_guide_remains_a_distinct_integration() -> None:
 def test_shell_and_powershell_installers_use_the_same_profile_safe_session() -> None:
     shell = (ROOT / "scripts/install.sh").read_text(encoding="utf-8")
     powershell = (ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
-    assert '$HERMES_HOME/platforms/whatsapp/session/creds.json' in shell
-    assert '$HermesHome\\platforms\\whatsapp\\session\\creds.json' in powershell
-    assert '$HERMES_HOME/whatsapp/session/creds.json' not in shell
-    assert '$HermesHome\\whatsapp\\session\\creds.json' not in powershell
+    assert "-m hermes_cli.whatsapp_runtime" in shell
+    assert "-m hermes_cli.whatsapp_runtime" in powershell
+    assert "whatsapp provision --role ordinary" not in powershell
+    assert 'WHATSAPP_STATE" = "enabled=true;ready=false"' in shell
+    assert '$whatsappState -eq "enabled=true;ready=false"' in powershell
 
-    # Both default and named profiles resolve HERMES_HOME/HermesHome first;
-    # the installer then appends exactly the same canonical relative path.
-    relative = Path("platforms/whatsapp/session/creds.json")
-    for profile_root in (Path("/fixture/default"), Path("/fixture/named")):
-        assert profile_root / relative == Path(
-            str(profile_root), "platforms", "whatsapp", "session", "creds.json"
-        )
+    # The shared probe owns legacy/canonical precedence; neither installer
+    # grows a second hard-coded session resolver.
+    assert "resolve_whatsapp_session_dir" not in shell
+    assert "resolve_whatsapp_session_dir" not in powershell

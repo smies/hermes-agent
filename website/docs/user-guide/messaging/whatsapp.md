@@ -75,6 +75,12 @@ only to the controlling terminal.
 There is no QR fallback, and production gateway startup cannot provision an
 account.
 
+Native Windows does not implement the owner/permission guarantees required by
+this offline provisioner. Provision on macOS, Linux, or WSL2 and migrate the
+pre-provisioned session without changing its ordinary/sensitive role, or use
+the official WhatsApp Cloud integration. The native Windows command exits
+before dependency installation or session access.
+
 ---
 
 ## Step 2: Getting a Second Phone Number (Bot Mode)
@@ -152,7 +158,10 @@ The gateway starts the WhatsApp bridge automatically using the saved session.
 
 ## Session Persistence
 
-The Baileys bridge saves its session under `~/.hermes/platforms/whatsapp/session`. This means:
+New Baileys sessions are saved under
+`~/.hermes/platforms/whatsapp/session`. A populated legacy
+`~/.hermes/whatsapp/session` remains authoritative for compatibility, including
+under named profile homes. This means:
 
 - **Sessions survive restarts** — a ready session is reused in place
 - The session data includes encryption keys and device credentials
@@ -170,7 +179,10 @@ hermes whatsapp provision --role ordinary --reprovision
 ```
 
 This requests a fresh short phone-number pairing code through the controlling terminal. Enter it
-through WhatsApp Linked Devices to re-establish the session. The gateway
+through WhatsApp Linked Devices to re-establish the session. The provisioner
+rejects unsafe legacy permissions during ordinary reuse without reading the
+credential files; explicit `--reprovision` is the safe replacement path.
+The gateway
 handles **temporary** disconnections (network blips, phone going offline briefly) automatically
 with reconnection logic.
 

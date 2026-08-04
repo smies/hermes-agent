@@ -1,13 +1,14 @@
 """Tests for the WhatsApp plugin's interactive_setup wizard home-channel flow.
 
 The interactive_setup wizard lazy-imports its CLI helpers from
-``hermes_cli.config`` (get_env_value / save_env_value / remove_env_value) and
+``hermes_cli.config`` (canonical config plus legacy secret/config helpers) and
 ``hermes_cli.cli_output`` (prompt / prompt_yes_no / print_*); we patch those
 source modules. Covers the home-channel clear-on-blank behavior added in
 PR #58421 and extended in the follow-up.
 """
 import hermes_cli.config as config_mod
 import hermes_cli.cli_output as cli_output_mod
+import yaml
 from plugins.platforms.whatsapp.adapter import interactive_setup
 
 
@@ -53,7 +54,9 @@ class TestWhatsAppHomeChannelClear:
             existing={"WHATSAPP_HOME_CHANNEL": "12025550100@c.us"},
         )
         interactive_setup()
+        config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        assert config["platforms"]["whatsapp"]["enabled"] is True
+        assert "WHATSAPP_ENABLED" not in saved
         assert "WHATSAPP_HOME_CHANNEL" in removed
         assert "WHATSAPP_HOME_CHANNEL" not in saved
-
 

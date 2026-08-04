@@ -1904,16 +1904,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.DISCORD].reply_to_mode = discord_reply_mode
     
     # WhatsApp (typically uses different auth mechanism)
-    whatsapp_enabled = is_truthy_value(getenv("WHATSAPP_ENABLED", ""))
-    whatsapp_disabled_explicitly = getenv("WHATSAPP_ENABLED", "").lower() in {"false", "0", "no"}
-    if Platform.WHATSAPP in config.platforms:
-        # YAML config exists — respect explicit disable
-        wa_cfg = config.platforms[Platform.WHATSAPP]
-        if whatsapp_disabled_explicitly:
-            wa_cfg.enabled = False
-        elif whatsapp_enabled:
-            wa_cfg.enabled = True
-        # else: keep whatever the YAML set
+    from hermes_cli.whatsapp_runtime import resolve_whatsapp_enabled
+
+    _wa_existing = config.platforms.get(Platform.WHATSAPP)
+    whatsapp_enabled = resolve_whatsapp_enabled(
+        config,
+        legacy_value=getenv("WHATSAPP_ENABLED", ""),
+        default=bool(_wa_existing and _wa_existing.enabled),
+    )
+    if _wa_existing is not None:
+        _wa_existing.enabled = whatsapp_enabled
     elif whatsapp_enabled:
         config.platforms[Platform.WHATSAPP] = PlatformConfig(enabled=True)
     whatsapp_home = getenv("WHATSAPP_HOME_CHANNEL")

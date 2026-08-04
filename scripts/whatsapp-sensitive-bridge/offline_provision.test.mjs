@@ -146,8 +146,11 @@ test('reprovision stages fresh auth, requests a fresh code, and preserves existi
   let pairingCalls = 0;
   try {
     await chmod(root, 0o700);
-    await mkdir(ordinary, { mode: 0o700 });
-    await writeFile(path.join(ordinary, 'creds.json'), original, { mode: 0o600 });
+    await mkdir(ordinary, { mode: 0o755 });
+    await writeFile(path.join(ordinary, 'creds.json'), original, { mode: 0o644 });
+    await chmod(ordinary, 0o755);
+    await chmod(path.join(ordinary, 'creds.json'), 0o644);
+    const beforeDirectory = await stat(ordinary);
     const before = await stat(path.join(ordinary, 'creds.json'));
     const request = parseProvisioningRequest({
       version: 1,
@@ -193,30 +196,177 @@ test('reprovision stages fresh auth, requests a fresh code, and preserves existi
     assert.equal(pairingCalls, 1);
     assert.equal(await readFile(path.join(ordinary, 'creds.json'), 'utf8'), original);
     assert.equal(after.ino, before.ino);
+    assert.equal(after.mode & 0o777, 0o644);
+    assert.equal((await stat(ordinary)).ino, beforeDirectory.ino);
+    assert.equal((await stat(ordinary)).mode & 0o777, 0o755);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test('suspicious pre-existing auth modes are rejected without repair or provider access', async () => {
+test('explicit reprovision replaces unsafe legacy auth with fresh owner-only state', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-legacy-replace-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'9'.repeat(10)}`;
+  const lid = '424242424';
+  let pairingCalls = 0;
+  try {
+    await chmod(root, 0o700);
+    await mkdir(ordinary, { mode: 0o755 });
+    await writeFile(path.join(ordinary, 'creds.json'), 'legacy-bytes', { mode: 0o644 });
+    await chmod(ordinary, 0o755);
+    await chmod(path.join(ordinary, 'creds.json'), 0o644);
+    const request = parseProvisioningRequest({
+      version: 1,
+      action: 'provision',
+      reprovision: true,
+      role: 'ordinary',
+      phone,
+      ordinary_session: ordinary,
+      sensitive_session: sensitive,
+    });
+    const result = await provisionOffline({
+      request,
+      canonicalizeJid: (value) => String(value).replace(/:\d+@/, '@'),
+      useAuthState: async (session) => {
+        assert.notEqual(session, ordinary, 'legacy auth must never be opened by provider code');
+        const creds = { registered: false };
+        return {
+          state: {
+            creds,
+            keys: {
+              get: async () => ({ [phone]: lid }),
+              set: async () => {},
+            },
+          },
+          saveCreds: async () => {
+            creds.registered = true;
+            creds.me = { id: `${phone}@s.whatsapp.net`, lid: `${lid}@lid` };
+            await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+          },
+        };
+      },
+      makeSocket: () => {
+        const ev = new EventEmitter();
+        const socket = {
+          ev,
+          user: { id: `${phone}@s.whatsapp.net` },
+          signalRepository: { lidMapping: { getLIDForPN: async () => `${lid}@lid` } },
+          requestPairingCode: async () => { pairingCalls += 1; return 'L3GY-C0DE'; },
+          end() {},
+        };
+        queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
+        queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
+        return socket;
+      },
+      emitCode: (code) => assert.equal(code, 'L3GY-C0DE'),
+      timeoutMs: 2_000,
+    });
+    assert.deepEqual(result, { account_namespace: 's.whatsapp.net', lid_ready: true });
+    assert.equal(pairingCalls, 1);
+    assert.equal((await stat(ordinary)).mode & 0o777, 0o700);
+    assert.equal((await stat(path.join(ordinary, 'creds.json'))).mode & 0o777, 0o600);
+    assert.notEqual(await readFile(path.join(ordinary, 'creds.json'), 'utf8'), 'legacy-bytes');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('post-install staged failure restores the exact unsafe legacy tree', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-rollback-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'8'.repeat(10)}`;
+  const original = 'legacy-exact-bytes';
+  try {
+    await chmod(root, 0o700);
+    await mkdir(ordinary, { mode: 0o755 });
+    await writeFile(path.join(ordinary, 'creds.json'), original, { mode: 0o644 });
+    await chmod(ordinary, 0o755);
+    await chmod(path.join(ordinary, 'creds.json'), 0o644);
+    const beforeDirectory = await stat(ordinary);
+    const beforeCredentials = await stat(path.join(ordinary, 'creds.json'));
+    const request = parseProvisioningRequest({
+      version: 1,
+      action: 'provision',
+      reprovision: true,
+      role: 'ordinary',
+      phone,
+      ordinary_session: ordinary,
+      sensitive_session: sensitive,
+    });
+    await assert.rejects(provisionOffline({
+      request,
+      canonicalizeJid: (value) => String(value).replace(/:\d+@/, '@'),
+      useAuthState: async (session) => {
+        assert.notEqual(session, ordinary, 'legacy auth must never be opened by provider code');
+        const creds = { registered: false };
+        return {
+          state: {
+            creds,
+            keys: {
+              get: async () => ({ [phone]: '818181818' }),
+              set: async () => {},
+            },
+          },
+          saveCreds: async () => {
+            creds.registered = true;
+            creds.me = { id: `${phone}@s.whatsapp.net`, lid: '818181818@lid' };
+            await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+          },
+        };
+      },
+      makeSocket: () => {
+        const ev = new EventEmitter();
+        const socket = {
+          ev,
+          user: { id: `${phone}@s.whatsapp.net` },
+          signalRepository: { lidMapping: { getLIDForPN: async () => '818181818@lid' } },
+          requestPairingCode: async () => 'R0LL-B4CK',
+          end() {},
+        };
+        queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
+        queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
+        return socket;
+      },
+      emitCode: () => {},
+      beforeDurableConfirmation: async () => { throw new Error('injected_commit_failure'); },
+      timeoutMs: 2_000,
+    }), /provisioning_failed/);
+    const afterDirectory = await stat(ordinary);
+    const afterCredentials = await stat(path.join(ordinary, 'creds.json'));
+    assert.equal(await readFile(path.join(ordinary, 'creds.json'), 'utf8'), original);
+    assert.equal(afterDirectory.ino, beforeDirectory.ino);
+    assert.equal(afterDirectory.mode & 0o777, 0o755);
+    assert.equal(afterCredentials.ino, beforeCredentials.ino);
+    assert.equal(afterCredentials.mode & 0o777, 0o644);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('ordinary reuse rejects unsafe legacy auth before provider access', async () => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-unsafe-reuse-')));
   const ordinary = path.join(root, 'ordinary');
   const sensitive = path.join(root, 'sensitive');
   const phone = `1${'5'.repeat(10)}`;
   try {
     await chmod(root, 0o700);
-    await mkdir(ordinary, { mode: 0o700 });
+    await mkdir(ordinary, { mode: 0o755 });
     const credentials = path.join(ordinary, 'creds.json');
     await writeFile(credentials, JSON.stringify({
       registered: true,
       me: { id: `${phone}@s.whatsapp.net` },
     }), { mode: 0o644 });
     await chmod(credentials, 0o644);
+    await chmod(ordinary, 0o755);
+    const beforeDirectory = await stat(ordinary);
     const before = await stat(credentials);
     const request = parseProvisioningRequest({
       version: 1,
       action: 'provision',
-      reprovision: true,
+      reprovision: false,
       role: 'ordinary',
       phone,
       ordinary_session: ordinary,
@@ -229,8 +379,10 @@ test('suspicious pre-existing auth modes are rejected without repair or provider
       canonicalizeJid: (value) => String(value),
       emitCode: () => assert.fail('unsafe reuse must not emit a code'),
       timeoutMs: 2_000,
-    }), /auth_file_unsafe/);
+    }), /session_path_unsafe/);
     const after = await stat(credentials);
+    assert.equal((await stat(ordinary)).ino, beforeDirectory.ino);
+    assert.equal((await stat(ordinary)).mode & 0o777, 0o755);
     assert.equal(after.mode & 0o777, 0o644);
     assert.equal(after.ino, before.ino);
   } finally {
@@ -244,6 +396,12 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
   const sensitive = path.join(root, 'sensitive');
   const phone = `1${'2'.repeat(10)}`;
   let releaseFirst;
+  let lockHeld = false;
+  const acquireLock = () => {
+    if (lockHeld) throw new Error('provisioning_lock_unavailable');
+    lockHeld = true;
+    return Object.freeze({ release() { lockHeld = false; } });
+  };
   const firstMayContinue = new Promise((resolve) => { releaseFirst = resolve; });
   try {
     await chmod(root, 0o700);
@@ -288,6 +446,7 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
       },
       emitCode: () => {},
       timeoutMs: 2_000,
+      acquireLock,
     });
     await assert.rejects(provisionOffline({
       request: Object.freeze({ ...request, role: 'sensitive', session: sensitive }),
@@ -296,6 +455,7 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
       canonicalizeJid: (value) => String(value),
       emitCode: () => {},
       timeoutMs: 2_000,
+      acquireLock,
     }), /provisioning_lock_unavailable/);
     releaseFirst();
     assert.deepEqual(await first, { account_namespace: 's.whatsapp.net', lid_ready: true });

@@ -3503,14 +3503,25 @@ function Invoke-SetupWizard {
 
 function Start-GatewayIfConfigured {
     $envPath = "$HermesHome\.env"
-    if (-not (Test-Path $envPath)) { return }
 
     $hasMessaging = $false
-    $content = Get-Content $envPath -ErrorAction SilentlyContinue
-    foreach ($var in @("TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "WHATSAPP_ENABLED")) {
+    $content = if (Test-Path $envPath) { Get-Content $envPath -ErrorAction SilentlyContinue } else { @() }
+    foreach ($var in @("TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")) {
         $match = $content | Where-Object { $_ -match "^${var}=.+" -and $_ -notmatch "your-token-here" }
         if ($match) { $hasMessaging = $true; break }
     }
+
+    $probePython = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { "python" }
+    $whatsappState = ""
+    try {
+        Push-Location $InstallDir
+        $whatsappState = (& $probePython -m hermes_cli.whatsapp_runtime 2>$null | Select-Object -First 1)
+    } catch {
+        $whatsappState = ""
+    } finally {
+        Pop-Location
+    }
+    if ($whatsappState -like "enabled=true*") { $hasMessaging = $true }
 
     if (-not $hasMessaging) { return }
 
@@ -3519,29 +3530,13 @@ function Start-GatewayIfConfigured {
         $hermesCmd = "hermes"
     }
 
-    # Authentication is an explicit offline phone-number-code operation.
-    $whatsappEnabled = $content | Where-Object { $_ -match "^WHATSAPP_ENABLED=true" }
-    # HermesHome is already the selected default/named profile root; mirror
-    # get_hermes_dir("platforms/whatsapp/session", "whatsapp/session").
-    $whatsappSession = "$HermesHome\platforms\whatsapp\session\creds.json"
-    if ($whatsappEnabled -and -not (Test-Path $whatsappSession)) {
+    # Native Windows cannot safely create Baileys auth with POSIX ownership
+    # semantics.  Never invoke the unsupported provisioner from this installer.
+    if ($whatsappState -eq "enabled=true;ready=false") {
         Write-Host ""
         Write-Info "WhatsApp is enabled but its ordinary session is not provisioned."
-        Write-Info "Offline provisioning uses a phone-number pairing code."
-        Write-Host ""
-        # Non-interactive callers skip the operator-only code channel.
-        if (-not $NonInteractive) {
-            $response = Read-Host "Provision WhatsApp now? [Y/n]"
-            if ($response -eq "" -or $response -match "^[Yy]") {
-                try {
-                    & $hermesCmd whatsapp provision --role ordinary
-                } catch {
-                    # Expected after pairing completes
-                }
-            }
-        } else {
-            Write-Info "Skipping WhatsApp provisioning prompt (non-interactive)."
-        }
+        Write-Info "Native Windows offline provisioning is unsupported."
+        Write-Info "Migrate a pre-provisioned session from a supported POSIX host, or configure WhatsApp Cloud."
     }
 
     Write-Host ""

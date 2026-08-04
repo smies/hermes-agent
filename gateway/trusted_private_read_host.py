@@ -295,6 +295,20 @@ class TrustedPrivateReadHostServices:
                 raise TypeError("trusted host services are incomplete")
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class TrustedPrivateReadEventBinding:
+    """Proof that the host installed a context for one logical event.
+
+    ``private_context`` distinguishes an authenticated private context from an
+    explicit empty context.  The opaque service token is intentionally kept
+    inside this exact wrapper, so ``None`` can never be confused with a
+    successful bind at the gateway boundary.
+    """
+
+    token: object
+    private_context: bool
+
+
 class _ContextProvider:
     def __init__(self, host: "TrustedPrivateReadGatewayHost") -> None:
         self._host = host
@@ -657,13 +671,33 @@ class TrustedPrivateReadGatewayHost:
             "worker_running": bool(self._task is not None and not self._task.done()),
         }
 
-    def bind_event(self, event: object) -> object:
+    def _install_empty_event_context(self) -> TrustedPrivateReadEventBinding:
+        """Install a task-local no-private context or fail before execution."""
+        try:
+            token = self.services.bind_event(None)
+            if self.services.context_for_current_event() is not None:
+                raise RuntimeError("trusted private-read empty context was not installed")
+        except BaseException:
+            if "token" in locals():
+                try:
+                    self.services.unbind_event(token)
+                except BaseException:
+                    pass
+            self._healthy = False
+            configure_private_read_request_runtime(None)
+            raise RuntimeError("trusted private-read event binding failed") from None
+        return TrustedPrivateReadEventBinding(token=token, private_context=False)
+
+    def bind_event(self, event: object) -> TrustedPrivateReadEventBinding:
         if not self.is_healthy():
-            return None
-        decision = self.services.decision_for_event(event)
+            raise RuntimeError("trusted private-read host is unavailable")
+        try:
+            decision = self.services.decision_for_event(event)
+        except BaseException:
+            return self._install_empty_event_context()
         if decision is not None:
             if type(decision) is not tuple or len(decision) != 3:
-                return None
+                return self._install_empty_event_context()
             outcome, owner_decision, resolution = decision
             if (
                 outcome not in {"approve", "deny"}
@@ -671,7 +705,7 @@ class TrustedPrivateReadGatewayHost:
                 or type(resolution) is not NotificationAttemptSpec
                 or self.store is None
             ):
-                return None
+                return self._install_empty_event_context()
             try:
                 item = self.store.load_task_work_item(
                     owner_decision.task_id, now_us=time.time_ns() // 1000
@@ -694,13 +728,37 @@ class TrustedPrivateReadGatewayHost:
                         reason_code="owner_rejected",
                     )
                 if not result.applied:
-                    return None
+                    return self._install_empty_event_context()
             except BaseException:
-                return None
-        return self.services.bind_event(event)
+                return self._install_empty_event_context()
+        try:
+            token = self.services.bind_event(event)
+            context = self.services.context_for_current_event()
+        except BaseException:
+            if "token" in locals():
+                try:
+                    self.services.unbind_event(token)
+                except BaseException:
+                    pass
+            self._healthy = False
+            configure_private_read_request_runtime(None)
+            raise RuntimeError("trusted private-read event binding failed") from None
+        return TrustedPrivateReadEventBinding(
+            token=token,
+            private_context=context is not None,
+        )
 
-    def unbind_event(self, token: object) -> None:
-        self.services.unbind_event(token)
+    def unbind_event(self, binding: TrustedPrivateReadEventBinding) -> None:
+        if type(binding) is not TrustedPrivateReadEventBinding:
+            self._healthy = False
+            configure_private_read_request_runtime(None)
+            raise TypeError("exact trusted event binding is required")
+        try:
+            self.services.unbind_event(binding.token)
+        except BaseException:
+            self._healthy = False
+            configure_private_read_request_runtime(None)
+            raise RuntimeError("trusted private-read event cleanup failed") from None
 
 
 def compose_trusted_private_read_services(
@@ -725,5 +783,6 @@ __all__ = [
     "TrustedPrivateReadGatewayHost",
     "TrustedPrivateReadHostConfig",
     "TrustedPrivateReadHostServices",
+    "TrustedPrivateReadEventBinding",
     "compose_trusted_private_read_services",
 ]

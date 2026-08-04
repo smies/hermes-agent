@@ -2823,16 +2823,17 @@ def cmd_whatsapp(args):
         print(f"\n✓ Mode: {mode_label}")
 
     # ── Step 2: Mode is selected; authentication remains offline ──
-    # We intentionally don't write WHATSAPP_ENABLED=true here.  If the user
+    # We intentionally don't enable WhatsApp here.  If the user
     # aborts the wizard later (Ctrl+C or failed npm install),
     # we'd otherwise leave .env claiming WhatsApp is ready when the bridge
     # has no creds.json.  Every subsequent `hermes gateway` then paid a 30s
     # bridge-bootstrap timeout and queued WhatsApp for indefinite retries.
-    # Now: aborted setup leaves WHATSAPP_ENABLED unset → gateway skips it.
-    # Re-runs that already have WHATSAPP_ENABLED=true (from a prior
-    # successful authentication) stay enabled — we just don't write it pre-emptively.
+    # Now: aborted setup leaves canonical enablement absent, so the gateway
+    # skips it. Re-runs preserve an existing YAML opt-in (or legacy env
+    # compatibility) without writing anything pre-emptively.
     print()
-    if (get_env_value("WHATSAPP_ENABLED") or "").lower() == "true":
+    from hermes_cli.whatsapp_runtime import resolve_whatsapp_enabled
+    if resolve_whatsapp_enabled(legacy_value=get_env_value("WHATSAPP_ENABLED")):
         print("✓ WhatsApp is already enabled")
 
     # ── Step 3: Allowed users ────────────────────────────────────────────

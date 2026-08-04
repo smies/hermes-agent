@@ -178,7 +178,7 @@ def _cron_summary(hermes_home: Path) -> str:
         return "(error reading)"
 
 
-def _configured_platforms() -> list[str]:
+def _configured_platforms(config: dict | None = None) -> list[str]:
     """Return list of configured messaging platform names."""
     checks = {
         "telegram": "TELEGRAM_BOT_TOKEN",
@@ -198,7 +198,18 @@ def _configured_platforms() -> list[str]:
         "weixin": "WEIXIN_ACCOUNT_ID",
         "qqbot": "QQ_APP_ID",
     }
-    return [name for name, env in checks.items() if os.getenv(env)]
+    configured = [
+        name for name, env in checks.items()
+        if name != "whatsapp" and os.getenv(env)
+    ]
+    from hermes_cli.config import get_env_value
+    from hermes_cli.whatsapp_runtime import resolve_whatsapp_enabled
+
+    if resolve_whatsapp_enabled(
+        config or {}, legacy_value=get_env_value("WHATSAPP_ENABLED")
+    ):
+        configured.append("whatsapp")
+    return configured
 
 
 def _memory_provider(config: dict) -> str:
@@ -430,7 +441,7 @@ def run_dump(args):
     lines.append(f"  memory_provider:    {_memory_provider(config)}")
     lines.append(f"  gateway:            {_gateway_status()}")
 
-    platforms = _configured_platforms()
+    platforms = _configured_platforms(config)
     lines.append(f"  platforms:          {', '.join(platforms) if platforms else 'none'}")
     lines.append(f"  cron_jobs:          {_cron_summary(hermes_home)}")
     lines.append(f"  skills:             {_count_skills(hermes_home)}")

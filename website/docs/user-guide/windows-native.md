@@ -73,7 +73,7 @@ Top-to-bottom, in order:
 4. **Installs portable Git** — if `git` is already on PATH the installer uses it; otherwise it downloads a trimmed, self-contained **PortableGit** (~45 MB, from the official `git-for-windows` release) to `%LOCALAPPDATA%\hermes\git`. No admin, no Windows installer registry, no interference with anything else on the box.
 5. **Clones the repo** to `%LOCALAPPDATA%\hermes\hermes-agent` and creates a virtualenv inside it.
 6. **Tiered `uv pip install`** — tries `.[all]` first, falls back to progressively smaller sets (`[messaging,dashboard,ext]` → `[messaging]` → `.`) if a `git+https` dep flakes on rate-limited GitHub. Prevents "single flake drops you to a bare install" failure mode.
-7. **Auto-installs messaging SDKs** keyed off `.env` — if `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` / `WHATSAPP_ENABLED` are present, runs `python -m ensurepip --upgrade` and targeted `pip install` calls so each platform's SDK is actually importable.
+7. **Auto-installs messaging SDKs** keyed off configured platforms. WhatsApp enablement is read from canonical `config.yaml`, with legacy `.env` compatibility only when the YAML key is absent. Native Windows does not run Baileys offline provisioning; migrate a pre-provisioned session from macOS/Linux/WSL2 or use WhatsApp Cloud.
 8. **Sets `HERMES_GIT_BASH_PATH`** to the resolved `bash.exe` so Hermes finds it deterministically in fresh shells.
 9. **Adds `%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts` to User PATH and sets `HERMES_HOME=%LOCALAPPDATA%\hermes`** — exposes the `hermes` command (and points it at your data dir) after you open a new terminal.
 10. **Runs `hermes setup`** — the normal first-run wizard (model, provider, toolsets). Skip with `-SkipSetup`.
@@ -84,13 +84,16 @@ On Windows, per-tool API key setup (Firecrawl, FAL, Browser Use, OpenAI TTS) is 
 
 ## Feature matrix
 
-Everything except the dashboard's embedded terminal pane runs natively on Windows.
+Most Hermes surfaces run natively on Windows. The explicit exceptions are the
+dashboard's embedded terminal pane and Baileys offline account provisioning.
 
 | Feature | Native Windows | WSL2 |
 |---|---|---|
 | CLI (`hermes chat`, `hermes setup`, `hermes gateway`, …) | ✓ | ✓ |
 | Interactive TUI (`hermes --tui`) | ✓ | ✓ |
-| Messaging gateway (Telegram, Discord, Slack, WhatsApp, 15+ platforms) | ✓ | ✓ |
+| Messaging gateway (Telegram, Discord, Slack, 15+ platforms) | ✓ | ✓ |
+| WhatsApp Baileys gateway with a pre-provisioned session | ✓ | ✓ |
+| WhatsApp Baileys offline provisioning | ✗ (migrate from POSIX/WSL2 or use Cloud) | ✓ |
 | Cron scheduler | ✓ | ✓ |
 | Browser tool (Chromium via Node) | ✓ | ✓ |
 | MCP servers (stdio and HTTP) | ✓ | ✓ |

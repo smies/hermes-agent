@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
 
 from hermes_cli.whatsapp_provisioning import (
+    _acquire_provisioning_lock,
+    _minimal_node_environment,
     WhatsAppProvisioningError,
     command,
     resolve_provisioning_roots,
@@ -85,6 +90,7 @@ def test_valid_existing_session_returns_ready_without_pairing_code(tmp_path: Pat
     request = json.loads(process.request)
     assert request["action"] == "validate"
     assert "phone" not in request
+    assert not (tmp_path / ".hermes-whatsapp-provision.lock").exists()
 
 
 def test_pairing_code_is_only_written_to_explicit_operator_channel(tmp_path: Path) -> None:
@@ -151,6 +157,44 @@ def test_profile_roots_are_canonical_owner_only_and_not_created_by_validation(
     assert not sensitive.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory-lock contract")
+@pytest.mark.live_system_guard_bypass
+def test_provisioning_lock_releases_on_owner_death_and_serializes_roles(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(0o700)
+    ordinary = tmp_path / "ordinary"
+    sensitive = tmp_path / "sensitive"
+    child_code = """
+import sys, time
+from pathlib import Path
+from hermes_cli.whatsapp_provisioning import _acquire_provisioning_lock
+fd = _acquire_provisioning_lock(Path(sys.argv[1]), Path(sys.argv[2]))
+print('locked', flush=True)
+time.sleep(60)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(ordinary), str(sensitive)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[2]),
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "locked"
+        with pytest.raises(WhatsAppProvisioningError, match="another .* active"):
+            _acquire_provisioning_lock(ordinary, sensitive)
+        child.terminate()
+        child.wait(timeout=5)
+        descriptor = _acquire_provisioning_lock(ordinary, sensitive)
+        os.close(descriptor)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
 @pytest.mark.parametrize("unsafe", ["mode", "symlink"])
 def test_profile_root_mode_and_symlink_attacks_are_rejected(
     tmp_path: Path, unsafe: str
@@ -180,46 +224,66 @@ def test_profile_root_mode_and_symlink_attacks_are_rejected(
         resolve_provisioning_roots()
 
 
-def test_simulated_windows_uses_bounded_stdio_without_posix_handles(tmp_path: Path) -> None:
-    code = "W1ND-0WS1"
-    process = _Process(
-        json.dumps({"event": "complete", "state": "ready_for_production", "lid_ready": True}) + "\n",
-        operator_event=json.dumps({"event": "pairing_code", "code": code}) + "\n",
-    )
-    captured = {}
-
-    def popen(args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return process
-
-    roots = (tmp_path / "ordinary", tmp_path / "sensitive")
+def test_native_windows_is_rejected_before_setup_or_spawn(tmp_path: Path) -> None:
     with (
-        patch("hermes_cli.whatsapp_provisioning.find_node_executable", return_value="C:/node/node.exe"),
-        patch("hermes_cli.whatsapp_provisioning.resolve_provisioning_roots", return_value=roots),
-        patch("hermes_cli.whatsapp_provisioning._provisioner_script", return_value=tmp_path / "offline.js"),
-        patch("hermes_cli.whatsapp_provisioning._ensure_provisioner_dependencies"),
         patch("hermes_cli.whatsapp_provisioning._is_windows", return_value=True),
-        patch("hermes_cli.whatsapp_provisioning.subprocess.CREATE_NEW_PROCESS_GROUP", 512, create=True),
-        patch("hermes_cli.whatsapp_provisioning.subprocess.Popen", side_effect=popen),
+        patch("hermes_cli.whatsapp_provisioning.find_node_executable") as find_node,
+        patch("hermes_cli.whatsapp_provisioning.resolve_provisioning_roots") as roots,
+        patch("hermes_cli.whatsapp_provisioning._ensure_provisioner_dependencies") as deps,
+        patch("hermes_cli.whatsapp_provisioning.subprocess.Popen") as popen,
+        pytest.raises(WhatsAppProvisioningError, match="native Windows.*unsupported"),
     ):
-        operator = _TTY()
-        machine = io.StringIO()
-        result = run_whatsapp_provisioning(
+        run_whatsapp_provisioning(
             "ordinary",
             phone="15550001111",
-            operator=operator,
-            machine_output=machine,
+            operator=_TTY(),
+            machine_output=io.StringIO(),
         )
-    assert result["state"] == "ready_for_production"
-    assert captured["args"] == ["C:/node/node.exe", str(tmp_path / "offline.js"), "--operator-stdio"]
-    assert captured["kwargs"]["creationflags"] == 512
-    assert "pass_fds" not in captured["kwargs"]
-    assert "start_new_session" not in captured["kwargs"]
-    assert captured["kwargs"]["stderr"] is not None
-    assert code in operator.getvalue()
-    assert code not in machine.getvalue()
-    assert "15550001111" not in repr(captured)
+    find_node.assert_not_called()
+    roots.assert_not_called()
+    deps.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_native_windows_command_rejects_before_phone_or_config() -> None:
+    args = type("Args", (), {
+        "role": "ordinary",
+        "validate_only": False,
+        "reprovision": True,
+    })()
+    with (
+        patch("hermes_cli.whatsapp_provisioning._is_windows", return_value=True),
+        patch("hermes_cli.whatsapp_provisioning.run_whatsapp_provisioning") as run,
+        patch("cli.save_config_value") as save,
+        patch("hermes_cli.whatsapp_provisioning.sys.stdin", _TTY("15550001111\n")),
+        pytest.raises(WhatsAppProvisioningError, match="native Windows.*unsupported"),
+    ):
+        command(args)
+    run.assert_not_called()
+    save.assert_not_called()
+
+
+def test_minimal_child_environment_preserves_windows_runtime_requirements(
+    monkeypatch,
+) -> None:
+    required = {
+        "SYSTEMROOT": r"C:\\Windows",
+        "WINDIR": r"C:\\Windows",
+        "COMSPEC": r"C:\\Windows\\System32\\cmd.exe",
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "USERPROFILE": r"C:\\Users\\fixture",
+        "LOCALAPPDATA": r"C:\\Users\\fixture\\AppData\\Local",
+        "APPDATA": r"C:\\Users\\fixture\\AppData\\Roaming",
+        "PROGRAMDATA": r"C:\\ProgramData",
+        "TEMP": r"C:\\Temp",
+        "TMP": r"C:\\Temp",
+    }
+    for name, value in required.items():
+        monkeypatch.setenv(name, value)
+
+    environment = _minimal_node_environment("/bin/node")
+
+    assert {name: environment[name] for name in required} == required
 
 
 @pytest.mark.parametrize(
@@ -250,6 +314,32 @@ def test_canonical_config_enablement_is_role_and_action_scoped(
     ):
         assert command(args) == 0
     assert observed == saved
+
+
+def test_ready_ordinary_reuse_enables_canonical_config_without_reprovision() -> None:
+    args = type("Args", (), {
+        "role": "ordinary",
+        "validate_only": False,
+        "reprovision": False,
+    })()
+    observed = []
+    ready = {"state": "ready_for_production", "lid_ready": True}
+    with (
+        patch(
+            "hermes_cli.whatsapp_provisioning.run_whatsapp_provisioning",
+            return_value=ready,
+        ) as run,
+        patch("hermes_cli.whatsapp_provisioning.sys.stdin", _TTY()),
+        patch("hermes_cli.whatsapp_provisioning.sys.stderr", _TTY()),
+        patch(
+            "cli.save_config_value",
+            side_effect=lambda key, value: observed.append((key, value)) or True,
+        ),
+    ):
+        assert command(args) == 0
+    assert run.call_count == 1
+    assert run.call_args.kwargs["validate_only"] is True
+    assert observed == [("platforms.whatsapp.enabled", True)]
 
 
 def test_failed_atomic_config_write_does_not_report_success() -> None:
@@ -300,7 +390,7 @@ def test_interrupted_atomic_config_write_preserves_existing_config(
     assert config.read_bytes() == original
 
 
-def test_simulated_windows_timeout_terminates_and_reaps_exact_child(
+def test_posix_timeout_terminates_reaps_and_releases_lock(
     tmp_path: Path,
 ) -> None:
     class TimedOutProcess(_Process):
@@ -317,14 +407,6 @@ def test_simulated_windows_timeout_terminates_and_reaps_exact_child(
         def poll(self):
             return None if self.running else self.returncode
 
-        def terminate(self):
-            self.terminated += 1
-            self.running = False
-
-        def kill(self):
-            self.killed += 1
-            self.running = False
-
         def wait(self, timeout: float):
             self.waited += 1
             return self.returncode
@@ -332,12 +414,15 @@ def test_simulated_windows_timeout_terminates_and_reaps_exact_child(
     process = TimedOutProcess()
     roots = (tmp_path / "ordinary", tmp_path / "sensitive")
     with (
-        patch("hermes_cli.whatsapp_provisioning.find_node_executable", return_value="C:/node/node.exe"),
+        patch("hermes_cli.whatsapp_provisioning.find_node_executable", return_value="/bin/node"),
         patch("hermes_cli.whatsapp_provisioning.resolve_provisioning_roots", return_value=roots),
         patch("hermes_cli.whatsapp_provisioning._provisioner_script", return_value=tmp_path / "offline.js"),
         patch("hermes_cli.whatsapp_provisioning._ensure_provisioner_dependencies"),
-        patch("hermes_cli.whatsapp_provisioning._is_windows", return_value=True),
         patch("hermes_cli.whatsapp_provisioning.subprocess.Popen", return_value=process),
+        patch(
+            "hermes_cli.whatsapp_provisioning.os.killpg",
+            side_effect=lambda *_args: setattr(process, "running", False),
+        ) as killpg,
         pytest.raises(__import__("subprocess").TimeoutExpired),
     ):
         run_whatsapp_provisioning(
@@ -347,6 +432,5 @@ def test_simulated_windows_timeout_terminates_and_reaps_exact_child(
             machine_output=io.StringIO(),
             timeout_seconds=0.1,
         )
-    assert process.terminated == 1
-    assert process.killed == 0
+    assert killpg.call_count == 1
     assert process.waited == 1

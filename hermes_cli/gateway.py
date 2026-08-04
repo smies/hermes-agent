@@ -5464,8 +5464,16 @@ def _platform_status(platform: dict) -> str:
         return "not configured"
     val = get_env_value(token_var)
     if token_var == "WHATSAPP_ENABLED":
-        if val and val.lower() == "true":
-            session_file = get_hermes_home() / "whatsapp" / "session" / "creds.json"
+        from hermes_cli.config import load_config
+        from hermes_cli.whatsapp_runtime import (
+            resolve_whatsapp_enabled,
+            resolve_whatsapp_session_dir,
+        )
+
+        if resolve_whatsapp_enabled(
+            load_config(), legacy_value=get_env_value("WHATSAPP_ENABLED")
+        ):
+            session_file = resolve_whatsapp_session_dir() / "creds.json"
             if session_file.exists():
                 return "configured + paired"
             return "enabled, not paired"

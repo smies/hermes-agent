@@ -25,6 +25,7 @@ from hermes_cli.nous_subscription import get_nous_subscription_features
 from hermes_cli.runtime_provider import resolve_requested_provider
 from hermes_cli.vercel_auth import describe_vercel_auth
 from hermes_constants import OPENROUTER_MODELS_URL
+from hermes_cli.whatsapp_runtime import resolve_whatsapp_enabled
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 def check_mark(ok: bool) -> str:
@@ -486,7 +487,14 @@ def show_status(args):
 
     for name, (token_var, home_var) in platforms.items():
         token = os.getenv(token_var, "")
-        has_token = bool(token)
+        has_token = (
+            resolve_whatsapp_enabled(
+                config,
+                legacy_value=get_env_value("WHATSAPP_ENABLED"),
+            )
+            if token_var == "WHATSAPP_ENABLED"
+            else bool(token)
+        )
         
         home_channel = ""
         if home_var:

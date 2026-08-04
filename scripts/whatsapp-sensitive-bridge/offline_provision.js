@@ -2,16 +2,12 @@
 
 import { randomUUID } from 'node:crypto';
 import {
-  closeSync,
   existsSync,
-  fstatSync,
   lstatSync,
-  openSync,
   realpathSync,
   readdirSync,
-  unlinkSync,
 } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -145,36 +141,6 @@ function commonOwnerRoot(left, right) {
   return root;
 }
 
-function acquireProvisioningLock(request) {
-  const ownerRoot = commonOwnerRoot(request.ordinarySession, request.sensitiveSession);
-  const lockPath = path.join(ownerRoot, '.hermes-whatsapp-provision.lock');
-  let descriptor;
-  try {
-    descriptor = openSync(lockPath, 'wx', AUTH_FILE_MODE);
-    const info = fstatSync(descriptor);
-    if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o777) !== AUTH_FILE_MODE
-        || (typeof process.getuid === 'function' && info.uid !== process.getuid())) {
-      throw new Error('provisioning_lock_unsafe');
-    }
-  } catch {
-    if (descriptor !== undefined) closeSync(descriptor);
-    throw new Error('provisioning_lock_unavailable');
-  }
-  const lockInfo = fstatSync(descriptor);
-  return Object.freeze({
-    ownerRoot,
-    release() {
-      closeSync(descriptor);
-      const observed = lstatSync(lockPath);
-      if (observed.dev !== lockInfo.dev || observed.ino !== lockInfo.ino
-          || observed.isSymbolicLink() || !observed.isFile()) {
-        throw new Error('provisioning_lock_identity_changed');
-      }
-      unlinkSync(lockPath);
-    },
-  });
-}
-
 async function ensureNewSessionParent(session) {
   validateOwnerDirectory(session, { required: false });
   const parent = path.dirname(session);
@@ -182,26 +148,73 @@ async function ensureNewSessionParent(session) {
   validateOwnerDirectory(parent, { required: true });
 }
 
-async function commitStagedSession(stage, session, ownerRoot) {
+async function syncDirectory(directory) {
+  const handle = await open(directory, 'r');
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+function validateLegacyReprovisionTarget(target, expected = null) {
+  if (!existsSync(target)) return null;
+  let cursor = path.parse(target).root;
+  for (const component of path.relative(cursor, target).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, component);
+    const info = lstatSync(cursor);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('session_path_unsafe');
+    if (typeof process.getuid === 'function' && info.uid !== 0 && info.uid !== process.getuid()) {
+      throw new Error('session_path_unsafe');
+    }
+    if ((info.mode & 0o022) !== 0 && !(info.uid === 0 && (info.mode & 0o1000) !== 0)) {
+      throw new Error('session_path_unsafe');
+    }
+  }
+  if (realpathSync.native(target) !== target) throw new Error('session_path_unsafe');
+  const info = lstatSync(target);
+  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+    throw new Error('session_path_unsafe');
+  }
+  const seal = Object.freeze({ dev: info.dev, ino: info.ino, mode: info.mode & 0o777 });
+  if (expected && (seal.dev !== expected.dev || seal.ino !== expected.ino
+      || seal.mode !== expected.mode)) throw new Error('session_path_changed');
+  return seal;
+}
+
+async function commitStagedSession(
+  stage,
+  session,
+  ownerRoot,
+  legacySeal = null,
+  beforeDurableConfirmation = null,
+) {
   await normalizeNewAuthTree(stage);
   validateAuthFiles(stage);
-  await ensureNewSessionParent(session);
+  if (legacySeal) validateOwnerDirectory(path.dirname(session), { required: true });
+  else await ensureNewSessionParent(session);
   const rollback = path.join(ownerRoot, `.whatsapp-provision-rollback-${randomUUID()}`);
   const failed = path.join(ownerRoot, `.whatsapp-provision-failed-${randomUUID()}`);
   let movedOriginal = false;
   let installedStage = false;
   try {
     if (existsSync(session)) {
-      validateOwnerDirectory(session, { required: true });
-      validateAuthFiles(session);
+      if (legacySeal) validateLegacyReprovisionTarget(session, legacySeal);
+      else {
+        validateOwnerDirectory(session, { required: true });
+        validateAuthFiles(session);
+      }
       await rename(session, rollback);
       movedOriginal = true;
+      if (legacySeal) validateLegacyReprovisionTarget(rollback, legacySeal);
+      await syncDirectory(path.dirname(session));
     }
     await rename(stage, session);
     installedStage = true;
+    await syncDirectory(path.dirname(session));
     validateOwnerDirectory(session, { required: true });
     validateAuthFiles(session);
-    if (movedOriginal) await rm(rollback, { recursive: true, force: false });
+    if (typeof beforeDurableConfirmation === 'function') await beforeDurableConfirmation();
+    if (movedOriginal) {
+      await rm(rollback, { recursive: true, force: false });
+      await syncDirectory(path.dirname(session));
+    }
   } catch {
     // Once the staged tree has taken the canonical name, move it aside before
     // restoring the old directory.  A validation failure after rename must
@@ -211,7 +224,10 @@ async function commitStagedSession(stage, session, ownerRoot) {
       try { await rename(session, failed); } catch {}
     }
     if (movedOriginal && existsSync(rollback) && !existsSync(session)) {
-      try { await rename(rollback, session); } catch {}
+      try {
+        await rename(rollback, session);
+        await syncDirectory(path.dirname(session));
+      } catch {}
     }
     if (existsSync(failed)) {
       try { await rm(failed, { recursive: true, force: true }); } catch {}
@@ -307,10 +323,16 @@ export async function provisionOffline({
   canonicalizeJid = jidNormalizedUser,
   emitCode,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  acquireLock = null,
+  beforeDurableConfirmation = null,
 }) {
   process.umask(0o077);
   if (typeof emitCode !== 'function') throw new TypeError('operator channel required');
-  const lock = acquireProvisioningLock(request);
+  const ownerRoot = commonOwnerRoot(request.ordinarySession, request.sensitiveSession);
+  // Production serialization is held by the Python parent with flock(2) for
+  // the exact child lifetime, so process death releases it automatically.
+  // Direct unit callers may inject an in-memory lock contract.
+  const lock = typeof acquireLock === 'function' ? acquireLock(request, ownerRoot) : null;
   let stage = null;
   const otherSession = request.role === 'ordinary' ? request.sensitiveSession : request.ordinarySession;
   let sock;
@@ -319,6 +341,7 @@ export async function provisionOffline({
   let done = false;
   let account = null;
   let lid = null;
+  let legacySeal = null;
   const phoneJid = `${request.phone}@s.whatsapp.net`;
   const close = () => {
     if (done) return;
@@ -344,8 +367,11 @@ export async function provisionOffline({
       if (!ordinaryReady) throw new Error('ordinary_session_not_ready');
     }
     if (existsSync(request.session)) {
-      validateOwnerDirectory(request.session, { required: true });
-      validateAuthFiles(request.session);
+      if (request.reprovision) legacySeal = validateLegacyReprovisionTarget(request.session);
+      else {
+        validateOwnerDirectory(request.session, { required: true });
+        validateAuthFiles(request.session);
+      }
     } else {
       validateOwnerDirectory(request.session, { required: false });
     }
@@ -356,7 +382,7 @@ export async function provisionOffline({
       validateOwnerDirectory(otherSession, { required: false });
     }
     const otherAccountBeforePairing = await existingAccount(otherSession, canonicalizeJid);
-    stage = await mkdtemp(path.join(lock.ownerRoot, '.whatsapp-provision-stage-'));
+    stage = await mkdtemp(path.join(ownerRoot, '.whatsapp-provision-stage-'));
     await chmod(stage, AUTH_DIRECTORY_MODE);
     const rawAuth = await useAuthState(stage);
     const auth = wrapStagedAuth(rawAuth, stage);
@@ -421,7 +447,13 @@ export async function provisionOffline({
               || (otherAccountBeforeCommit && account === otherAccountBeforeCommit)) {
             return fail('account_separation_required');
           }
-          await commitStagedSession(stage, request.session, lock.ownerRoot);
+          await commitStagedSession(
+            stage,
+            request.session,
+            ownerRoot,
+            legacySeal,
+            beforeDurableConfirmation,
+          );
           stage = null;
           resolve(Object.freeze({ account_namespace: account.split('@')[1], lid_ready: true }));
         } catch { fail('provisioning_failed'); }
@@ -433,7 +465,7 @@ export async function provisionOffline({
     if (stage) {
       try { await rm(stage, { recursive: true, force: true }); } catch {}
     }
-    lock.release();
+    lock?.release();
   }
 }
 
@@ -468,8 +500,17 @@ export async function runProvisioner({
     });
     output.write(`${JSON.stringify({ event: 'complete', state: 'ready_for_production', ...result })}\n`);
     return 0;
-  } catch {
-    output.write(`${JSON.stringify({ event: 'complete', state: 'needs_provisioning' })}\n`);
+  } catch (error) {
+    const code = String(error?.message || '');
+    const unsafeExisting = new Set([
+      'auth_file_unsafe', 'auth_directory_unsafe', 'credential_file_unsafe',
+      'session_path_unsafe', 'session_path_changed',
+    ]).has(code);
+    output.write(`${JSON.stringify({
+      event: 'complete',
+      state: 'needs_provisioning',
+      ...(unsafeExisting ? { error: 'unsafe_existing_session_requires_reprovision' } : {}),
+    })}\n`);
     return 1;
   } finally {
     request = null;

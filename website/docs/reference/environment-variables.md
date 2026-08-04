@@ -360,7 +360,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `GOOGLE_CHAT_HTTP_EVENTS_URL` | Authenticated HTTP endpoint for Chat message events (alternative to Pub/Sub) |
 | `GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE` | Expected audience for Google-signed HTTP event bearer tokens (defaults to `GOOGLE_CHAT_HTTP_EVENTS_URL`) |
 | `GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL` | Expected Google service account email for HTTP event bearer tokens |
-| `WHATSAPP_ENABLED` | Enable the WhatsApp bridge (`true`/`false`) |
+| `WHATSAPP_ENABLED` | Legacy compatibility only when `platforms.whatsapp.enabled` is absent from `config.yaml` |
 | `WHATSAPP_MODE` | `bot` (separate number) or `self-chat` (message yourself) |
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers (with country code, no `+`), or `*` to allow all senders |
 | `WHATSAPP_ALLOW_ALL_USERS` | Allow all WhatsApp senders without an allowlist (`true`/`false`) |

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, stat } from 'node:fs/promises';
+import { chmod, mkdtemp, realpath, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -10,7 +10,7 @@ import { provisionOffline } from './offline_provision.js';
 import { parseProvisioningRequest, verifyLidBootstrap } from './provisioning_core.js';
 
 test('real pinned multi-file auth uses bare numeric LID keys and staged owner-only modes under parent umask 0022', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-real-auth-'));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-real-auth-')));
   const ordinary = path.join(root, 'ordinary');
   const sensitive = path.join(root, 'sensitive');
   const phone = `1${'8'.repeat(10)}`;

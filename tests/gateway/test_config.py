@@ -278,6 +278,34 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_whatsapp_explicit_yaml_true_beats_legacy_env_false(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n  whatsapp:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("WHATSAPP_ENABLED", "false")
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.WHATSAPP].enabled is True
+
+    def test_whatsapp_legacy_env_remains_compatible_when_yaml_absent(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.WHATSAPP].enabled is True
+
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):
         """A fresh install seeded from cli-config.yaml.example must not
         auto-reset sessions.

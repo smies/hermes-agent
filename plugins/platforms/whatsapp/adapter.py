@@ -558,8 +558,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not creds_path.exists():
             logger.warning(
                 "[%s] WhatsApp is enabled but not provisioned. "
-                "Run `hermes whatsapp provision --role ordinary`; remove "
-                "WHATSAPP_ENABLED from your .env to disable.",
+                "Run `hermes whatsapp provision --role ordinary`; set "
+                "platforms.whatsapp.enabled to false in config.yaml to disable.",
                 self.name,
             )
             self._set_fatal_error(
@@ -1821,7 +1821,13 @@ def interactive_setup() -> None:
     static _PLATFORMS["whatsapp"] dict. CLI helpers are lazy-imported so the
     plugin's module-load surface stays minimal.
     """
-    from hermes_cli.config import get_env_value, remove_env_value, save_env_value
+    from hermes_cli.config import (
+        get_env_value,
+        remove_env_value,
+        save_env_value,
+        write_platform_config_field,
+    )
+    from hermes_cli.whatsapp_runtime import resolve_whatsapp_enabled
     from hermes_cli.cli_output import (
         prompt,
         prompt_yes_no,
@@ -1833,17 +1839,19 @@ def interactive_setup() -> None:
     print_header("WhatsApp")
     print_info("WhatsApp uses a local Node.js bridge (WhatsApp Web client).")
     print_info("Start the bridge separately; the gateway connects to it over HTTP.")
-    existing = get_env_value("WHATSAPP_ENABLED")
-    if existing and existing.lower() in {"true", "1", "yes"}:
+    existing = resolve_whatsapp_enabled(
+        legacy_value=get_env_value("WHATSAPP_ENABLED")
+    )
+    if existing:
         print_info("WhatsApp: already enabled")
         if not prompt_yes_no("Reconfigure WhatsApp?", False):
             return
 
     if prompt_yes_no("Enable WhatsApp?", True):
-        save_env_value("WHATSAPP_ENABLED", "true")
+        write_platform_config_field("whatsapp", "enabled", True, raw=True)
         print_success("WhatsApp enabled")
     else:
-        save_env_value("WHATSAPP_ENABLED", "false")
+        write_platform_config_field("whatsapp", "enabled", False, raw=True)
         print_info("WhatsApp left disabled")
         return
 
@@ -1898,26 +1906,20 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
 
 def _is_connected(config) -> bool:
     """WhatsApp is considered connected when the user has explicitly enabled it
-    via ``WHATSAPP_ENABLED`` (or the YAML-bridged equivalent on the config).
+    in canonical YAML, with ``WHATSAPP_ENABLED`` only as an absent-YAML legacy
+    fallback.
 
     Auth itself is handled by the external Node.js bridge — we can't verify the
-    bridge token here — so the opt-in flag is the connection signal. The legacy
-    built-in path keyed off ``WHATSAPP_ENABLED`` in both the connected-platforms
-    check and the setup-status display; returning an unconditional True here
-    would make WhatsApp always show as "configured" in ``hermes setup`` even
-    when the user never enabled it. #41112.
+    bridge token here — so the canonical opt-in is the connection signal.
     """
-    extra = getattr(config, "extra", {}) or {}
-    if config is not None and getattr(config, "enabled", False) and extra:
-        # An explicitly-enabled PlatformConfig with seeded extras (e.g. from
-        # YAML) counts as configured.
-        return True
-    # Read via hermes_cli.gateway.get_env_value (not os.getenv) so setup-status
-    # callers that patch get_env_value — and the gateway connected-platforms
-    # check — observe the same value. Matches the discord/slack plugin pattern.
+    from hermes_cli.config import load_config
+    from hermes_cli.whatsapp_runtime import resolve_whatsapp_enabled
     import hermes_cli.gateway as gateway_mod
-    val = (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower()
-    return val in {"true", "1", "yes"}
+
+    return resolve_whatsapp_enabled(
+        load_config(),
+        legacy_value=gateway_mod.get_env_value("WHATSAPP_ENABLED"),
+    )
 
 
 def _build_adapter(config):
@@ -1933,7 +1935,7 @@ def register(ctx) -> None:
         adapter_factory=_build_adapter,
         check_fn=check_whatsapp_requirements,
         is_connected=_is_connected,
-        required_env=["WHATSAPP_ENABLED"],
+        required_env=[],
         install_hint="WhatsApp requires a Node.js bridge — see the WhatsApp messaging docs",
         setup_fn=interactive_setup,
         apply_yaml_config_fn=_apply_yaml_config,

@@ -99,6 +99,30 @@ def _base_xai_mocks(monkeypatch, tmp_path):
     return status_mod
 
 
+def test_status_uses_canonical_whatsapp_enablement_over_legacy_env(
+    monkeypatch, capsys, tmp_path
+):
+    status_mod = _base_xai_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        status_mod,
+        "load_config",
+        lambda: {"model": "gpt-5.4", "platforms": {"whatsapp": {"enabled": True}}},
+    )
+    monkeypatch.setattr(
+        status_mod,
+        "get_env_value",
+        lambda key: "false" if key == "WHATSAPP_ENABLED" else None,
+    )
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+
+    whatsapp_line = next(
+        line for line in capsys.readouterr().out.splitlines() if "WhatsApp" in line
+    )
+    assert "configured" in whatsapp_line
+    assert "not configured" not in whatsapp_line
+
+
 class TestShowStatusXaiOAuth:
     """xAI OAuth row in hermes status."""
 

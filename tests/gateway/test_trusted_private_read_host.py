@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -91,6 +92,26 @@ def test_default_config_has_no_block_and_schema_is_unavailable() -> None:
     assert config.trusted_private_read is None
     assert "trusted_private_read" not in config.to_dict()
     assert check_private_read_request_runtime() is False
+
+
+@pytest.mark.asyncio
+async def test_enabled_config_cannot_activate_unavailable_production_composition(
+    tmp_path: Path,
+) -> None:
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(trusted_private_read=_config(tmp_path))
+    runner._trusted_private_read_host = None
+
+    assert await GatewayRunner._start_trusted_private_read_host(runner) is False
+    assert runner._trusted_private_read_host is None
+    assert check_private_read_request_runtime() is False
+
+
+def test_arbitrary_services_module_is_not_a_configuration_surface(tmp_path: Path) -> None:
+    raw = _config(tmp_path)
+    raw["services_module"] = "fixture.untrusted"
+    with pytest.raises(TrustedPrivateReadConfigurationError):
+        TrustedPrivateReadHostConfig.parse(raw)
 
 
 @pytest.mark.asyncio

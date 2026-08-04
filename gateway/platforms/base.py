@@ -2810,6 +2810,7 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._busy_principal_gate: Optional[Callable[[MessageEvent, str], bool]] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3345,6 +3346,13 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_busy_principal_gate(
+        self,
+        gate: Optional[Callable[[MessageEvent, str], bool]],
+    ) -> None:
+        """Install the authenticated-principal fence for every busy bypass."""
+        self._busy_principal_gate = gate
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -5591,6 +5599,22 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            # This is the earliest common busy-session chokepoint.  It must run
+            # before direct command dispatch and the clarify resolver because
+            # both paths bypass the normal runner busy handler.
+            _principal_gate = getattr(self, "_busy_principal_gate", None)
+            if _principal_gate is not None:
+                try:
+                    if _principal_gate(event, session_key) is not True:
+                        return
+                except BaseException:
+                    logger.error(
+                        "[%s] Busy-session principal gate failed closed",
+                        self.name,
+                        exc_info=True,
+                    )
+                    return
+
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:

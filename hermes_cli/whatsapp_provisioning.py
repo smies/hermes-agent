@@ -34,7 +34,12 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _canonical_owner_directory(path: Path, *, require_existing: bool) -> Path:
+def _canonical_owner_directory(
+    path: Path,
+    *,
+    require_existing: bool,
+    allow_legacy_target: bool = False,
+) -> Path:
     if not path.is_absolute() or Path(os.path.abspath(path)) != path:
         raise WhatsAppProvisioningError("unsafe provisioning session path")
     cursor = path
@@ -63,21 +68,39 @@ def _canonical_owner_directory(path: Path, *, require_existing: bool) -> Path:
         not stat.S_ISDIR(info.st_mode)
         or stat.S_ISLNK(info.st_mode)
         or (hasattr(os, "getuid") and info.st_uid != os.getuid())
-        or stat.S_IMODE(info.st_mode) != 0o700
+        or (
+            stat.S_IMODE(info.st_mode) != 0o700
+            and not (
+                allow_legacy_target
+                and stat.S_IMODE(info.st_mode) & 0o022 == 0
+            )
+        )
     ):
         raise WhatsAppProvisioningError("provisioning session path must be owner-only")
     return path
 
 
-def resolve_provisioning_roots() -> tuple[Path, Path]:
+def resolve_provisioning_roots(
+    *,
+    role: str | None = None,
+    reprovision: bool = False,
+) -> tuple[Path, Path]:
     ordinary = Path(
         get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
     )
     sensitive = (
         get_hermes_home() / "sensitive-delivery" / "whatsapp" / "session"
     )
-    _canonical_owner_directory(ordinary, require_existing=False)
-    _canonical_owner_directory(sensitive, require_existing=False)
+    _canonical_owner_directory(
+        ordinary,
+        require_existing=False,
+        allow_legacy_target=bool(reprovision and role == "ordinary"),
+    )
+    _canonical_owner_directory(
+        sensitive,
+        require_existing=False,
+        allow_legacy_target=bool(reprovision and role == "sensitive"),
+    )
     try:
         ordinary.relative_to(sensitive)
         overlap = True
@@ -199,11 +222,56 @@ def _ensure_provisioner_dependencies(node: str, script: Path) -> None:
 def _minimal_node_environment(node: str) -> dict[str, str]:
     executable_paths = [str(Path(node).resolve().parent), *os.defpath.split(os.pathsep)]
     environment = {"PATH": os.pathsep.join(dict.fromkeys(executable_paths))}
-    for name in ("LANG", "LC_ALL", "TZ"):
+    for name in (
+        "LANG", "LC_ALL", "TZ",
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE",
+        "LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "TEMP", "TMP",
+    ):
         value = os.environ.get(name)
         if value:
             environment[name] = value
     return environment
+
+
+def _acquire_provisioning_lock(ordinary: Path, sensitive: Path) -> int:
+    """Acquire one owner-checked advisory lock covering both account roles."""
+    if _is_windows():
+        raise WhatsAppProvisioningError(
+            "native Windows offline provisioning is unsupported; use a pre-provisioned session from a supported POSIX host or WhatsApp Cloud"
+        )
+    import fcntl
+
+    owner_root = Path(os.path.commonpath((str(ordinary), str(sensitive))))
+    _canonical_owner_directory(owner_root, require_existing=True)
+    lock_path = owner_root / ".hermes-whatsapp-provision.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+        observed = os.lstat(lock_path)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (hasattr(os, "getuid") and opened.st_uid != os.getuid())
+            or lock_path.resolve(strict=True) != lock_path
+        ):
+            raise WhatsAppProvisioningError("provisioning lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except WhatsAppProvisioningError:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise
+    except (OSError, ValueError):
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise WhatsAppProvisioningError(
+            "another WhatsApp provisioning attempt is active"
+        ) from None
 
 
 def run_whatsapp_provisioning(
@@ -217,6 +285,10 @@ def run_whatsapp_provisioning(
     reprovision: bool = False,
 ) -> dict[str, object]:
     """Run the separate provisioner and return its non-sensitive final state."""
+    if _is_windows():
+        raise WhatsAppProvisioningError(
+            "native Windows offline provisioning is unsupported; use a pre-provisioned session from a supported POSIX host or WhatsApp Cloud"
+        )
     if role not in _ROLES:
         raise WhatsAppProvisioningError("provisioning role is invalid")
     if not validate_only and not operator.isatty():
@@ -226,7 +298,10 @@ def run_whatsapp_provisioning(
         raise WhatsAppProvisioningError("Node.js is unavailable")
     script = _provisioner_script()
     _ensure_provisioner_dependencies(node, script)
-    ordinary, sensitive = resolve_provisioning_roots()
+    ordinary, sensitive = resolve_provisioning_roots(
+        role=role,
+        reprovision=reprovision,
+    )
     request_value: dict[str, object] = {
         "version": 1,
         "action": "validate" if validate_only else "provision",
@@ -244,12 +319,19 @@ def run_whatsapp_provisioning(
         separators=(",", ":"),
         sort_keys=True,
     ) + "\n"
-    phone = None
-    ordinary = None
-    sensitive = None
     child_args = [node, str(script)]
     if not validate_only:
         child_args.append("--operator-stdio")
+    # Validation is strictly read-only.  A provisioning child holds the
+    # cross-role advisory lock for its exact lifetime; validation instead
+    # tolerates a concurrent atomic rename by returning not-ready/failing
+    # closed without creating a persistent lock path.
+    lock_descriptor = (
+        None if validate_only else _acquire_provisioning_lock(ordinary, sensitive)
+    )
+    phone = None
+    ordinary = None
+    sensitive = None
     try:
         popen_kwargs: dict[str, object] = {
             "stdin": subprocess.PIPE,
@@ -260,12 +342,7 @@ def run_whatsapp_provisioning(
             "errors": "strict",
             "env": _minimal_node_environment(node),
         }
-        if _is_windows():
-            popen_kwargs["creationflags"] = getattr(
-                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-            )
-        else:
-            popen_kwargs["start_new_session"] = True
+        popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
             child_args,
             **popen_kwargs,
@@ -276,6 +353,8 @@ def run_whatsapp_provisioning(
         phone = None
         ordinary = None
         sensitive = None
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
         raise WhatsAppProvisioningError("provisioner could not start") from None
     operator_stream = process.stderr if not validate_only else None
     # ``communicate`` must not compete with the dedicated operator reader for
@@ -346,6 +425,7 @@ def run_whatsapp_provisioning(
                     "state": event.get("state"),
                     "role": role,
                     "lid_ready": bool(event.get("lid_ready", False)),
+                    "error": event.get("error"),
                 }
         if final is None or final["state"] not in {
             "ready_for_production",
@@ -356,23 +436,22 @@ def run_whatsapp_provisioning(
             raise WhatsAppProvisioningError("provisioner readiness was inconsistent")
         if final["state"] == "needs_provisioning" and process.returncode not in {0, 1}:
             raise WhatsAppProvisioningError("provisioner readiness was inconsistent")
+        if final.get("error") == "unsafe_existing_session_requires_reprovision":
+            raise WhatsAppProvisioningError(
+                "existing WhatsApp session is unsafe to reuse; run again with explicit --reprovision"
+            )
+        final.pop("error", None)
         machine_output.write(json.dumps(final, sort_keys=True) + "\n")
         machine_output.flush()
         return final
     except BaseException:
         if process.poll() is None:
             try:
-                if not _is_windows():
-                    os.killpg(process.pid, 15)
-                else:
-                    process.terminate()
+                os.killpg(process.pid, 15)  # windows-footgun: ok — native win32 rejected before launch
                 process.wait(timeout=3)
             except BaseException:
                 try:
-                    if not _is_windows():
-                        os.killpg(process.pid, 9)
-                    else:
-                        process.kill()
+                    os.killpg(process.pid, 9)  # windows-footgun: ok — native win32 rejected before launch
                     process.wait(timeout=3)
                 except BaseException:
                     pass
@@ -399,9 +478,18 @@ def run_whatsapp_provisioning(
         code_event = None
         code_frame = ""
         operator_failure.clear()
+        if lock_descriptor is not None:
+            try:
+                os.close(lock_descriptor)
+            except OSError:
+                pass
 
 
 def command(args) -> int:
+    if _is_windows():
+        raise WhatsAppProvisioningError(
+            "native Windows offline provisioning is unsupported; use a pre-provisioned session from a supported POSIX host or WhatsApp Cloud"
+        )
     role = str(getattr(args, "role", "") or "")
     validate_only = getattr(args, "validate_only", False) is True
     reprovision = getattr(args, "reprovision", False) is True
@@ -431,6 +519,13 @@ def command(args) -> int:
                 validate_only=True,
             )
             if validated["state"] == "ready_for_production":
+                if role == "ordinary":
+                    from cli import save_config_value
+
+                    if save_config_value("platforms.whatsapp.enabled", True) is not True:
+                        raise WhatsAppProvisioningError(
+                            "ordinary provisioning completed but configuration was not enabled"
+                        )
                 return 0
         try:
             operator.write("WhatsApp phone number (international format): ")

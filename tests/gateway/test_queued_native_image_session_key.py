@@ -1,4 +1,5 @@
 import base64
+from contextvars import ContextVar
 import importlib
 import sys
 import types
@@ -9,6 +10,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+from gateway.trusted_private_read_host import TrustedPrivateReadEventBinding
 
 
 _ONE_BY_ONE_PNG = base64.b64decode(
@@ -65,6 +67,21 @@ class CaptureQueuedNativeImageAgent:
         }
 
 
+class _TypedEventHost:
+    def __init__(self):
+        self.current = ContextVar("queued-private-event", default=None)
+        self.bound_users = []
+
+    def bind_event(self, event):
+        user = event.source.user_id if event is not None else None
+        self.bound_users.append(user)
+        token = self.current.set(user)
+        return TrustedPrivateReadEventBinding(token, user is not None)
+
+    def unbind_event(self, binding):
+        self.current.reset(binding.token)
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -116,15 +133,17 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
         chat_type="group",
+        user_id="user-a",
     )
     pending_source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
         chat_type="group",
         thread_id="17585",
+        user_id="user-b",
     )
 
-    adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
+    pending_event = MessageEvent(
         text="describe this",
         message_type=MessageType.PHOTO,
         source=pending_source,
@@ -132,6 +151,16 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         media_types=["image/png"],
         message_id="queued-1",
     )
+    adapter._pending_messages["agent:main:telegram:group:-1001"] = pending_event
+    initial_event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="initial-1",
+    )
+    host = _TypedEventHost()
+    runner._trusted_private_read_host = host
+    runner._private_read_active_principals = {}
 
     result = await runner._run_agent(
         message="hello",
@@ -140,6 +169,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         source=source,
         session_id="sess-native-image-followup",
         session_key="agent:main:telegram:group:-1001",
+        logical_event=initial_event,
     )
 
     assert result["final_response"] == "done-2"
@@ -149,3 +179,5 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+    assert host.bound_users == ["user-a", "user-b"]
+    assert host.current.get() is None

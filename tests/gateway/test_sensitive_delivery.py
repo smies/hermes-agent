@@ -3052,6 +3052,21 @@ async def test_synthetic_authenticated_private_read_e2e_never_persists_plaintext
         approval_token = host.bind_event(approval_event)
         host.unbind_event(approval_token)
 
+        # Real-host replay regression: the second identical OwnerDecision is
+        # unapplied.  Even while an A context exists in this task, the replay
+        # must install an explicit empty context rather than inheriting A.
+        user_a_binding = host.bind_event(request_event)
+        assert user_a_binding.private_context is True
+        assert current_context.get() is not None
+        replay_binding = host.bind_event(approval_event)
+        try:
+            assert replay_binding.private_context is False
+            assert current_context.get() is None
+        finally:
+            host.unbind_event(replay_binding)
+            host.unbind_event(user_a_binding)
+        assert current_context.get() is None
+
         deadline = time.monotonic() + 5
         terminal = None
         while time.monotonic() < deadline:

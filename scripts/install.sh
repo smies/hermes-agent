@@ -2435,20 +2435,34 @@ run_setup_wizard() {
 }
 
 maybe_start_gateway() {
-    # Check if any messaging platform tokens were configured
+    # Check if any messaging platform tokens were configured. WhatsApp uses
+    # the runtime's YAML-first resolver (including populated legacy-session
+    # precedence), rather than a second installer-only implementation.
     ENV_FILE="$HERMES_HOME/.env"
-    if [ ! -f "$ENV_FILE" ]; then
-        return 0
-    fi
 
     HAS_MESSAGING=false
-    for VAR in TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN WHATSAPP_ENABLED; do
-        VAL=$(grep "^${VAR}=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-        if [ -n "$VAL" ] && [ "$VAL" != "your-token-here" ]; then
-            HAS_MESSAGING=true
-            break
-        fi
-    done
+    if [ -f "$ENV_FILE" ]; then
+        for VAR in TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
+            VAL=$(grep "^${VAR}=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
+            if [ -n "$VAL" ] && [ "$VAL" != "your-token-here" ]; then
+                HAS_MESSAGING=true
+                break
+            fi
+        done
+    fi
+
+    if [ "$USE_VENV" = true ]; then
+        WHATSAPP_PROBE_PY="$INSTALL_DIR/venv/bin/python"
+    else
+        WHATSAPP_PROBE_PY="$(command -v python3 || command -v python || true)"
+    fi
+    WHATSAPP_STATE=""
+    if [ -n "$WHATSAPP_PROBE_PY" ] && [ -x "$WHATSAPP_PROBE_PY" ]; then
+        WHATSAPP_STATE=$(cd "$INSTALL_DIR" && "$WHATSAPP_PROBE_PY" -m hermes_cli.whatsapp_runtime 2>/dev/null || true)
+    fi
+    case "$WHATSAPP_STATE" in
+        enabled=true*) HAS_MESSAGING=true ;;
+    esac
 
     if [ "$HAS_MESSAGING" = false ]; then
         return 0
@@ -2459,11 +2473,7 @@ maybe_start_gateway() {
     log_info "The gateway needs to be running for Hermes to send/receive messages."
 
     # Authentication is an explicit offline phone-number-code operation.
-    WHATSAPP_VAL=$(grep "^WHATSAPP_ENABLED=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
-    # HERMES_HOME is already the selected default/named profile root; mirror
-    # get_hermes_dir("platforms/whatsapp/session", "whatsapp/session").
-    WHATSAPP_SESSION="$HERMES_HOME/platforms/whatsapp/session/creds.json"
-    if [ "$WHATSAPP_VAL" = "true" ] && [ ! -f "$WHATSAPP_SESSION" ]; then
+    if [ "$WHATSAPP_STATE" = "enabled=true;ready=false" ]; then
         if [ "$IS_INTERACTIVE" = true ]; then
             echo ""
             log_info "WhatsApp is enabled but its ordinary session is not provisioned."

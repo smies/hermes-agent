@@ -6680,8 +6680,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(self, "_trusted_private_read_host", None) is None:
             return True
         active = getattr(self, "_private_read_active_principals", {}).get(session_key)
+        if active is None:
+            return True
         incoming = self._private_read_principal(event)
-        return active is not None and incoming is not None and active == incoming
+        return incoming is not None and active == incoming
+
+    def _guard_private_read_busy_principal(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Fence every live-turn route before it can mutate shared state."""
+        # The adapter's active-session key is intentionally profile-agnostic;
+        # the runner's key is profile-namespaced under multiplexing.  Check
+        # the canonical runner key first, but retain the adapter key as a
+        # compatibility fallback so neither representation can fail open.
+        canonical_key = self._session_key_for_source(event.source)
+        active_principals = getattr(self, "_private_read_active_principals", {})
+        principal_key = canonical_key if canonical_key in active_principals else session_key
+        if self._private_read_live_injection_allowed(principal_key, event):
+            return True
+        self._queue_or_replace_pending_event(session_key, event)
+        logger.info(
+            "Queued cross-principal event for private-read-capable session %s",
+            session_key,
+        )
+        return False
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -11090,6 +11114,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            adapter.set_busy_principal_gate(self._guard_private_read_busy_principal)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
@@ -12464,6 +12489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    adapter.set_busy_principal_gate(self._guard_private_read_busy_principal)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
@@ -13418,6 +13444,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        adapter.set_busy_principal_gate(self._guard_private_read_busy_principal)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
@@ -14526,6 +14553,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        # Earliest runner-side busy-turn fence.  Adapter direct-dispatch paths
+        # apply the same callback before entering this handler, while relay and
+        # test callers can enter here directly.  Keep this before update,
+        # clarify, slash-confirm, redirect, interrupt, steer, and queue state.
+        if not self._guard_private_read_busy_principal(event, _quick_key):
+            return None
         _up_state = self._peek_session_state(_quick_key)
         if _up_state is not None and _up_state.persistent.update_prompt_pending:
             raw = (event.text or "").strip()
@@ -24031,9 +24064,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # host then installs an explicit empty context, preventing a
                 # nested helper call without a logical event from inheriting
                 # its caller's authenticated private-read authority.
+                from gateway.trusted_private_read_host import (
+                    TrustedPrivateReadEventBinding,
+                )
+
                 private_token = private_host.bind_event(logical_event)
+                if type(private_token) is not TrustedPrivateReadEventBinding:
+                    try:
+                        private_host.unbind_event(private_token)
+                    except BaseException:
+                        pass
+                    try:
+                        private_host._healthy = False
+                    except BaseException:
+                        pass
+                    try:
+                        from tools.private_read_request_tool import (
+                            configure_private_read_request_runtime,
+                        )
+                        configure_private_read_request_runtime(None)
+                    except BaseException:
+                        pass
+                    raise RuntimeError(
+                        "trusted private-read host did not prove event binding"
+                    )
                 private_bound = True
-                if logical_event is not None:
+                if logical_event is not None and private_token.private_context:
                     principal = self._private_read_principal(logical_event)
                     if principal is None:
                         raise RuntimeError("authenticated private-read principal is unavailable")

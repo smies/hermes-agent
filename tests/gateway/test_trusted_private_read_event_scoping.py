@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from types import MethodType, SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.config import PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
+from gateway.trusted_private_read_host import TrustedPrivateReadEventBinding
 
 
 def _event(user: str, message: str) -> MessageEvent:
@@ -34,20 +37,37 @@ class _EventBoundHost:
 
     def bind_event(self, event: MessageEvent):
         if event is None:
-            return self.current.set(None)
+            return TrustedPrivateReadEventBinding(self.current.set(None), False)
         user = event.source.user_id
-        return self.current.set({
+        token = self.current.set({
             "source": (event.source.platform.value, event.source.scope_id, user),
             "pdp_subject": f"subject-{user}",
             "approval": f"approval-{user}",
             "resource": f"resource-{user}",
             "delivery": f"delivery-{user}",
         })
+        return TrustedPrivateReadEventBinding(token, True)
 
     def unbind_event(self, token) -> None:
         self.unbound.append(token)
-        if token is not None:
-            self.current.reset(token)
+        self.current.reset(token.token)
+
+
+class _FenceAdapter(BasePlatformAdapter):
+    def __init__(self) -> None:
+        super().__init__(PlatformConfig(enabled=True, token="fixture"), Platform.SLACK)
+
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content, **kwargs):
+        return SendResult(success=True, message_id="fixture")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
 
 
 def _runner(host: _EventBoundHost) -> GatewayRunner:
@@ -200,3 +220,107 @@ async def test_nested_internal_run_receives_explicit_empty_private_context() -> 
     assert observed[1] is None
     assert observed[2]["source"] == ("slack", "workspace-1", "user-a")
     assert host.current.get() is None
+
+
+@pytest.mark.asyncio
+async def test_untyped_binding_aborts_and_attempts_cleanup_before_agent_execution() -> None:
+    event = _event("user-a", "active")
+    cleaned: list[object] = []
+
+    class _AmbiguousHost:
+        _healthy = True
+
+        def bind_event(self, _event):
+            return None
+
+        def unbind_event(self, token):
+            cleaned.append(token)
+
+    runner = _runner(_EventBoundHost())
+    runner._trusted_private_read_host = _AmbiguousHost()
+    runner._run_agent_inner = AsyncMock(side_effect=AssertionError("agent must not run"))
+
+    with pytest.raises(RuntimeError, match="did not prove event binding"):
+        await runner._run_agent(
+            "message",
+            "context",
+            [],
+            event.source,
+            "session",
+            session_key=build_session_key(event.source, thread_sessions_per_user=False),
+            logical_event=event,
+        )
+
+    assert cleaned == [None]
+    runner._run_agent_inner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["2", "/approve", "/stop", "redirect me"])
+async def test_base_adapter_principal_gate_precedes_every_busy_direct_dispatch(
+    text: str,
+) -> None:
+    from tools import clarify_gateway
+
+    event_a = _event("user-a", "active")
+    event_b = _event("user-b", text)
+    event_b.message_type = MessageType.TEXT
+    session = build_session_key(event_a.source, thread_sessions_per_user=False)
+    runner = _runner(_EventBoundHost())
+    runner._private_read_active_principals[session] = runner._private_read_principal(event_a)
+    queued: list[MessageEvent] = []
+    runner._queue_or_replace_pending_event = lambda _key, event: queued.append(event)
+
+    adapter = _FenceAdapter()
+    adapter._message_handler = AsyncMock(return_value="")
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+    adapter.set_busy_principal_gate(runner._guard_private_read_busy_principal)
+    adapter._active_sessions[session] = __import__("asyncio").Event()
+    clarify_gateway.clear_session(session)
+    clarify_gateway.register("clarify-fence", session, "Pick", ["A", "B"])
+    try:
+        await adapter.handle_message(event_b)
+        assert queued == [event_b]
+        adapter._message_handler.assert_not_awaited()
+        adapter._busy_session_handler.assert_not_awaited()
+        assert clarify_gateway.get_pending_for_session(
+            session, include_choice_prompts=True
+        ) is not None
+    finally:
+        clarify_gateway.clear_session(session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route_text",
+    ["yes", "clarify answer", "/approve", "redirect", "/stop", "/steer guidance"],
+)
+async def test_runner_earliest_gate_queues_cross_principal_before_early_routes(
+    route_text: str,
+) -> None:
+    event_a = _event("user-a", "active")
+    event_b = _event("user-b", route_text)
+    session = build_session_key(event_a.source, thread_sessions_per_user=False)
+    runner = _runner(_EventBoundHost())
+    runner.config = SimpleNamespace(
+        multiplex_profiles=False,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    runner.session_store = None
+    runner._running_agents = {session: MagicMock()}
+    runner._running_agents_ts = {session: 1.0}
+    runner._private_read_active_principals[session] = runner._private_read_principal(event_a)
+    runner._is_user_authorized = lambda _source: True
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    queued: list[MessageEvent] = []
+    runner._queue_or_replace_pending_event = lambda _key, event: queued.append(event)
+
+    result = await GatewayRunner._handle_message(runner, event_b)
+
+    assert result is None
+    assert queued == [event_b]
+    runner._running_agents[session].interrupt.assert_not_called()
+    runner._running_agents[session].redirect.assert_not_called()
+    runner._running_agents[session].steer.assert_not_called()

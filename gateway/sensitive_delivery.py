@@ -1004,7 +1004,7 @@ class SensitiveDeliveryProcessLease(_NoCopyOrPickle):
             )
 
         if _process_group_exists(process_group_id):
-            _signal_process_group(process_group_id, signal.SIGKILL)
+            _signal_process_group(process_group_id, signal.SIGKILL)  # windows-footgun: ok — sensitive transport is POSIX-only and runtime-gated
         while (
             monotonic_clock() < cleanup_deadline
             and time.monotonic() < real_cleanup_deadline
@@ -1033,7 +1033,7 @@ class SensitiveDeliveryProcessLease(_NoCopyOrPickle):
             ) from exc
         if _process_group_exists(process_group_id):
             try:
-                _signal_process_group(process_group_id, signal.SIGKILL)
+                _signal_process_group(process_group_id, signal.SIGKILL)  # windows-footgun: ok — sensitive transport is POSIX-only and runtime-gated
             finally:
                 raise SensitiveDeliveryCleanupError(
                     "sidecar process-group cleanup could not be proven"
@@ -2298,10 +2298,10 @@ class SensitiveDeliveryRouter(_NoCopyOrPickle):
                     message=r".*multi-threaded.*fork.*deadlocks.*",
                     category=DeprecationWarning,
                 )
-                pid = os.fork()
+                pid = os.fork()  # windows-footgun: ok — constructor rejects non-POSIX before launch
             if pid == 0:
                 try:
-                    os.setsid()
+                    os.setsid()  # windows-footgun: ok — post-fork POSIX child only
                     os.dup2(stdin_read, 0)
                     os.dup2(stdout_write, 1)
                     os.dup2(stderr_write, 2)
@@ -2641,7 +2641,7 @@ class SensitiveDeliveryRouter(_NoCopyOrPickle):
                 )
             )
         if _process_group_exists(process_group_id):
-            _signal_owned_process(process, signal.SIGKILL)
+            _signal_owned_process(process, signal.SIGKILL)  # windows-footgun: ok — owned POSIX child only
 
         while (
             self._monotonic() < process_deadline
@@ -2690,7 +2690,7 @@ class SensitiveDeliveryRouter(_NoCopyOrPickle):
         ):
             process.child_ownership.state = "reaped"
         if group_exists and not _owned_pid_number_was_reused(process):
-            _signal_owned_process(process, signal.SIGKILL)
+            _signal_owned_process(process, signal.SIGKILL)  # windows-footgun: ok — owned POSIX child only
             cleanup_errors.append(
                 SensitiveDeliveryCleanupError(
                     "one-shot process-group cleanup could not be proven"
@@ -3189,7 +3189,7 @@ def _cleanup_budget_seconds(term_grace_seconds):
 
 def _signal_process_group(process_group_id, sig):
     try:
-        os.killpg(process_group_id, sig)
+        os.killpg(process_group_id, sig)  # windows-footgun: ok — helper is called only by POSIX-only sensitive transport
     except ProcessLookupError:
         return False
     except OSError:
@@ -3278,10 +3278,10 @@ def _cleanup_raw_fork_pid(
             # cleanup checks or signals at an unrelated process group.
             time.sleep(_CLEANUP_POLL_SECONDS)
 
-    _signal_process_group(pid, signal.SIGKILL)
+    _signal_process_group(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX child cleanup only
     if not leader_reaped:
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX child cleanup only
         except (ProcessLookupError, OSError):
             pass
     child_state = "leader_reaped" if leader_reaped else "owned"
@@ -3371,7 +3371,7 @@ def _owned_pid_number_was_reused(process):
 
 def _process_group_exists(process_group_id):
     try:
-        os.killpg(process_group_id, 0)
+        os.killpg(process_group_id, 0)  # windows-footgun: ok — POSIX process-group liveness probe
     except ProcessLookupError:
         return False
     except PermissionError:

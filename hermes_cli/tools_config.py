@@ -2080,7 +2080,11 @@ def _get_enabled_platforms() -> List[str]:
         enabled.append("discord")
     if get_env_value("SLACK_BOT_TOKEN"):
         enabled.append("slack")
-    if get_env_value("WHATSAPP_ENABLED"):
+    from hermes_cli.whatsapp_runtime import resolve_whatsapp_enabled
+
+    if resolve_whatsapp_enabled(
+        load_config(), legacy_value=get_env_value("WHATSAPP_ENABLED")
+    ):
         enabled.append("whatsapp")
     if get_env_value("QQ_APP_ID"):
         enabled.append("qqbot")
