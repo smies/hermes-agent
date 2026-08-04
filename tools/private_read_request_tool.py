@@ -33,11 +33,15 @@ _GENERIC_DEFERRED_FINAL = (
 
 def configure_private_read_request_runtime(
     runtime: PrivateReadRequestRuntime | None,
+    *,
+    health_check=None,
 ) -> None:
     """Atomically install or remove complete trusted host configuration."""
     if runtime is not None and type(runtime) is not PrivateReadRequestRuntime:
         raise TypeError("private read request runtime has an invalid type")
-    _register_runtime(runtime)
+    if health_check is not None and not callable(health_check):
+        raise TypeError("private read request health check must be callable")
+    _register_runtime(runtime, health_check=health_check)
 
 
 def check_private_read_request_runtime() -> bool:
@@ -96,12 +100,22 @@ class _RuntimeBoundPrivateReadHandler:
     """Exact runtime and handler identity committed in one registry entry."""
 
     runtime: PrivateReadRequestRuntime | None = field(repr=False)
+    health_check: object = field(default=None, repr=False)
+
+    def healthy(self) -> bool:
+        if self.health_check is None:
+            return True
+        try:
+            return self.health_check() is True
+        except BaseException:
+            return False
 
     def available(self) -> bool:
         runtime = self.runtime
         return bool(
             runtime is not None
             and runtime.enabled
+            and self.healthy()
             and len(runtime.capabilities.capabilities) > 0
         )
 
@@ -112,6 +126,8 @@ class _RuntimeBoundPrivateReadHandler:
         tool_call_id: str | None = None,
         **_host_kwargs: object,
     ) -> ToolExecutionResult:
+        if not self.healthy():
+            return terminal_safe_failure("terminal_handler_error")
         return _private_read_request_for_runtime(
             self.runtime,
             args,
@@ -140,9 +156,9 @@ PRIVATE_READ_REQUEST_SCHEMA = {
 }
 
 
-def _register_runtime(runtime: PrivateReadRequestRuntime | None) -> None:
+def _register_runtime(runtime: PrivateReadRequestRuntime | None, *, health_check=None) -> None:
     """Commit a runtime-bound handler and its generation under registry authority."""
-    handler = _RuntimeBoundPrivateReadHandler(runtime)
+    handler = _RuntimeBoundPrivateReadHandler(runtime, health_check)
     registry._register_host_terminal_tool(
         name=PRIVATE_READ_REQUEST_TOOL_NAME,
         toolset="private-read-request",

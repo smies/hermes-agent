@@ -147,7 +147,7 @@ TTS settings are read from **two** OpenClaw config locations with this priority:
 | Slack | `channels.slack.botToken` or `.accounts.default.botToken` | `SLACK_BOT_TOKEN` | |
 | Slack | `channels.slack.appToken` or `.accounts.default.appToken` | `SLACK_APP_TOKEN` | |
 | Slack | `channels.slack.allowFrom` or `.accounts.default.allowFrom` | `SLACK_ALLOWED_USERS` | |
-| WhatsApp | `channels.whatsapp.allowFrom` or `.accounts.default.allowFrom` | `WHATSAPP_ALLOWED_USERS` | Auth via Baileys QR pairing — requires re-pairing after migration |
+| WhatsApp | `channels.whatsapp.allowFrom` or `.accounts.default.allowFrom` | `WHATSAPP_ALLOWED_USERS` | Auth is validated in place or provisioned offline with a phone-number pairing code |
 | Signal | `channels.signal.account` or `.accounts.default.account` | `SIGNAL_ACCOUNT` | |
 | Signal | `channels.signal.httpUrl` or `.accounts.default.httpUrl` | `SIGNAL_HTTP_URL` | |
 | Signal | `channels.signal.allowFrom` or `.accounts.default.allowFrom` | `SIGNAL_ALLOWED_USERS` | |
@@ -235,7 +235,7 @@ The migration resolves all three formats. For env templates and SecretRef object
 
 6. **Check session policies** — run `hermes config show` and verify the `session_reset` value matches your expectations.
 
-7. **Re-pair WhatsApp** — WhatsApp uses QR code pairing (Baileys), not token migration. Run `hermes whatsapp` to pair.
+7. **Validate WhatsApp auth** — Run `hermes whatsapp provision --role ordinary`. Hermes reuses an exact valid session in place; only an unavailable or stale session needs a phone-number pairing code.
 
 8. **Archive cleanup** — after confirming everything works, run `hermes claw cleanup` to rename leftover OpenClaw directories to `.pre-migration/` (prevents state confusion).
 

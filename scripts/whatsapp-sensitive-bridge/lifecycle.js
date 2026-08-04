@@ -146,9 +146,13 @@ export class SensitiveSocketLifecycle {
       return;
     }
     if (!this.running || generation !== this.generation) return;
-    const storedAccount = auth?.state?.creds?.me?.id
-      ? this.#canonicalAccount(auth.state.creds.me.id)
-      : null;
+    const storedAccounts = [
+      auth?.state?.creds?.me?.id,
+      auth?.state?.creds?.me?.lid,
+    ].map((value) => this.#canonicalAccount(value)).filter(Boolean);
+    const storedAccount = storedAccounts.includes(this.expectedSensitiveAccountJid)
+      ? this.expectedSensitiveAccountJid
+      : storedAccounts[0] || null;
     if (storedAccount && (storedAccount !== this.expectedSensitiveAccountJid
         || storedAccount === this.ordinaryAccountJid)) {
       this.#fatal('sensitive_account_mismatch');

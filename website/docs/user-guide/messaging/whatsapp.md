@@ -43,38 +43,37 @@ bot stops working after a WhatsApp update, pull the latest Hermes version and re
 ## Prerequisites
 
 - **Node.js v18+** and **npm** — the WhatsApp bridge runs as a Node.js process
-- **A phone with WhatsApp** installed (for scanning the QR code)
+- **A phone with WhatsApp** installed (for entering a linked-device code)
 
 Unlike older browser-driven bridges, the current Baileys-based bridge does **not** require a local Chromium or Puppeteer dependency stack.
 
 ---
 
-## Step 1: Run the Setup Wizard
+## Step 1: Configure and authenticate
 
 ```bash
 hermes whatsapp
 ```
 
-The wizard will:
+The setup wizard configures mode and dependencies. Authentication is a
+separate offline command:
 
-1. Ask which mode you want (**bot** or **self-chat**)
-2. Install bridge dependencies if needed
-3. Display a **QR code** in your terminal
-4. Wait for you to scan it
+```bash
+hermes whatsapp provision --role ordinary
+```
 
-**To scan the QR code:**
+The command first validates the profile's configured ordinary session. A valid
+session is reused in place without copying or changing credentials. Otherwise,
+it asks for the phone number interactively and writes one short pairing code
+only to the controlling terminal.
 
 1. Open WhatsApp on your phone
 2. Go to **Settings → Linked Devices**
 3. Tap **Link a Device**
-4. Point your camera at the terminal QR code
+4. Choose the phone-number-code option and enter the displayed code
 
-Once paired, the wizard confirms the connection and exits. Your session is saved automatically.
-
-:::tip
-If the QR code looks garbled, make sure your terminal is at least 60 columns wide and supports
-Unicode. You can also try a different terminal emulator.
-:::
+There is no QR fallback, and production gateway startup cannot provision an
+account.
 
 ---
 
@@ -92,7 +91,7 @@ After getting the number:
 
 1. Install WhatsApp on a phone (or use WhatsApp Business app with dual-SIM)
 2. Register the new number with WhatsApp
-3. Run `hermes whatsapp` and scan the QR code from that WhatsApp account
+3. Run `hermes whatsapp provision --role ordinary` and enter its pairing code
 
 ---
 
@@ -146,22 +145,23 @@ The gateway starts the WhatsApp bridge automatically using the saved session.
 
 The Baileys bridge saves its session under `~/.hermes/platforms/whatsapp/session`. This means:
 
-- **Sessions survive restarts** — you don't need to re-scan the QR code every time
+- **Sessions survive restarts** — a ready session is reused in place
 - The session data includes encryption keys and device credentials
 - **Do not share or commit this session directory** — it grants full access to the WhatsApp account
 
 ---
 
-## Re-pairing
+## Reprovisioning
 
 If the session breaks (phone reset, WhatsApp update, manually unlinked), you'll see connection
 errors in the gateway logs. To fix it:
 
 ```bash
-hermes whatsapp
+hermes whatsapp provision --role ordinary --reprovision
 ```
 
-This generates a fresh QR code. Scan it again and the session is re-established. The gateway
+This requests a fresh short phone-number pairing code through the controlling terminal. Enter it
+through WhatsApp Linked Devices to re-establish the session. The gateway
 handles **temporary** disconnections (network blips, phone going offline briefly) automatically
 with reconnection logic.
 
@@ -244,12 +244,11 @@ Set `text_batch_delay_seconds: 0` to dispatch each message immediately (disables
 
 | Problem | Solution |
 |---------|----------|
-| **QR code not scanning** | Ensure terminal is wide enough (60+ columns). Try a different terminal. Make sure you're scanning from the correct WhatsApp account (bot number, not personal). |
-| **QR code expires** | QR codes refresh every ~20 seconds. If it times out, restart `hermes whatsapp`. |
+| **Pairing code expires** | Run `hermes whatsapp provision --role ordinary` again. There is no QR fallback. |
 | **Session not persisting** | Check that `~/.hermes/platforms/whatsapp/session` exists and is writable. If containerized, mount it as a persistent volume. |
-| **Logged out unexpectedly** | WhatsApp unlinks devices after long inactivity. Keep the phone on and connected to the network, then re-pair with `hermes whatsapp` if needed. |
-| **Bridge crashes or reconnect loops** | Restart the gateway, update Hermes, and re-pair if the session was invalidated by a WhatsApp protocol change. |
-| **Bot stops working after WhatsApp update** | Update Hermes to get the latest bridge version, then re-pair. |
+| **Logged out unexpectedly** | WhatsApp unlinks devices after long inactivity. Keep the phone on and connected to the network, then reprovision with `hermes whatsapp provision --role ordinary --reprovision` if needed. |
+| **Bridge crashes or reconnect loops** | Restart the gateway, update Hermes, and reprovision if the session was invalidated by a WhatsApp protocol change. |
+| **Bot stops working after WhatsApp update** | Update Hermes to get the latest bridge version, then reprovision if validation reports it is needed. |
 | **macOS: "Node.js not installed" but node works in terminal** | launchd services don't inherit your shell PATH. Run `hermes gateway install` to re-snapshot your current PATH into the plist, then `hermes gateway start`. See the [Gateway Service docs](./index.md#macos-launchd) for details. |
 | **Messages not being received** | Verify `WHATSAPP_ALLOWED_USERS` includes the sender's number (with country code, no `+` or spaces), or set it to `*` to allow everyone. Set `WHATSAPP_DEBUG=true` in `.env` and restart the gateway to see raw message events in `bridge.log`. |
 | **Bot replies to strangers with a pairing code** | Set `whatsapp.unauthorized_dm_behavior: ignore` in `~/.hermes/config.yaml` if you want unauthorized DMs to be silently ignored instead. |

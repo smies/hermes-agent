@@ -5824,6 +5824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._draining = False
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
+        self._trusted_private_read_host = None
         # External (NAS-driven) drain state — distinct from the shutdown
         # ``_draining`` flag above. Set by ``_drain_control_watcher`` when the
         # ``.drain_request.json`` marker is present: the gateway flips
@@ -6165,6 +6166,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Teams pipeline runtime unavailable: %s",
                 self._teams_pipeline_runtime_error,
             )
+
+    async def _start_trusted_private_read_host(self) -> bool:
+        """Parse and atomically install the explicit trusted-host runtime.
+
+        The services factory is a narrow gateway-owned composition seam. A
+        production build supplies the concrete provider/PDP/transport host;
+        absence or any invalid prerequisite leaves the service-gated schema
+        unavailable.
+        """
+        raw = getattr(self.config, "trusted_private_read", None)
+        if raw is None or not isinstance(raw, dict) or raw.get("enabled") is not True:
+            return False
+        host = None
+        try:
+            from gateway.trusted_private_read_host import (
+                TrustedPrivateReadGatewayHost,
+                TrustedPrivateReadHostConfig,
+                TrustedPrivateReadHostServices,
+            )
+
+            parsed = TrustedPrivateReadHostConfig.parse(raw)
+            if parsed is None:
+                return False
+            factory = getattr(self, "_trusted_private_read_services_factory", None)
+            if not callable(factory):
+                import importlib
+
+                module = importlib.import_module(parsed.services_module)
+                factory = getattr(module, "build_trusted_private_read_services", None)
+            if not callable(factory):
+                logger.error("Trusted private-read host services are unavailable")
+                return False
+            services = factory(self, parsed)
+            if type(services) is not TrustedPrivateReadHostServices:
+                logger.error("Trusted private-read host services failed validation")
+                return False
+            host = TrustedPrivateReadGatewayHost(parsed, services)
+            if not await host.start():
+                await host.stop()
+                return False
+            self._trusted_private_read_host = host
+            logger.info("Trusted private-read host is ready")
+            return True
+        except BaseException:
+            # Never include config paths, account identities, or provider
+            # exception text in the log boundary.
+            logger.error("Trusted private-read host failed closed")
+            if host is not None:
+                try:
+                    await host.stop()
+                except BaseException:
+                    pass
+            try:
+                from tools.private_read_request_tool import configure_private_read_request_runtime
+                configure_private_read_request_runtime(None)
+            except BaseException:
+                pass
+            return False
 
 
     def _warn_if_docker_media_delivery_is_risky(self) -> None:
@@ -10549,6 +10608,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Remove any process-global runtime left by an earlier runner in the
+        # same interpreter before parsing this runner's explicit opt-in.
+        try:
+            from tools.private_read_request_tool import configure_private_read_request_runtime
+            configure_private_read_request_runtime(None)
+        except BaseException:
+            logger.error("Trusted private-read runtime reset failed closed")
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -11228,6 +11294,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
+
+        await self._start_trusted_private_read_host()
 
         self._running = True
         self._update_runtime_status("running")
@@ -12681,6 +12749,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+
+            private_host = getattr(self, "_trusted_private_read_host", None)
+            self._trusted_private_read_host = None
+            if private_host is not None:
+                try:
+                    await private_host.stop()
+                except BaseException:
+                    logger.error(
+                        "Trusted private-read host cleanup could not be proven",
+                    )
+                    # Continue the gateway-wide cleanup so unrelated adapters,
+                    # readers and subprocess groups are still reaped.
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -16290,6 +16370,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        _private_read_event_token = None
+        _private_read_host = getattr(self, "_trusted_private_read_host", None)
+        if _private_read_host is not None:
+            try:
+                # Bind the exact authenticated event object after ordinary
+                # gateway authorization and propagate it through copy_context
+                # into the agent executor. Model arguments never enter here.
+                _private_read_event_token = _private_read_host.bind_event(event)
+            except BaseException:
+                logger.error("Trusted private-read event binding failed closed")
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -18126,6 +18216,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if _private_read_host is not None:
+                try:
+                    _private_read_host.unbind_event(_private_read_event_token)
+                except BaseException:
+                    logger.error("Trusted private-read event cleanup failed closed")
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 

@@ -3,9 +3,11 @@
 This package is a canonical, loopback-only Baileys process for low-level
 sensitive-delivery evidence. It does not import the ordinary WhatsApp bridge
 or its adapter, session, socket, queue, indexes, logger, hooks, formatting, or
-retry paths. It does not mint authorization or user-facing receipts; a later
-trusted host launcher must verify the transport identity, validate the returned
-evidence, and bind that evidence into its own immutable receipt.
+retry paths. It does not mint authorization or user-facing receipts. The
+default-off gateway owner verifies the transport identity, validates returned
+evidence, and binds it into its own immutable receipt; provider-specific
+dependencies come from the reviewed host services module named by the
+versioned configuration block.
 
 Production is disabled unless the host supplies a fresh inherited capability
 and all canonical launcher arguments. The sensitive session must be paired and
@@ -59,6 +61,13 @@ auth directory before production enablement. The production socket sets
 `fireInitQueries` to false, so it will not use history or offline-sync payloads.
 The host must treat a missing or stale LID mapping as unavailable and return the
 session to offline provisioning; it must not relax these production settings.
+
+Run `hermes whatsapp provision --role sensitive` in an interactive terminal.
+It first performs a read-only readiness check and reuses a valid session. Only
+a missing, invalid, stale, mismatched, or explicitly reprovisioned session
+reaches Baileys `requestPairingCode`; the phone number crosses on bounded stdin
+and the short code crosses a dedicated inherited operator pipe. Production
+startup contains no pairing operation and there is no QR fallback.
 
 ## Evidence semantics
 

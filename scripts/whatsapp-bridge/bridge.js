@@ -29,7 +29,6 @@ import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
-import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
@@ -108,8 +107,6 @@ try {
     .digest('hex')
     .slice(0, 16);
 } catch {}
-const PAIR_ONLY = args.includes('--pair-only');
-const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -388,18 +385,24 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
-function emitPairEvent(event) {
-  if (!PAIR_JSON) return;
-  try {
-    console.log(JSON.stringify({ ts: Date.now(), ...event }));
-  } catch {}
-}
-
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  if (state?.creds?.registered !== true) {
+    console.log('❌ WhatsApp session requires offline provisioning.');
+    process.exitCode = 1;
+    return;
+  }
+  const storedPhone = String(state?.creds?.me?.id || '')
+    .replace(/:\d+@/, '@')
+    .replace(/@s\.whatsapp\.net$/, '');
+  if (!storedPhone || !Object.values(lidToPhone).includes(storedPhone)) {
+    console.log('❌ WhatsApp session LID bootstrap is incomplete.');
+    process.exitCode = 1;
+    return;
+  }
   const version = await getWAVersion();
 
   sock = makeWASocket({
@@ -409,72 +412,38 @@ async function startSocket() {
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
+    fireInitQueries: false,
+    shouldSyncHistoryMessage: () => false,
     markOnlineOnConnect: false,
-    // Required for Baileys 7.x: without this, incoming messages that need
-    // E2EE session re-establishment are silently dropped (msg.message === null)
-    getMessage: async (key) => {
-      // We don't maintain a message store, so return a placeholder.
-      // This is enough for Baileys to complete the retry handshake.
-      return { conversation: '' };
-    },
+    // Production never recovers offline payloads. Authentication and the
+    // initial LID mapping are completed only by offline_provision.js.
+    getMessage: async () => undefined,
   });
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      if (PAIR_JSON) {
-        emitPairEvent({ event: 'qr', qr });
-      } else {
-        console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
-        qrcode.generate(qr, { small: true });
-        console.log('\nWaiting for scan...\n');
-      }
-    }
+    const { connection, lastDisconnect } = update;
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
 
       if (reason === DisconnectReason.loggedOut) {
-        emitPairEvent({ event: 'error', error: 'logged_out', reason });
-        if (!PAIR_JSON) {
-          console.log('❌ Logged out. Delete session and restart to re-authenticate.');
-        }
+        console.log('❌ Logged out. Run the offline provisioner to authenticate again.');
         process.exit(1);
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
-        emitPairEvent({ event: 'disconnected', reason });
-        if (!PAIR_JSON) {
-          if (reason === 515) {
-            console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
-          } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
-          }
+        if (reason === 515) {
+          console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+        } else {
+          console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
         }
         scheduleReconnect(reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
-      const connectedUser = sock?.user
-        ? {
-            id: sock.user.id || null,
-            name: sock.user.name || sock.user.verifiedName || null,
-          }
-        : null;
-      emitPairEvent({ event: 'connected', user: connectedUser });
-      if (!PAIR_JSON) {
-        console.log('✅ WhatsApp connected!');
-      }
-      if (PAIR_ONLY) {
-        if (!PAIR_JSON) {
-          console.log('✅ Pairing complete. Credentials saved.');
-        }
-        // Give Baileys a moment to flush creds, then exit cleanly
-        setTimeout(() => process.exit(0), 2000);
-      }
+      console.log('✅ WhatsApp connected!');
     }
   });
 
@@ -1114,29 +1083,12 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start
-if (PAIR_ONLY) {
-  // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
-  if (PAIR_JSON) {
-    emitPairEvent({ event: 'started', session: SESSION_DIR });
-  } else {
-    console.log('📱 WhatsApp pairing mode');
-    console.log(`📁 Session: ${SESSION_DIR}`);
-    console.log();
-  }
-  startSocket().catch((err) => {
-    emitPairEvent({ event: 'error', error: err?.message || String(err) });
-    if (!PAIR_JSON) {
-      console.error(err);
-    }
-    process.exit(1);
-  });
-} else {
-  app.listen(PORT, '127.0.0.1', () => {
-    console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
-    console.log(`📁 Session stored in: ${SESSION_DIR}`);
+// Production startup is deliberately pairing-free. Missing or invalid auth
+// can only be repaired by the separately invoked offline provisioner.
+app.listen(PORT, '127.0.0.1', () => {
+    console.log('🌉 WhatsApp bridge is listening');
     if (ALLOWED_USERS.size > 0) {
-      console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
+      console.log('🔒 An explicit allowlist is active.');
     } else if (WHATSAPP_MODE === 'self-chat') {
       console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
     } else if (WHATSAPP_MODE === 'bot' && WHATSAPP_DM_POLICY === 'pairing') {
@@ -1150,6 +1102,5 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    scheduleReconnect(0);
-  });
-}
+  scheduleReconnect(0);
+});

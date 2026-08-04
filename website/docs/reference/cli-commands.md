@@ -46,7 +46,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes egress` | Outbound credential-injection firewall for remote terminal sandboxes (iron-proxy). Disabled by default. See [Egress proxy](../user-guide/egress/iron-proxy.md). |
 | `hermes lsp` | Manage Language Server Protocol integration (semantic diagnostics for write_file/patch). |
 | `hermes setup` | Interactive setup wizard for all or part of the configuration. |
-| `hermes whatsapp` | Configure and pair the WhatsApp bridge. |
+| `hermes whatsapp` | Configure the WhatsApp bridge. Use `hermes whatsapp provision --role ordinary|sensitive` for reuse-first offline phone-number-code provisioning; add `--validate-only` for machine-readable readiness or `--reprovision` for explicit replacement. There is no QR fallback. |
 | `hermes whatsapp-cloud` | Configure the official Meta WhatsApp Business Cloud API adapter (Business account + public webhook required). Distinct from `hermes whatsapp` (Baileys personal-account bridge). |
 | `hermes slack` | Slack helpers (currently: generate the app manifest with every command as a native slash). |
 | `hermes auth` | Manage credentials — add, list, remove, reset, status, logout. Handles OAuth flows for Codex/Nous/Anthropic. |
@@ -353,7 +353,7 @@ For configuration of the gateway itself, see [Tool Gateway](../user-guide/featur
 hermes whatsapp
 ```
 
-Runs the WhatsApp pairing/setup flow, including mode selection and QR-code pairing.
+Configures the WhatsApp bridge. Auth sessions are validated or provisioned separately with `hermes whatsapp provision --role ordinary|sensitive`; existing valid sessions are reused, otherwise an alphanumeric phone-number pairing code is shown through the interactive operator channel.
 
 ## `hermes slack`
 

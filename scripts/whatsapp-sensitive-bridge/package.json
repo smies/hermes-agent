@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node sensitive_bridge.js",
+    "provision": "node offline_provision.js",
     "test": "node --test --test-concurrency=1 *.test.mjs"
   },
   "dependencies": {

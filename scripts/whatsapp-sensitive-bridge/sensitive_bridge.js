@@ -16,6 +16,7 @@ import { createSensitiveHttpHandler, listenLoopback } from './http_server.js';
 import { SensitiveSocketLifecycle } from './lifecycle.js';
 import { prepareSessionPaths, SessionPathError } from './session_paths.js';
 import { computeTransportIdentity } from './transport_identity.js';
+import { verifyLidBootstrap } from './provisioning_core.js';
 
 const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CAPABILITY_ENV = 'HERMES_WHATSAPP_SENSITIVE_CAPABILITY';
@@ -115,7 +116,25 @@ export async function runSensitiveBridge({ argv = process.argv.slice(2), env = p
     sessionPathGuard,
     expectedSensitiveAccountJid: sensitiveAccountJid,
     ordinaryAccountJid,
-    useAuthState: useMultiFileAuthState,
+    useAuthState: async (sessionDir) => {
+      const auth = await useMultiFileAuthState(sessionDir);
+      if (auth?.state?.creds?.registered !== true) {
+        throw new Error('provisioning_required');
+      }
+      const phoneJid = jidNormalizedUser(auth.state.creds?.me?.id || '');
+      const storedLid = jidNormalizedUser(auth.state.creds?.me?.lid || '');
+      const lid = await verifyLidBootstrap({
+        auth,
+        sock: {},
+        phoneJid,
+        canonicalizeJid: jidNormalizedUser,
+      });
+      if (!lid || (storedLid && lid !== storedLid)
+          || ![phoneJid, storedLid].includes(sensitiveAccountJid)) {
+        throw new Error('lid_bootstrap_incomplete');
+      }
+      return auth;
+    },
     makeSocket: makeWASocket,
     canonicalizeJid: jidNormalizedUser,
     onBound: (connection) => transport.bindConnection(connection),

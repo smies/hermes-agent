@@ -955,6 +955,11 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Versioned, generic trusted-host authorization block. ``None`` is the
+    # default and is intentionally omitted from serialization so disabled
+    # installations have no feature config surface or tool schema.
+    trusted_private_read: Optional[Dict[str, Any]] = None
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1047,7 +1052,7 @@ class GatewayConfig:
         return self.default_reset_policy
     
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        value = {
             "platforms": {
                 p.value: c.to_dict() for p, c in self.platforms.items()
             },
@@ -1080,6 +1085,9 @@ class GatewayConfig:
                 for r in self.profile_routes
             ],
         }
+        if self.trusted_private_read is not None:
+            value["trusted_private_read"] = dict(self.trusted_private_read)
+        return value
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GatewayConfig":
@@ -1214,6 +1222,11 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            trusted_private_read=(
+                dict(data["trusted_private_read"])
+                if isinstance(data.get("trusted_private_read"), dict)
+                else None
+            ),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -1368,6 +1381,10 @@ def load_gateway_config() -> GatewayConfig:
                 if "systemd_watchdog_seconds" in gateway_section:
                     gw_data["systemd_watchdog_seconds"] = gateway_section[
                         "systemd_watchdog_seconds"
+                    ]
+                if "trusted_private_read" in gateway_section:
+                    gw_data["trusted_private_read"] = gateway_section[
+                        "trusted_private_read"
                     ]
 
             if "max_concurrent_sessions" in yaml_cfg:

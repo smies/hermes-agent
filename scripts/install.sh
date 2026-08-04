@@ -2458,21 +2458,21 @@ maybe_start_gateway() {
     log_info "Messaging platform token detected!"
     log_info "The gateway needs to be running for Hermes to send/receive messages."
 
-    # If WhatsApp is enabled and no session exists yet, run foreground first for QR scan
+    # Authentication is an explicit offline phone-number-code operation.
     WHATSAPP_VAL=$(grep "^WHATSAPP_ENABLED=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
     WHATSAPP_SESSION="$HERMES_HOME/whatsapp/session/creds.json"
     if [ "$WHATSAPP_VAL" = "true" ] && [ ! -f "$WHATSAPP_SESSION" ]; then
         if [ "$IS_INTERACTIVE" = true ]; then
             echo ""
-            log_info "WhatsApp is enabled but not yet paired."
-            log_info "Running 'hermes whatsapp' to pair via QR code..."
+            log_info "WhatsApp is enabled but its ordinary session is not provisioned."
+            log_info "Offline provisioning uses a phone-number pairing code."
             echo ""
-            if prompt_yes_no "Pair WhatsApp now?" "yes"; then
+            if prompt_yes_no "Provision WhatsApp now?" "yes"; then
                 HERMES_CMD="$(get_hermes_command_path)"
-                $HERMES_CMD whatsapp || true
+                $HERMES_CMD whatsapp provision --role ordinary || true
             fi
         else
-            log_info "WhatsApp pairing skipped (non-interactive). Run 'hermes whatsapp' to pair."
+            log_info "WhatsApp provisioning skipped (non-interactive). Run 'hermes whatsapp provision --role ordinary'."
         fi
     fi
 

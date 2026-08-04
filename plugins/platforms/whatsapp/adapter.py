@@ -547,24 +547,24 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             )
             return False
 
-        # Pre-flight: skip the 30s bridge bootstrap entirely if the user
-        # never finished pairing.  Without creds.json the bridge prints
-        # QR codes to its log file and never reaches status:connected,
+        # Pre-flight: skip bridge bootstrap entirely if the profile has no
+        # offline-provisioned credential file. Production cannot authenticate
+        # a new account and therefore never reaches status:connected,
         # so every gateway restart paid the 30s timeout + queued WhatsApp
         # for indefinite retries.  Mark non-retryable so the user gets a
-        # clear pairing message instead of the watcher
+        # clear provisioning message instead of the watcher
         # silently hammering an unconfigured platform.
         creds_path = self._session_path / "creds.json"
         if not creds_path.exists():
             logger.warning(
-                "[%s] WhatsApp is enabled but not paired (no creds.json at %s). "
-                "Pair from the dashboard or run `hermes whatsapp`; remove "
+                "[%s] WhatsApp is enabled but not provisioned. "
+                "Run `hermes whatsapp provision --role ordinary`; remove "
                 "WHATSAPP_ENABLED from your .env to disable.",
-                self.name, creds_path,
+                self.name,
             )
             self._set_fatal_error(
                 "whatsapp_not_paired",
-                "WhatsApp enabled but not paired — pair from the dashboard or run `hermes whatsapp`.",
+                "WhatsApp enabled but not provisioned — run `hermes whatsapp provision --role ordinary`.",
                 retryable=False,
             )
             return False
@@ -684,8 +684,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await asyncio.sleep(1)
             
             # Start the bridge process in its own process group.
-            # Route output to a log file so QR codes, errors, and reconnection
-            # messages are preserved for troubleshooting.
+            # Route content-free lifecycle errors to the bridge log.
             whatsapp_mode = _wenv("WHATSAPP_MODE", "self-chat")
             self._bridge_log = self._session_path.parent / "bridge.log"
             bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
@@ -816,7 +815,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     # auto-reconnect later, e.g. after a code 515 restart).
                     print(f"[{self.name}] ⚠ WhatsApp not connected after 30s")
                     print(f"[{self.name}]   Bridge log: {self._bridge_log}")
-                    print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
+                    print(f"[{self.name}]   If session expired, run offline provisioning")
             
             # Create a persistent HTTP session for all bridge communication
             self._http_session = aiohttp.ClientSession()

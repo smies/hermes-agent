@@ -3401,7 +3401,6 @@ function Install-PlatformSdks {
         @{ Var = "DISCORD_BOT_TOKEN";  Import = "discord";   Spec = "discord.py[voice]>=2.7.1,<3" },
         @{ Var = "SLACK_BOT_TOKEN";    Import = "slack_sdk"; Spec = "slack-sdk>=3.27.0,<4" },
         @{ Var = "SLACK_APP_TOKEN";    Import = "slack_bolt";Spec = "slack-bolt>=1.18.0,<2" },
-        @{ Var = "WHATSAPP_ENABLED";   Import = "qrcode";    Spec = "qrcode>=7.0,<8" }
     )
 
     # Which tokens are actually set (not placeholder)?
@@ -3520,22 +3519,20 @@ function Start-GatewayIfConfigured {
         $hermesCmd = "hermes"
     }
 
-    # If WhatsApp is enabled but not yet paired, run foreground for QR scan
+    # Authentication is an explicit offline phone-number-code operation.
     $whatsappEnabled = $content | Where-Object { $_ -match "^WHATSAPP_ENABLED=true" }
     $whatsappSession = "$HermesHome\whatsapp\session\creds.json"
     if ($whatsappEnabled -and -not (Test-Path $whatsappSession)) {
         Write-Host ""
-        Write-Info "WhatsApp is enabled but not yet paired."
-        Write-Info "Running 'hermes whatsapp' to pair via QR code..."
+        Write-Info "WhatsApp is enabled but its ordinary session is not provisioned."
+        Write-Info "Offline provisioning uses a phone-number pairing code."
         Write-Host ""
-        # Non-interactive callers (GUI installer, CI) skip the QR-pair prompt;
-        # WhatsApp pairing requires a human looking at a phone camera, so the
-        # downstream UI is responsible for surfacing this when it makes sense.
+        # Non-interactive callers skip the operator-only code channel.
         if (-not $NonInteractive) {
-            $response = Read-Host "Pair WhatsApp now? [Y/n]"
+            $response = Read-Host "Provision WhatsApp now? [Y/n]"
             if ($response -eq "" -or $response -match "^[Yy]") {
                 try {
-                    & $hermesCmd whatsapp
+                    & $hermesCmd whatsapp provision --role ordinary
                 } catch {
                     # Expected after pairing completes
                 }
