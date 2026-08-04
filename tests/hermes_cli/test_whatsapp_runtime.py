@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 from hermes_cli.whatsapp_runtime import (
     installer_probe,
@@ -98,6 +99,81 @@ def test_probe_and_runtime_expand_canonical_yaml_before_boolean_coercion(
         assert resolve_whatsapp_enabled() is False
     finally:
         reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("yaml_enabled", [True, False])
+@pytest.mark.parametrize("managed_enabled", [None, True, False])
+def test_all_whatsapp_config_consumers_share_expansion_overlay_and_precedence(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    yaml_enabled: bool,
+    managed_enabled: bool | None,
+) -> None:
+    from gateway.config import Platform, load_gateway_config
+    from hermes_cli import dump, gateway, status, tools_config
+    from hermes_cli.config import load_config
+    from hermes_cli.managed_scope import invalidate_managed_cache
+
+    home = tmp_path / f"home-{yaml_enabled}-{managed_enabled}"
+    home.mkdir(mode=0o700)
+    (home / "config.yaml").write_text(
+        "platforms:\n  whatsapp:\n    enabled: ${WA_ENABLED}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WA_ENABLED", str(yaml_enabled).lower())
+    monkeypatch.setenv("WHATSAPP_ENABLED", str(not yaml_enabled).lower())
+    if managed_enabled is not None:
+        managed = tmp_path / f"managed-{managed_enabled}"
+        managed.mkdir(mode=0o700)
+        (managed / "config.yaml").write_text(
+            f"platforms:\n  whatsapp:\n    enabled: {str(managed_enabled).lower()}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    else:
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    invalidate_managed_cache()
+    expected = managed_enabled if managed_enabled is not None else yaml_enabled
+
+    token = set_hermes_home_override(home)
+    try:
+        config = load_config()
+        gateway_config = load_gateway_config()
+        legacy = os.environ["WHATSAPP_ENABLED"]
+        assert resolve_whatsapp_enabled(config, legacy_value=legacy) is expected
+        assert gateway_config.platforms[Platform.WHATSAPP].enabled is expected
+        assert installer_probe(home=home)[0] is expected
+        assert ("whatsapp" in dump._configured_platforms(config)) is expected
+        with (
+            patch.object(tools_config, "load_config", return_value=config),
+            patch.object(tools_config, "get_env_value", return_value=legacy),
+        ):
+            assert ("whatsapp" in tools_config._get_enabled_platforms()) is expected
+        with (
+            patch("hermes_cli.config.load_config", return_value=config),
+            patch.object(gateway, "get_env_value", return_value=legacy),
+        ):
+            assert gateway._platform_status({
+                "key": "whatsapp", "token_var": "WHATSAPP_ENABLED",
+            }) == ("enabled, not paired" if expected else "not configured")
+        # The status command's WhatsApp row uses the same resolver.
+        with (
+            patch.object(status, "load_config", return_value=config),
+            patch.object(
+                status,
+                "get_env_value",
+                side_effect=lambda name: legacy if name == "WHATSAPP_ENABLED" else "",
+            ),
+        ):
+            status.show_status(type("Args", (), {"deep": False})())
+        whatsapp_line = next(
+            line for line in capsys.readouterr().out.splitlines() if "WhatsApp" in line
+        )
+        assert ("not configured" not in whatsapp_line) is expected
+    finally:
+        reset_hermes_home_override(token)
+        invalidate_managed_cache()
 
 
 def test_probe_uses_legacy_env_only_when_canonical_key_is_absent(

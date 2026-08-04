@@ -18,6 +18,7 @@ import {
   BAILEYS_TARBALL,
   computeTransportIdentity,
 } from './transport_identity.js';
+import { EXPECTED_MANIFEST_SHA256 } from './launcher.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -33,7 +34,7 @@ test('rc14 exports the reviewed canonicalizer, ID pattern, and numeric statuses'
 });
 
 test('package, lock, installed metadata, and deterministic tree bind the exact npm artifact', () => {
-  const identity = computeTransportIdentity(HERE);
+  const identity = computeTransportIdentity(HERE, EXPECTED_MANIFEST_SHA256);
   assert.equal(Object.isFrozen(identity), true);
   const pkg = JSON.parse(readFileSync(path.join(HERE, 'package.json'), 'utf8'));
   const lock = JSON.parse(readFileSync(path.join(HERE, 'package-lock.json'), 'utf8'));
@@ -55,20 +56,20 @@ test('package, lock, installed metadata, and deterministic tree bind the exact n
   for (const key of ['manifest_sha256', 'source_sha256', 'package_sha256', 'lock_sha256', 'baileys_package_sha256', 'baileys_tree_sha256']) {
     assert.match(identity[key], /^[a-f0-9]{64}$/);
   }
-  assert.deepEqual(computeTransportIdentity(HERE), identity);
+  assert.deepEqual(computeTransportIdentity(HERE, EXPECTED_MANIFEST_SHA256), identity);
 });
 
 test('transport identity fails closed after source or installed package tampering', () => {
   const copy = mkdtempSync(path.join(tmpdir(), 'hermes-sensitive-identity-'));
   cpSync(HERE, copy, { recursive: true, filter: (source) => !source.includes(`${path.sep}.git`) });
-  const before = computeTransportIdentity(copy);
+  const before = computeTransportIdentity(copy, EXPECTED_MANIFEST_SHA256);
   const modulePath = path.join(copy, 'session_paths.js');
   writeFileSync(modulePath, `${readFileSync(modulePath, 'utf8')}\n// tamper\n`);
-  assert.throws(() => computeTransportIdentity(copy), /reviewed manifest/);
+  assert.throws(() => computeTransportIdentity(copy, EXPECTED_MANIFEST_SHA256), /reviewed manifest/);
 
   writeFileSync(modulePath, readFileSync(path.join(HERE, 'session_paths.js')));
   const installedPath = path.join(copy, 'node_modules/@whiskeysockets/baileys/package.json');
   writeFileSync(installedPath, `${readFileSync(installedPath, 'utf8')} `);
-  assert.throws(() => computeTransportIdentity(copy), /reviewed manifest/);
+  assert.throws(() => computeTransportIdentity(copy, EXPECTED_MANIFEST_SHA256), /reviewed manifest/);
   assert.match(before.manifest_sha256, /^[a-f0-9]{64}$/);
 });

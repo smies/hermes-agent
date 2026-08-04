@@ -1,11 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  chmod, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { provisionOffline } from './offline_provision.js';
+import {
+  commitStagedSession,
+  ProvisioningCommitError,
+  provisionOffline,
+} from './offline_provision.js';
 import { parseProvisioningRequest } from './provisioning_core.js';
 
 function identities() {
@@ -28,6 +34,134 @@ function fakeSocket({ phoneJid, lidJid, update, onPairingCode }) {
   };
   queueMicrotask(() => ev.emit('connection.update', update(socket)));
   return socket;
+}
+
+async function syncDirectoryForTest(directory) {
+  const handle = await open(directory, 'r');
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+async function commitFixture(prefix) {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), prefix)));
+  await chmod(root, 0o700);
+  const session = path.join(root, 'ordinary');
+  const stage = path.join(root, '.whatsapp-provision-stage-test');
+  await mkdir(session, { mode: 0o700 });
+  await mkdir(stage, { mode: 0o700 });
+  await writeFile(path.join(session, 'creds.json'), 'old-synthetic', { mode: 0o600 });
+  await writeFile(path.join(stage, 'creds.json'), 'new-synthetic', { mode: 0o600 });
+  return {
+    root,
+    session,
+    stage,
+    oldDirectory: await stat(session),
+    oldCredentials: await stat(path.join(session, 'creds.json')),
+  };
+}
+
+for (const failurePoint of [
+  'rename_old', 'rename_old_after_move', 'sync_after_old',
+  'rename_stage', 'rename_stage_after_move', 'sync_after_stage',
+  'move_failed_once', 'restore_old_once', 'sync_after_restore_once',
+  'remove_failed_state_once',
+]) {
+  test(`commit restores exact old session before cleanup boundary: ${failurePoint}`, async () => {
+    const fixture = await commitFixture('hermes-wa-boundary-pre-');
+    let renameCalls = 0;
+    let syncCalls = 0;
+    const ops = {
+      rename: async (...args) => {
+        renameCalls += 1;
+        if (failurePoint === 'rename_old_after_move' && renameCalls === 1) {
+          await rename(...args);
+          throw new Error('injected');
+        }
+        if (failurePoint === 'rename_stage_after_move' && renameCalls === 2) {
+          await rename(...args);
+          throw new Error('injected');
+        }
+        if ((failurePoint === 'rename_old' && renameCalls === 1)
+            || (failurePoint === 'rename_stage' && renameCalls === 2)
+            || (failurePoint === 'move_failed_once' && renameCalls === 3)
+            || (failurePoint === 'restore_old_once' && renameCalls === 4)) {
+          throw new Error('injected');
+        }
+        return rename(...args);
+      },
+      syncDirectory: async (...args) => {
+        syncCalls += 1;
+        if ((failurePoint === 'sync_after_old' && syncCalls === 1)
+            || (['sync_after_stage', 'move_failed_once', 'restore_old_once',
+              'sync_after_restore_once', 'remove_failed_state_once'].includes(failurePoint)
+              && syncCalls === 2)
+            || (failurePoint === 'sync_after_restore_once' && syncCalls === 3)) {
+          throw new Error('injected');
+        }
+        return syncDirectoryForTest(...args);
+      },
+      remove: async (...args) => {
+        if (failurePoint === 'remove_failed_state_once' && !ops.remove.failed) {
+          ops.remove.failed = true;
+          throw new Error('injected');
+        }
+        return rm(...args);
+      },
+    };
+    try {
+      await assert.rejects(
+        commitStagedSession(fixture.stage, fixture.session, fixture.root, null, null, ops),
+        /staged_commit_failed/,
+      );
+      const directory = await stat(fixture.session);
+      const credentials = await stat(path.join(fixture.session, 'creds.json'));
+      assert.equal(await readFile(path.join(fixture.session, 'creds.json'), 'utf8'), 'old-synthetic');
+      assert.equal(directory.ino, fixture.oldDirectory.ino);
+      assert.equal(directory.mode & 0o777, 0o700);
+      assert.equal(credentials.ino, fixture.oldCredentials.ino);
+      assert.equal(credentials.mode & 0o777, 0o600);
+      await assert.rejects(stat(fixture.stage));
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const failurePoint of ['remove_backup', 'sync_after_backup_delete']) {
+  test(`commit preserves new canonical session after cleanup boundary: ${failurePoint}`, async () => {
+    const fixture = await commitFixture('hermes-wa-boundary-post-');
+    let syncCalls = 0;
+    const ops = {
+      remove: async (...args) => {
+        if (failurePoint === 'remove_backup') throw new Error('injected');
+        return rm(...args);
+      },
+      syncDirectory: async (...args) => {
+        syncCalls += 1;
+        if (failurePoint === 'sync_after_backup_delete' && syncCalls === 3) {
+          throw new Error('injected');
+        }
+        return syncDirectoryForTest(...args);
+      },
+    };
+    try {
+      let observed;
+      try {
+        await commitStagedSession(
+          fixture.stage, fixture.session, fixture.root, null, null, ops,
+        );
+      } catch (error) {
+        observed = error;
+      }
+      assert.ok(observed instanceof ProvisioningCommitError);
+      assert.equal(observed.code, 'cleanup_durability_uncertain');
+      assert.equal(observed.retryable, false);
+      assert.equal(await readFile(path.join(fixture.session, 'creds.json'), 'utf8'), 'new-synthetic');
+      assert.equal((await stat(fixture.session)).mode & 0o777, 0o700);
+      assert.equal((await stat(path.join(fixture.session, 'creds.json'))).mode & 0o777, 0o600);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
 }
 
 test('offline provisioning uses only requestPairingCode and persists canonical LID readiness', async () => {
@@ -180,7 +314,7 @@ test('reprovision stages fresh auth, requests a fresh code, and preserves existi
         const socket = {
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
-          requestPairingCode: async () => { pairingCalls += 1; return 'R3PR0V1S'; },
+          requestPairingCode: async () => { pairingCalls += 1; return 'R3PR9V1S'; },
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
@@ -253,14 +387,14 @@ test('explicit reprovision replaces unsafe legacy auth with fresh owner-only sta
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => `${lid}@lid` } },
-          requestPairingCode: async () => { pairingCalls += 1; return 'M3GYC0DE'; },
+          requestPairingCode: async () => { pairingCalls += 1; return 'M3GYC9DE'; },
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
         queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
-      emitCode: (code) => assert.equal(code, 'M3GYC0DE'),
+      emitCode: (code) => assert.equal(code, 'M3GYC9DE'),
       timeoutMs: 2_000,
     });
     assert.deepEqual(result, { account_namespace: 's.whatsapp.net', lid_ready: true });
@@ -323,7 +457,7 @@ test('post-install staged failure restores the exact unsafe legacy tree', async 
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => '818181818@lid' } },
-          requestPairingCode: async () => 'R0MMB4CK',
+          requestPairingCode: async () => 'R9MMB4CK',
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
@@ -434,7 +568,7 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => '777777777@lid' } },
-          requestPairingCode: async () => 'R4CEC0DE',
+          requestPairingCode: async () => 'R4CEC9DE',
           end() {},
         };
         queueMicrotask(async () => {

@@ -56,7 +56,7 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 | 依赖            | Hermes 需要它的原因                                                                             |
 | --------------- | ----------------------------------------------------------------------------------------------- |
 | **PortableGit** | 为终端工具提供 `bash.exe`，为会话内克隆提供 `git`。在安装时配置，而非由 `dep_ensure` 负责。     |
-| **Node.js 26**  | 浏览器工具（`agent-browser`）、TUI 的 web 桥接以及 WhatsApp 桥接所必需。                        |
+| **Node.js 22.22+**  | 浏览器工具（`agent-browser`）、TUI 的 web 桥接以及 WhatsApp 桥接所必需。                        |
 | **ffmpeg**      | TTS / 语音消息的音频格式转换。                                                                  |
 | **ripgrep**     | 快速文件搜索——不可用时回退到 `grep`。                                                           |
 | **npm 包**      | `agent-browser`、Playwright Chromium 以及各工具集的 Node 依赖，在首次使用浏览器工具时安装一次。 |
@@ -69,7 +69,7 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 
 1. **引导 `uv`** — Astral 的快速 Python 管理器。安装到 `%USERPROFILE%\.local\bin`。
 2. **通过 `uv` 安装 Python 3.11**。无需预先安装 Python。
-3. **安装 Node.js 26**（优先使用 winget，否则将便携式 Node 压缩包解压到 `%LOCALAPPDATA%\hermes\node`）。用于浏览器工具和 WhatsApp 桥接。
+3. **安装 Node.js 22.22+**（优先使用现有兼容版本，否则将便携式 Node 22 压缩包解压到 `%LOCALAPPDATA%\hermes\node`）。用于浏览器工具和 WhatsApp 桥接。
 4. **安装便携式 Git** — 如果 `git` 已在 PATH 中，安装程序直接使用；否则从官方 `git-for-windows` 发布版下载精简的自包含 **PortableGit**（约 45 MB）到 `%LOCALAPPDATA%\hermes\git`。无需管理员权限，不写入 Windows 安装程序注册表，不干扰系统上的其他任何内容。
 5. **将仓库克隆**到 `%LOCALAPPDATA%\hermes\hermes-agent` 并在其中创建 virtualenv。
 6. **分层 `uv pip install`** — 先尝试 `.[all]`，如果 `git+https` 依赖在 GitHub 限速时失败，则逐步回退到更小的集合（`[messaging,dashboard,ext]` → `[messaging]` → `.`）。防止"单次失败导致裸安装"的故障模式。

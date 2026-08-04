@@ -21,6 +21,10 @@ import pytest
 
 from gateway.config import Platform
 
+_VERIFIED_TEST_LAUNCHER = (
+    Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge" / "launcher.js"
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,7 +51,7 @@ def _make_adapter():
     adapter.platform = Platform.WHATSAPP
     adapter.config = MagicMock()
     adapter._bridge_port = 19876
-    adapter._bridge_script = "/tmp/test-bridge.js"
+    adapter._bridge_script = str(_VERIFIED_TEST_LAUNCHER)
     adapter._session_path = Path("/tmp/test-wa-session")
     adapter._bridge_log_fh = None
     adapter._bridge_log = None
@@ -440,6 +444,27 @@ class TestNoCredsPreflight:
     ``hermes whatsapp``.
     """
 
+    @pytest.mark.asyncio
+    async def test_tampered_launcher_rejects_before_session_or_lock_access(
+        self, tmp_path
+    ):
+        adapter = _make_adapter()
+        tampered_launcher = tmp_path / "launcher.js"
+        tampered_launcher.write_text("// synthetic tampered launcher\n")
+        adapter._bridge_script = str(tampered_launcher)
+        adapter._session_path = MagicMock()
+        adapter._acquire_platform_lock = MagicMock()
+
+        with patch(
+            "plugins.platforms.whatsapp.adapter.check_whatsapp_requirements",
+            return_value=True,
+        ):
+            assert await adapter.connect() is False
+
+        assert adapter._fatal_error_code == "whatsapp_bridge_identity_mismatch"
+        adapter._session_path.__truediv__.assert_not_called()
+        adapter._acquire_platform_lock.assert_not_called()
+
 
     @pytest.mark.asyncio
     async def test_connect_proceeds_when_creds_present(self, tmp_path):
@@ -453,9 +478,7 @@ class TestNoCredsPreflight:
         adapter.platform = Platform.WHATSAPP
         adapter.config = MagicMock()
         adapter._bridge_port = 19877
-        bridge = tmp_path / "bridge.js"
-        bridge.write_text("// stub")
-        adapter._bridge_script = str(bridge)
+        adapter._bridge_script = str(_VERIFIED_TEST_LAUNCHER)
         session_dir = tmp_path / "session"
         session_dir.mkdir()
         (session_dir / "creds.json").write_text("{}")

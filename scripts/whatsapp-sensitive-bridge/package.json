@@ -5,8 +5,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node sensitive_bridge.js",
-    "provision": "node offline_provision.js",
+    "start": "node launcher.js",
+    "provision": "node provision_launcher.js",
     "test": "node --test --test-concurrency=1 *.test.mjs"
   },
   "dependencies": {

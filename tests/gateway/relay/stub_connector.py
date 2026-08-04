@@ -113,11 +113,11 @@ class StubConnector:
             raise RuntimeError("no inbound handler registered (call adapter.connect first)")
         await self._inbound(event)
 
-    async def push_interrupt(self, session_key: str, chat_id: str) -> None:
+    async def push_interrupt(self, event: MessageEvent, session_key: str, chat_id: str) -> None:
         """Simulate the connector delivering an interrupt_inbound over the WS."""
         if self._interrupt_inbound is None:
             raise RuntimeError("no interrupt_inbound handler registered (call adapter.connect first)")
-        await self._interrupt_inbound(session_key, chat_id)
+        await self._interrupt_inbound(event, session_key, chat_id)
 
     async def push_passthrough(self, forward: Any, buffer_id: Optional[str] = None) -> None:
         """Simulate the connector forwarding a passthrough request over the WS (§5.1)."""

@@ -81,9 +81,10 @@ def _mock_health(json_data):
 
 
 def _setup_bridge_dir(tmp_path: Path) -> Path:
-    """Create a real bridge dir with bridge.js + package.json + creds."""
+    """Create a synthetic bridge dir with launcher/core/package + creds."""
     bridge_dir = tmp_path / "whatsapp-bridge"
     bridge_dir.mkdir()
+    (bridge_dir / "launcher.js").write_text("// verified by patched host anchor\n")
     (bridge_dir / "bridge.js").write_text("// current bridge code\n")
     (bridge_dir / "package.json").write_text('{"name": "bridge"}\n')
     session_path = tmp_path / "session"
@@ -124,7 +125,7 @@ class TestStaleBridgeHandshake:
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
         adapter = _make_adapter(
-            bridge_script=str(bridge_dir / "bridge.js"),
+            bridge_script=str(bridge_dir / "launcher.js"),
             session_path=tmp_path / "session",
         )
         adapter._send_read_receipts = True
@@ -141,6 +142,7 @@ class TestStaleBridgeHandshake:
         mock_proc.returncode = 1
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("gateway.platforms.whatsapp_common.verify_ordinary_launcher", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
@@ -158,7 +160,7 @@ class TestDepRefreshStamp:
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
         adapter = _make_adapter(
-            bridge_script=str(bridge_dir / "bridge.js"),
+            bridge_script=str(bridge_dir / "launcher.js"),
             session_path=tmp_path / "session",
         )
         mock_proc = MagicMock()
@@ -166,6 +168,7 @@ class TestDepRefreshStamp:
         mock_proc.returncode = 1
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("gateway.platforms.whatsapp_common.verify_ordinary_launcher", return_value=True), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
@@ -184,7 +187,7 @@ class TestCacheDirEnvPassthrough:
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
         adapter = _make_adapter(
-            bridge_script=str(bridge_dir / "bridge.js"),
+            bridge_script=str(bridge_dir / "launcher.js"),
             session_path=tmp_path / "session",
         )
         adapter._send_read_receipts = True
@@ -193,6 +196,7 @@ class TestCacheDirEnvPassthrough:
         mock_proc.returncode = 1
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("gateway.platforms.whatsapp_common.verify_ordinary_launcher", return_value=True), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \

@@ -40,7 +40,7 @@ test('real pinned multi-file auth uses bare numeric LID keys and staged owner-on
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => `${lidUser}@lid` } },
-          requestPairingCode: async () => 'R34KC0DE',
+          requestPairingCode: async () => 'R34KC9DE',
           end() {},
         };
         queueMicrotask(async () => {

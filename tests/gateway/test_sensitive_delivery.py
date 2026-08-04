@@ -73,6 +73,7 @@ from gateway.sensitive_delivery import (
     SensitiveDeliveryTransportRegistry,
 )
 from gateway.trusted_private_read_host import (
+    SENSITIVE_VERIFIED_LAUNCHER_SHA256,
     TrustedPrivateReadGatewayHost,
     TrustedPrivateReadHostConfig,
     TrustedPrivateReadHostServices,
@@ -2761,6 +2762,7 @@ def _synthetic_host_config(root: Path) -> TrustedPrivateReadHostConfig:
     }), encoding="utf-8")
     identity = {
         "manifest_sha256": "a" * 64,
+        "launcher_sha256": SENSITIVE_VERIFIED_LAUNCHER_SHA256,
         "source_sha256": "b" * 64,
         "package_sha256": "c" * 64,
         "lock_sha256": "d" * 64,

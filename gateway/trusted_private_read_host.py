@@ -49,6 +49,11 @@ from gateway.sensitive_delivery import (
 from tools.private_read_request_tool import configure_private_read_request_runtime
 
 
+SENSITIVE_VERIFIED_LAUNCHER_SHA256 = (
+    "7747ec8aa319f8430314daaba5fdc2584da26226dbefeaa678aea41d9109397e"
+)
+
+
 class TrustedPrivateReadConfigurationError(RuntimeError):
     """A deliberately path- and identifier-free configuration failure."""
 
@@ -216,6 +221,7 @@ class TrustedPrivateReadHostConfig:
         identity = allowlist.get("transport_identity")
         identity_fields = {
             "manifest_sha256", "source_sha256", "package_sha256", "lock_sha256",
+            "launcher_sha256",
             "package_name", "package_version", "baileys_spec",
             "baileys_lock_version", "baileys_lock_resolved",
             "baileys_lock_integrity", "baileys_installed_name", "baileys_version",
@@ -229,6 +235,12 @@ class TrustedPrivateReadHostConfig:
                 raise TrustedPrivateReadConfigurationError("transport allowlist is invalid")
             if name.endswith("sha256") and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
                 raise TrustedPrivateReadConfigurationError("transport allowlist is invalid")
+        if not hmac.compare_digest(
+            identity["launcher_sha256"], SENSITIVE_VERIFIED_LAUNCHER_SHA256
+        ):
+            raise TrustedPrivateReadConfigurationError(
+                "sensitive launcher identity is invalid"
+            )
         specs = raw["capabilities"]
         if type(specs) is not list:
             raise TrustedPrivateReadConfigurationError("trusted capabilities are invalid")

@@ -8,6 +8,8 @@ production bridges have no provisioning mode.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 from pathlib import Path
 import stat
@@ -23,7 +25,9 @@ from hermes_constants import find_node_executable, get_hermes_dir, get_hermes_ho
 
 _MAX_EVENT_BYTES = 4096
 _ROLES = frozenset({"ordinary", "sensitive"})
-_PAIRING_CODE_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
+_PAIRING_CODE_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTVWXYZ"
+_PAIRING_CODE_RE = re.compile(rf"^[{_PAIRING_CODE_ALPHABET}]{{8}}$")
+_SENSITIVE_PROVISION_LAUNCHER_SHA256 = "57e0dafb54e55baf4a912641cb16e808cd1ab86c3f808bf1380bfd8f5a6681b4"
 
 
 class WhatsAppProvisioningError(RuntimeError):
@@ -121,10 +125,16 @@ def _provisioner_script() -> Path:
         Path(__file__).resolve().parents[1]
         / "scripts"
         / "whatsapp-sensitive-bridge"
-        / "offline_provision.js"
+        / "provision_launcher.js"
     )
     if not script.is_file():
         raise WhatsAppProvisioningError("offline provisioner is unavailable")
+    try:
+        observed = hashlib.sha256(script.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise WhatsAppProvisioningError("offline provisioner is unavailable") from exc
+    if not hmac.compare_digest(observed, _SENSITIVE_PROVISION_LAUNCHER_SHA256):
+        raise WhatsAppProvisioningError("offline provisioner identity mismatch")
     return script
 
 
@@ -200,14 +210,9 @@ def _ensure_provisioner_dependencies(node: str, script: Path) -> None:
     # used by the sensitive transport before launching the provisioner.  This
     # both catches an incomplete clean install (including ERR_MODULE_NOT_FOUND)
     # and binds launch to the pinned commit and installed tree digest.
-    identity_script = (
-        "import('./transport_identity.js')"
-        ".then(m=>m.computeTransportIdentity(process.cwd()))"
-        ".catch(()=>process.exitCode=1)"
-    )
     try:
         verified = subprocess.run(
-            [node, "--input-type=module", "--eval", identity_script],
+            [node, str(script), "--verify-only"],
             cwd=str(root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

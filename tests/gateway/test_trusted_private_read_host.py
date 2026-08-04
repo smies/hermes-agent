@@ -45,6 +45,9 @@ def _config(root: Path) -> dict:
     }
     identity = {
         "manifest_sha256": "a" * 64,
+        "launcher_sha256": (
+            "7747ec8aa319f8430314daaba5fdc2584da26226dbefeaa678aea41d9109397e"
+        ),
         "source_sha256": "b" * 64,
         "package_sha256": "c" * 64,
         "lock_sha256": "d" * 64,
@@ -156,6 +159,14 @@ def test_symlinked_key_and_transport_allowlist_drift_are_rejected(tmp_path: Path
     alias = tmp_path / "alias.json"
     alias.symlink_to(key)
     raw["key_file"] = str(alias)
+    with pytest.raises(TrustedPrivateReadConfigurationError):
+        TrustedPrivateReadHostConfig.parse(raw)
+
+    raw = _config(tmp_path / "third")
+    allowlist = Path(raw["allowlist_file"])
+    payload = json.loads(allowlist.read_text(encoding="utf-8"))
+    payload["transport_identity"]["launcher_sha256"] = "0" * 64
+    _write_owner_json(allowlist, payload)
     with pytest.raises(TrustedPrivateReadConfigurationError):
         TrustedPrivateReadHostConfig.parse(raw)
 

@@ -2,9 +2,10 @@ import path from 'node:path';
 
 const ACCOUNT_RE = /^\d{1,32}@(s\.whatsapp\.net|lid)$/;
 const PHONE_RE = /^\d{7,15}$/;
-// WhatsApp phone-number linking returns eight Crockford Base32 characters.
-// Reject separators and ambiguous I/L/O/U glyphs at the operator boundary.
-const CODE_RE = /^[0-9A-HJKMNP-TV-Z]{8}$/;
+// Exact Baileys 7.0.0-rc14 phone-link alphabet (custom base-32), not generic
+// Crockford Base32. In particular 0/I/O are impossible and must fail closed.
+export const PAIRING_CODE_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTVWXYZ';
+const CODE_RE = new RegExp(`^[${PAIRING_CODE_ALPHABET}]{8}$`);
 
 export function normalizePhone(value) {
   if (typeof value !== 'string') throw new Error('phone_input_invalid');

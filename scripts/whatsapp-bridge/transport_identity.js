@@ -12,6 +12,7 @@ export const CANONICAL_SOURCE_FILES = Object.freeze([
   'allowlist.js',
   'bridge.js',
   'bridge_helpers.js',
+  'lid_bootstrap.js',
   'outbound_ids.js',
   'owner_message_gate.js',
   'transport_identity.js',
@@ -61,11 +62,16 @@ function exactObject(value, keys, label) {
   return value;
 }
 
-export function computeTransportIdentity(packageRoot) {
+export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   const root = path.resolve(packageRoot);
   const packageBytes = readFileSync(path.join(root, 'package.json'));
   const lockBytes = readFileSync(path.join(root, 'package-lock.json'));
   const manifestBytes = readFileSync(path.join(root, 'transport-manifest.json'));
+  if (typeof expectedManifestSha256 !== 'string'
+      || !/^[a-f0-9]{64}$/.test(expectedManifestSha256)
+      || sha256(manifestBytes) !== expectedManifestSha256) {
+    throw new Error('ordinary transport manifest anchor mismatch');
+  }
   const pkg = JSON.parse(packageBytes.toString('utf8'));
   const lock = JSON.parse(lockBytes.toString('utf8'));
   const manifest = exactObject(

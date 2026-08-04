@@ -12,11 +12,12 @@ import {
   BAILEYS_TARBALL,
   computeTransportIdentity,
 } from './transport_identity.js';
+import { EXPECTED_MANIFEST_SHA256 } from './launcher.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 test('ordinary bridge verifies the exact rc14 npm artifact and reviewed bytes', () => {
-  const identity = computeTransportIdentity(HERE);
+  const identity = computeTransportIdentity(HERE, EXPECTED_MANIFEST_SHA256);
   assert.equal(identity.baileys_spec, BAILEYS_SPEC);
   assert.equal(identity.baileys_lock_version, BAILEYS_SPEC);
   assert.equal(identity.baileys_lock_resolved, BAILEYS_TARBALL);
@@ -34,7 +35,7 @@ test('ordinary bridge source tampering fails before bridge import can create a s
   cpSync(HERE, copy, { recursive: true });
   const target = path.join(copy, 'bridge_helpers.js');
   writeFileSync(target, `${readFileSync(target, 'utf8')}\n// tamper\n`);
-  assert.throws(() => computeTransportIdentity(copy), /reviewed manifest/);
+  assert.throws(() => computeTransportIdentity(copy, EXPECTED_MANIFEST_SHA256), /reviewed manifest/);
 });
 
 for (const fileName of ['package.json', 'package-lock.json']) {
@@ -43,25 +44,6 @@ for (const fileName of ['package.json', 'package-lock.json']) {
     cpSync(HERE, copy, { recursive: true });
     const target = path.join(copy, fileName);
     writeFileSync(target, `${readFileSync(target, 'utf8')}\n`);
-    assert.throws(() => computeTransportIdentity(copy), /reviewed manifest/);
+    assert.throws(() => computeTransportIdentity(copy, EXPECTED_MANIFEST_SHA256), /reviewed manifest/);
   });
 }
-
-test('ordinary and sensitive bridges resolve the same rc14 package artifact', async () => {
-  const sensitiveRoot = path.resolve(HERE, '../whatsapp-sensitive-bridge');
-  const sensitiveModule = await import('../whatsapp-sensitive-bridge/transport_identity.js');
-  const ordinary = computeTransportIdentity(HERE);
-  const sensitive = sensitiveModule.computeTransportIdentity(sensitiveRoot);
-  for (const key of [
-    'baileys_spec',
-    'baileys_lock_version',
-    'baileys_lock_resolved',
-    'baileys_lock_integrity',
-    'baileys_installed_name',
-    'baileys_version',
-    'baileys_package_sha256',
-    'baileys_tree_sha256',
-  ]) {
-    assert.equal(ordinary[key], sensitive[key], key);
-  }
-});

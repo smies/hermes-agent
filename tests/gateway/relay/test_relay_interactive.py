@@ -19,12 +19,18 @@ Covers:
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from typing import Any, Dict, Optional
 
 import pytest
 
-from gateway.config import PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    build_session_key,
+)
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.session import SessionSource
@@ -69,12 +75,16 @@ def _event(
     prompt_response: Optional[Dict[str, Any]] = None,
     text: str = "/once",
     chat_id: str = "c1",
+    user_id: str = "u1",
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.COMMAND,
         source=SessionSource(
-            platform="telegram", chat_id=chat_id, chat_type="dm", user_id="u1"
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=user_id,
         ),
         prompt_response=prompt_response,
     )
@@ -171,7 +181,12 @@ async def test_clarify_renders_choices_plus_other_with_positional_ids():
 @pytest.mark.asyncio
 async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
     adapter, stub = _adapter()
-    await adapter.send_clarify("c1", "Which?", ["alpha", "beta"], "cl-9", "s")
+    owner = _event(text="start")
+    adapter._capture_scope(owner)
+    session = build_session_key(owner.source)
+    await adapter.send_clarify(
+        "c1", "Which?", ["alpha", "beta"], "cl-9", session
+    )
     prompt_id = stub.sent[-1]["prompt_id"]
 
     resolved: list[tuple] = []
@@ -189,11 +204,71 @@ async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
     assert resolved == [("cl-9", "beta")]
 
     # "Other" flips to text capture.
-    await adapter.send_clarify("c1", "Which?", ["a"], "cl-10", "s")
+    await adapter.send_clarify("c1", "Which?", ["a"], "cl-10", session)
     prompt_id2 = stub.sent[-1]["prompt_id"]
     event2 = _event({"prompt_id": prompt_id2, "option_id": "other"})
     assert await adapter._consume_prompt_response(event2) is True
     assert marked == ["cl-10"]
+
+
+@pytest.mark.asyncio
+async def test_cross_principal_structured_clarify_and_slash_are_fenced_before_mutation(
+    monkeypatch,
+):
+    """Review regression: B cannot resolve or consume A's relay prompts."""
+    from tools import clarify_gateway, slash_confirm
+
+    adapter, stub = _adapter()
+    owner = _event(text="start", user_id="principal-a")
+    attacker = _event(text="/c0", user_id="principal-b")
+    adapter._capture_scope(owner)
+    session = build_session_key(owner.source)
+    clarify_entry = clarify_gateway.register(
+        "clarify-owner-a", session, "Which?", ["alpha", "beta"]
+    )
+    slash_calls: list[str] = []
+
+    async def slash_handler(choice: str) -> str:
+        slash_calls.append(choice)
+        return "ran"
+
+    slash_confirm.register(session, "confirm-owner-a", "reload-mcp", slash_handler)
+    gate_calls: list[tuple[MessageEvent, str]] = []
+    adapter.set_busy_principal_gate(
+        lambda event, key: gate_calls.append((event, key)) or False
+    )
+    try:
+        await adapter.send_clarify(
+            "c1", "Which?", ["alpha", "beta"], "clarify-owner-a", session
+        )
+        clarify_prompt_id = stub.sent[-1]["prompt_id"]
+        await adapter.send_slash_confirm(
+            "c1", "Reload", "Confirm", session, "confirm-owner-a"
+        )
+        slash_prompt_id = stub.sent[-1]["prompt_id"]
+        before_prompts = deepcopy(adapter._pending_prompts)
+        before_slash = slash_confirm.get_pending(session)
+
+        attacker.prompt_response = {
+            "prompt_id": clarify_prompt_id,
+            "option_id": "c0",
+        }
+        assert await adapter._consume_prompt_response(attacker) is True
+        attacker.prompt_response = {
+            "prompt_id": slash_prompt_id,
+            "option_id": "once",
+        }
+        assert await adapter._consume_prompt_response(attacker) is True
+
+        assert gate_calls == [(attacker, session), (attacker, session)]
+        assert adapter._pending_prompts == before_prompts
+        assert clarify_entry.event.is_set() is False
+        assert clarify_entry.response is None
+        assert slash_confirm.get_pending(session) == before_slash
+        assert slash_calls == []
+    finally:
+        clarify_gateway.clear_session(session)
+        slash_confirm.clear(session)
 
 
 # ── Discord type-3 hp1 decode ────────────────────────────────────────────
@@ -255,5 +330,3 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
         ("✅", False),
     ]
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
-
-

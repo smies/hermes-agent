@@ -6,15 +6,21 @@ import {
   buildProvisioningSocketConfig,
   normalizePairingCode,
   normalizePhone,
+  PAIRING_CODE_ALPHABET,
   parseProvisioningRequest,
   verifyLidBootstrap,
 } from './provisioning_core.js';
 
-test('eight-character Crockford pairing-code normalization with no QR surface', () => {
+test('exact rc14 pairing-code alphabet normalization with no QR surface', () => {
   const digits = `1${'7'.repeat(10)}`;
   assert.equal(normalizePhone(`+${digits}`), digits);
   assert.equal(normalizePairingCode('ab12cd34'), 'AB12CD34');
-  for (const invalid of ['bad code', 'AB12-CD34', 'ABCD123', 'ABCD12345', 'ABCDI234']) {
+  assert.equal(PAIRING_CODE_ALPHABET, '123456789ABCDEFGHJKLMNPQRSTVWXYZ');
+  assert.equal(normalizePairingCode('WXYZ1234'), 'WXYZ1234');
+  for (const invalid of [
+    '00000000', 'bad code', 'AB12-CD34', 'ABCD123', 'ABCD12345',
+    'ABCDI234', 'ABCDO234', 'ABCDU234',
+  ]) {
     assert.throws(() => normalizePairingCode(invalid), /pairing_code_invalid/);
   }
   assert.throws(() => normalizePhone('not-a-phone'), /phone_input_invalid/);

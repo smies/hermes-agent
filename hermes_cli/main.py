@@ -2872,7 +2872,7 @@ def cmd_whatsapp(args):
     # ── Step 4: Install bridge dependencies ──────────────────────────────
     from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
     bridge_dir = resolve_whatsapp_bridge_dir()
-    bridge_script = bridge_dir / "bridge.js"
+    bridge_script = bridge_dir / "launcher.js"
 
     if not bridge_script.exists():
         print(f"\n✗ Bridge script not found at {bridge_script}")

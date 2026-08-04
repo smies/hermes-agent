@@ -11,9 +11,11 @@ import asyncio
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+from gateway.session import SessionSource, build_session_key
 
 from tests.gateway.relay.stub_connector import StubConnector
 
@@ -39,16 +41,49 @@ def adapter():
 
 @pytest.mark.asyncio
 async def test_interrupt_sets_only_target_session_event(adapter):
-    key_a = "agent:main:discord:group:chanA:userX"
+    event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chanA",
+            chat_type="group",
+            user_id="userX",
+        ),
+    )
+    key_a = build_session_key(event.source)
     key_b = "agent:main:discord:group:chanB:userY"
     ev_a = asyncio.Event()
     ev_b = asyncio.Event()
     adapter._active_sessions[key_a] = ev_a
     adapter._active_sessions[key_b] = ev_b
 
-    await adapter.on_interrupt(key_a, chat_id="chanA")
+    await adapter.on_interrupt(event, key_a, chat_id="chanA")
 
     assert ev_a.is_set() is True, "target session's interrupt Event must be set"
     assert ev_b.is_set() is False, "sibling session must be untouched"
 
 
+@pytest.mark.asyncio
+async def test_interrupt_without_authenticated_event_or_rejected_principal_is_noop(adapter):
+    event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chanA",
+            chat_type="group",
+            user_id="userX",
+        ),
+    )
+    key = build_session_key(event.source)
+    active = asyncio.Event()
+    adapter._active_sessions[key] = active
+    calls = []
+    adapter.set_busy_principal_gate(lambda inbound, session: calls.append((inbound, session)) or False)
+
+    await adapter.on_interrupt(None, key, "chanA")
+    await adapter.on_interrupt(event, key, "chanA")
+
+    assert calls == [(event, key)]
+    assert active.is_set() is False

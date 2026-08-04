@@ -32,7 +32,7 @@ WhatsApp 会定期更新其 Web 协议，这可能导致第三方桥接暂时失
 
 ## 前置条件
 
-- **Node.js v20+** 和 **npm**——WhatsApp 桥接作为 Node.js 进程运行
+- **Node.js 22.22+** 和 **npm**——WhatsApp 桥接作为 Node.js 进程运行
 - **已安装 WhatsApp 的手机**（用于输入关联设备配对码）
 
 与旧版浏览器驱动的桥接不同，当前基于 Baileys 的桥接**不**需要本地 Chromium 或 Puppeteer 依赖栈。

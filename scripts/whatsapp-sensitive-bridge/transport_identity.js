@@ -63,7 +63,7 @@ function exactObject(value, keys, label) {
   return value;
 }
 
-export function computeTransportIdentity(packageRoot) {
+export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   const root = path.resolve(packageRoot);
   const packagePath = path.join(root, 'package.json');
   const lockPath = path.join(root, 'package-lock.json');
@@ -71,6 +71,11 @@ export function computeTransportIdentity(packageRoot) {
   const packageBytes = readFileSync(packagePath);
   const lockBytes = readFileSync(lockPath);
   const manifestBytes = readFileSync(manifestPath);
+  if (typeof expectedManifestSha256 !== 'string'
+      || !/^[a-f0-9]{64}$/.test(expectedManifestSha256)
+      || sha256(manifestBytes) !== expectedManifestSha256) {
+    throw new Error('sensitive transport manifest anchor mismatch');
+  }
   const pkg = JSON.parse(packageBytes.toString('utf8'));
   const lock = JSON.parse(lockBytes.toString('utf8'));
   const manifest = exactObject(

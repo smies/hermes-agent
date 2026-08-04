@@ -15,7 +15,7 @@ Frames:
   outbound         {type, requestId, action}                (send/edit/typing/follow_up)
   outbound_result  {type, requestId, result}
   interrupt        {type, session_key, reason?}             (gateway egresses /stop)
-  interrupt_inbound{type, session_key, chat_id}             (connector -> owning gateway)
+  interrupt_inbound{type, session_key, chat_id, event}      (connector -> owning gateway)
 
 This is the concrete transport behind the ``RelayTransport`` Protocol; the
 ``RelayAdapter`` delegates all wire I/O to it. Outbound calls block on a
@@ -870,10 +870,18 @@ class WebSocketRelayTransport:
             if fut is not None and not fut.done():
                 fut.set_result(frame.get("result", {}))
         elif ftype == "interrupt_inbound":
-            # Bridged into the adapter's interrupt path by the runner wiring.
+            # A structured control event must carry the same authenticated
+            # sender/chat source as ordinary inbound.  Legacy frames without
+            # an event cannot pass the adapter principal fence and are dropped.
             handler = getattr(self, "_interrupt_inbound_handler", None)
             if handler is not None:
-                await handler(frame.get("session_key", ""), frame.get("chat_id", ""))
+                raw_event = frame.get("event")
+                event = _event_from_wire(raw_event) if isinstance(raw_event, dict) else None
+                await handler(
+                    event,
+                    frame.get("session_key", ""),
+                    frame.get("chat_id", ""),
+                )
         elif ftype == "passthrough_forward":
             # Phase 5 §5.1: a forwarded passthrough-plane request (Discord
             # interaction, Twilio, …) the connector already edge-ACKed. It rides

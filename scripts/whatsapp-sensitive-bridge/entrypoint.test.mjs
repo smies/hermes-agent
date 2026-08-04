@@ -113,13 +113,21 @@ test('canonical module graph imports without loading any ordinary bridge module'
   assert.equal(result.stdout, '');
 });
 
-test('canonical executable never prints a missing capability or argument failure', () => {
+test('direct sensitive core is inert and launcher sanitizes startup failure', () => {
   const result = spawnSync(process.execPath, [path.join(HERE, 'sensitive_bridge.js')], {
     cwd: HERE,
     encoding: 'utf8',
     env: {},
   });
-  assert.equal(result.status, 1);
+  assert.equal(result.status, 0);
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, '');
+  const launched = spawnSync(process.execPath, [path.join(HERE, 'launcher.js')], {
+    cwd: HERE,
+    encoding: 'utf8',
+    env: {},
+  });
+  assert.equal(launched.status, 1);
+  assert.equal(launched.stdout, '');
+  assert.equal(launched.stderr, '');
 });

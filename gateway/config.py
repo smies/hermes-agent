@@ -1294,6 +1294,17 @@ def load_gateway_config() -> GatewayConfig:
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
 
+            # Match the canonical runtime loader: expand user-authored
+            # ${VAR}/${env:VAR} references before applying the managed leaf
+            # overlay.  Without this, GatewayConfig coerces a literal
+            # "${WA_ENABLED}" as truthy while probes/status/dump/tools all see
+            # the expanded boolean, splitting one config into two realities.
+            from config_env import expand_env_vars
+
+            yaml_cfg = expand_env_vars(yaml_cfg)
+            if not isinstance(yaml_cfg, dict):
+                yaml_cfg = {}
+
             # Managed scope: overlay administrator-pinned values so the gateway
             # honors them too. This loader builds its own dict instead of going
             # through hermes_cli.config.load_config, so without this a managed

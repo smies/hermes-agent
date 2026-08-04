@@ -13,6 +13,9 @@ import pytest
 from hermes_cli.whatsapp_provisioning import (
     _acquire_provisioning_lock,
     _minimal_node_environment,
+    _PAIRING_CODE_ALPHABET,
+    _PAIRING_CODE_RE,
+    _provisioner_script,
     WhatsAppProvisioningError,
     command,
     resolve_provisioning_roots,
@@ -23,6 +26,20 @@ from hermes_cli.whatsapp_provisioning import (
 class _TTY(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+def test_python_pairing_validator_uses_exact_rc14_alphabet() -> None:
+    assert _PAIRING_CODE_ALPHABET == "123456789ABCDEFGHJKLMNPQRSTVWXYZ"
+    assert _PAIRING_CODE_RE.fullmatch("WXYZ1234") is not None
+    for impossible in ("00000000", "ABCDI234", "ABCDO234", "ABCDU234"):
+        assert _PAIRING_CODE_RE.fullmatch(impossible) is None
+
+
+def test_sensitive_provision_launcher_is_bound_by_host_source_identity() -> None:
+    assert _provisioner_script().name == "provision_launcher.js"
+    with patch.object(Path, "read_bytes", return_value=b"synthetic-tampering"):
+        with pytest.raises(WhatsAppProvisioningError, match="identity mismatch"):
+            _provisioner_script()
 
 
 class _Process:

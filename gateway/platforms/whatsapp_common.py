@@ -34,7 +34,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
+import hmac
 import re
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -59,6 +62,17 @@ def _get_wsecret(name, default=None):
     return val if val is not None else default
 
 logger = logging.getLogger(__name__)
+
+ORDINARY_VERIFIED_LAUNCHER_SHA256 = "ccd9472c8193de3ac31b9d67c307d6eac86f64229d591937bb91f9868fc20b4d"
+
+
+def verify_ordinary_launcher(path: Path) -> bool:
+    """Bind the manifest-anchor launcher to the trusted Python host source."""
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    return hmac.compare_digest(digest, ORDINARY_VERIFIED_LAUNCHER_SHA256)
 
 
 class WhatsAppBehaviorMixin:

@@ -94,7 +94,9 @@ HTTP call.
 Frames (connector → gateway, over the WS):
 
 - `{"type":"inbound", "event": <MessageEvent>, "bufferId"?}`
-- `{"type":"interrupt_inbound", "session_key", "chat_id"}` (§5)
+- `{"type":"interrupt_inbound", "session_key", "chat_id", "event"}` (§5),
+  where `event.source` is the connector-authenticated sender/chat identity. A
+  frame without that source is rejected before active-session mutation.
 - `{"type":"passthrough_forward", "forward": <PassthroughForward>, "bufferId"?}` (§5.1)
 
 **Channel context on inbound (design relay-channel-context).** When the source

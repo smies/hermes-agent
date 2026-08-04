@@ -32,8 +32,7 @@ import { tmpdir } from 'os';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
-import { computeTransportIdentity } from './transport_identity.js';
-import { verifyLidBootstrap } from '../whatsapp-sensitive-bridge/provisioning_core.js';
+import { verifyLidBootstrap } from './lid_bootstrap.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -50,9 +49,7 @@ import {
 } from './bridge_helpers.js';
 
 const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
-// Verify the exact npm artifact and all reviewed source bytes before any auth
-// load, listener registration, HTTP listen, or WhatsApp socket creation.
-const TRANSPORT_IDENTITY = computeTransportIdentity(PACKAGE_ROOT);
+let TRANSPORT_IDENTITY = null;
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -1090,6 +1087,7 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    launcherHash: TRANSPORT_IDENTITY.launcher_sha256,
     transportManifestHash: TRANSPORT_IDENTITY.manifest_sha256,
     sendReadReceipts: SEND_READ_RECEIPTS,
   });
@@ -1097,7 +1095,13 @@ app.get('/health', (req, res) => {
 
 // Production startup is deliberately pairing-free. Missing or invalid auth
 // can only be repaired by the separately invoked offline provisioner.
-app.listen(PORT, '127.0.0.1', () => {
+export function runBridge({ transportIdentity } = {}) {
+  if (!transportIdentity || typeof transportIdentity !== 'object'
+      || !/^[a-f0-9]{64}$/.test(String(transportIdentity.manifest_sha256 || ''))) {
+    throw new Error('verified ordinary transport identity is required');
+  }
+  TRANSPORT_IDENTITY = Object.freeze({ ...transportIdentity });
+  return app.listen(PORT, '127.0.0.1', () => {
     console.log('🌉 WhatsApp bridge is listening');
     if (ALLOWED_USERS.size > 0) {
       console.log('🔒 An explicit allowlist is active.');
@@ -1115,4 +1119,5 @@ app.listen(PORT, '127.0.0.1', () => {
     }
     console.log();
   scheduleReconnect(0);
-});
+  });
+}

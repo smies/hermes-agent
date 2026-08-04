@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
+from config_env import expand_env_vars as _expand_env_vars
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -2483,54 +2484,6 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
-def _env_expand_match(m: re.Match) -> str:
-    """Expand one ``${...}`` config reference.
-
-    Two accepted shapes, matching what MCP server config already resolves
-    (``tools/mcp_tool.py::_env_ref_name``):
-
-    * ``${VAR}`` — legacy bare name, resolved via ``os.environ``.
-    * ``${env:VAR}`` — Cursor-style SecretRef, same resolution after the
-      ``env:`` prefix is stripped.  Before this, the prefixed form worked in
-      MCP config but stayed a literal string in config.yaml — a confusing
-      half-support.
-
-    Other SecretRef sources (``file:``, ``bitwarden:``, ``vault:``, ...)
-    are NOT resolved here — external secret backends inject their values
-    into the environment at startup (the ``secrets:`` block), so a config
-    ref only ever needs the env shape.  Unknown prefixes warn once and stay
-    verbatim so callers can detect them.
-    """
-    raw = m.group(0)
-    inner = m.group(1).strip()
-    if inner.startswith("env:"):
-        name = inner[len("env:"):].strip()
-        if not name:
-            return raw
-        val = os.environ.get(name)
-        if val is not None:
-            return val
-        logger.warning(
-            "Config ref %r: %s is not set (check ~/.hermes/.env); "
-            "keeping the literal placeholder", raw, name,
-        )
-        return raw
-    if ":" in inner and re.match(r"^[a-z][a-z0-9_-]*:", inner):
-        # Looks like a SecretRef with a non-env source.  Values from vault
-        # backends arrive via the secrets: block as env vars — point there
-        # instead of silently treating "bitwarden:FOO" as a var named
-        # "bitwarden:FOO".
-        logger.warning(
-            "Config ref %r uses source %r which is not resolvable in "
-            "config.yaml — external secret sources inject env vars at "
-            "startup, so reference the variable as ${env:NAME} instead",
-            raw, inner.split(":", 1)[0],
-        )
-        return raw
-    # Legacy ``${VAR}`` — bare name.
-    return os.environ.get(inner, raw)
-
-
 def _env_ref_var_name(ref: str) -> Optional[str]:
     """Normalize a ``${...}`` body to the env-var name it reads, or None
     when the ref uses a non-env source and never touches the environment."""
@@ -2541,23 +2494,6 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     if ":" in ref and re.match(r"^[a-z][a-z0-9_-]*:", ref):
         return None
     return ref
-
-
-def _expand_env_vars(obj):
-    """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
-    values.
-
-    Only string values are processed; dict keys, numbers, booleans, and
-    None are left untouched.  Unresolved references (variable not in
-    ``os.environ``) are kept verbatim so callers can detect them.
-    """
-    if isinstance(obj, str):
-        return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
-    return obj
 
 
 def _env_ref_snapshot(obj, snapshot=None):

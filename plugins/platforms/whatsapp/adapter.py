@@ -437,7 +437,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_port: int = config.extra.get("bridge_port", 3000)
         self._bridge_script: Optional[str] = config.extra.get(
             "bridge_script",
-            str(self._DEFAULT_BRIDGE_DIR / "bridge.js"),
+            str(self._DEFAULT_BRIDGE_DIR / "launcher.js"),
         )
         self._session_path: Path = Path(config.extra.get(
             "session_path",
@@ -543,6 +543,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._set_fatal_error(
                 "whatsapp_bridge_missing",
                 f"WhatsApp bridge script missing at {bridge_path}.",
+                retryable=False,
+            )
+            return False
+        from gateway.platforms.whatsapp_common import (
+            ORDINARY_VERIFIED_LAUNCHER_SHA256,
+            verify_ordinary_launcher,
+        )
+        if not verify_ordinary_launcher(bridge_path):
+            logger.warning("[%s] WhatsApp verified launcher identity mismatch", self.name)
+            self._set_fatal_error(
+                "whatsapp_bridge_identity_mismatch",
+                "WhatsApp bridge launcher identity mismatch.",
                 retryable=False,
             )
             return False
@@ -652,13 +664,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # bridges that don't report scriptHash are
                                 # treated as stale by definition.
                                 running_hash = data.get("scriptHash", "")
-                                disk_hash = _file_content_hash(bridge_path)
+                                running_launcher_hash = data.get("launcherHash", "")
+                                disk_hash = _file_content_hash(bridge_dir / "bridge.js")
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
                                 config_matches = running_read_receipts == self._send_read_receipts
                                 if (
                                     running_hash
                                     and disk_hash
                                     and running_hash == disk_hash
+                                    and running_launcher_hash
+                                    == ORDINARY_VERIFIED_LAUNCHER_SHA256
                                     and config_matches
                                 ):
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")

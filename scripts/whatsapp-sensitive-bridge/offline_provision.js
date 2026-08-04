@@ -9,7 +9,6 @@ import {
 } from 'node:fs';
 import { chmod, mkdir, mkdtemp, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import makeWASocket, { jidNormalizedUser, useMultiFileAuthState } from '@whiskeysockets/baileys';
 
@@ -153,6 +152,37 @@ async function syncDirectory(directory) {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
+export class ProvisioningCommitError extends Error {
+  constructor(code) {
+    super(code);
+    this.name = 'ProvisioningCommitError';
+    this.code = code;
+    this.retryable = false;
+  }
+}
+
+async function retryRecovery(operation, attempts = 2) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await operation();
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+function inodeSeal(target) {
+  if (!existsSync(target)) return null;
+  const info = lstatSync(target);
+  return Object.freeze({ dev: info.dev, ino: info.ino });
+}
+
+function sameInode(target, seal) {
+  if (!seal || !existsSync(target)) return false;
+  const info = lstatSync(target);
+  return info.dev === seal.dev && info.ino === seal.ino;
+}
+
 function validateLegacyReprovisionTarget(target, expected = null) {
   if (!existsSync(target)) return null;
   let cursor = path.parse(target).root;
@@ -178,21 +208,25 @@ function validateLegacyReprovisionTarget(target, expected = null) {
   return seal;
 }
 
-async function commitStagedSession(
+export async function commitStagedSession(
   stage,
   session,
   ownerRoot,
   legacySeal = null,
   beforeDurableConfirmation = null,
+  commitOps = null,
 ) {
+  const renamePath = commitOps?.rename || rename;
+  const removePath = commitOps?.remove || rm;
+  const syncParent = commitOps?.syncDirectory || syncDirectory;
   await normalizeNewAuthTree(stage);
   validateAuthFiles(stage);
   if (legacySeal) validateOwnerDirectory(path.dirname(session), { required: true });
   else await ensureNewSessionParent(session);
   const rollback = path.join(ownerRoot, `.whatsapp-provision-rollback-${randomUUID()}`);
   const failed = path.join(ownerRoot, `.whatsapp-provision-failed-${randomUUID()}`);
-  let movedOriginal = false;
-  let installedStage = false;
+  let originalSeal = null;
+  let commitState = 'prepared';
   try {
     if (existsSync(session)) {
       if (legacySeal) validateLegacyReprovisionTarget(session, legacySeal);
@@ -200,37 +234,70 @@ async function commitStagedSession(
         validateOwnerDirectory(session, { required: true });
         validateAuthFiles(session);
       }
-      await rename(session, rollback);
-      movedOriginal = true;
+      originalSeal = inodeSeal(session);
+      await renamePath(session, rollback);
+      commitState = 'old_backup_renamed';
       if (legacySeal) validateLegacyReprovisionTarget(rollback, legacySeal);
-      await syncDirectory(path.dirname(session));
+      await syncParent(path.dirname(session));
+      commitState = 'old_backup_durable';
     }
-    await rename(stage, session);
-    installedStage = true;
-    await syncDirectory(path.dirname(session));
+    await renamePath(stage, session);
+    commitState = 'new_canonical_renamed';
+    await syncParent(path.dirname(session));
+    commitState = 'new_canonical_durable';
     validateOwnerDirectory(session, { required: true });
     validateAuthFiles(session);
     if (typeof beforeDurableConfirmation === 'function') await beforeDurableConfirmation();
-    if (movedOriginal) {
-      await rm(rollback, { recursive: true, force: false });
-      await syncDirectory(path.dirname(session));
+    commitState = 'new_canonical_validated';
+    if (originalSeal) {
+      // Irreversible boundary. From this point onward the new canonical tree
+      // is the survivor; cleanup uncertainty must never move/delete it.
+      commitState = 'cleanup_started';
+      await removePath(rollback, { recursive: true, force: false });
+      commitState = 'old_backup_deleted';
+      await syncParent(path.dirname(session));
     }
+    commitState = 'committed';
   } catch {
-    // Once the staged tree has taken the canonical name, move it aside before
-    // restoring the old directory.  A validation failure after rename must
-    // still preserve the original files *and inodes* exactly.  With no prior
-    // session, remove only the newly-created failed tree.
-    if (installedStage && existsSync(session)) {
-      try { await rename(session, failed); } catch {}
+    if (['cleanup_started', 'old_backup_deleted'].includes(commitState)) {
+      throw new ProvisioningCommitError('cleanup_durability_uncertain');
     }
-    if (movedOriginal && existsSync(rollback) && !existsSync(session)) {
-      try {
-        await rename(rollback, session);
-        await syncDirectory(path.dirname(session));
-      } catch {}
+
+    // A failed rename can be ambiguous to its caller: the namespace mutation
+    // may have happened before the error surfaced. Recover from observed
+    // inodes, not only from the last in-memory state transition.
+    let recoveryCertain = true;
+    if (existsSync(session) && !sameInode(session, originalSeal)) {
+      recoveryCertain = await retryRecovery(() => renamePath(session, failed));
     }
+    if (originalSeal && !sameInode(session, originalSeal)) {
+      if (!existsSync(session) && existsSync(rollback)) {
+        const restored = await retryRecovery(() => renamePath(rollback, session));
+        const synced = restored
+          ? await retryRecovery(() => syncParent(path.dirname(session)))
+          : false;
+        recoveryCertain = recoveryCertain && restored && synced
+          && sameInode(session, originalSeal);
+      } else {
+        recoveryCertain = false;
+      }
+    }
+    // Removal is bounded and only targets staged NEW state. A persistent
+    // cleanup failure keeps an owner-only survivor and becomes non-retryable;
+    // it never risks the restored original.
+    let cleanupCertain = true;
     if (existsSync(failed)) {
-      try { await rm(failed, { recursive: true, force: true }); } catch {}
+      cleanupCertain = await retryRecovery(
+        () => removePath(failed, { recursive: true, force: true }),
+      );
+    }
+    if (existsSync(stage)) {
+      cleanupCertain = await retryRecovery(
+        () => removePath(stage, { recursive: true, force: true }),
+      ) && cleanupCertain;
+    }
+    if (!recoveryCertain || !cleanupCertain) {
+      throw new ProvisioningCommitError('recovery_durability_uncertain');
     }
     throw new Error('staged_commit_failed');
   }
@@ -325,6 +392,7 @@ export async function provisionOffline({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   acquireLock = null,
   beforeDurableConfirmation = null,
+  commitOps = null,
 }) {
   process.umask(0o077);
   if (typeof emitCode !== 'function') throw new TypeError('operator channel required');
@@ -400,7 +468,7 @@ export async function provisionOffline({
     const onCredsUpdate = () => { void persistAuth(); };
     const outcome = await new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(new Error('provisioning_timeout')), timeoutMs);
-      const fail = (code) => reject(new Error(code));
+      const fail = (code) => reject(code instanceof Error ? code : new Error(code));
       sock.ev.on('creds.update', onCredsUpdate);
       sock.ev.on('connection.update', async (update) => {
         try {
@@ -453,10 +521,13 @@ export async function provisionOffline({
             ownerRoot,
             legacySeal,
             beforeDurableConfirmation,
+            commitOps,
           );
           stage = null;
           resolve(Object.freeze({ account_namespace: account.split('@')[1], lid_ready: true }));
-        } catch { fail('provisioning_failed'); }
+        } catch (error) {
+          fail(error instanceof ProvisioningCommitError ? error : 'provisioning_failed');
+        }
       });
     });
     return outcome;
@@ -509,18 +580,13 @@ export async function runProvisioner({
     output.write(`${JSON.stringify({
       event: 'complete',
       state: 'needs_provisioning',
+      ...(error instanceof ProvisioningCommitError
+        ? { error: error.code, retryable: false }
+        : {}),
       ...(unsafeExisting ? { error: 'unsafe_existing_session_requires_reprovision' } : {}),
     })}\n`);
     return 1;
   } finally {
     request = null;
   }
-}
-
-if (path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url)) {
-  const args = process.argv.slice(2);
-  const operatorOutput = args.length === 1 && args[0] === '--operator-stdio'
-    ? process.stderr
-    : null;
-  process.exitCode = await runProvisioner({ operatorOutput });
 }

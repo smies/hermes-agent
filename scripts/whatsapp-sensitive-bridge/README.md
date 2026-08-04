@@ -5,9 +5,19 @@ sensitive-delivery evidence. It does not import the ordinary WhatsApp bridge
 or its adapter, session, socket, queue, indexes, logger, hooks, formatting, or
 retry paths. It does not mint authorization or user-facing receipts. The
 default-off gateway owner verifies the transport identity, validates returned
-evidence, and binds it into its own immutable receipt; provider-specific
-dependencies come from the reviewed host services module named by the
-versioned configuration block.
+evidence, and binds it into its own immutable receipt. Production private-read
+composition remains deliberately unavailable; configuration cannot select an
+arbitrary services module or activate provider reads.
+
+Every process entrypoint is a minimal launcher that imports only Node built-ins
+until qualification completes. The launcher contains an exact digest of the
+byte-for-byte `transport-manifest.json`; that manifest binds the package, lock,
+installed Baileys tree, and every executable module beneath the launcher. The
+trusted Python host separately binds the launcher source digest, avoiding a
+circular self-hash claim. Only then does `launcher.js` dynamically import the
+sensitive bridge core, or `provision_launcher.js` import the offline
+provisioner. Directly importing either core is inert and creates no socket,
+listener, or auth state.
 
 Production is disabled unless the host supplies a fresh inherited capability
 and all canonical launcher arguments. The sensitive session must be paired and
@@ -35,7 +45,8 @@ around auth loading or later auth operations all fail closed.
 Before enablement, process spawn, any send, and acceptance of any evidence, the
 trusted host must compare the complete returned transport identity to immutable,
 reviewed allowlisted expected values. That comparison includes
-`manifest_sha256`, `source_sha256`, `package_sha256`, `lock_sha256`, the exact
+`launcher_sha256`, `manifest_sha256`, `source_sha256`, `package_sha256`,
+`lock_sha256`, the exact
 npm spec, lock version/resolved/integrity, installed name/version/package bytes,
 and `baileys_tree_sha256`. The published Git head is recorded only as reviewed
 release metadata because the npm package does not claim a `gitHead`; it is not

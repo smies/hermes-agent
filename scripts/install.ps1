@@ -587,7 +587,7 @@ function Get-NpmRange {
 
 # Upgrade the Hermes-managed Node tree's bundled npm into $NpmRange.
 #
-# The nodejs.org zip ships whatever npm that Node major bundles -- Node 26.5.1
+# The nodejs.org zip ships whatever npm that Node major bundles.
 # bundles npm 11.17.0, one minor below the root package.json's own
 # `engines.npm` floor of >=12.  The repo .npmrc sets `engine-strict=true`, so
 # that is fatal rather than a warning and a brand-new install dies at the first
@@ -1217,7 +1217,7 @@ function Test-Node {
             $script:HasNode = $true
             return $true
         }
-        Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
+        Write-Warn "Node.js $version is too old (Hermes requires Node >=22.22.0)"
     }
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
@@ -3029,7 +3029,7 @@ function Install-Desktop {
 
     # Always re-resolve Node here. Stages run in separate PowerShell processes,
     # so $script:HasNode from Stage-Node isn't visible; more importantly Test-Node
-    # enforces the build floor (Node >=26) and prepends the Hermes-managed
+    # enforces the build floor (Node >=22.22.0) and prepends the Hermes-managed
     # Node to PATH, so the build never runs on a too-old system Node -- the cause
     # of the opaque "Build desktop app ... exit code 1" failure (Vite crashes on
     # old Node).
@@ -3513,13 +3513,23 @@ function Start-GatewayIfConfigured {
 
     $probePython = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { "python" }
     $whatsappState = ""
+    $previousProcessHermesHome = $env:HERMES_HOME
     try {
+        # Stage workers run in fresh processes and may inherit a stale home
+        # from their driver. Scope the probe to the exact -HermesHome argument
+        # and restore the child environment afterward.
+        $env:HERMES_HOME = $HermesHome
         Push-Location $InstallDir
         $whatsappState = (& $probePython -m hermes_cli.whatsapp_runtime 2>$null | Select-Object -First 1)
     } catch {
         $whatsappState = ""
     } finally {
         Pop-Location
+        if ($null -eq $previousProcessHermesHome) {
+            Remove-Item Env:HERMES_HOME -ErrorAction SilentlyContinue
+        } else {
+            $env:HERMES_HOME = $previousProcessHermesHome
+        }
     }
     if ($whatsappState -like "enabled=true*") { $hasMessaging = $true }
 

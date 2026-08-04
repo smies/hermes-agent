@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import path from 'node:path';
 
@@ -15,10 +14,8 @@ import { SensitiveDeliveryTransport } from './delivery_core.js';
 import { createSensitiveHttpHandler, listenLoopback } from './http_server.js';
 import { SensitiveSocketLifecycle } from './lifecycle.js';
 import { prepareSessionPaths, SessionPathError } from './session_paths.js';
-import { computeTransportIdentity } from './transport_identity.js';
 import { verifyLidBootstrap } from './provisioning_core.js';
 
-const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CAPABILITY_ENV = 'HERMES_WHATSAPP_SENSITIVE_CAPABILITY';
 
 export function parseCanonicalArgs(argv) {
@@ -90,7 +87,11 @@ export function parseCanonicalArgs(argv) {
   });
 }
 
-export async function runSensitiveBridge({ argv = process.argv.slice(2), env = process.env } = {}) {
+export async function runSensitiveBridge({
+  argv = process.argv.slice(2),
+  env = process.env,
+  transportIdentity,
+} = {}) {
   const capability = env[CAPABILITY_ENV];
   if (typeof capability !== 'string' || Buffer.byteLength(capability, 'utf8') < 32
       || Buffer.byteLength(capability, 'utf8') > 512) {
@@ -102,7 +103,10 @@ export async function runSensitiveBridge({ argv = process.argv.slice(2), env = p
     sensitiveAccountJid,
     ordinaryAccountJid,
   } = parseCanonicalArgs(argv);
-  const transportIdentity = computeTransportIdentity(PACKAGE_ROOT);
+  if (!transportIdentity || typeof transportIdentity !== 'object'
+      || !/^[a-f0-9]{64}$/.test(String(transportIdentity.manifest_sha256 || ''))) {
+    throw new Error('verified sensitive transport identity is required');
+  }
   const transport = new SensitiveDeliveryTransport({
     runtimeId: `sensitive-${randomUUID()}`,
     ordinaryAccountJid,
@@ -167,10 +171,4 @@ export async function runSensitiveBridge({ argv = process.argv.slice(2), env = p
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   return Object.freeze({ server, lifecycle, transport, stop, transportIdentity });
-}
-
-if (path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url)) {
-  runSensitiveBridge().catch(() => {
-    process.exitCode = 1;
-  });
 }
