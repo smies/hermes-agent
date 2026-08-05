@@ -1417,6 +1417,7 @@ class JunoPrivateReadDependencies:
     gmail: PrivateReadProvider
     ordinary: OrdinaryNotifier
     sensitive: SensitiveSubmitter
+    ordinary_fence: Callable[[], bool]
 
     def __repr__(self) -> str:
         return "<JunoPrivateReadDependencies redacted>"
@@ -1451,6 +1452,8 @@ class JunoPrivateReadMvpHost:
 
     async def start(self, *, _background_worker: bool = True) -> bool:
         if self._active_profile != self.config.profile:
+            return False
+        if not self._ordinary_fence_healthy():
             return False
         try:
             master = _load_or_create_state_key(self.config.state_dir)
@@ -1498,6 +1501,9 @@ class JunoPrivateReadMvpHost:
         self._coordinator = coordinator
         self._running = True
         self._healthy = True
+        if not self.is_healthy():
+            await self.stop()
+            return False
         from tools.private_read_request_tool import configure_private_read_mvp_handler
         configure_private_read_mvp_handler(self.request_from_tool, health_check=self.is_healthy)
         if _background_worker:
@@ -1506,7 +1512,7 @@ class JunoPrivateReadMvpHost:
 
     async def _run(self) -> None:
         try:
-            while self._running:
+            while self.is_healthy():
                 worked = await self.process_once()
                 await asyncio.sleep(0 if worked else 0.1)
         except asyncio.CancelledError:
@@ -1514,6 +1520,11 @@ class JunoPrivateReadMvpHost:
         except BaseException:
             self._running = False
             self._healthy = False
+        finally:
+            self._running = False
+            self._healthy = False
+            from tools.private_read_request_tool import configure_private_read_mvp_handler
+            configure_private_read_mvp_handler(None)
 
     async def stop(self) -> None:
         self._running = False
@@ -1542,7 +1553,14 @@ class JunoPrivateReadMvpHost:
             self._running and self._healthy and self.store is not None
             and self.repository is not None and self._journal is not None
             and self._journal.healthy()
+            and self._ordinary_fence_healthy()
         )
+
+    def _ordinary_fence_healthy(self) -> bool:
+        try:
+            return self.dependencies.ordinary_fence() is True
+        except BaseException:
+            return False
 
     def health(self) -> dict[str, object]:
         return {"enabled": self._running, "ready": self.is_healthy(),
@@ -1822,18 +1840,29 @@ class _GatewayOrdinaryNotifier:
     def __init__(self, runner: object, config: JunoPrivateReadMvpConfig):
         self._runner = runner
         self._config = config
+        self._adapter = self._resolve_adapter()
+
+    def _resolve_adapter(self):
+        active_resolver = getattr(self._runner, "_active_profile_name", None)
+        active_profile = active_resolver() if callable(active_resolver) else None
+        if self._config.profile != active_profile:
+            return None
+        return getattr(self._runner, "adapters", {}).get(Platform.WHATSAPP)
+
+    def fence_healthy(self) -> bool:
+        if bool(getattr(getattr(self._runner, "config", None), "multiplex_profiles", False)):
+            return False
+        adapter = self._resolve_adapter()
+        if adapter is None or adapter is not self._adapter:
+            return False
+        check = getattr(adapter, "private_read_sender_companion_fence_healthy", None)
+        return bool(callable(check) and check(self._config.profile) is True)
 
     async def send(self, destination: str, text: str) -> str:
         if not hmac.compare_digest(destination, self._config.owner_chat):
             raise JunoPrivateReadError("ordinary transport unavailable")
-        active_resolver = getattr(self._runner, "_active_profile_name", None)
-        active_profile = active_resolver() if callable(active_resolver) else None
-        profile_maps = getattr(self._runner, "_profile_adapters", {})
-        if self._config.profile == active_profile:
-            adapter = getattr(self._runner, "adapters", {}).get(Platform.WHATSAPP)
-        else:
-            adapter = profile_maps.get(self._config.profile, {}).get(Platform.WHATSAPP)
-        if adapter is None:
+        adapter = self._resolve_adapter()
+        if adapter is None or adapter is not self._adapter:
             raise JunoPrivateReadError("ordinary transport unavailable")
         result = await adapter.send(destination, text)
         message_id = getattr(result, "message_id", None)
@@ -2008,11 +2037,13 @@ def compose_juno_private_read_mvp_services(
 ) -> JunoPrivateReadDependencies:
     """Concrete code-owned production composition; config supplies data only."""
     transport = FixedHttpJsonTransport()
+    ordinary = _GatewayOrdinaryNotifier(runner, config)
     return JunoPrivateReadDependencies(
         openfga=OpenFgaChecker(config, transport),
         gmail=GmailNewestInboxProvider(config, transport),
-        ordinary=_GatewayOrdinaryNotifier(runner, config),
+        ordinary=ordinary,
         sensitive=_SensitiveHttpSubmitter(config, transport),
+        ordinary_fence=ordinary.fence_healthy,
     )
 
 

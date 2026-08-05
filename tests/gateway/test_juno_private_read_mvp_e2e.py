@@ -234,6 +234,7 @@ async def _host(tmp_path: Path):
             GmailNewestInboxProvider(config, transport),
             ordinary,
             sensitive,
+            lambda: True,
         ),
         active_profile="juno",
     )

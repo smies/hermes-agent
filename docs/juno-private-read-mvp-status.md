@@ -31,12 +31,27 @@ The enforceable guarantee is application containment: private Gmail plaintext
 must not reach the low-trust model, prompt/tool/session history, ordinary
 inbound queue, extractor, quote/sent index, mirrors, hooks, logs, standard
 output/error, audit/PDP/authorization data, retry/dead-letter storage, or
-ordinary delivery APIs. The ordinary production callback fences authenticated
-Baileys `key.fromMe` events before those surfaces. This is not an account-level
+ordinary delivery APIs. Only the dedicated `juno` profile's host-attested
+ordinary runtime fences authenticated Baileys `key.fromMe` events, at the
+first production `messages.upsert` callback before diagnostics or content
+inspection. Baileys does not provide a trustworthy distinction between an
+owner-typed own message and sender-companion fan-out, so the Juno private-read
+ordinary session deliberately drops all `fromMe` events. Generic self-chat and
+bot-mode `WHATSAPP_FORWARD_OWNER_MESSAGES` behavior remains unchanged when
+the private-read fence is absent. This is not an account-level
 plaintext boundary: sender-companion fan-out can expose plaintext to another
 linked Juno device and shared WhatsApp history, and the ordinary bridge may
 decrypt it in process memory before the callback fence. WhatsApp-account and
 same-UID/process-memory compromise remain outside the boundary.
+
+Fence authority is not an ambient boolean. The dedicated gateway generates a
+per-adapter runtime key before launching the reviewed ordinary bridge. Bridge
+health returns a profile/runtime/timestamp/artifact-bound HMAC proof; the
+adapter verifies it against the anchored launcher, manifest, source and local
+bridge bytes. Missing, false, malformed, stale, cross-profile, cross-adapter,
+or runtime-drifted evidence removes the private-read tool surface. Evidence is
+refreshed continuously, and version-2 hosting remains unavailable under
+profile multiplexing.
 
 The implementation is deliberately smaller than the accepted high-assurance
 ADR. This product decision revises the ADR's WhatsApp topology and threat

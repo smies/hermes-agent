@@ -26,7 +26,7 @@ import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes, createHash, createHmac } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
@@ -63,6 +63,63 @@ const WHATSAPP_DEBUG =
   process.env &&
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
+
+// Opt-in generic bot behavior retained from the public bridge contract.
+// The Juno private-read fence below takes precedence when it is installed by
+// the profile-owning Python host.
+const FORWARD_OWNER_MESSAGES =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_FORWARD_OWNER_MESSAGES === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_FORWARD_OWNER_MESSAGES.toLowerCase());
+
+const PRIVATE_READ_FENCE_PROFILE_ENV = 'HERMES_INTERNAL_WHATSAPP_FENCE_PROFILE';
+const PRIVATE_READ_FENCE_KEY_ENV = 'HERMES_INTERNAL_WHATSAPP_FENCE_KEY';
+
+function readPrivateReadFenceBootstrap() {
+  const profile = process.env[PRIVATE_READ_FENCE_PROFILE_ENV];
+  const key = process.env[PRIVATE_READ_FENCE_KEY_ENV];
+  if (profile === undefined && key === undefined) return null;
+  if (profile !== 'juno' || typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key)) {
+    throw new Error('private-read sender-companion fence bootstrap is invalid');
+  }
+  return Object.freeze({
+    profile,
+    key,
+    runtimeId: randomBytes(32).toString('hex'),
+  });
+}
+
+const PRIVATE_READ_FENCE = readPrivateReadFenceBootstrap();
+
+export function privateReadFenceEvidence(
+  transportIdentity = TRANSPORT_IDENTITY,
+) {
+  if (!PRIVATE_READ_FENCE || !transportIdentity) return null;
+  const observedAtUs = Date.now() * 1000;
+  const material = [
+    'juno-sender-companion-fence-v1',
+    PRIVATE_READ_FENCE.profile,
+    PRIVATE_READ_FENCE.runtimeId,
+    String(observedAtUs),
+    transportIdentity.manifest_sha256,
+    transportIdentity.source_sha256,
+    SCRIPT_HASH,
+  ].join('\0');
+  return {
+    version: 1,
+    active: true,
+    profile: PRIVATE_READ_FENCE.profile,
+    runtimeId: PRIVATE_READ_FENCE.runtimeId,
+    observedAtUs,
+    manifestSha256: transportIdentity.manifest_sha256,
+    sourceSha256: transportIdentity.source_sha256,
+    scriptHash: SCRIPT_HASH,
+    proof: createHmac('sha256', Buffer.from(PRIVATE_READ_FENCE.key, 'hex'))
+      .update(material)
+      .digest('hex'),
+  };
+}
 
 const SEND_READ_RECEIPTS =
   typeof process !== 'undefined' &&
@@ -258,8 +315,8 @@ const logger = pino({ level: 'warn' });
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 
-// Track recently sent message IDs for poll-origin correlation. Capacity is
-// bounded (see outbound_ids.js) to keep memory flat under sustained sending.
+// Track recently sent message IDs for poll-origin correlation and for the
+// generic bot-mode owner-forwarding echo classifier. Capacity is bounded.
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
@@ -398,6 +455,10 @@ export function registerProductionInboundMessageHandler({
     producerDependencies: {
       mode: WHATSAPP_MODE,
       dmPolicy: WHATSAPP_DM_POLICY,
+      forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+      recentlySentIds,
+      replyPrefix: REPLY_PREFIX,
+      senderCompanionFenceActive: PRIVATE_READ_FENCE !== null,
       allowlistMatches: id => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
       extractEvent: extractBridgeEvent,
       downloadMedia: async mediaMsg => downloadMediaMessage(
@@ -962,6 +1023,7 @@ app.get('/health', (req, res) => {
     launcherHash: TRANSPORT_IDENTITY.launcher_sha256,
     transportManifestHash: TRANSPORT_IDENTITY.manifest_sha256,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    senderCompanionFence: privateReadFenceEvidence(),
   });
 });
 
@@ -985,6 +1047,12 @@ export function runBridge({ transportIdentity } = {}) {
       console.log(`🔒 No WHATSAPP_ALLOWED_USERS set — incoming messages are rejected.`);
       console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
       console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
+    }
+    if (WHATSAPP_MODE === 'bot' && FORWARD_OWNER_MESSAGES && !PRIVATE_READ_FENCE) {
+      console.log('👤 Owner-typed messages are forwarded with fromOwner:true');
+    }
+    if (PRIVATE_READ_FENCE) {
+      console.log('🔒 Profile-attested sender-companion fence is active');
     }
     console.log();
   scheduleReconnect(0);

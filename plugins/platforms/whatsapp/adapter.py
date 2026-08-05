@@ -16,12 +16,16 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import platform
 import re
+import secrets
 import signal
 import subprocess
+import time
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -65,6 +69,8 @@ _OWNER_REPLY_PREFIX = "[owner reply] "
 # ``SessionSource.message_id``.  Keep the bridge value byte-for-byte, but only
 # admit the bounded string shape shared by the downstream source contracts.
 _MAX_INBOUND_MESSAGE_ID_BYTES = 256
+_PRIVATE_READ_FENCE_MAX_AGE_SECONDS = 5.0
+_PRIVATE_READ_FENCE_FUTURE_SKEW_US = 250_000
 
 
 def _validated_inbound_message_id(value: Any) -> Optional[str]:
@@ -300,7 +306,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+from gateway.platforms.whatsapp_common import (
+    ORDINARY_VERIFIED_LAUNCHER_SHA256,
+    ORDINARY_VERIFIED_MANIFEST_SHA256,
+    ORDINARY_VERIFIED_SOURCE_SHA256,
+    WhatsAppBehaviorMixin,
+)
 from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -477,6 +488,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
+        # Runtime-only authority installed by the owning GatewayRunner after
+        # exact version-2 Juno profile validation. It is never accepted from
+        # user configuration or an ambient boolean.
+        self._private_read_fence_profile: Optional[str] = None
+        self._private_read_fence_key: Optional[str] = None
+        self._private_read_fence_bound_runtime_id: Optional[str] = None
+        self._private_read_fence_runtime_id: Optional[str] = None
+        self._private_read_fence_received_monotonic: float = 0.0
         # Set to True by disconnect() before we SIGTERM our child bridge so
         # _check_managed_bridge_exit() can distinguish an intentional
         # shutdown-time exit (returncode -15 / -2 / 0) from a real crash.
@@ -502,6 +521,112 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
+    def configure_private_read_sender_companion_fence(self, profile: str) -> None:
+        """Install a one-adapter attestation authority before bridge launch."""
+        if profile != "juno" or self._bridge_process is not None or self._running:
+            raise RuntimeError("private-read sender-companion fence cannot be configured")
+        if self._private_read_fence_profile is not None:
+            raise RuntimeError("private-read sender-companion fence is already configured")
+        self._private_read_fence_profile = profile
+        self._private_read_fence_key = secrets.token_hex(32)
+        self._private_read_fence_bound_runtime_id = None
+        self._private_read_fence_runtime_id = None
+        self._private_read_fence_received_monotonic = 0.0
+
+    def _clear_private_read_fence_evidence(self) -> None:
+        self._private_read_fence_runtime_id = None
+        self._private_read_fence_received_monotonic = 0.0
+
+    def _apply_private_read_fence_environment(self, bridge_env: dict[str, str]) -> None:
+        """Replace inherited fence bootstrap with this adapter's authority."""
+        bridge_env.pop("HERMES_INTERNAL_WHATSAPP_FENCE_PROFILE", None)
+        bridge_env.pop("HERMES_INTERNAL_WHATSAPP_FENCE_KEY", None)
+        profile = self._private_read_fence_profile
+        key = self._private_read_fence_key
+        if profile is None and key is None:
+            return
+        if profile != "juno" or not isinstance(key, str):
+            raise RuntimeError("private-read sender-companion fence authority is invalid")
+        bridge_env["HERMES_INTERNAL_WHATSAPP_FENCE_PROFILE"] = profile
+        bridge_env["HERMES_INTERNAL_WHATSAPP_FENCE_KEY"] = key
+
+    def _observe_private_read_fence_health(self, health: object) -> bool:
+        """Authenticate one fresh ordinary-bridge health observation."""
+        self._clear_private_read_fence_evidence()
+        profile = getattr(self, "_private_read_fence_profile", None)
+        key = getattr(self, "_private_read_fence_key", None)
+        if profile != "juno" or type(key) is not str or re.fullmatch(r"[a-f0-9]{64}", key) is None:
+            return False
+        if type(health) is not dict or health.get("status") != "connected":
+            return False
+        evidence = health.get("senderCompanionFence")
+        required = {
+            "version", "active", "profile", "runtimeId", "observedAtUs",
+            "manifestSha256", "sourceSha256", "scriptHash", "proof",
+        }
+        if type(evidence) is not dict or set(evidence) != required:
+            return False
+        runtime_id = evidence.get("runtimeId")
+        observed_at_us = evidence.get("observedAtUs")
+        script_hash = _file_content_hash(Path(self._bridge_script).parent / "bridge.js")
+        now_us = time.time_ns() // 1000
+        if (
+            evidence.get("version") != 1
+            or evidence.get("active") is not True
+            or evidence.get("profile") != profile
+            or type(runtime_id) is not str
+            or re.fullmatch(r"[a-f0-9]{64}", runtime_id) is None
+            or type(observed_at_us) is not int
+            or now_us - int(_PRIVATE_READ_FENCE_MAX_AGE_SECONDS * 1_000_000) > observed_at_us
+            or observed_at_us > now_us + _PRIVATE_READ_FENCE_FUTURE_SKEW_US
+            or not script_hash
+            or health.get("scriptHash") != script_hash
+            or evidence.get("scriptHash") != script_hash
+            or health.get("launcherHash") != ORDINARY_VERIFIED_LAUNCHER_SHA256
+            or health.get("transportManifestHash") != ORDINARY_VERIFIED_MANIFEST_SHA256
+            or evidence.get("manifestSha256") != ORDINARY_VERIFIED_MANIFEST_SHA256
+            or evidence.get("sourceSha256") != ORDINARY_VERIFIED_SOURCE_SHA256
+            or (
+                getattr(self, "_private_read_fence_bound_runtime_id", None) is not None
+                and runtime_id != self._private_read_fence_bound_runtime_id
+            )
+        ):
+            return False
+        material = "\0".join((
+            "juno-sender-companion-fence-v1", profile, runtime_id,
+            str(observed_at_us), ORDINARY_VERIFIED_MANIFEST_SHA256,
+            ORDINARY_VERIFIED_SOURCE_SHA256, script_hash,
+        ))
+        expected = hmac.new(
+            bytes.fromhex(key), material.encode("utf-8"), hashlib.sha256,
+        ).hexdigest()
+        proof = evidence.get("proof")
+        if type(proof) is not str or not hmac.compare_digest(proof, expected):
+            return False
+        if self._private_read_fence_bound_runtime_id is None:
+            self._private_read_fence_bound_runtime_id = runtime_id
+        self._private_read_fence_runtime_id = runtime_id
+        self._private_read_fence_received_monotonic = time.monotonic()
+        return True
+
+    def private_read_sender_companion_fence_healthy(self, profile: str) -> bool:
+        """Return cached authority only for this exact adapter and profile."""
+        return bool(
+            profile == getattr(self, "_private_read_fence_profile", None) == "juno"
+            and type(getattr(self, "_private_read_fence_runtime_id", None)) is str
+            and getattr(self, "_private_read_fence_received_monotonic", 0.0) > 0
+            and time.monotonic() - getattr(
+                self, "_private_read_fence_received_monotonic", 0.0
+            )
+                <= _PRIVATE_READ_FENCE_MAX_AGE_SECONDS
+        )
+
+    def _fence_configuration_matches_health(self, health: object) -> bool:
+        if getattr(self, "_private_read_fence_profile", None) is None:
+            self._clear_private_read_fence_evidence()
+            return type(health) is dict and health.get("senderCompanionFence") is None
+        return self._observe_private_read_fence_health(health)
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -546,10 +671,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 retryable=False,
             )
             return False
-        from gateway.platforms.whatsapp_common import (
-            ORDINARY_VERIFIED_LAUNCHER_SHA256,
-            verify_ordinary_launcher,
-        )
+        from gateway.platforms.whatsapp_common import verify_ordinary_launcher
         if not verify_ordinary_launcher(bridge_path):
             logger.warning("[%s] WhatsApp verified launcher identity mismatch", self.name)
             self._set_fatal_error(
@@ -674,7 +796,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_launcher_hash = data.get("launcherHash", "")
                                 disk_hash = _file_content_hash(bridge_dir / "bridge.js")
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and self._fence_configuration_matches_health(data)
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -722,6 +847,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            # Fence authority is minted by this adapter instance. Never let
+            # inherited process environment activate or key a generic bridge.
+            self._apply_private_read_fence_environment(bridge_env)
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
@@ -796,6 +924,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             if resp.status == 200:
                                 http_ready = True
                                 data = await resp.json()
+                                self._fence_configuration_matches_health(data)
                                 if data.get("status") == "connected":
                                     print(f"[{self.name}] Bridge ready (status: connected)")
                                     break
@@ -827,6 +956,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             ) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
+                                    self._fence_configuration_matches_health(data)
                                     if data.get("status") == "connected":
                                         print(f"[{self.name}] Bridge ready (status: connected)")
                                         break
@@ -945,6 +1075,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         self._release_platform_lock()
 
+        self._clear_private_read_fence_evidence()
         self._mark_disconnected()
         self._bridge_process = None
         self._close_bridge_log()
@@ -1361,6 +1492,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if bridge_exit:
                 print(f"[{self.name}] {bridge_exit}")
                 break
+            if getattr(self, "_private_read_fence_profile", None) is not None:
+                try:
+                    async with self._http_session.get(
+                        f"http://127.0.0.1:{self._bridge_port}/health",
+                        timeout=aiohttp.ClientTimeout(total=2),
+                    ) as health_response:
+                        if health_response.status != 200:
+                            self._clear_private_read_fence_evidence()
+                        else:
+                            self._observe_private_read_fence_health(
+                                await health_response.json()
+                            )
+                except asyncio.CancelledError:
+                    break
+                except BaseException:
+                    self._clear_private_read_fence_evidence()
             try:
                 async with self._http_session.get(
                     f"http://127.0.0.1:{self._bridge_port}/messages",

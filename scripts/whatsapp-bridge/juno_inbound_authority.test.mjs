@@ -38,7 +38,17 @@ function message({
   };
 }
 
-function register({ emittingSocket, activeSocket, queue = [], extractEvent } = {}) {
+function register({
+  emittingSocket,
+  activeSocket,
+  queue = [],
+  extractEvent,
+  mode = 'bot',
+  forwardOwnerMessages = true,
+  recentlySentIds = new Set(),
+  senderCompanionFenceActive = false,
+  handlePollUpdate = null,
+} = {}) {
   const store = createBoundedMessageStore();
   registerInboundMessageHandler({
     emittingSocket,
@@ -47,8 +57,8 @@ function register({ emittingSocket, activeSocket, queue = [], extractEvent } = {
       // A mismatching independent authority is deliberately ignored: the
       // production API has no socketUser parameter.
       socketUser: { id: '99999999999@s.whatsapp.net' },
-      mode: 'bot', dmPolicy: 'allowlist', forwardOwnerMessages: true,
-      recentlySentIds: new Set(),
+      mode, dmPolicy: 'allowlist', forwardOwnerMessages,
+      recentlySentIds, senderCompanionFenceActive,
       allowlistMatches: id => new Set([
         '11111111111@s.whatsapp.net',
         '22222222222@s.whatsapp.net',
@@ -56,10 +66,70 @@ function register({ emittingSocket, activeSocket, queue = [], extractEvent } = {
       extractEvent: extractEvent || extractBridgeEvent,
       cacheDirs: {}, replyPrefix: '', messageStore: store,
       messageQueue: queue, maxQueueSize: 100,
+      handlePollUpdate,
     },
   });
   return { queue, store };
 }
+
+test('generic self-chat fromMe event traverses extraction and queues', async () => {
+  const emittingSocket = socket();
+  const activeSocket = { current: emittingSocket };
+  let extractions = 0;
+  const { queue } = register({
+    emittingSocket,
+    activeSocket,
+    mode: 'self-chat',
+    extractEvent: async args => {
+      extractions += 1;
+      return extractBridgeEvent(args);
+    },
+  });
+  const outcome = await emittingSocket.ev.emit('messages.upsert', {
+    type: 'append',
+    messages: [message({
+      id: 'GENERIC-SELF-CHAT-1',
+      sender: '33333333333@s.whatsapp.net',
+      fromMe: true,
+      text: 'ordinary self-chat input',
+    })],
+  });
+  assert.equal(outcome.action, 'queued');
+  assert.equal(extractions, 1);
+  assert.deepEqual(queue.map(item => item.messageId), ['GENERIC-SELF-CHAT-1']);
+  assert.equal(queue[0].fromOwner, false);
+});
+
+test('generic bot forwards owner-typed fromMe and suppresses tracked agent echo', async () => {
+  const emittingSocket = socket();
+  const activeSocket = { current: emittingSocket };
+  const tracked = new Set(['GENERIC-AGENT-ECHO-1']);
+  const { queue } = register({
+    emittingSocket,
+    activeSocket,
+    recentlySentIds: tracked,
+  });
+  const owner = await emittingSocket.ev.emit('messages.upsert', {
+    type: 'notify', messages: [message({
+      id: 'GENERIC-OWNER-TYPED-1',
+      sender: '11111111111@s.whatsapp.net',
+      fromMe: true,
+      text: 'owner handover reply',
+    })],
+  });
+  const echo = await emittingSocket.ev.emit('messages.upsert', {
+    type: 'notify', messages: [message({
+      id: 'GENERIC-AGENT-ECHO-1',
+      sender: '11111111111@s.whatsapp.net',
+      fromMe: true,
+      text: 'tracked agent response',
+    })],
+  });
+  assert.equal(owner.action, 'queued');
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0].fromOwner, true);
+  assert.deepEqual(echo, { action: 'ignored', reason: 'drop_echo' });
+});
 
 test('exact production registration extracts, gates, stamps socket, and queues', async () => {
   const emittingSocket = socket();
@@ -102,6 +172,7 @@ test('all authenticated sender-companion upsert shapes are fenced before plainte
     const queue = [];
     const debug = [];
     let extractions = 0;
+    let polls = 0;
     const store = createBoundedMessageStore();
     registerInboundMessageHandler({
       emittingSocket,
@@ -109,6 +180,7 @@ test('all authenticated sender-companion upsert shapes are fenced before plainte
       emitDebugEvent: value => debug.push(value),
       producerDependencies: {
         mode: 'bot', dmPolicy: 'allowlist', forwardOwnerMessages: true,
+        senderCompanionFenceActive: true,
         recentlySentIds: new Set(), allowlistMatches: () => true,
         extractEvent: async () => {
           extractions += 1;
@@ -117,6 +189,7 @@ test('all authenticated sender-companion upsert shapes are fenced before plainte
         cacheDirs: {}, replyPrefix: '', messageStore: store,
         messageQueue: queue, maxQueueSize: 100,
         debugEnabled: true,
+        handlePollUpdate: async () => { polls += 1; return false; },
       },
     });
     const outcome = await emittingSocket.ev.emit('messages.upsert', {
@@ -133,6 +206,7 @@ test('all authenticated sender-companion upsert shapes are fenced before plainte
       action: 'ignored', reason: 'sender_companion_fenced',
     }, shape.label);
     assert.equal(extractions, 0, shape.label);
+    assert.equal(polls, 0, shape.label);
     assert.deepEqual(queue, [], shape.label);
     assert.equal(store.get(`SENDER-${shape.type}-${shape.requestId || 'direct'}`), null, shape.label);
     assert.equal(JSON.stringify(debug).includes(sentinel), false, shape.label);
@@ -143,7 +217,9 @@ test('all authenticated sender-companion upsert shapes are fenced before plainte
 test('concurrent ordinary inbound and sensitive sender echo cannot cross-suppress', async () => {
   const emittingSocket = socket();
   const activeSocket = { current: emittingSocket };
-  const { queue } = register({ emittingSocket, activeSocket });
+  const { queue } = register({
+    emittingSocket, activeSocket, senderCompanionFenceActive: true,
+  });
   const [ordinary, sensitive] = await Promise.all([
     emittingSocket.ev.emit('messages.upsert', {
       type: 'notify', messages: [message({ id: 'ORDINARY-CONCURRENT', fromMe: false })],
@@ -165,7 +241,9 @@ test('concurrent ordinary inbound and sensitive sender echo cannot cross-suppres
 test('sender-companion events are fenced regardless of owner allowlist', async () => {
   const emittingSocket = socket();
   const activeSocket = { current: emittingSocket };
-  const { queue } = register({ emittingSocket, activeSocket });
+  const { queue } = register({
+    emittingSocket, activeSocket, senderCompanionFenceActive: true,
+  });
   const owner = await emittingSocket.ev.emit('messages.upsert', {
     type: 'notify', messages: [message({
       id: 'JUNO-OWNER-PROVIDER-MESSAGE-1',

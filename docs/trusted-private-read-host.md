@@ -63,3 +63,15 @@ and capabilities remain separate. This reduces application capability and
 process coupling; it does not prevent sender-companion plaintext fan-out into
 WhatsApp account history or another linked device, and it provides no boundary
 against WhatsApp-account or same-UID/process-memory compromise.
+
+The version-2 Juno host additionally requires a profile-scoped ordinary
+sender-companion fence before publication. The gateway supplies a fresh
+per-adapter authority to the reviewed ordinary bridge and continuously
+authenticates the bridge's `/health` evidence, including profile, runtime,
+fresh timestamp, launcher, manifest, source and bridge hashes. Missing,
+negative, malformed, stale or drifted evidence depublishes private read;
+multiplexed profiles cannot receive or reuse this authority. Because provider
+`fromMe` does not distinguish owner typing from sender-companion fan-out, the
+fenced Juno ordinary session drops every `fromMe` event at the first production
+`messages.upsert` callback. Unfenced generic self-chat and enabled bot owner
+forwarding retain their ordinary behavior.

@@ -131,6 +131,7 @@ async def test_approved_request_is_bound_to_exact_sensitive_artifact_across_rest
             mvp.GmailNewestInboxProvider(config, transport),
             ordinary,
             sensitive,
+            lambda: True,
         ),
         active_profile="juno",
     )
@@ -267,6 +268,7 @@ async def test_host_marks_boundary_expiry_without_consuming_or_sending(
             mvp.GmailNewestInboxProvider(config, provider_transport),
             FakeOrdinary(),
             sensitive,
+            lambda: True,
         ),
         active_profile="juno",
     )

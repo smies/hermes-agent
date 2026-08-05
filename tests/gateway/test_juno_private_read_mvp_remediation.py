@@ -677,7 +677,7 @@ async def test_group_source_is_possible_only_when_exactly_configured(tmp_path: P
         JunoPrivateReadDependencies(
             OpenFgaChecker(config, FakeJsonTransport()),
             GmailNewestInboxProvider(config, FakeJsonTransport()),
-            FakeOrdinary(), FakeSensitive(),
+            FakeOrdinary(), FakeSensitive(), lambda: True,
         ),
         active_profile="juno",
     )
@@ -890,7 +890,7 @@ async def test_replay_genesis_startup_faults_remain_unpublished_and_offline(
     sensitive = FakeSensitive()
     dependencies = JunoPrivateReadDependencies(
         OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
-        ordinary, sensitive,
+        ordinary, sensitive, lambda: True,
     )
     # Supply the exact historical raw-key migration input. Production creates
     # and fsyncs genesis journal+marker before it seals this key, so each
@@ -1182,6 +1182,7 @@ async def test_read_crossing_expiry_never_reaches_sensitive_submit(tmp_path: Pat
         config,
         JunoPrivateReadDependencies(
             OpenFgaChecker(config, transport), CrossingGmail(), FakeOrdinary(), sensitive,
+            lambda: True,
         ),
         active_profile="juno",
         _clock_us=lambda: clock[0],
@@ -1215,7 +1216,7 @@ async def test_clock_reaches_exact_expiry_during_final_validation_and_never_subm
         JunoPrivateReadDependencies(
             OpenFgaChecker(config, FakeJsonTransport()),
             GmailNewestInboxProvider(config, FakeJsonTransport()),
-            FakeOrdinary(), sensitive,
+            FakeOrdinary(), sensitive, lambda: True,
         ),
         active_profile="juno", _clock_us=lambda: clock[0],
     )
@@ -1277,7 +1278,7 @@ async def test_sensitive_identity_drift_fails_before_gmail(tmp_path: Path) -> No
         config,
         JunoPrivateReadDependencies(
             OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
-            FakeOrdinary(), sensitive,
+            FakeOrdinary(), sensitive, lambda: True,
         ),
         active_profile="juno",
     )
@@ -1311,7 +1312,7 @@ async def test_sensitive_runtime_restart_after_read_prevents_submission(tmp_path
         config,
         JunoPrivateReadDependencies(
             OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
-            FakeOrdinary(), sensitive,
+            FakeOrdinary(), sensitive, lambda: True,
         ),
         active_profile="juno",
     )
@@ -1398,7 +1399,7 @@ async def test_non_monotonic_sensitive_identity_fails_before_private_read(
         config,
         JunoPrivateReadDependencies(
             OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
-            FakeOrdinary(), sensitive,
+            FakeOrdinary(), sensitive, lambda: True,
         ),
         active_profile="juno",
     )
@@ -1433,7 +1434,7 @@ async def test_unavailable_or_wrong_sensitive_identity_fails_before_gmail(
         config,
         JunoPrivateReadDependencies(
             OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
-            FakeOrdinary(), sensitive,
+            FakeOrdinary(), sensitive, lambda: True,
         ),
         active_profile="juno",
     )
@@ -1909,6 +1910,17 @@ async def test_gateway_runner_v2_production_composition_publishes_only_when_read
     runner._active_profile_name = lambda: "juno"
     runner.adapters = {}
     runner._profile_adapters = {}
+    assert await GatewayRunner._start_trusted_private_read_host(runner) is False
+    assert runner._trusted_private_read_host is None
+
+    class AttestedAdapter:
+        healthy = True
+
+        def private_read_sender_companion_fence_healthy(self, profile):
+            return self.healthy and profile == "juno"
+
+    attested_adapter = AttestedAdapter()
+    runner.adapters[Platform.WHATSAPP] = attested_adapter
     assert await GatewayRunner._start_trusted_private_read_host(runner) is True
     host = runner._trusted_private_read_host
     try:
@@ -1920,6 +1932,9 @@ async def test_gateway_runner_v2_production_composition_publishes_only_when_read
             assert binding.private_context is True
         finally:
             host.unbind_event(binding)
+        attested_adapter.healthy = False
+        assert host.is_healthy() is False
+        assert check_private_read_request_runtime() is False
     finally:
         await host.stop()
     assert check_private_read_request_runtime() is False
@@ -1974,6 +1989,9 @@ async def test_real_gateway_runner_startup_dispatch_registry_and_cleanup_seam(
         async def send(self, destination, text):
             self.sent.append((destination, text))
             return SimpleNamespace(success=True, message_id="runner-notice")
+
+        def private_read_sender_companion_fence_healthy(self, profile):
+            return profile == "juno"
 
     config = GatewayConfig(
         sessions_dir=tmp_path / "sessions",
@@ -2075,6 +2093,9 @@ async def test_dedicated_juno_profile_binds_profileless_events_and_real_adapter_
         async def send(self, destination, text):
             self.sent.append((destination, text))
             return SimpleNamespace(success=True, message_id="ordinary-provider-notice")
+
+        def private_read_sender_companion_fence_healthy(self, profile):
+            return profile == "juno"
 
     adapter = Adapter()
     runner = SimpleNamespace(
@@ -2234,6 +2255,9 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         async def send(self, destination, text, metadata=None):
             self.sent.append((destination, text, metadata))
             return SimpleNamespace(success=True, message_id="ordinary-vertical-notice")
+
+        def private_read_sender_companion_fence_healthy(self, profile):
+            return profile == "juno"
 
     authority = f"http://127.0.0.1:{provider.server_port}"
     transport = FixedHttpJsonTransport(_test_authorities={
@@ -2577,7 +2601,7 @@ async def test_non_juno_active_profile_cannot_start_or_bind_v2_host(tmp_path: Pa
     dependencies = JunoPrivateReadDependencies(
         OpenFgaChecker(config, FakeJsonTransport()),
         GmailNewestInboxProvider(config, FakeJsonTransport()),
-        FakeOrdinary(), FakeSensitive(),
+        FakeOrdinary(), FakeSensitive(), lambda: True,
     )
     host = JunoPrivateReadMvpHost(config, dependencies, active_profile="default")
     assert not await host.start(_background_worker=False)
@@ -2788,7 +2812,7 @@ async def test_immutable_checkpoint_schema_migrates_legacy_rows_fail_closed(
     sensitive = FakeSensitive()
     dependencies = JunoPrivateReadDependencies(
         OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
-        ordinary, sensitive,
+        ordinary, sensitive, lambda: True,
     )
     db_path = config.state_dir / "authorization.db"
     key_path = config.state_dir / "mvp-store.key"

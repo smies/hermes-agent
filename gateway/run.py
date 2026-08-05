@@ -13786,6 +13786,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import hashlib
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
+    def _configure_juno_private_read_sender_fence(
+        self, platform: Platform, adapter: BasePlatformAdapter,
+    ) -> None:
+        """Attest the exact dedicated Juno ordinary adapter before connect."""
+        if platform is not Platform.WHATSAPP:
+            return
+        raw = getattr(self.config, "trusted_private_read", None)
+        if (
+            type(raw) is not dict
+            or raw.get("version") != 2
+            or raw.get("enabled") is not True
+            or bool(getattr(self.config, "multiplex_profiles", False))
+        ):
+            return
+        try:
+            from gateway.juno_private_read_mvp import JunoPrivateReadMvpConfig
+
+            parsed = JunoPrivateReadMvpConfig.parse(raw)
+            if parsed is None or self._active_profile_name() != parsed.profile:
+                return
+            configure = getattr(
+                adapter, "configure_private_read_sender_companion_fence", None,
+            )
+            if not callable(configure):
+                return
+            configure(parsed.profile)
+        except BaseException:
+            # Adapter startup remains ordinary/generic. The private host later
+            # refuses publication because no attested fence evidence exists.
+            logger.error("Juno ordinary sender-companion fence failed closed")
+
     def _create_adapter(
         self, 
         platform: Platform, 
@@ -13820,6 +13851,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # this reaches ALL platforms (not just the ones that
                     # pre-declared it), making profile routing platform-generic.
                     adapter.gateway_runner = self
+                    self._configure_juno_private_read_sender_fence(platform, adapter)
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).
