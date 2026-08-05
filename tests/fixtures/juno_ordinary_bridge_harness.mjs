@@ -37,6 +37,13 @@ await bridge.startSocket({
   createSocket: () => socket,
   canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
 });
+const originalConsoleLog = console.log;
+console.log = () => {};
+try {
+  ev.emit('connection.update', { connection: 'open' });
+} finally {
+  console.log = originalConsoleLog;
+}
 
 function invokeMessagesRoute() {
   return new Promise((resolve, reject) => {
