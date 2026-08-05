@@ -14,6 +14,7 @@ export const CANONICAL_SOURCE_FILES = Object.freeze([
   'allowlist.js',
   'bridge.js',
   'bridge_helpers.js',
+  'inbound_producer.js',
   'lid_bootstrap.js',
   'outbound_ids.js',
   'owner_message_gate.js',

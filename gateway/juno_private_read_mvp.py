@@ -27,6 +27,7 @@ from urllib import request as urllib_request
 from gateway.authorization_contracts import CoordinatorIdentity
 from gateway.authorization_tasks import AuthorizationTaskStore
 from gateway.config import Platform
+from gateway.juno_replay_journal import JunoReplayAuthority, ReplayAuthorityError
 from gateway.platforms.base import MessageEvent
 from gateway.trusted_private_read_host import _owner_directory, _owner_file
 
@@ -68,6 +69,25 @@ _APPROVAL_RE = re.compile(r"^/(approve|deny) ([A-Za-z0-9_-]{16,80})$")
 _SENSITIVE_MESSAGE_ID_RE = re.compile(r"^3EB0[0-9A-F]{18}$")
 _WHATSAPP_DIRECT_RE = re.compile(r"^\d{1,32}@(s\.whatsapp\.net|lid)$")
 _WHATSAPP_CHAT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}@(s\.whatsapp\.net|lid|g\.us)$")
+
+
+def _provider_authority_digest(config: "JunoPrivateReadMvpConfig") -> str:
+    """Seal all fixed provider authority/contract inputs into one digest."""
+    value = {
+        "capability": CAPABILITY_ID,
+        "gmail_account": config.gmail_account,
+        "gmail_authority": GMAIL_AUTHORITY,
+        "gmail_contract": GMAIL_CONTRACT_VERSION,
+        "gmail_scope": GMAIL_SCOPE,
+        "openfga_authority": OPENFGA_AUTHORITY,
+        "openfga_client_contract": OPENFGA_CLIENT_CONTRACT_VERSION,
+        "openfga_model_id": config.openfga_model_id,
+        "openfga_store_id": config.openfga_store_id,
+        "sensitive_authority": "http://127.0.0.1:3011",
+    }
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode()).hexdigest()
 
 
 class JunoPrivateReadError(RuntimeError):
@@ -291,6 +311,10 @@ class MvpRequest:
     owner_sender: str
     approval_chat: str
     approval_message: str | None
+    gmail_account: str
+    openfga_store_id: str
+    openfga_model_id: str
+    provider_authority_digest: str
     descriptor_digest: str
     created_at_us: int
     expires_at_us: int
@@ -314,7 +338,9 @@ class MvpAuthorizationRepository:
         "request_id", "requester", "source_profile", "source_account",
         "source_chat", "source_message", "capability_id",
         "destination_account", "destination_chat", "owner_sender",
-        "approval_chat", "approval_message", "descriptor_digest",
+        "approval_chat", "approval_message", "gmail_account",
+        "openfga_store_id", "openfga_model_id", "provider_authority_digest",
+        "descriptor_digest",
         "created_at_us", "expires_at_us", "status", "notice_claimed",
         "claim_token_digest", "provider_message_id", "terminal_code",
         "updated_at_us", "version",
@@ -326,16 +352,19 @@ class MvpAuthorizationRepository:
 
     def __init__(self, store: AuthorizationTaskStore, key: bytes,
                  config: JunoPrivateReadMvpConfig,
+                 journal: JunoReplayAuthority,
                  *, clock_us: Callable[[], int] | None = None):
         if (
             type(store) is not AuthorizationTaskStore
             or type(config) is not JunoPrivateReadMvpConfig
+            or type(journal) is not JunoReplayAuthority
             or len(key) < 32
         ):
             raise TypeError("exact authorization store, key, and config are required")
         self.store = store
         self._key = bytes(key)
         self._config = config
+        self._journal = journal
         self._clock_us = clock_us or (lambda: time.time_ns() // 1000)
 
     @staticmethod
@@ -348,6 +377,10 @@ class MvpAuthorizationRepository:
             destination_account=row["destination_account"],
             destination_chat=row["destination_chat"], owner_sender=row["owner_sender"],
             approval_chat=row["approval_chat"], approval_message=row["approval_message"],
+            gmail_account=row["gmail_account"],
+            openfga_store_id=row["openfga_store_id"],
+            openfga_model_id=row["openfga_model_id"],
+            provider_authority_digest=row["provider_authority_digest"],
             descriptor_digest=row["descriptor_digest"], created_at_us=row["created_at_us"],
             expires_at_us=row["expires_at_us"], status=row["status"],
             notice_claimed=bool(row["notice_claimed"]),
@@ -396,6 +429,10 @@ class MvpAuthorizationRepository:
                 "source_message": values["source_message"],
                 "source_profile": values["source_profile"],
                 "expires_at_us": values["expires_at_us"],
+                "gmail_account": values["gmail_account"],
+                "openfga_store_id": values["openfga_store_id"],
+                "openfga_model_id": values["openfga_model_id"],
+                "provider_authority_digest": values["provider_authority_digest"],
             }, sort_keys=True, separators=(",", ":"),
         )
 
@@ -413,6 +450,10 @@ class MvpAuthorizationRepository:
             and values["destination_chat"] == requester.sensitive_destination
             and values["owner_sender"] == self._config.owner_sender
             and values["approval_chat"] == self._config.owner_chat
+            and values["gmail_account"] == self._config.gmail_account
+            and values["openfga_store_id"] == self._config.openfga_store_id
+            and values["openfga_model_id"] == self._config.openfga_model_id
+            and values["provider_authority_digest"] == _provider_authority_digest(self._config)
         )
 
     def _authenticated(self, row) -> bool:
@@ -422,7 +463,9 @@ class MvpAuthorizationRepository:
                 "request_id", "requester", "source_profile", "source_account",
                 "source_chat", "source_message", "capability_id",
                 "destination_account", "destination_chat", "owner_sender",
-                "approval_chat", "descriptor_digest", "status",
+                "approval_chat", "gmail_account", "openfga_store_id",
+                "openfga_model_id", "provider_authority_digest",
+                "descriptor_digest", "status",
             }
             if any(type(values[name]) is not str or not values[name] for name in text_fields):
                 return False
@@ -519,6 +562,47 @@ class MvpAuthorizationRepository:
             "SELECT rowid,* FROM private_read_mvp_requests WHERE rowid=?", (row["rowid"],)
         ).fetchone(), now_us)
 
+    def _authority_digest(self, domain: str, values: object) -> str:
+        framed = json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return self._digest("juno-mvp-replay-" + domain + "-v1\n" + framed)
+
+    def _request_journal_id(self, values: dict[str, object]) -> str:
+        """Digest the durable request ID together with its sealed providers."""
+        return self._authority_digest("request", {
+            "gmail_account": values["gmail_account"],
+            "openfga_model_id": values["openfga_model_id"],
+            "openfga_store_id": values["openfga_store_id"],
+            "provider_authority_digest": values["provider_authority_digest"],
+            "request_id": values["request_id"],
+        })
+
+    def _source_journal_id(self, context: MvpEventContext) -> str:
+        return self._authority_digest("source", {
+            "account": context.source_account,
+            "capability": CAPABILITY_ID,
+            "chat": context.source_chat,
+            "message": context.source_message,
+            "profile": context.source_profile,
+            "sender": context.requester.sender,
+        })
+
+    def _approval_journal_id(self, context: MvpEventContext) -> str:
+        return self._authority_digest("approval", {
+            "account": context.source_account,
+            "capability": CAPABILITY_ID,
+            "chat": context.source_chat,
+            "message": context.source_message,
+            "profile": context.source_profile,
+            "sender": context.requester.sender,
+        })
+
+    def _delivery_journal_id(self, values: dict[str, object]) -> str:
+        return self._authority_digest("delivery", {
+            "descriptor_digest": values["descriptor_digest"],
+            "provider_authority_digest": values["provider_authority_digest"],
+            "request_id": values["request_id"],
+        })
+
     def create(self, context: MvpEventContext, config: JunoPrivateReadMvpConfig) -> MvpRequest:
         now_us = self._clock_us()
         expires_us = now_us + int(config.approval_timeout * 1_000_000)
@@ -531,7 +615,11 @@ class MvpAuthorizationRepository:
             "capability_id": CAPABILITY_ID, "destination_account": config.sensitive_account,
             "destination_chat": context.requester.sensitive_destination,
             "owner_sender": config.owner_sender, "approval_chat": config.owner_chat,
-            "approval_message": None, "descriptor_digest": "", "created_at_us": now_us,
+            "approval_message": None, "gmail_account": config.gmail_account,
+            "openfga_store_id": config.openfga_store_id,
+            "openfga_model_id": config.openfga_model_id,
+            "provider_authority_digest": _provider_authority_digest(config),
+            "descriptor_digest": "", "created_at_us": now_us,
             "expires_at_us": expires_us, "status": initial, "notice_claimed": 0,
             "claim_token_digest": None, "provider_message_id": None,
             "terminal_code": None, "updated_at_us": now_us, "version": 1,
@@ -540,18 +628,41 @@ class MvpAuthorizationRepository:
         state_hmac = self._state_digest(values)
 
         def mutate(conn):
+            existing = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE source_profile=? "
+                "AND source_account=? AND source_chat=? AND requester=? "
+                "AND source_message=? AND capability_id=?",
+                (context.source_profile, context.source_account, context.source_chat,
+                 context.requester.sender, context.source_message, CAPABILITY_ID),
+            ).fetchone()
+            if existing is not None:
+                verified = self._verified(conn, existing, now_us)
+                if verified is None:
+                    raise JunoPrivateReadError("private request unavailable")
+                return self._row(verified)
+            source_id = self._source_journal_id(context)
+            request_journal_id = self._request_journal_id(values)
+            if self._journal.contains("source", source_id) or self._journal.contains(
+                "source", request_journal_id
+            ):
+                raise JunoPrivateReadError("private request unavailable")
+            if not self._journal.append("source", (source_id, request_journal_id)):
+                raise JunoPrivateReadError("private request unavailable")
             conn.execute(
                 "INSERT INTO private_read_mvp_requests "
                 "(request_id,requester,source_profile,source_account,source_chat,source_message,"
                 "capability_id,destination_account,destination_chat,owner_sender,approval_chat,"
-                "approval_message,descriptor_digest,created_at_us,expires_at_us,status,"
+                "approval_message,gmail_account,openfga_store_id,openfga_model_id,"
+                "provider_authority_digest,descriptor_digest,created_at_us,expires_at_us,status,"
                 "notice_claimed,claim_token_digest,provider_message_id,terminal_code,"
                 "updated_at_us,version,state_hmac) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (request_id, context.requester.sender, context.source_profile,
                  context.source_account, context.source_chat, context.source_message, CAPABILITY_ID,
                  config.sensitive_account, context.requester.sensitive_destination,
-                 config.owner_sender, config.owner_chat, None, values["descriptor_digest"],
+                 config.owner_sender, config.owner_chat, None, config.gmail_account,
+                 config.openfga_store_id, config.openfga_model_id,
+                 values["provider_authority_digest"], values["descriptor_digest"],
                  now_us, expires_us, initial, 0, None, None, None, now_us, 1, state_hmac),
             )
             row = conn.execute(
@@ -677,6 +788,14 @@ class MvpAuthorizationRepository:
                 or row["approval_chat"] != context.source_chat
             ):
                 return False
+            approval_id = self._approval_journal_id(context)
+            request_journal_id = self._request_journal_id(self._values(row))
+            if self._journal.contains("approval", approval_id) or self._journal.contains(
+                "approval", request_journal_id
+            ):
+                return False
+            if not self._journal.append("approval", (approval_id, request_journal_id)):
+                return False
             return self._transition(
                 conn, row, now_us, status=target,
                 approval_message=context.source_message,
@@ -708,6 +827,24 @@ class MvpAuthorizationRepository:
                 "AND expires_at_us>? ORDER BY created_at_us", (now_us,),
             ).fetchall()
             for row in rows:
+                row = self._verified(conn, row, now_us)
+                if row is None:
+                    continue
+                values = self._values(row)
+                delivery_id = self._delivery_journal_id(values)
+                request_journal_id = self._request_journal_id(values)
+                if self._journal.contains("delivery", delivery_id) or self._journal.contains(
+                    "delivery", request_journal_id
+                ):
+                    self._transition(
+                        conn, row, now_us, status="failed_consumed", notice_claimed=1,
+                        claim_token_digest=None, terminal_code="replay_authority_consumed",
+                    )
+                    continue
+                if not self._journal.append(
+                    "delivery", (delivery_id, request_journal_id)
+                ):
+                    continue
                 current = self._transition(
                     conn, row, now_us, status="claimed", claim_token_digest=token_digest,
                 )
@@ -737,6 +874,51 @@ class MvpAuthorizationRepository:
             ) is not None
         return self.store._write(mutate, at_us=now_us)
 
+    def reconcile_journal(self, now_us: int) -> None:
+        """Terminalize actionable SQLite state older than independent evidence."""
+        def mutate(conn):
+            rows = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE status IN "
+                "('pending','approved','claimed')"
+            ).fetchall()
+            for row in rows:
+                row = self._verified(conn, row, now_us)
+                if row is None:
+                    continue
+                values = self._values(row)
+                request_journal_id = self._request_journal_id(values)
+                source_context = MvpEventContext(
+                    self._config.requester(row["requester"]), row["source_profile"],
+                    row["source_account"], row["source_chat"], row["source_message"],
+                )
+                invalid = (
+                    source_context.requester is None
+                    or not self._journal.contains("source", request_journal_id)
+                    or not self._journal.contains("source", self._source_journal_id(source_context))
+                )
+                if row["approval_message"] is not None:
+                    approval_context = MvpEventContext(
+                        self._config.requester(self._config.owner_sender), row["source_profile"],
+                        row["source_account"], row["approval_chat"], row["approval_message"],
+                    )
+                    invalid = invalid or approval_context.requester is None or not self._journal.contains(
+                        "approval", self._approval_journal_id(approval_context)
+                    )
+                elif self._journal.contains("approval", request_journal_id):
+                    invalid = True
+                delivery_seen = self._journal.contains("delivery", request_journal_id) or \
+                    self._journal.contains("delivery", self._delivery_journal_id(values))
+                if row["status"] != "claimed" and delivery_seen:
+                    invalid = True
+                if invalid:
+                    self._transition(
+                        conn, row, now_us, status="failed_consumed", notice_claimed=1,
+                        claim_token_digest=None, provider_message_id=None,
+                        terminal_code="replay_authority_mismatch",
+                    )
+            return None
+        self.store._write(mutate, at_us=now_us)
+
     def validate_claim(
         self, request: MvpRequest, claim_token: str, now_us: int
     ) -> MvpRequest | None:
@@ -748,6 +930,7 @@ class MvpAuthorizationRepository:
             row = self._verified(conn, row, now_us)
             if (
                 row is None or row["status"] != "claimed"
+                or now_us >= row["expires_at_us"]
                 or not hmac.compare_digest(row["claim_token_digest"], self._digest(claim_token))
             ):
                 return None
@@ -833,7 +1016,9 @@ class FixedHttpJsonTransport:
                 body, sort_keys=True, separators=(",", ":")
             ).encode()
             request = urllib_request.Request(url, data=encoded, headers=headers, method=method)
-            with urllib_request.build_opener(_RejectRedirects()).open(
+            with urllib_request.build_opener(
+                urllib_request.ProxyHandler({}), _RejectRedirects()
+            ).open(
                 request, timeout=timeout
             ) as response:
                 if not 200 <= response.status < 300:
@@ -1080,6 +1265,13 @@ class OpenFgaChecker:
         return "<OpenFgaChecker redacted>"
 
     async def check(self, request: MvpRequest) -> bool:
+        if (
+            request.gmail_account != self._config.gmail_account
+            or request.openfga_store_id != self._config.openfga_store_id
+            or request.openfga_model_id != self._config.openfga_model_id
+            or request.provider_authority_digest != _provider_authority_digest(self._config)
+        ):
+            return False
         body = {
             "authorization_model_id": self._config.openfga_model_id,
             "consistency": "HIGHER_CONSISTENCY",
@@ -1102,6 +1294,10 @@ class OpenFgaChecker:
                 "approval_chat": request.approval_chat,
                 "approval_message": request.approval_message,
                 "expires_at_us": request.expires_at_us,
+                "gmail_account": request.gmail_account,
+                "openfga_store_id": request.openfga_store_id,
+                "openfga_model_id": request.openfga_model_id,
+                "provider_authority_digest": request.provider_authority_digest,
                 "descriptor_digest": request.descriptor_digest,
             },
         }
@@ -1188,6 +1384,7 @@ class JunoPrivateReadMvpHost:
         self.dependencies = dependencies
         self.store: AuthorizationTaskStore | None = None
         self.repository: MvpAuthorizationRepository | None = None
+        self._journal: JunoReplayAuthority | None = None
         self._context: ContextVar[MvpEventContext | None] = ContextVar(
             "juno-private-read-mvp-event", default=None
         )
@@ -1222,14 +1419,25 @@ class JunoPrivateReadMvpHost:
         ) is None:
             store.close()
             return False
+        try:
+            journal = JunoReplayAuthority(self.config.state_dir, master)
+        except ReplayAuthorityError:
+            store.close()
+            return False
         self.store = store
+        self._journal = journal
         self.repository = MvpAuthorizationRepository(
-            store, master, self.config, clock_us=self._clock_us
+            store, master, self.config, journal, clock_us=self._clock_us
         )
-        self.repository.quarantine_invalid_active(self._clock_us())
-        self.repository.recover_claimed(self._clock_us())
-        self.repository.recover_claimed_notices(self._clock_us())
-        self.repository.recover_incomplete_bindings(self._clock_us())
+        try:
+            self.repository.quarantine_invalid_active(self._clock_us())
+            self.repository.reconcile_journal(self._clock_us())
+            self.repository.recover_claimed(self._clock_us())
+            self.repository.recover_claimed_notices(self._clock_us())
+            self.repository.recover_incomplete_bindings(self._clock_us())
+        except BaseException:
+            await self.stop()
+            return False
         self._lock = lock
         self._coordinator = coordinator
         self._running = True
@@ -1265,13 +1473,20 @@ class JunoPrivateReadMvpHost:
                 pass
         if self.store is not None:
             self.store.close()
+        if self._journal is not None:
+            self._journal.close()
         self.store = None
         self.repository = None
+        self._journal = None
         self._lock = None
         self._coordinator = None
 
     def is_healthy(self) -> bool:
-        return self._running and self._healthy and self.store is not None and self.repository is not None
+        return bool(
+            self._running and self._healthy and self.store is not None
+            and self.repository is not None and self._journal is not None
+            and self._journal.healthy()
+        )
 
     def health(self) -> dict[str, object]:
         return {"enabled": self._running, "ready": self.is_healthy(),
@@ -1464,6 +1679,16 @@ class JunoPrivateReadMvpHost:
                 return True
             if repository.validate_claim(request, token, self._clock_us()) is None:
                 code = "state_integrity_failed"
+                return True
+            # Validation performs SQLite/HMAC work and is therefore itself a
+            # clock-crossing boundary.  Sample again after it returns, then
+            # once more at the final local call boundary.  Exact expiry is
+            # stale (>=), never a last-microsecond grace period.
+            if self._clock_us() >= request.expires_at_us:
+                code = "expired_after_final_validation"
+                return True
+            if self._clock_us() >= request.expires_at_us:
+                code = "expired_before_submit"
                 return True
             result = await asyncio.wait_for(
                 self.dependencies.sensitive.submit(
@@ -1693,7 +1918,10 @@ def _sealed_load_or_create_state_key(state_dir: Path) -> bytes | None:
             finally:
                 os.close(descriptor)
         value = _owner_file(path).read_bytes()
-        return value if len(value) == 32 else None
+        # The replay authority validates the complete sealed form.  Returning
+        # only the key prefix here lets cycle-0/1/2 raw 32-byte keys migrate
+        # without treating the post-migration seal as a new HMAC key.
+        return value[:32] if len(value) >= 32 and len(value) <= 256 else None
     except BaseException:
         return None
 

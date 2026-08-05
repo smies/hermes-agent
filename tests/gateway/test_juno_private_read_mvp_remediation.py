@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import io
 import json
 import logging
 import os
+import selectors
+import shutil
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sqlite3
@@ -37,6 +40,7 @@ from gateway.juno_private_read_mvp import (
     compose_juno_private_read_mvp_services,
     render_gmail_message,
 )
+from gateway.juno_replay_journal import JOURNAL_NAME, MARKER_NAME
 from tests.gateway.test_juno_private_read_mvp_e2e import (
     FakeJsonTransport, FakeOrdinary, FakeSensitive, ORDINARY_ACCOUNT,
     OWNER, OWNER_CHAT, PRIVATE_SENTINEL, SENSITIVE_ACCOUNT,
@@ -63,8 +67,8 @@ def _runtime_identity(
 def _node_forwarded_event(*, sender: str, text: str, message_id: str) -> dict:
     source = r"""
 import { pathToFileURL } from 'node:url';
-import { readFileSync } from 'node:fs';
 const helper = await import(pathToFileURL(process.env.JUNO_BRIDGE_HELPER));
+const producer = await import(pathToFileURL(process.env.JUNO_BRIDGE_PRODUCER));
 const input = JSON.parse(process.env.JUNO_BRIDGE_INPUT);
 const msg = {
   key: { id: input.messageId, remoteJid: input.sender,
@@ -72,17 +76,18 @@ const msg = {
   pushName: 'Synthetic User', messageTimestamp: 1786000000,
   message: { conversation: input.text },
 };
-const event = await helper.extractBridgeEvent({
-  msg, chatId: input.sender, senderId: input.sender,
-  senderNumber: input.sender.split('@')[0], isGroup: false,
+const queue = [];
+const store = helper.createBoundedMessageStore();
+const outcome = await producer.produceInboundMessage({
+  msg, socketUser: { id: '33333333333:19@s.whatsapp.net' }, socket: {},
+  mode: 'bot', dmPolicy: 'allowlist', forwardOwnerMessages: true,
+  recentlySentIds: new Set(),
+  allowlistMatches: id => [input.sender, '11111111111@s.whatsapp.net'].includes(id),
+  extractEvent: helper.extractBridgeEvent, cacheDirs: {}, replyPrefix: '',
+  messageStore: store, messageQueue: queue, maxQueueSize: 100,
 });
-const production = readFileSync(process.env.JUNO_BRIDGE_SOURCE, 'utf8');
-if (!/event\.fromOwner = fromOwner;[\s\S]*?event\.accountId = normalizeWhatsAppId\(sock\.user\?\.id\);[\s\S]*?messageQueue\.push\(event\);/.test(production)) {
-  throw new Error('production inbound authority forwarding path is missing');
-}
-event.fromOwner = false;
-event.accountId = helper.normalizeWhatsAppId('33333333333:19@s.whatsapp.net');
-process.stdout.write(JSON.stringify(event));
+if (outcome.action !== 'queued' || queue.length !== 1) throw new Error('producer rejected');
+process.stdout.write(JSON.stringify(queue[0]));
 """
     completed = subprocess.run(
         ["node", "--input-type=module", "-e", source],
@@ -90,10 +95,12 @@ process.stdout.write(JSON.stringify(event));
         env={
             **os.environ,
             "JUNO_BRIDGE_HELPER": str(
-                Path(__file__).parents[2] / "scripts/whatsapp-bridge/bridge_helpers.js"
+                os.environ.get("JUNO_ISOLATED_BRIDGE_HELPER")
+                or Path(__file__).parents[2] / "scripts/whatsapp-bridge/bridge_helpers.js"
             ),
-            "JUNO_BRIDGE_SOURCE": str(
-                Path(__file__).parents[2] / "scripts/whatsapp-bridge/bridge.js"
+            "JUNO_BRIDGE_PRODUCER": str(
+                os.environ.get("JUNO_ISOLATED_BRIDGE_PRODUCER")
+                or Path(__file__).parents[2] / "scripts/whatsapp-bridge/inbound_producer.js"
             ),
             "JUNO_BRIDGE_INPUT": json.dumps({
                 "sender": sender, "text": text, "messageId": message_id,
@@ -108,6 +115,33 @@ def _loopback_server(handler) -> HTTPServer:
         return HTTPServer(("127.0.0.1", 0), handler)
     except PermissionError:
         pytest.skip("execution sandbox denies loopback socket binding")
+
+
+def _node_harness_failure(stderr: str, returncode: int | None) -> str:
+    value = stderr[:4096]
+    if returncode == 73 and value.strip() in {
+        "JUNO_SOCKET_BIND_DENIED:EACCES:listen",
+        "JUNO_SOCKET_BIND_DENIED:EPERM:listen",
+    }:
+        return "socket_bind_denied"
+    if "ERR_MODULE_NOT_FOUND" in value or "Cannot find module" in value:
+        return "module_not_found"
+    if "SyntaxError" in value:
+        return "syntax_error"
+    if returncode == 74 and value.strip() == "JUNO_HARNESS_STARTUP_FAILURE":
+        return "startup_failure"
+    return "unexpected_node_failure"
+
+
+def test_node_harness_failure_classification_skips_only_exact_bind_denial() -> None:
+    assert _node_harness_failure(
+        "JUNO_SOCKET_BIND_DENIED:EPERM:listen\n", 73
+    ) == "socket_bind_denied"
+    assert _node_harness_failure(
+        "Error [ERR_MODULE_NOT_FOUND]: synthetic", 1
+    ) == "module_not_found"
+    assert _node_harness_failure("SyntaxError: synthetic", 1) == "syntax_error"
+    assert _node_harness_failure("", 1) == "unexpected_node_failure"
 
 
 class _SensitiveHandler(BaseHTTPRequestHandler):
@@ -338,6 +372,194 @@ async def test_exact_source_event_replay_is_durable_across_restart(tmp_path: Pat
         await restarted.stop()
 
 
+def _sqlite_snapshot(source: Path, destination: Path) -> None:
+    source_conn = sqlite3.connect(source)
+    destination_conn = sqlite3.connect(destination)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
+    destination.chmod(0o600)
+
+
+@pytest.mark.asyncio
+async def test_restored_valid_hmac_pre_delivery_sqlite_cannot_disclose_twice(
+    tmp_path: Path,
+) -> None:
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    config, dependencies = host.config, host.dependencies
+    result = _tool(_event(OWNER, "request", message="sqlite-rollback-source"), host)
+    request_id = dict(result.terminal.metadata)["request_id"]
+    snapshot = tmp_path / "pre-delivery.db"
+    _sqlite_snapshot(host.store.db_path, snapshot)
+    assert await host.process_once()
+    assert len(sensitive.calls) == 1
+    await host.stop()
+
+    shutil.copyfile(snapshot, config.state_dir / "authorization.db")
+    (config.state_dir / "authorization.db").chmod(0o600)
+    for suffix in ("-wal", "-shm"):
+        path = config.state_dir / ("authorization.db" + suffix)
+        if path.exists():
+            path.unlink()
+    restarted = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
+    assert await restarted.start(_background_worker=False)
+    try:
+        row = restarted.repository.get(request_id)
+        assert row.status == "failed_consumed"
+        assert row.terminal_code == "replay_authority_mismatch"
+        assert await restarted.process_once() is False
+        assert len(sensitive.calls) == 1
+        assert transport.calls
+        assert ordinary.messages == []
+    finally:
+        await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_deleted_row_does_not_free_consumed_owner_provider_message(
+    tmp_path: Path,
+) -> None:
+    host, _transport, _ordinary, sensitive = await _host(tmp_path)
+    config, dependencies = host.config, host.dependencies
+    first = _tool(_event(TRUSTED, "request", message="deleted-row-source-1"), host)
+    first_id = dict(first.terminal.metadata)["request_id"]
+    decision_id = "deleted-row-owner-decision"
+    assert host.intercept_approval(_event(
+        OWNER, f"/approve {first_id}", message=decision_id,
+    )).mutated
+    assert await host.process_once()
+    assert len(sensitive.calls) == 1
+    conn = host.store._connect()
+    try:
+        conn.execute("DELETE FROM private_read_mvp_requests WHERE request_id=?", (first_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    await host.stop()
+
+    restarted = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
+    assert await restarted.start(_background_worker=False)
+    try:
+        second = _tool(_event(
+            TRUSTED, "request", message="deleted-row-source-2"
+        ), restarted)
+        second_id = dict(second.terminal.metadata)["request_id"]
+        replay = restarted.intercept_approval(_event(
+            OWNER, f"/approve {second_id}", message=decision_id,
+        ))
+        assert replay.matched and not replay.mutated
+        assert await restarted.process_once()
+        assert await restarted.process_once() is False
+        assert len(sensitive.calls) == 1
+    finally:
+        await restarted.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["journal_missing", "journal_truncated", "journal_corrupt",
+                                    "marker_missing", "marker_corrupt", "both_missing"])
+async def test_required_replay_authority_damage_keeps_host_unpublished_and_offline(
+    tmp_path: Path, damage: str,
+) -> None:
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    config, dependencies = host.config, host.dependencies
+    _tool(_event(OWNER, "request", message="journal-damage-source"), host)
+    await host.stop()
+    journal = config.state_dir / JOURNAL_NAME
+    marker = config.state_dir / MARKER_NAME
+    if damage == "journal_missing":
+        journal.unlink()
+    elif damage == "both_missing":
+        journal.unlink()
+        marker.unlink()
+    elif damage == "journal_truncated":
+        value = journal.read_bytes()
+        journal.write_bytes(value.splitlines(keepends=True)[0])
+    elif damage == "journal_corrupt":
+        value = bytearray(journal.read_bytes())
+        value[min(10, len(value) - 1)] ^= 1
+        journal.write_bytes(value)
+    elif damage == "marker_missing":
+        marker.unlink()
+    else:
+        marker.write_text("corrupt\n", encoding="utf-8")
+    for path in (journal, marker):
+        if path.exists():
+            path.chmod(0o600)
+    restarted = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
+    assert not await restarted.start(_background_worker=False)
+    assert not restarted.is_healthy()
+    assert not check_private_read_request_runtime()
+    assert transport.calls == []
+    assert ordinary.messages == []
+    assert sensitive.calls == []
+
+
+@pytest.mark.asyncio
+async def test_journal_fsync_before_marker_failure_depublishes_without_db_transition(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    original = host._journal._replace_marker
+
+    def fail_marker(*_args, **_kwargs):
+        raise OSError("synthetic marker failure")
+
+    monkeypatch.setattr(host._journal, "_replace_marker", fail_marker)
+    result = _tool(_event(OWNER, "request", message="journal-marker-crash"), host)
+    assert result.terminal.status == "safe_failure"
+    assert not host.is_healthy()
+    assert not check_private_read_request_runtime()
+    assert transport.calls == [] and ordinary.messages == [] and sensitive.calls == []
+    monkeypatch.setattr(host._journal, "_replace_marker", original)
+    await host.stop()
+
+
+@pytest.mark.asyncio
+async def test_journal_delivery_tombstone_survives_db_commit_failure_without_disclosure(
+    tmp_path: Path,
+) -> None:
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    config, dependencies = host.config, host.dependencies
+    result = _tool(_event(OWNER, "request", message="delivery-db-crash"), host)
+    request_id = dict(result.terminal.metadata)["request_id"]
+    fired = [False]
+    conn = host.store._connect()
+    try:
+        values = host.repository._values(conn.execute(
+            "SELECT * FROM private_read_mvp_requests WHERE request_id=?", (request_id,)
+        ).fetchone())
+    finally:
+        conn.close()
+    request_journal_id = host.repository._request_journal_id(values)
+
+    def fail_commit(step):
+        if (
+            step == "commit.before" and not fired[0]
+            and host._journal.contains("delivery", request_journal_id)
+        ):
+            fired[0] = True
+            raise RuntimeError("synthetic commit failure")
+
+    host.store._fault_hook = fail_commit
+    with pytest.raises(RuntimeError, match="synthetic commit failure"):
+        await host.process_once()
+    host.store._fault_hook = None
+    assert sensitive.calls == [] and transport.calls == []
+    await host.stop()
+    restarted = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
+    assert await restarted.start(_background_worker=False)
+    try:
+        row = restarted.repository.get(request_id)
+        assert row.status == "failed_consumed"
+        assert await restarted.process_once() is False
+        assert sensitive.calls == [] and transport.calls == [] and ordinary.messages == []
+    finally:
+        await restarted.stop()
+
+
 @pytest.mark.asyncio
 async def test_concurrent_exact_event_creates_one_durable_request(tmp_path: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
@@ -410,6 +632,65 @@ async def test_read_crossing_expiry_never_reaches_sensitive_submit(tmp_path: Pat
         request = host.repository.get(request_id)
         assert request.status == "failed_consumed"
         assert sensitive.calls == []
+    finally:
+        await host.stop()
+
+
+@pytest.mark.asyncio
+async def test_clock_reaches_exact_expiry_during_final_validation_and_never_submits(
+    tmp_path: Path,
+) -> None:
+    clock = [time.time_ns() // 1000]
+    config = JunoPrivateReadMvpConfig.parse(_raw_config(tmp_path))
+
+    class ClockSensitive(FakeSensitive):
+        async def observe_identity(self, *, request):
+            return _runtime_identity(observed_at_us=clock[0])
+
+    sensitive = ClockSensitive()
+    host = JunoPrivateReadMvpHost(
+        config,
+        JunoPrivateReadDependencies(
+            OpenFgaChecker(config, FakeJsonTransport()),
+            GmailNewestInboxProvider(config, FakeJsonTransport()),
+            FakeOrdinary(), sensitive,
+        ),
+        active_profile="juno", _clock_us=lambda: clock[0],
+    )
+    assert await host.start(_background_worker=False)
+    try:
+        result = _tool(_event(OWNER, "request", message="exact-expiry-final-validation"), host)
+        request_id = dict(result.terminal.metadata)["request_id"]
+        request = host.repository.get(request_id)
+        original = host.repository.validate_claim
+        validations = [0]
+
+        def crossing_validate(candidate, token, now_us):
+            validations[0] += 1
+            validated = original(candidate, token, now_us)
+            if validations[0] == 4:
+                clock[0] = candidate.expires_at_us
+            return validated
+
+        host.repository.validate_claim = crossing_validate
+        assert await host.process_once()
+        terminal = host.repository.get(request_id)
+        assert terminal.status == "failed_consumed"
+        assert terminal.terminal_code == "expired_after_final_validation"
+        assert sensitive.calls == []
+    finally:
+        await host.stop()
+
+
+@pytest.mark.asyncio
+async def test_validate_claim_rejects_exact_expiry(tmp_path: Path) -> None:
+    host, _transport, _ordinary, _sensitive = await _host(tmp_path)
+    try:
+        result = _tool(_event(OWNER, "request", message="exact-expiry-claim"), host)
+        request_id = dict(result.terminal.metadata)["request_id"]
+        request, token = host.repository.claim_approved(host._clock_us())
+        assert request.request_id == request_id
+        assert host.repository.validate_claim(request, token, request.expires_at_us) is None
     finally:
         await host.stop()
 
@@ -897,8 +1178,83 @@ async def test_fixed_transport_refuses_redirect_without_forwarding_secrets() -> 
 
 
 @pytest.mark.asyncio
+async def test_fixed_authority_transport_ignores_all_ambient_proxy_variables(
+    monkeypatch,
+) -> None:
+    target_calls: list[tuple[str, bytes]] = []
+    proxy_calls: list[tuple[str, bytes]] = []
+
+    def handler_for(capture):
+        class Handler(BaseHTTPRequestHandler):
+            def _handle(self):
+                body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                capture.append((self.path, body))
+                encoded = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *_args):
+                pass
+        return Handler
+
+    target = _loopback_server(handler_for(target_calls))
+    proxy = _loopback_server(handler_for(proxy_calls))
+    threads = [Thread(target=item.serve_forever, daemon=True) for item in (target, proxy)]
+    for thread in threads:
+        thread.start()
+    proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    ):
+        monkeypatch.setenv(name, proxy_url)
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    fixed = f"http://127.0.0.1:{target.server_port}"
+    transport = FixedHttpJsonTransport(_test_authorities={
+        GMAIL_AUTHORITY: fixed, OPENFGA_AUTHORITY: fixed,
+        "http://127.0.0.1:3011": fixed,
+    })
+    try:
+        calls = (
+            ("GET", GMAIL_AUTHORITY, "/gmail", None,
+             {"authorization": "Bearer " + CREDENTIAL_SENTINEL}),
+            ("POST", OPENFGA_AUTHORITY, "/fga", {"request": "authority-only"},
+             {"authorization": "Bearer " + CREDENTIAL_SENTINEL,
+              "content-type": "application/json"}),
+            ("POST", "http://127.0.0.1:3011", "/sensitive",
+             {"private_value": PRIVATE_SENTINEL},
+             {"x-hermes-sensitive-capability": CREDENTIAL_SENTINEL,
+              "content-type": "application/json"}),
+        )
+        for method, authority, path, body, headers in calls:
+            result = await transport.request(
+                method=method, authority=authority, path=path, query=(), headers=headers,
+                body=body, timeout=2, max_bytes=1024,
+            )
+            assert result == {"ok": True}
+        assert [path for path, _body_value in target_calls] == [
+            "/gmail", "/fga", "/sensitive",
+        ]
+        assert proxy_calls == []
+        assert PRIVATE_SENTINEL.encode() in target_calls[-1][1]
+    finally:
+        for server in (target, proxy):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+
+@pytest.mark.asyncio
 async def test_redirect_refusal_is_content_free_without_socket(monkeypatch) -> None:
     import gateway.juno_private_read_mvp as mvp
+    handlers = []
 
     class Opener:
         def open(self, request, timeout):
@@ -908,13 +1264,23 @@ async def test_redirect_refusal_is_content_free_without_socket(monkeypatch) -> N
             ) is None
             raise OSError(PRIVATE_SENTINEL + CREDENTIAL_SENTINEL)
 
-    monkeypatch.setattr(mvp.urllib_request, "build_opener", lambda *_: Opener())
+    def build_opener(*values):
+        handlers.extend(values)
+        return Opener()
+
+    monkeypatch.setattr(mvp.urllib_request, "build_opener", build_opener)
     result = await FixedHttpJsonTransport().request(
         method="POST", authority=GMAIL_AUTHORITY, path="/fixed",
         query=(), headers={"authorization": "Bearer " + CREDENTIAL_SENTINEL},
         body={"private_value": PRIVATE_SENTINEL}, timeout=1, max_bytes=1024,
     )
     assert repr(result) == "<private transport failure>"
+    proxy_handlers = [
+        item for item in handlers if isinstance(item, mvp.urllib_request.ProxyHandler)
+    ]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
+    assert any(isinstance(item, mvp._RejectRedirects) for item in handlers)
     assert PRIVATE_SENTINEL not in repr(result)
     assert CREDENTIAL_SENTINEL not in repr(result)
 
@@ -989,6 +1355,133 @@ async def test_gateway_runner_v2_production_composition_publishes_only_when_read
 
 
 @pytest.mark.asyncio
+async def test_real_gateway_runner_startup_dispatch_registry_and_cleanup_seam(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import gateway.juno_private_read_mvp as mvp
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from tools.private_read_request_tool import PRIVATE_READ_REQUEST_TOOL_NAME
+    from tools.registry import registry
+
+    home = tmp_path / "home"
+    profile_home = home / ".hermes" / "profiles" / "juno"
+    profile_home.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", f"{OWNER},{TRUSTED}")
+    authority_root = tmp_path / "authority"
+    authority_root.mkdir(mode=0o700)
+    raw = _raw_config(authority_root)
+
+    class RunnerTransport(FakeJsonTransport):
+        async def request(self, **call):
+            if call["authority"] == "http://127.0.0.1:3011":
+                if call["path"] == "/v1/identity":
+                    return {
+                        "outcome": "available", "submitted": False,
+                        "provider_account_jid": SENSITIVE_ACCOUNT,
+                        "identity_observed_us": time.time_ns() // 1000,
+                        "adapter_runtime_id": "runner-runtime",
+                        "connection_epoch": "runner-epoch",
+                        "transport_identity": _SENSITIVE_TRANSPORT_IDENTITY,
+                    }
+                return {
+                    "state": "submitted", "message_id": "3EB0ABCDEF0123456789AB",
+                    "account": SENSITIVE_ACCOUNT,
+                    "destination": call["body"]["destination"],
+                }
+            return await super().request(**call)
+
+    fake_transport = RunnerTransport()
+    monkeypatch.setattr(mvp, "FixedHttpJsonTransport", lambda: fake_transport)
+
+    class Adapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, destination, text):
+            self.sent.append((destination, text))
+            return SimpleNamespace(success=True, message_id="runner-notice")
+
+    config = GatewayConfig(
+        sessions_dir=tmp_path / "sessions",
+        trusted_private_read=raw,
+        platforms={Platform.WHATSAPP: PlatformConfig(
+            enabled=True,
+            extra={"allow_from": [OWNER, TRUSTED], "dm_policy": "allowlist"},
+        )},
+    )
+    runner = GatewayRunner(config)
+    adapter = Adapter()
+    runner.adapters[Platform.WHATSAPP] = adapter
+    runner.delivery_router.adapters = runner.adapters
+    assert runner._active_profile_name() == "juno"
+    assert await runner._start_trusted_private_read_host()
+    host = runner._trusted_private_read_host
+    observed_results: list[object] = []
+
+    async def fake_model(*_args, **_kwargs):
+        entry = registry.get_entry(PRIVATE_READ_REQUEST_TOOL_NAME)
+        result = entry.handler({"capability_id": CAPABILITY_ID}, tool_call_id="runner-tool")
+        observed_results.append(result)
+        return {"final_response": result.terminal.final_response, "messages": [],
+                "api_calls": 0, "tools": [PRIVATE_READ_REQUEST_TOOL_NAME]}
+
+    monkeypatch.setattr(runner, "_run_agent_inner", fake_model)
+    trusted = _event(
+        TRUSTED, "read newest inbox", profile=None, message="runner-trusted-provider-message",
+    )
+    wrong_events = (
+        _event(TRUSTED, "x", profile="default", message="runner-wrong-profile"),
+        _event(TRUSTED, "x", account="99999999999@s.whatsapp.net",
+               profile=None, message="runner-wrong-account"),
+        _event(TRUSTED, "x", chat=OWNER_CHAT, profile=None,
+               message="runner-wrong-chat"),
+        _event(TRUSTED, "x", profile=None, message=""),
+    )
+    try:
+        dispatched = await runner._run_agent(
+            trusted.text, "", [], trusted.source, "runner-session",
+            session_key="runner-session-key", logical_event=trusted,
+        )
+        assert observed_results[-1].terminal.status == "deferred"
+        request_id = dict(observed_results[-1].terminal.metadata)["request_id"]
+        for wrong in wrong_events:
+            await runner._run_agent(
+                wrong.text, "", [], wrong.source, "wrong-session",
+                session_key="wrong-session-key", logical_event=wrong,
+            )
+            assert observed_results[-1].terminal.status == "safe_failure"
+        for _ in range(100):
+            if adapter.sent:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter.sent and adapter.sent[0][0] == OWNER_CHAT
+        owner = _event(
+            OWNER, f"/approve {request_id}", profile=None,
+            message="runner-owner-provider-message",
+        )
+        response = await runner._handle_message(owner)
+        assert response == "Private-read request approved."
+        for _ in range(100):
+            row = host.repository.get(request_id)
+            if row.status in {"consumed", "failed_consumed"}:
+                break
+            await asyncio.sleep(0.01)
+        assert host.repository.get(request_id).status == "consumed"
+        serialized = json.dumps({"dispatch": dispatched, "results": [repr(x) for x in observed_results]})
+        assert PRIVATE_SENTINEL not in serialized
+        assert CREDENTIAL_SENTINEL not in serialized
+        with pytest.raises(JunoPrivateReadError):
+            host.request_from_tool(CAPABILITY_ID)
+    finally:
+        await host.stop()
+        runner._trusted_private_read_host = None
+    assert not check_private_read_request_runtime()
+
+
+@pytest.mark.asyncio
 async def test_dedicated_juno_profile_binds_profileless_events_and_real_adapter_map(
     tmp_path: Path,
 ) -> None:
@@ -1038,14 +1531,23 @@ async def test_dedicated_juno_profile_binds_profileless_events_and_real_adapter_
 
 @pytest.mark.asyncio
 async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
-    tmp_path: Path, caplog,
+    tmp_path: Path, caplog, monkeypatch,
 ) -> None:
+    import gateway.juno_private_read_mvp as mvp
+    from gateway.config import GatewayConfig
     from hermes_state import SessionDB
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
-    from gateway.juno_private_read_mvp import _SensitiveHttpSubmitter
     from gateway.run import GatewayRunner
+    from tools.private_read_request_tool import PRIVATE_READ_REQUEST_TOOL_NAME
+    from tools.registry import registry
 
     caplog.set_level(logging.DEBUG)
+    home = tmp_path / "home"
+    profile_home = home / ".hermes" / "profiles" / "juno"
+    profile_home.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", f"{OWNER},{TRUSTED}")
     _VerticalProviderHandler.observed = []
     raw = _raw_config(tmp_path)
     Path(raw["openfga"]["api_credential_file"]).write_text(
@@ -1057,12 +1559,11 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
     token_path.write_text(json.dumps(token_data), encoding="utf-8")
     config = JunoPrivateReadMvpConfig.parse(raw)
 
-    provider = _loopback_server(_VerticalProviderHandler)
-    provider_thread = Thread(target=provider.serve_forever, daemon=True)
-    provider_thread.start()
     capture = tmp_path / "private-delivery-capture.jsonl"
     capture.touch(mode=0o600)
-    harness = Path(__file__).parents[1] / "fixtures/juno_sensitive_http_harness.mjs"
+    harness = Path(os.environ.get("JUNO_ISOLATED_SENSITIVE_HARNESS") or (
+        Path(__file__).parents[1] / "fixtures/juno_sensitive_http_harness.mjs"
+    ))
     sensitive_process = subprocess.Popen(
         ["node", str(harness)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env={
@@ -1072,11 +1573,35 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             "JUNO_TEST_SENSITIVE_CAPABILITY": "s" * 48,
         },
     )
+    selector = selectors.DefaultSelector()
+    selector.register(sensitive_process.stdout, selectors.EVENT_READ)
+    ready = selector.select(timeout=10)
+    selector.close()
+    if not ready:
+        sensitive_process.terminate()
+        sensitive_process.wait(timeout=5)
+        classification = _node_harness_failure(
+            sensitive_process.stderr.read(), sensitive_process.returncode,
+        )
+        pytest.fail(f"Node vertical harness timed out: {classification}")
     first_line = sensitive_process.stdout.readline()
     if not first_line:
-        sensitive_process.terminate()
-        pytest.skip("Node loopback harness could not bind")
+        returncode = sensitive_process.wait(timeout=5)
+        classification = _node_harness_failure(
+            sensitive_process.stderr.read(), returncode,
+        )
+        if classification == "socket_bind_denied":
+            pytest.skip("execution sandbox positively denied Node loopback listen")
+        pytest.fail(f"Node vertical harness failed: {classification}")
     sensitive_port = json.loads(first_line)["port"]
+    try:
+        provider = HTTPServer(("127.0.0.1", 0), _VerticalProviderHandler)
+    except PermissionError:
+        sensitive_process.terminate()
+        sensitive_process.wait(timeout=5)
+        pytest.skip("execution sandbox positively denied Python provider loopback listen")
+    provider_thread = Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
 
     class OrdinaryAdapter:
         def __init__(self):
@@ -1086,24 +1611,43 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             self.sent.append((destination, text))
             return SimpleNamespace(success=True, message_id="ordinary-vertical-notice")
 
-    ordinary_adapter = OrdinaryAdapter()
-    runner = object.__new__(GatewayRunner)
-    runner._active_profile_name = lambda: "juno"
-    runner.adapters = {Platform.WHATSAPP: ordinary_adapter}
-    runner._profile_adapters = {}
-    production = compose_juno_private_read_mvp_services(runner, config)
     authority = f"http://127.0.0.1:{provider.server_port}"
     transport = FixedHttpJsonTransport(_test_authorities={
         OPENFGA_AUTHORITY: authority,
         GMAIL_AUTHORITY: authority,
         "http://127.0.0.1:3011": f"http://127.0.0.1:{sensitive_port}",
     })
-    dependencies = JunoPrivateReadDependencies(
-        OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
-        production.ordinary, _SensitiveHttpSubmitter(config, transport),
+    monkeypatch.setattr(mvp, "FixedHttpJsonTransport", lambda: transport)
+    runner_config = GatewayConfig(
+        sessions_dir=tmp_path / "runner-sessions",
+        trusted_private_read=raw,
+        platforms={Platform.WHATSAPP: PlatformConfig(
+            enabled=True,
+            extra={"allow_from": [OWNER, TRUSTED], "dm_policy": "allowlist"},
+        )},
     )
-    host = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
-    assert await host.start(_background_worker=False)
+    runner = GatewayRunner(runner_config)
+    ordinary_adapter = OrdinaryAdapter()
+    runner.adapters[Platform.WHATSAPP] = ordinary_adapter
+    runner.delivery_router.adapters = runner.adapters
+    assert runner._active_profile_name() == "juno"
+    assert await runner._start_trusted_private_read_host()
+    host = runner._trusted_private_read_host
+    tool_results: list[object] = []
+
+    async def fake_model(*_args, **_kwargs):
+        entry = registry.get_entry(PRIVATE_READ_REQUEST_TOOL_NAME)
+        tool_result = entry.handler(
+            {"capability_id": CAPABILITY_ID}, tool_call_id="vertical-tool"
+        )
+        tool_results.append(tool_result)
+        return {
+            "final_response": tool_result.terminal.final_response,
+            "messages": [], "api_calls": 0,
+            "tools": [PRIVATE_READ_REQUEST_TOOL_NAME],
+        }
+
+    monkeypatch.setattr(runner, "_run_agent_inner", fake_model)
     session_db = None
     try:
         bridge_data = _node_forwarded_event(
@@ -1119,12 +1663,19 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         assert inbound.metadata["whatsapp_account_id"] == ORDINARY_ACCOUNT
         assert inbound.source.profile is None
 
-        result = _tool(inbound, host)
+        dispatch = await runner._run_agent(
+            inbound.text, "", [], inbound.source, "vertical-session",
+            session_key="vertical-session-key", logical_event=inbound,
+        )
+        result = tool_results[-1]
         request_id = dict(result.terminal.metadata)["request_id"]
         assert json.loads(result.content) == {
             "status": "deferred", "reason": "approval_required"
         }
-        assert await host.process_once()
+        for _ in range(200):
+            if ordinary_adapter.sent:
+                break
+            await asyncio.sleep(0.01)
         assert len(ordinary_adapter.sent) == 1
 
         approval_data = _node_forwarded_event(
@@ -1133,11 +1684,19 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         )
         approval = await inbound_adapter._build_message_event(approval_data)
         assert approval.source.profile is None
-        assert host.intercept_approval(approval).mutated
-        assert await host.process_once()
-        assert not host.intercept_approval(approval).mutated
-        assert _tool(inbound, host).terminal.status == "safe_failure"
-        assert await host.process_once() is False
+        assert await runner._handle_message(approval) == "Private-read request approved."
+        for _ in range(300):
+            if host.repository.get(request_id).status in {"consumed", "failed_consumed"}:
+                break
+            await asyncio.sleep(0.01)
+        assert host.repository.get(request_id).status == "consumed"
+        replay_approval = await runner._handle_message(approval)
+        assert replay_approval != "Private-read request approved."
+        await runner._run_agent(
+            inbound.text, "", [], inbound.source, "vertical-replay-session",
+            session_key="vertical-replay-session-key", logical_event=inbound,
+        )
+        assert tool_results[-1].terminal.status == "safe_failure"
 
         deliveries = [json.loads(line) for line in capture.read_text().splitlines()]
         assert len(deliveries) == 1
@@ -1157,14 +1716,18 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         session_db.close()
         session_db = None
         trajectory = tmp_path / "trajectory.json"
-        trajectory.write_text(json.dumps({"tool_result": result.content}), encoding="utf-8")
+        trajectory.write_text(json.dumps({
+            "tool_result": result.content, "dispatch": dispatch,
+        }), encoding="utf-8")
         gateway_log = tmp_path / "gateway.log"
         gateway_log.write_text(caplog.text, encoding="utf-8")
 
         await host.stop()
+        runner._trusted_private_read_host = None
         ordinary_surfaces = [
-            config.state_dir / "authorization.db", session_path, trajectory, gateway_log,
+            session_path, trajectory, gateway_log,
         ]
+        ordinary_surfaces.extend(config.state_dir.iterdir())
         for base in tuple(ordinary_surfaces):
             ordinary_surfaces.extend(base.parent.glob(base.name + "-*"))
         scanned = b"\n".join(
@@ -1179,8 +1742,9 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
     finally:
         if session_db is not None:
             session_db.close()
-        if host.is_healthy():
+        if host is not None and host.is_healthy():
             await host.stop()
+        runner._trusted_private_read_host = None
         sensitive_process.terminate()
         sensitive_process.wait(timeout=5)
         provider.shutdown()
@@ -1253,60 +1817,163 @@ async def test_non_juno_active_profile_cannot_start_or_bind_v2_host(tmp_path: Pa
     assert runner._trusted_private_read_host is None
 
 
-def _install_legacy_mvp_table(db_path: Path, *, cycle1: bool) -> None:
+def _checkpoint_metadata(checkpoint: int):
+    columns = [
+        ("request_id", "TEXT", 0, None, 1),
+        ("requester", "TEXT", 1, None, 0),
+        ("source_profile", "TEXT", 1, None, 0),
+        ("source_account", "TEXT", 1, None, 0),
+        ("source_chat", "TEXT", 1, None, 0),
+    ]
+    if checkpoint >= 1:
+        columns.extend([
+            ("source_message", "TEXT", 1, None, 0),
+        ])
+    columns.extend([
+        ("capability_id", "TEXT", 1, None, 0),
+        ("destination_account", "TEXT", 1, None, 0),
+        ("destination_chat", "TEXT", 1, None, 0),
+        ("owner_sender", "TEXT", 1, None, 0),
+    ])
+    if checkpoint >= 1:
+        columns.append(("approval_chat", "TEXT", 1, None, 0))
+    if checkpoint >= 2:
+        columns.append(("approval_message", "TEXT", 0, None, 0))
+    columns.extend([
+        ("descriptor_digest", "TEXT", 1, None, 0),
+        ("created_at_us", "INTEGER", 1, None, 0),
+        ("expires_at_us", "INTEGER", 1, None, 0),
+        ("status", "TEXT", 1, None, 0),
+        ("notice_claimed", "INTEGER", 1, "0", 0),
+        ("claim_token_digest", "TEXT", 0, None, 0),
+        ("provider_message_id", "TEXT", 0, None, 0),
+        ("terminal_code", "TEXT", 0, None, 0),
+        ("updated_at_us", "INTEGER", 1, None, 0),
+        ("version", "INTEGER", 1, "1", 0),
+    ])
+    if checkpoint >= 2:
+        columns.append(("state_hmac", "TEXT", 1, None, 0))
+    return [
+        (cid, name, kind, notnull, default, primary)
+        for cid, (name, kind, notnull, default, primary) in enumerate(columns)
+    ]
+
+
+def _install_legacy_mvp_table(db_path: Path, *, checkpoint: int) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("DROP INDEX IF EXISTS idx_private_read_mvp_state")
         conn.execute("DROP INDEX IF EXISTS idx_private_read_mvp_source_event")
         conn.execute("DROP INDEX IF EXISTS idx_private_read_mvp_approval_event")
-        conn.execute("DROP TABLE private_read_mvp_requests")
-        binding_columns = (
-            "source_message TEXT NOT NULL,approval_chat TEXT NOT NULL,"
-            if cycle1 else ""
-        )
+        conn.execute("DROP TABLE IF EXISTS private_read_mvp_requests")
+        source_column = "source_message TEXT NOT NULL," if checkpoint >= 1 else ""
+        approval_columns = "approval_chat TEXT NOT NULL," if checkpoint >= 1 else ""
+        if checkpoint >= 2:
+            approval_columns += "approval_message TEXT,"
+        state_column = ",state_hmac TEXT NOT NULL" if checkpoint >= 2 else ""
         conn.execute(
             "CREATE TABLE private_read_mvp_requests ("
             "request_id TEXT PRIMARY KEY,requester TEXT NOT NULL,"
             "source_profile TEXT NOT NULL,source_account TEXT NOT NULL,"
-            "source_chat TEXT NOT NULL," + binding_columns +
+            "source_chat TEXT NOT NULL," + source_column +
             "capability_id TEXT NOT NULL,destination_account TEXT NOT NULL,"
             "destination_chat TEXT NOT NULL,owner_sender TEXT NOT NULL,"
+            + approval_columns +
             "descriptor_digest TEXT NOT NULL,created_at_us INTEGER NOT NULL,"
             "expires_at_us INTEGER NOT NULL,status TEXT NOT NULL CHECK (status IN ("
             "'pending','approved','denied','expired','claimed','consumed','failed_consumed'"
             ")),notice_claimed INTEGER NOT NULL DEFAULT 0 CHECK (notice_claimed IN (0,1)),"
             "claim_token_digest TEXT,provider_message_id TEXT,terminal_code TEXT,"
-            "updated_at_us INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1)"
+            "updated_at_us INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1"
+            + state_column + ")"
         )
         conn.execute(
             "CREATE INDEX idx_private_read_mvp_state ON private_read_mvp_requests("
             "status,expires_at_us,created_at_us)"
         )
-        if cycle1:
+        if checkpoint >= 1:
             conn.execute(
                 "CREATE UNIQUE INDEX idx_private_read_mvp_source_event "
                 "ON private_read_mvp_requests(source_profile,source_account,source_chat,"
                 "requester,source_message,capability_id) WHERE source_message <> ''"
             )
+        if checkpoint >= 2:
+            conn.execute(
+                "CREATE UNIQUE INDEX idx_private_read_mvp_approval_event "
+                "ON private_read_mvp_requests(source_profile,source_account,owner_sender,"
+                "approval_chat,approval_message,capability_id) "
+                "WHERE approval_message IS NOT NULL"
+            )
+        # All three source checkpoints used authorization schema version 7;
+        # the MVP table was an additive table outside that version number.
+        conn.execute("PRAGMA user_version=7")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert [tuple(row) for row in conn.execute(
+            "PRAGMA table_info(private_read_mvp_requests)"
+        )] == _checkpoint_metadata(checkpoint)
+        expected_indexes = {
+            "sqlite_autoindex_private_read_mvp_requests_1": (
+                1, "pk", 0, ("request_id",),
+            ),
+            "idx_private_read_mvp_state": (
+                0, "c", 0, ("status", "expires_at_us", "created_at_us"),
+            ),
+        }
+        if checkpoint >= 1:
+            expected_indexes["idx_private_read_mvp_source_event"] = (
+                1, "c", 1,
+                ("source_profile", "source_account", "source_chat", "requester",
+                 "source_message", "capability_id"),
+            )
+        if checkpoint >= 2:
+            expected_indexes["idx_private_read_mvp_approval_event"] = (
+                1, "c", 1,
+                ("source_profile", "source_account", "owner_sender", "approval_chat",
+                 "approval_message", "capability_id"),
+            )
+        observed_indexes = {}
+        for row in conn.execute("PRAGMA index_list(private_read_mvp_requests)"):
+            observed_indexes[row[1]] = (
+                row[2], row[3], row[4], tuple(
+                    item[2] for item in conn.execute(f"PRAGMA index_info('{row[1]}')")
+                ),
+            )
+        assert observed_indexes == expected_indexes
         columns = ["request_id", "requester", "source_profile", "source_account", "source_chat"]
-        if cycle1:
-            columns.extend(("source_message", "approval_chat"))
+        if checkpoint >= 1:
+            columns.append("source_message")
         columns.extend((
             "capability_id", "destination_account", "destination_chat", "owner_sender",
+        ))
+        if checkpoint >= 1:
+            columns.append("approval_chat")
+        if checkpoint >= 2:
+            columns.append("approval_message")
+        columns.extend((
             "descriptor_digest", "created_at_us", "expires_at_us", "status",
             "notice_claimed", "claim_token_digest", "provider_message_id", "terminal_code",
             "updated_at_us", "version",
         ))
+        if checkpoint >= 2:
+            columns.append("state_hmac")
         for index, status in enumerate(("pending", "approved", "claimed")):
             values = [f"legacy-{index}", TRUSTED, "juno", ORDINARY_ACCOUNT, TRUSTED_CHAT]
-            if cycle1:
-                values.extend((f"legacy-source-{index}", OWNER_CHAT))
+            if checkpoint >= 1:
+                values.append(f"legacy-source-{index}")
             values.extend((
                 CAPABILITY_ID, SENSITIVE_ACCOUNT, "77777777777@s.whatsapp.net", OWNER,
+            ))
+            if checkpoint >= 1:
+                values.append(OWNER_CHAT)
+            if checkpoint >= 2:
+                values.append(None)
+            values.extend((
                 "0" * 64, 1_000_000 + index, 9_000_000_000_000_000, status, 0,
                 "legacy-claim" if status == "claimed" else None,
                 None, None, 1_000_000 + index, 1,
             ))
+            if checkpoint >= 2:
+                values.append("")
             conn.execute(
                 "INSERT INTO private_read_mvp_requests (" + ",".join(columns) + ") VALUES ("
                 + ",".join("?" for _ in columns) + ")", values,
@@ -1317,19 +1984,39 @@ def _install_legacy_mvp_table(db_path: Path, *, cycle1: bool) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cycle1", [False, True])
+@pytest.mark.parametrize("checkpoint", [0, 1, 2])
 async def test_exact_checkpoint_schema_migrates_legacy_rows_fail_closed(
-    tmp_path: Path, cycle1: bool,
+    tmp_path: Path, checkpoint: int,
 ) -> None:
-    host, transport, ordinary, sensitive = await _host(tmp_path)
-    config, dependencies = host.config, host.dependencies
+    from gateway.authorization_tasks import AuthorizationTaskStore
+
+    config = JunoPrivateReadMvpConfig.parse(_raw_config(tmp_path))
+    transport = FakeJsonTransport()
+    ordinary = FakeOrdinary()
+    sensitive = FakeSensitive()
+    dependencies = JunoPrivateReadDependencies(
+        OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
+        ordinary, sensitive,
+    )
     db_path = config.state_dir / "authorization.db"
-    await host.stop()
-    _install_legacy_mvp_table(db_path, cycle1=cycle1)
+    key_path = config.state_dir / "mvp-store.key"
+    key_path.write_bytes(b"k" * 32)
+    key_path.chmod(0o600)
+    assert not (config.state_dir / JOURNAL_NAME).exists()
+    assert not (config.state_dir / MARKER_NAME).exists()
+    bootstrap = AuthorizationTaskStore(
+        db_path=db_path, audit_hmac_key=b"a" * 32,
+        request_hmac_key=b"r" * 32, key_version="checkpoint-fixture",
+    )
+    bootstrap.close()
+    _install_legacy_mvp_table(db_path, checkpoint=checkpoint)
 
     migrated = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
     assert await migrated.start(_background_worker=False)
     try:
+        assert (config.state_dir / JOURNAL_NAME).is_file()
+        assert (config.state_dir / MARKER_NAME).is_file()
+        assert len(key_path.read_bytes()) > 32
         conn = migrated.store._connect()
         try:
             columns = {row[1] for row in conn.execute(
@@ -1352,11 +2039,11 @@ async def test_exact_checkpoint_schema_migrates_legacy_rows_fail_closed(
             conn.close()
         assert await migrated.process_once() is False
         fresh = _tool(_event(
-            TRUSTED, "request", message=f"authenticated-after-migration-{cycle1}"
+            TRUSTED, "request", message=f"authenticated-after-migration-{checkpoint}"
         ), migrated)
         fresh_id = dict(fresh.terminal.metadata)["request_id"]
         assert migrated.intercept_approval(_event(
-            OWNER, f"/deny {fresh_id}", message=f"deny-after-migration-{cycle1}"
+            OWNER, f"/deny {fresh_id}", message=f"deny-after-migration-{checkpoint}"
         )).mutated
         authenticated = migrated.repository.get(fresh_id)
         assert authenticated.status == "denied"
@@ -1388,6 +2075,10 @@ async def test_exact_checkpoint_schema_migrates_legacy_rows_fail_closed(
     ("owner_sender", TRUSTED),
     ("approval_chat", TRUSTED_CHAT),
     ("approval_message", "forged-approval-message"),
+    ("gmail_account", "forged@example.test"),
+    ("openfga_store_id", "forged-store"),
+    ("openfga_model_id", "forged-model"),
+    ("provider_authority_digest", "f" * 64),
     ("created_at_us", 1),
     ("expires_at_us", 9_000_000_000_000_000),
     ("notice_claimed", 1),
@@ -1496,6 +2187,59 @@ async def test_historical_authenticated_row_fails_when_sealed_requester_mapping_
         assert transport.calls == []
         assert ordinary.messages == []
         assert sensitive.calls == []
+    finally:
+        await restarted.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "changed_value"), [
+    ("gmail_account", "other@example.test"),
+    ("openfga_store_id", "store-other"),
+    ("openfga_model_id", "model-other"),
+])
+async def test_approved_request_is_terminalized_on_exact_provider_authority_drift(
+    tmp_path: Path, field: str, changed_value: str,
+) -> None:
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    result = _tool(_event(OWNER, "request", message="provider-drift-" + field), host)
+    request_id = dict(result.terminal.metadata)["request_id"]
+    old_config, dependencies = host.config, host.dependencies
+    await host.stop()
+    changed = replace(old_config, **{field: changed_value})
+    restarted = JunoPrivateReadMvpHost(changed, dependencies, active_profile="juno")
+    assert await restarted.start(_background_worker=False)
+    try:
+        assert restarted.repository.get(request_id) is None
+        assert await restarted.process_once() is False
+        assert transport.calls == []
+        assert ordinary.messages == []
+        assert sensitive.calls == []
+    finally:
+        await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_exact_provider_authority_survives_restart_and_submits(
+    tmp_path: Path,
+) -> None:
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    result = _tool(_event(OWNER, "request", message="provider-authority-stable"), host)
+    request_id = dict(result.terminal.metadata)["request_id"]
+    config, dependencies = host.config, host.dependencies
+    await host.stop()
+    restarted = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
+    assert await restarted.start(_background_worker=False)
+    try:
+        request = restarted.repository.get(request_id)
+        assert request.status == "approved"
+        assert request.gmail_account == "juno@example.test"
+        assert request.openfga_store_id == "store-juno"
+        assert request.openfga_model_id == "model-juno"
+        assert await restarted.process_once()
+        assert restarted.repository.get(request_id).status == "consumed"
+        assert len(sensitive.calls) == 1
+        assert transport.calls
+        assert ordinary.messages == []
     finally:
         await restarted.stop()
 

@@ -313,6 +313,10 @@ async def test_james_full_private_read_is_submitted_with_content_free_model_stat
                     "approval_chat": OWNER_CHAT,
                     "approval_message": None,
                     "expires_at_us": request.expires_at_us,
+                    "gmail_account": "juno@example.test",
+                    "openfga_store_id": "store-juno",
+                    "openfga_model_id": "model-juno",
+                    "provider_authority_digest": request.provider_authority_digest,
                 "descriptor_digest": request.descriptor_digest,
             },
         }

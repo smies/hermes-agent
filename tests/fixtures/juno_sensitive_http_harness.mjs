@@ -37,7 +37,16 @@ const transport = new SensitiveDeliveryTransport({
 transport.bindConnection({ socket, sock: socket, accountJid: account, epoch });
 
 const server = http.createServer(createSensitiveHttpHandler({ capability, transport }));
-await listenLoopback(server, { port: 0 });
+try {
+  await listenLoopback(server, { port: 0 });
+} catch (error) {
+  if (['EACCES', 'EPERM'].includes(error?.code) && error?.syscall === 'listen') {
+    process.stderr.write(`JUNO_SOCKET_BIND_DENIED:${error.code}:listen\n`);
+    process.exit(73);
+  }
+  process.stderr.write('JUNO_HARNESS_STARTUP_FAILURE\n');
+  process.exit(74);
+}
 process.stdout.write(`${JSON.stringify({ port: server.address().port })}\n`);
 
 const stop = () => {

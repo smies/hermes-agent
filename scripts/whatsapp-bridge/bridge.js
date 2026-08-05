@@ -31,7 +31,7 @@ import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
-import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { produceInboundMessage } from './inbound_producer.js';
 import { verifyLidBootstrap } from './lid_bootstrap.js';
 import {
   buildPollPayload,
@@ -514,249 +514,95 @@ async function startSocket() {
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
 
-    const botIds = Array.from(new Set([
-      normalizeWhatsAppId(sock.user?.id),
-      normalizeWhatsAppId(sock.user?.lid),
-    ].filter(Boolean)));
-
     for (const msg of messages) {
-      if (!msg.message) continue;
-
-      const chatId = msg.key.remoteJid;
-      const senderId = msg.key.participant || chatId;
-      const isGroup = chatId.endsWith('@g.us');
-      const senderNumber = senderId.replace(/@.*/, '');
       emitDebugEvent({
         stage: 'upsert',
         type,
         fromMe: !!msg.key.fromMe,
-        chatId: redactWhatsAppId(chatId),
-        senderId: redactWhatsAppId(senderId),
+        chatId: redactWhatsAppId(msg.key?.remoteJid),
+        senderId: redactWhatsAppId(msg.key?.participant || msg.key?.remoteJid),
         messageKeys: Object.keys(msg.message || {}),
       });
-
-      // Handle fromMe messages based on mode
-      let fromOwner = false;
-      if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) {
-          emitDebugEvent({
-            stage: 'ignored',
-            reason: isGroup ? 'from_me_group' : 'from_me_status',
-            chatId: redactWhatsAppId(chatId),
-          });
-          continue;
-        }
-
-        if (WHATSAPP_MODE === 'bot') {
-          // Bot mode: separate bot number. fromMe inbound is either
-          //   (a) an echo of our own /send (recentlySentIds will catch it), or
-          //   (b) a message the owner typed from their own phone using the
-          //       linked-device session.
-          //
-          // We always drop (a). We drop (b) too unless the operator opts in
-          // via WHATSAPP_FORWARD_OWNER_MESSAGES so existing deployments see
-          // no behavior change. When opted in, we still gate on the
-          // customer chatId allowlist — without that gate, any contact
-          // the owner replied to would leak into Hermes and trigger
-          // implicit handover. See `owner_message_gate.js`.
-          const decision = classifyOwnerMessageGate({
-            fromMe: true,
-            fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
-            recentlySent: recentlySentIds,
-            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
-            messageId: msg.key.id,
-            chatId,
-          });
-          if (decision.action === 'drop_echo') continue;
-          if (decision.action === 'drop_disabled') continue;
-          if (decision.action === 'drop_allowlist') {
-            try {
-              console.log(JSON.stringify({
-                event: 'ignored',
-                reason: 'allowlist_mismatch_owner_chat',
-                chatId,
-                senderId,
-              }));
-            } catch {}
-            continue;
-          }
-          fromOwner = true;
-        } else {
-          // Self-chat mode: only allow messages in the user's own self-chat.
-          // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
-          // AND classic format: 34652029134@s.whatsapp.net
-          // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const chatNumber = chatId.replace(/@.*/, '');
-          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-          emitDebugEvent({
-            stage: 'self_chat_check',
-            matched: !!isSelfChat,
-            chatId: redactWhatsAppId(chatId),
-            accountId: redactWhatsAppId(sock.user?.id),
-            accountLid: redactWhatsAppId(sock.user?.lid),
-          });
-          if (!isSelfChat) {
-            emitDebugEvent({
-              stage: 'ignored',
-              reason: 'self_chat_mismatch',
-              chatId: redactWhatsAppId(chatId),
-              senderId: redactWhatsAppId(senderId),
-            });
-            continue;
-          }
-        }
-      }
-
-      // Handle !fromMe messages (from other people) based on mode.
-      // Self-chat mode only responds to the user's own messages to
-      // themselves — stranger DMs / group pings must never reach the
-      // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
-      if (!msg.key.fromMe) {
-        if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
-      }
-
-      const messageContent = getMessageContent(msg);
-      if (messageContent.pollUpdateMessage) {
-        const pollUpdateMessage = messageContent.pollUpdateMessage;
-        const pollKey = pollUpdateMessage.pollCreationMessageKey || {
-          id: pollUpdateMessage.key?.id || msg.key.id,
-          remoteJid: chatId,
-          participant: senderId,
-        };
-        const pollCreation = messageStore.get(pollKey.id);
-        let aggregation = [];
-        let pollUpdates = [pollUpdateMessage];
-        try {
-          if (pollCreation) {
-            const meId = jidNormalizedUser(sock.user?.id || 'me');
-            const pollUpdate = pollUpdateForAggregation({
-              pollUpdateMessage,
-              pollUpdateMessageKey: msg.key,
-              pollCreation,
-              decryptPollVote,
-              getKeyAuthor,
-              meId,
-              pollCreatorJids: [
-                jidNormalizedUser(sock.user?.lid || ''),
-                jidNormalizedUser(sock.user?.id || ''),
-                getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(sock.user?.lid || '')),
-                getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(sock.user?.id || '')),
-              ],
-              voterJids: [
-                normalizeWhatsAppId(msg.key?.participant || ''),
-                normalizeWhatsAppId(msg.key?.remoteJid || chatId || ''),
-                normalizeWhatsAppId(senderId || ''),
-              ],
-            });
-            if (pollUpdate) pollUpdates = [pollUpdate];
-            aggregation = getAggregateVotesInPollMessage({
-              message: pollCreation.message,
-              pollUpdates,
-            });
-          }
-        } catch (err) {
-          console.warn('[bridge] failed to aggregate poll upsert:', err.message);
-        }
-        const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates[0]);
-        logPollUpdateDiagnostic({
-          sourcePath: 'messages.upsert',
-          pollId: pollKey.id,
-          pollCreation,
-          pollUpdates,
-          selectedOptions,
-          aggregation,
-        });
-        enqueuePollUpdateEvent({
-          key: { ...pollKey, remoteJid: pollKey.remoteJid || chatId, participant: pollKey.participant || senderId },
-          update: { pollUpdates },
-          selectedOptions,
-          aggregation,
-        });
-        continue;
-      }
-
-      const event = await extractBridgeEvent({
+      const outcome = await produceInboundMessage({
         msg,
-        chatId,
-        senderId,
-        senderNumber,
-        botIds,
-        isGroup,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+        socketUser: sock.user,
+        socket: sock,
+        mode: WHATSAPP_MODE,
+        dmPolicy: WHATSAPP_DM_POLICY,
+        forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+        recentlySentIds,
+        allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+        extractEvent: extractBridgeEvent,
+        downloadMedia: async (mediaMsg) => downloadMediaMessage(
+          mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage },
+        ),
         cacheDirs: {
           image: IMAGE_CACHE_DIR,
           document: DOCUMENT_CACHE_DIR,
           audio: AUDIO_CACHE_DIR,
         },
-      });
-      event.fromOwner = fromOwner;
-      // Loopback host provenance: bind each accepted inbound to the exact
-      // authenticated bridge account. The Python adapter keeps this out of
-      // message text and exposes it only as host metadata.
-      event.accountId = normalizeWhatsAppId(sock.user?.id);
-
-      // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
-      if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
-        if (WHATSAPP_DEBUG) {
-          emitDebugEvent({
-            stage: 'ignored',
-            reason: 'agent_echo',
-            chatId: redactWhatsAppId(chatId),
-            messageId: msg.key.id,
+        replyPrefix: REPLY_PREFIX,
+        messageStore,
+        messageQueue,
+        maxQueueSize: MAX_QUEUE_SIZE,
+        emitDebugEvent,
+        handlePollUpdate: async ({ msg: pollMsg, chatId, senderId, socketUser }) => {
+          const messageContent = getMessageContent(pollMsg);
+          if (!messageContent.pollUpdateMessage) return false;
+          const pollUpdateMessage = messageContent.pollUpdateMessage;
+          const pollKey = pollUpdateMessage.pollCreationMessageKey || {
+            id: pollUpdateMessage.key?.id || pollMsg.key.id,
+            remoteJid: chatId,
+            participant: senderId,
+          };
+          const pollCreation = messageStore.get(pollKey.id);
+          let aggregation = [];
+          let pollUpdates = [pollUpdateMessage];
+          try {
+            if (pollCreation) {
+              const meId = jidNormalizedUser(socketUser?.id || 'me');
+              const pollUpdate = pollUpdateForAggregation({
+                pollUpdateMessage, pollUpdateMessageKey: pollMsg.key, pollCreation,
+                decryptPollVote, getKeyAuthor, meId,
+                pollCreatorJids: [
+                  jidNormalizedUser(socketUser?.lid || ''),
+                  jidNormalizedUser(socketUser?.id || ''),
+                  getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(socketUser?.lid || '')),
+                  getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(socketUser?.id || '')),
+                ],
+                voterJids: [
+                  normalizeWhatsAppId(pollMsg.key?.participant || ''),
+                  normalizeWhatsAppId(pollMsg.key?.remoteJid || chatId || ''),
+                  normalizeWhatsAppId(senderId || ''),
+                ],
+              });
+              if (pollUpdate) pollUpdates = [pollUpdate];
+              aggregation = getAggregateVotesInPollMessage({
+                message: pollCreation.message, pollUpdates,
+              });
+            }
+          } catch (err) {
+            console.warn('[bridge] failed to aggregate poll upsert:', err.message);
+          }
+          const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates[0]);
+          logPollUpdateDiagnostic({
+            sourcePath: 'messages.upsert', pollId: pollKey.id, pollCreation,
+            pollUpdates, selectedOptions, aggregation,
           });
-        }
-        continue;
-      }
-
-      // Skip empty messages
-      if (!event.body && !event.hasMedia) {
-        emitDebugEvent({
-          stage: 'ignored',
-          reason: 'empty',
-          chatId: redactWhatsAppId(chatId),
-          messageKeys: Object.keys(msg.message || {}),
-        });
-        continue;
-      }
-
-      messageStore.remember(msg);
-      messageQueue.push(event);
-      emitDebugEvent({
-        stage: 'queued',
-        chatId: redactWhatsAppId(chatId),
-        senderId: redactWhatsAppId(senderId),
-        fromOwner: !!fromOwner,
-        bodyLength: event.body.length,
-        hasMedia: event.hasMedia,
-        mediaType: event.mediaType,
-        queueLength: messageQueue.length,
+          enqueuePollUpdateEvent({
+            key: { ...pollKey, remoteJid: pollKey.remoteJid || chatId,
+              participant: pollKey.participant || senderId },
+            update: { pollUpdates }, selectedOptions, aggregation,
+          });
+          return true;
+        },
       });
-      if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
+      if (outcome.action === 'ignored' && WHATSAPP_DEBUG) {
+        emitDebugEvent({
+          stage: 'ignored', reason: outcome.reason,
+          chatId: redactWhatsAppId(msg.key?.remoteJid),
+          senderId: redactWhatsAppId(msg.key?.participant || msg.key?.remoteJid),
+        });
       }
     }
   });

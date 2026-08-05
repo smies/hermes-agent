@@ -397,6 +397,18 @@ class AuthorizationTaskStore(
                                 "ALTER TABLE private_read_mvp_requests "
                                 "ADD COLUMN state_hmac TEXT NOT NULL DEFAULT ''"
                             )
+                        # Cycle-0/1/2 rows did not seal provider authority.  Empty
+                        # migration sentinels deliberately fail repository
+                        # authentication and are terminalized before provider use.
+                        for column in (
+                            "gmail_account", "openfga_store_id", "openfga_model_id",
+                            "provider_authority_digest",
+                        ):
+                            if column not in mvp_columns:
+                                conn.execute(
+                                    "ALTER TABLE private_read_mvp_requests "
+                                    f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                                )
                     for statement in _PRIVATE_READ_MVP.split(";"):
                         if statement.strip():
                             conn.execute(statement)
