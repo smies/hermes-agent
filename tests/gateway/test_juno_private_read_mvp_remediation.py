@@ -2641,15 +2641,18 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             "status": "deferred", "reason": "approval_required"
         }
         ordinary_sent = []
-        for _ in range(200):
+        for _ in range(500):
             ordinary_sent = await asyncio.to_thread(
                 _ordinary_bridge_sent, ordinary_process,
             )
-            if ordinary_sent:
+            if len(ordinary_sent) >= 2:
                 break
             await asyncio.sleep(0.01)
-        assert len(ordinary_sent) == 1
-        assert ordinary_sent[0]["chatId"] == OWNER_CHAT
+        ordinary_destinations = [message["chatId"] for message in ordinary_sent]
+        assert OWNER_CHAT in ordinary_destinations
+        assert TRUSTED in ordinary_destinations
+        assert set(ordinary_destinations) <= {TRUSTED, OWNER_CHAT}
+        assert all(PRIVATE_SENTINEL not in message["text"] for message in ordinary_sent)
 
         approval_callback = await asyncio.to_thread(
             _emit_ordinary_bridge_message,
