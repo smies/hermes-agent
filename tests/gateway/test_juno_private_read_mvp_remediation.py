@@ -6,10 +6,12 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import hashlib
+import hmac
 import io
 import json
 import logging
 import os
+import re
 import selectors
 import shutil
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,11 +23,17 @@ from threading import Lock, Thread
 import time
 import traceback
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 
 import gateway.juno_replay_journal as replay_journal
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.whatsapp_common import (
+    ORDINARY_VERIFIED_LAUNCHER_SHA256,
+    ORDINARY_VERIFIED_MANIFEST_SHA256,
+    ORDINARY_VERIFIED_SOURCE_SHA256,
+)
 from gateway.juno_private_read_mvp import (
     CAPABILITY_ID,
     GMAIL_AUTHORITY,
@@ -151,10 +159,13 @@ def _start_ordinary_bridge_harness(
     *, bridge_module: Path, harness: Path, home: Path,
     session_path: Path | None = None,
     fence_environment: dict[str, str] | None = None,
+    in_process_only: bool = False,
 ) -> tuple[subprocess.Popen, dict]:
     argv = ["node", str(harness)]
     if session_path is not None:
         argv.extend(("--session", str(session_path)))
+    if in_process_only:
+        argv.append("--in-process-only")
     process = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -221,9 +232,16 @@ def _emit_ordinary_bridge_message(
     return json.loads(line)
 
 
-def _poll_ordinary_bridge_route(process: subprocess.Popen) -> dict:
+def _request_ordinary_bridge_route(
+    process: subprocess.Popen, url: str,
+) -> dict:
+    route = urlsplit(url).path
+    if route not in {"/health", "/messages"}:
+        raise AssertionError("unsupported in-process ordinary bridge route")
     with process._juno_stdio_lock:
-        process.stdin.write('{"command":"poll"}\n')
+        process.stdin.write(json.dumps({
+            "command": "request", "url": route,
+        }) + "\n")
         process.stdin.flush()
         line = process.stdout.readline()
     if not line:
@@ -249,25 +267,26 @@ def _stop_ordinary_bridge_harness(process: subprocess.Popen) -> None:
 
 
 class _InProcessBridgeResponse:
-    def __init__(self, process: subprocess.Popen):
+    def __init__(self, process: subprocess.Popen, url: str):
         self._process = process
+        self._url = url
         self.status = 0
-        self._messages = None
+        self._body = None
 
     async def __aenter__(self):
         evidence = await asyncio.to_thread(
-            _poll_ordinary_bridge_route, self._process
+            _request_ordinary_bridge_route, self._process, self._url,
         )
-        assert evidence["poll"] is True
+        assert evidence["request"] is True
         self.status = evidence["status"]
-        self._messages = evidence["messages"]
+        self._body = evidence["body"]
         return self
 
     async def __aexit__(self, *_args):
         return False
 
     async def json(self):
-        return self._messages
+        return self._body
 
 
 class _InProcessBridgeSession:
@@ -275,8 +294,8 @@ class _InProcessBridgeSession:
         self._process = process
         self.closed = False
 
-    def get(self, *_args, **_kwargs):
-        return _InProcessBridgeResponse(self._process)
+    def get(self, url, *_args, **_kwargs):
+        return _InProcessBridgeResponse(self._process, url)
 
     async def close(self):
         self.closed = True
@@ -376,11 +395,101 @@ def test_node_harness_failure_classification_skips_only_exact_bind_denial() -> N
     assert _node_harness_failure("", 1) == "unexpected_node_failure"
 
 
+def _assert_actual_fence_health_invariants(
+    *, health: object, adapter, bridge_module: Path, session_path: Path,
+) -> None:
+    """Diagnose copied-runtime fence drift without exposing signed material."""
+    assert type(health) is dict, "ordinary /health body is not an object"
+    assert health.get("status") == "connected", \
+        "ordinary /health status is not connected"
+    evidence = health.get("senderCompanionFence")
+    assert type(evidence) is dict, \
+        "verified launcher transport identity did not reach fence evidence"
+    required = {
+        "version", "active", "profile", "runtimeId", "observedAtUs",
+        "socketGeneration", "accountPhoneJid", "accountLidJid",
+        "sessionPath", "sessionIdentity", "manifestSha256",
+        "sourceSha256", "scriptHash", "proof",
+    }
+    assert set(evidence) == required, \
+        "ordinary fence evidence field set is not exact"
+    assert evidence.get("version") == 2, \
+        "ordinary fence evidence version mismatch"
+    assert evidence.get("active") is True, \
+        "ordinary fence evidence is not active"
+    assert evidence.get("profile") == "juno", \
+        "ordinary fence profile mismatch"
+    runtime_id = evidence.get("runtimeId")
+    assert type(runtime_id) is str and re.fullmatch(r"[a-f0-9]{64}", runtime_id), \
+        "ordinary fence runtime generation has invalid type or shape"
+    socket_generation = evidence.get("socketGeneration")
+    assert type(socket_generation) is int and socket_generation >= 1, \
+        "ordinary socket generation has invalid type or value"
+    account_phone = evidence.get("accountPhoneJid")
+    account_lid = evidence.get("accountLidJid")
+    assert type(account_phone) is str and re.fullmatch(
+        r"\d{1,32}@s\.whatsapp\.net", account_phone,
+    ), "ordinary account phone JID is not canonical"
+    assert type(account_lid) is str and re.fullmatch(
+        r"\d{1,32}@lid", account_lid,
+    ), "ordinary account LID JID is not canonical"
+
+    canonical_session = session_path.resolve(strict=True)
+    session_stat = canonical_session.stat()
+    expected_session_identity = f"{session_stat.st_dev}:{session_stat.st_ino}"
+    assert evidence.get("sessionPath") == str(canonical_session), \
+        "ordinary fence session path is not the configured canonical root"
+    assert evidence.get("sessionIdentity") == expected_session_identity, \
+        "ordinary fence session dev:ino identity mismatch"
+    observed_at_us = evidence.get("observedAtUs")
+    now_us = time.time_ns() // 1000
+    assert type(observed_at_us) is int, \
+        "ordinary fence observation time has invalid type"
+    assert now_us - 5_000_000 <= observed_at_us, \
+        "ordinary fence observation is stale"
+    assert observed_at_us <= now_us + 250_000, \
+        "ordinary fence observation is implausibly in the future"
+
+    script_hash = hashlib.sha256(bridge_module.read_bytes()).hexdigest()[:16]
+    assert health.get("scriptHash") == script_hash, \
+        "ordinary /health bridge script hash mismatch"
+    assert evidence.get("scriptHash") == script_hash, \
+        "ordinary fence bridge script hash mismatch"
+    assert health.get("launcherHash") == ORDINARY_VERIFIED_LAUNCHER_SHA256, \
+        "ordinary verified launcher anchor mismatch"
+    assert health.get("transportManifestHash") \
+        == ORDINARY_VERIFIED_MANIFEST_SHA256, \
+        "ordinary verified manifest anchor mismatch"
+    assert evidence.get("manifestSha256") \
+        == ORDINARY_VERIFIED_MANIFEST_SHA256, \
+        "ordinary fence manifest anchor mismatch"
+    assert evidence.get("sourceSha256") == ORDINARY_VERIFIED_SOURCE_SHA256, \
+        "ordinary fence source anchor mismatch"
+
+    assert adapter._private_read_fence_profile == "juno", \
+        "adapter fence profile is not Juno"
+    fence_key = adapter._private_read_fence_key
+    assert type(fence_key) is str and re.fullmatch(r"[a-f0-9]{64}", fence_key), \
+        "adapter runtime fence key has invalid type or shape"
+    material = "\0".join((
+        "juno-sender-companion-fence-v2", "juno", runtime_id,
+        str(socket_generation), account_phone, account_lid,
+        str(canonical_session), expected_session_identity,
+        str(observed_at_us), ORDINARY_VERIFIED_MANIFEST_SHA256,
+        ORDINARY_VERIFIED_SOURCE_SHA256, script_hash,
+    ))
+    expected_proof = hmac.new(
+        bytes.fromhex(fence_key), material.encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+    proof = evidence.get("proof")
+    assert type(proof) is str and hmac.compare_digest(proof, expected_proof), \
+        "ordinary fence HMAC field order, encoding, or key binding mismatch"
+
+
 @pytest.mark.asyncio
 async def test_actual_start_socket_route_adapter_dispatch(
     tmp_path: Path,
 ) -> None:
-    import aiohttp
     from gateway.run import GatewayRunner
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
@@ -393,27 +502,34 @@ async def test_actual_start_socket_route_adapter_dispatch(
     worktree_root = Path(__file__).parents[2].resolve()
     assert not bridge_module.is_relative_to(worktree_root)
     assert not harness.is_relative_to(worktree_root)
-    process, ready = _start_ordinary_bridge_harness(
-        bridge_module=bridge_module,
-        harness=harness,
-        home=tmp_path / "ordinary-dispatch-home",
-    )
+    ordinary_session = tmp_path / "ordinary-session"
+    ordinary_session.mkdir(mode=0o700)
     adapter = WhatsAppAdapter(PlatformConfig(
         enabled=True,
         extra={
             "allow_from": [TRUSTED, OWNER],
             "dm_policy": "allowlist",
-            "bridge_port": ready["port"],
+            "bridge_script": str(bridge_module.parent / "launcher.js"),
+            "session_path": str(ordinary_session),
             "text_batch_delay_seconds": 0,
             "text_batch_split_delay_seconds": 0,
         },
     ))
-    adapter._running = True
-    adapter._http_session = (
-        aiohttp.ClientSession()
-        if ready["transport"] == "loopback"
-        else _InProcessBridgeSession(process)
+    adapter.configure_private_read_sender_companion_fence("juno")
+    fence_environment: dict[str, str] = {}
+    adapter._apply_private_read_fence_environment(fence_environment)
+    process, ready = _start_ordinary_bridge_harness(
+        bridge_module=bridge_module,
+        harness=harness,
+        home=tmp_path / "ordinary-dispatch-home",
+        session_path=ordinary_session,
+        fence_environment=fence_environment,
+        in_process_only=True,
     )
+    assert ready["transport"] == "in_process"
+    adapter._bridge_port = ready["port"]
+    adapter._running = True
+    adapter._http_session = _InProcessBridgeSession(process)
     runner = object.__new__(GatewayRunner)
     runner.config = SimpleNamespace(multiplex_profiles=False)
     dispatched = []
@@ -423,8 +539,30 @@ async def test_actual_start_socket_route_adapter_dispatch(
 
     runner._handle_message = observed_handler
     adapter.set_message_handler(runner._primary_message_handler())
-    poll_task = asyncio.create_task(adapter._poll_messages())
+    poll_task = None
     try:
+        async with adapter._http_session.get(
+            "http://127.0.0.1:0/health",
+        ) as health_response:
+            assert health_response.status == 200, \
+                "copied ordinary /health route did not return HTTP 200"
+            health = await health_response.json()
+        _assert_actual_fence_health_invariants(
+            health=health, adapter=adapter, bridge_module=bridge_module,
+            session_path=ordinary_session,
+        )
+        assert adapter._observe_private_read_fence_health(health) is True, \
+            "adapter rejected copied ordinary fence health"
+        topology = adapter.private_read_runtime_topology("juno")
+        assert topology is not None, \
+            "adapter did not publish authenticated ordinary topology"
+        assert topology["adapter_generation"] \
+            == adapter._private_read_adapter_generation, \
+            "adapter topology generation binding mismatch"
+        assert topology["ordinary_runtime_id"] \
+            == adapter._private_read_fence_bound_runtime_id, \
+            "adapter topology runtime binding mismatch"
+        poll_task = asyncio.create_task(adapter._poll_messages())
         callback = await asyncio.to_thread(
             _emit_ordinary_bridge_message,
             process,
@@ -445,8 +583,9 @@ async def test_actual_start_socket_route_adapter_dispatch(
             == ORDINARY_INBOUND_PROVENANCE
     finally:
         adapter._running = False
-        poll_task.cancel()
-        await asyncio.gather(poll_task, return_exceptions=True)
+        if poll_task is not None:
+            poll_task.cancel()
+            await asyncio.gather(poll_task, return_exceptions=True)
         await adapter._http_session.close()
         adapter._http_session = None
         _stop_ordinary_bridge_harness(process)
@@ -2343,110 +2482,126 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         session_path=ordinary_session,
         fence_environment=fence_environment,
     )
-    assert ordinary_ready["ready"] is True
-    assert ordinary_ready["callbackRegistered"] is True
-    assert ordinary_ready["transport"] in {"loopback", "in_process"}
+    try:
+        assert ordinary_ready["ready"] is True
+        assert ordinary_ready["callbackRegistered"] is True
+        assert ordinary_ready["transport"] in {"loopback", "in_process"}
+    except BaseException:
+        _stop_ordinary_bridge_harness(ordinary_process)
+        raise
     ordinary_port = ordinary_ready["port"]
     try:
         provider = HTTPServer(("127.0.0.1", 0), _VerticalProviderHandler)
     except PermissionError:
         _stop_ordinary_bridge_harness(ordinary_process)
         pytest.skip("execution sandbox positively denied Python provider loopback listen")
+    except BaseException:
+        _stop_ordinary_bridge_harness(ordinary_process)
+        raise
     provider_thread = Thread(target=provider.serve_forever, daemon=True)
-    provider_thread.start()
-
-    authority = f"http://127.0.0.1:{provider.server_port}"
-    transport = FixedHttpJsonTransport(_test_authorities={
-        OPENFGA_AUTHORITY: authority,
-        GMAIL_AUTHORITY: authority,
-    })
-    monkeypatch.setattr(mvp, "FixedHttpJsonTransport", lambda: transport)
-    import gateway.trusted_private_read_host as trusted_host
-    monkeypatch.setattr(
-        trusted_host, "SENSITIVE_RUNTIME_LAUNCHER_PATH", harness,
-    )
-    monkeypatch.setattr(
-        trusted_host, "SENSITIVE_VERIFIED_LAUNCHER_SHA256",
-        hashlib.sha256(harness.read_bytes()).hexdigest(),
-    )
-    monkeypatch.setenv("JUNO_TEST_DELIVERY_CAPTURE", str(capture))
-    inbound_adapter._bridge_port = ordinary_port
-    inbound_adapter._running = True
-    inbound_adapter._http_session = (
-        aiohttp.ClientSession()
-        if ordinary_ready["transport"] == "loopback"
-        else _InProcessBridgeSession(ordinary_process)
-    )
-    runner.adapters[Platform.WHATSAPP] = inbound_adapter
-    runner.delivery_router.adapters = runner.adapters
-    assert runner._active_profile_name() == "juno"
-    inbound_events = []
-    handler_responses = []
-    primary_handler = runner._primary_message_handler()
-
-    async def observed_primary_handler(event):
-        inbound_events.append(event)
-        response = await primary_handler(event)
-        handler_responses.append(response)
-        return response
-
-    inbound_adapter.set_message_handler(observed_primary_handler)
-    ordinary_poll_task = asyncio.create_task(inbound_adapter._poll_messages())
-    for _ in range(500):
-        if inbound_adapter.private_read_runtime_topology("juno") is not None:
-            break
-        await asyncio.sleep(0.01)
-    adapter_topology = inbound_adapter.private_read_runtime_topology("juno")
-    assert adapter_topology is not None
-    assert adapter_topology["ordinary_session_path"] == str(ordinary_session)
-    assert adapter_topology["ordinary_session_identity"] == (
-        f"{ordinary_session.stat().st_dev}:{ordinary_session.stat().st_ino}"
-    )
-
-    # Causal negative: the supervisor still owns and launches the copied
-    # process with its fresh capability and exact topology, but the harness
-    # reports a stale process generation. Publication must fail before any
-    # provider delivery can occur.
-    monkeypatch.setenv("JUNO_TEST_SENSITIVE_STALE_PROCESS_GENERATION", "1")
-    assert not await runner._start_trusted_private_read_host()
-    assert runner._trusted_private_read_host is None
-    assert capture.read_text() == ""
-    assert _VerticalProviderHandler.observed == []
-    reconcile_task = runner._trusted_private_read_reconciler_task
-    reconcile_task.cancel()
-    await asyncio.gather(reconcile_task, return_exceptions=True)
-    runner._trusted_private_read_reconciler_task = None
-    monkeypatch.delenv("JUNO_TEST_SENSITIVE_STALE_PROCESS_GENERATION")
-
-    assert await runner._start_trusted_private_read_host()
-    host = runner._trusted_private_read_host
-    assert host is not None
-    supervisor = runner._trusted_private_read_supervisor
-    assert supervisor is not None and supervisor.process is not None
-    assert Path(supervisor.process.args[1]) == harness
-    assert supervisor.process.args[-2:] == ["--port", "3011"]
-    assert supervisor.capability != config.sensitive_capability_file.read_text()
-    assert len(supervisor.process_generation) == 64
-    tool_results: list[object] = []
-
-    async def fake_model(*_args, **_kwargs):
-        entry = registry.get_entry(PRIVATE_READ_REQUEST_TOOL_NAME)
-        tool_result = entry.handler(
-            {"capability_id": CAPABILITY_ID}, tool_call_id="vertical-tool"
-        )
-        tool_results.append(tool_result)
-        return {
-            "final_response": tool_result.terminal.final_response,
-            "messages": [], "api_calls": 0,
-            "tools": [PRIVATE_READ_REQUEST_TOOL_NAME],
-        }
-
-    monkeypatch.setattr(runner, "_run_agent_inner", fake_model)
+    try:
+        provider_thread.start()
+    except BaseException:
+        provider.server_close()
+        _stop_ordinary_bridge_harness(ordinary_process)
+        raise
     session_db = None
     sabotaged_process = None
     sabotaged_adapter = None
     sabotaged_poll_task = None
+    ordinary_poll_task = None
     try:
+        authority = f"http://127.0.0.1:{provider.server_port}"
+        transport = FixedHttpJsonTransport(_test_authorities={
+            OPENFGA_AUTHORITY: authority,
+            GMAIL_AUTHORITY: authority,
+        })
+        monkeypatch.setattr(mvp, "FixedHttpJsonTransport", lambda: transport)
+        import gateway.trusted_private_read_host as trusted_host
+        monkeypatch.setattr(
+            trusted_host, "SENSITIVE_RUNTIME_LAUNCHER_PATH", harness,
+        )
+        monkeypatch.setattr(
+            trusted_host, "SENSITIVE_VERIFIED_LAUNCHER_SHA256",
+            hashlib.sha256(harness.read_bytes()).hexdigest(),
+        )
+        monkeypatch.setenv("JUNO_TEST_DELIVERY_CAPTURE", str(capture))
+        inbound_adapter._bridge_port = ordinary_port
+        inbound_adapter._running = True
+        inbound_adapter._http_session = (
+            aiohttp.ClientSession()
+            if ordinary_ready["transport"] == "loopback"
+            else _InProcessBridgeSession(ordinary_process)
+        )
+        runner.adapters[Platform.WHATSAPP] = inbound_adapter
+        runner.delivery_router.adapters = runner.adapters
+        assert runner._active_profile_name() == "juno"
+        inbound_events = []
+        handler_responses = []
+        primary_handler = runner._primary_message_handler()
+
+        async def observed_primary_handler(event):
+            inbound_events.append(event)
+            response = await primary_handler(event)
+            handler_responses.append(response)
+            return response
+
+        inbound_adapter.set_message_handler(observed_primary_handler)
+        ordinary_poll_task = asyncio.create_task(inbound_adapter._poll_messages())
+        for _ in range(500):
+            if inbound_adapter.private_read_runtime_topology("juno") is not None:
+                break
+            await asyncio.sleep(0.01)
+        adapter_topology = inbound_adapter.private_read_runtime_topology("juno")
+        assert adapter_topology is not None
+        assert adapter_topology["ordinary_session_path"] == str(ordinary_session)
+        assert adapter_topology["ordinary_session_identity"] == (
+            f"{ordinary_session.stat().st_dev}:{ordinary_session.stat().st_ino}"
+        )
+
+        # The supervisor must reject every stale launch binding before the
+        # private provider can be reached or a delivery can be emitted.
+        for stale_environment in (
+            "JUNO_TEST_SENSITIVE_STALE_CAPABILITY",
+            "JUNO_TEST_SENSITIVE_STALE_TOPOLOGY",
+            "JUNO_TEST_SENSITIVE_STALE_PROCESS_GENERATION",
+        ):
+            monkeypatch.setenv(stale_environment, "1")
+            assert not await runner._start_trusted_private_read_host()
+            assert runner._trusted_private_read_host is None
+            assert capture.read_text() == ""
+            assert _VerticalProviderHandler.observed == []
+            reconcile_task = runner._trusted_private_read_reconciler_task
+            assert reconcile_task is not None
+            reconcile_task.cancel()
+            await asyncio.gather(reconcile_task, return_exceptions=True)
+            runner._trusted_private_read_reconciler_task = None
+            monkeypatch.delenv(stale_environment)
+
+        assert await runner._start_trusted_private_read_host()
+        host = runner._trusted_private_read_host
+        assert host is not None
+        supervisor = runner._trusted_private_read_supervisor
+        assert supervisor is not None and supervisor.process is not None
+        assert Path(supervisor.process.args[1]) == harness
+        assert supervisor.process.args[-2:] == ["--port", "3011"]
+        assert supervisor.capability != config.sensitive_capability_file.read_text()
+        assert len(supervisor.process_generation) == 64
+        tool_results: list[object] = []
+
+        async def fake_model(*_args, **_kwargs):
+            entry = registry.get_entry(PRIVATE_READ_REQUEST_TOOL_NAME)
+            tool_result = entry.handler(
+                {"capability_id": CAPABILITY_ID}, tool_call_id="vertical-tool"
+            )
+            tool_results.append(tool_result)
+            return {
+                "final_response": tool_result.terminal.final_response,
+                "messages": [], "api_calls": 0,
+                "tools": [PRIVATE_READ_REQUEST_TOOL_NAME],
+            }
+
+        monkeypatch.setattr(runner, "_run_agent_inner", fake_model)
         callback = await asyncio.to_thread(
             _emit_ordinary_bridge_message,
             ordinary_process,
@@ -2658,8 +2813,9 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         if session_db is not None:
             session_db.close()
         inbound_adapter._running = False
-        ordinary_poll_task.cancel()
-        await asyncio.gather(ordinary_poll_task, return_exceptions=True)
+        if ordinary_poll_task is not None:
+            ordinary_poll_task.cancel()
+            await asyncio.gather(ordinary_poll_task, return_exceptions=True)
         if inbound_adapter._http_session is not None:
             await inbound_adapter._http_session.close()
             inbound_adapter._http_session = None

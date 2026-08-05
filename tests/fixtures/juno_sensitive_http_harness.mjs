@@ -98,12 +98,20 @@ const topologyIdentity = {
   ordinary: Object.freeze({ ...launch.ordinary }),
   sensitive: observed.sensitive,
 };
+if (process.env.JUNO_TEST_SENSITIVE_STALE_TOPOLOGY === '1') {
+  topologyIdentity.ordinary = Object.freeze({
+    ...topologyIdentity.ordinary,
+    socket_generation: topologyIdentity.ordinary.socket_generation + 1,
+  });
+}
 topologyIdentity.topology_sha256 = createHash('sha256').update(JSON.stringify(stableValue({
   ordinary: topologyIdentity.ordinary,
   sensitive: topologyIdentity.sensitive,
 }))).digest('hex');
 const reportedGeneration = process.env.JUNO_TEST_SENSITIVE_STALE_PROCESS_GENERATION === '1'
   ? '0'.repeat(64) : launch.process_generation;
+const reportedCapability = process.env.JUNO_TEST_SENSITIVE_STALE_CAPABILITY === '1'
+  ? `${capability}-stale` : capability;
 const runtime = `sensitive-${reportedGeneration}`;
 const epoch = `vertical-epoch-${process.pid}`;
 const ev = new EventEmitter();
@@ -134,7 +142,10 @@ transport.bindConnection({
   epoch,
 });
 
-const server = http.createServer(createSensitiveHttpHandler({ capability, transport }));
+const server = http.createServer(createSensitiveHttpHandler({
+  capability: reportedCapability,
+  transport,
+}));
 try {
   await listenLoopback(server, { port: requestedPort() });
 } catch (error) {
