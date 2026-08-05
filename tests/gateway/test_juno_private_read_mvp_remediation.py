@@ -55,6 +55,37 @@ from tools.private_read_request_tool import check_private_read_request_runtime
 
 
 CREDENTIAL_SENTINEL = "SYNTHETIC-CREDENTIAL-SENTINEL-74a1"
+SENSITIVE_PROCESS_GENERATION = "a" * 64
+
+
+def _sensitive_topology_payload() -> dict:
+    payload = {
+        "ordinary": {
+            "adapter_generation": "b" * 64,
+            "runtime_id": "ordinary-runtime",
+            "socket_generation": 1,
+            "account_phone_jid": SENSITIVE_ACCOUNT,
+            "account_lid_jid": "44444444444@lid",
+            "session_path": "/synthetic/ordinary",
+            "session_identity": "1:2",
+            "manifest_sha256": "c" * 64,
+            "source_sha256": "d" * 64,
+            "launcher_sha256": "e" * 64,
+        },
+        "sensitive": {
+            "session_path": "/synthetic/sensitive",
+            "session_identity": "1:3",
+            "credential_identity": "1:4",
+            "device_identity_sha256": "f" * 64,
+            "credential_tree_sha256": "0" * 64,
+            "account_phone_jid": SENSITIVE_ACCOUNT,
+            "account_lid_jid": "44444444444@lid",
+        },
+    }
+    payload["topology_sha256"] = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()).hexdigest()
+    return payload
 
 
 def _runtime_identity(
@@ -513,8 +544,10 @@ class _SensitiveHandler(BaseHTTPRequestHandler):
                 "outcome": "available", "submitted": False,
                 "provider_account_jid": SENSITIVE_ACCOUNT,
                 "identity_observed_us": time.time_ns() // 1000,
-                "adapter_runtime_id": "runtime-fresh",
+                "adapter_runtime_id": f"sensitive-{SENSITIVE_PROCESS_GENERATION}",
+                "process_generation": SENSITIVE_PROCESS_GENERATION,
                 "connection_epoch": "epoch-fresh",
+                "topology_identity": _sensitive_topology_payload(),
                 "transport_identity": _SENSITIVE_TRANSPORT_IDENTITY,
             })
             return
@@ -1358,8 +1391,10 @@ async def test_sensitive_identity_requires_fresh_exact_reviewed_transport(
                     "outcome": "available", "submitted": False,
                     "provider_account_jid": SENSITIVE_ACCOUNT,
                     "identity_observed_us": observed,
-                    "adapter_runtime_id": "reviewed-runtime",
+                    "adapter_runtime_id": f"sensitive-{SENSITIVE_PROCESS_GENERATION}",
+                    "process_generation": SENSITIVE_PROCESS_GENERATION,
                     "connection_epoch": "reviewed-epoch",
+                    "topology_identity": _sensitive_topology_payload(),
                     "transport_identity": proof,
                 }
 
@@ -1864,7 +1899,7 @@ async def test_python_submitter_real_http_route_uses_fresh_identity(tmp_path: Pa
         submitter = _SensitiveHttpSubmitter(host.config, transport)
         identity = await submitter.observe_identity(request=request)
         assert identity is not None
-        assert identity.registration == "runtime-fresh"
+        assert identity.registration == f"sensitive-{SENSITIVE_PROCESS_GENERATION}"
         assert identity.account == SENSITIVE_ACCOUNT
         assert identity.session == "epoch-fresh"
         assert identity.transport_identity == tuple(
@@ -1884,10 +1919,13 @@ async def test_python_submitter_real_http_route_uses_fresh_identity(tmp_path: Pa
         path, body = _SensitiveHandler.observed[1]
         assert path == "/v1/submit"
         assert set(body) == {
-            "contract_version", "request_id", "registration", "session", "account",
-            "destination", "expires_at_us", "private_value",
+            "contract_version", "request_id", "registration", "process_generation",
+            "session", "topology_sha256", "account", "destination",
+            "expires_at_us", "private_value",
         }
-        assert (body["registration"], body["session"]) == ("runtime-fresh", "epoch-fresh")
+        assert (body["registration"], body["session"]) == (
+            f"sensitive-{SENSITIVE_PROCESS_GENERATION}", "epoch-fresh"
+        )
         assert body["contract_version"] == "juno-sensitive-submit-v2"
         assert body["expires_at_us"] == request.expires_at_us
     finally:
@@ -1920,22 +1958,10 @@ async def test_gateway_runner_v2_production_composition_publishes_only_when_read
 
     attested_adapter = AttestedAdapter()
     runner.adapters[Platform.WHATSAPP] = attested_adapter
-    assert await GatewayRunner._start_trusted_private_read_host(runner) is True
-    host = runner._trusted_private_read_host
-    try:
-        assert type(host) is JunoPrivateReadMvpHost
-        assert host.is_healthy()
-        assert check_private_read_request_runtime()
-        binding = host.bind_event(_event(OWNER, "request", message="startup-event"))
-        try:
-            assert binding.private_context is True
-        finally:
-            host.unbind_event(binding)
-        attested_adapter.healthy = False
-        assert host.is_healthy() is False
-        assert check_private_read_request_runtime() is False
-    finally:
-        await host.stop()
+    # Fence-only evidence is intentionally insufficient: publication also
+    # requires exact adapter/session/socket topology and an owned child.
+    assert await GatewayRunner._start_trusted_private_read_host(runner) is False
+    assert runner._trusted_private_read_host is None
     assert check_private_read_request_runtime() is False
 
 
@@ -1967,8 +1993,10 @@ async def test_real_gateway_runner_startup_dispatch_registry_and_cleanup_seam(
                         "outcome": "available", "submitted": False,
                         "provider_account_jid": SENSITIVE_ACCOUNT,
                         "identity_observed_us": time.time_ns() // 1000,
-                        "adapter_runtime_id": "runner-runtime",
+                        "adapter_runtime_id": f"sensitive-{SENSITIVE_PROCESS_GENERATION}",
+                        "process_generation": SENSITIVE_PROCESS_GENERATION,
                         "connection_epoch": "runner-epoch",
+                        "topology_identity": _sensitive_topology_payload(),
                         "transport_identity": _SENSITIVE_TRANSPORT_IDENTITY,
                     }
                 return {
@@ -2004,6 +2032,38 @@ async def test_real_gateway_runner_startup_dispatch_registry_and_cleanup_seam(
     adapter = Adapter()
     runner.adapters[Platform.WHATSAPP] = adapter
     runner.delivery_router.adapters = runner.adapters
+    topology = SimpleNamespace(generation=(id(adapter), "synthetic-generation"))
+    runner._current_juno_private_read_topology = lambda: topology
+    runner._ensure_juno_private_read_reconciler = lambda: None
+
+    class TestSupervisor:
+        def healthy(self):
+            return True
+
+        async def stop(self):
+            return None
+
+    async def activate(_topology):
+        from gateway.juno_private_read_mvp import (
+            _GatewayOrdinaryNotifier, _SensitiveHttpSubmitter,
+        )
+        parsed = runner._trusted_private_read_config
+        ordinary = _GatewayOrdinaryNotifier(runner, parsed)
+        host = JunoPrivateReadMvpHost(
+            parsed,
+            JunoPrivateReadDependencies(
+                OpenFgaChecker(parsed, fake_transport),
+                GmailNewestInboxProvider(parsed, fake_transport),
+                ordinary,
+                _SensitiveHttpSubmitter(parsed, fake_transport),
+                ordinary.fence_healthy,
+            ),
+            active_profile="juno",
+        )
+        assert await host.start()
+        return host, TestSupervisor()
+
+    runner._activate_juno_private_read_generation = activate
     assert runner._active_profile_name() == "juno"
     assert await runner._start_trusted_private_read_host()
     host = runner._trusted_private_read_host
@@ -2102,7 +2162,16 @@ async def test_dedicated_juno_profile_binds_profileless_events_and_real_adapter_
         adapters={Platform.WHATSAPP: adapter},
         _profile_adapters={"secondary": {}},
     )
-    dependencies = compose_juno_private_read_mvp_services(runner, config)
+    from gateway.juno_private_read_mvp import _GatewayOrdinaryNotifier
+    transport = FakeJsonTransport()
+    ordinary = _GatewayOrdinaryNotifier(runner, config)
+    dependencies = JunoPrivateReadDependencies(
+        OpenFgaChecker(config, transport),
+        GmailNewestInboxProvider(config, transport),
+        ordinary,
+        FakeSensitive(),
+        ordinary.fence_healthy,
+    )
     host = JunoPrivateReadMvpHost(
         config, dependencies, active_profile=runner._active_profile_name()
     )

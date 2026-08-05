@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
 
@@ -17,15 +17,25 @@ import { prepareSessionPaths, SessionPathError } from './session_paths.js';
 import { verifyLidBootstrap } from './provisioning_core.js';
 
 const CAPABILITY_ENV = 'HERMES_WHATSAPP_SENSITIVE_CAPABILITY';
+const LAUNCH_ENV = 'HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH';
 
-export function parseCanonicalArgs(argv) {
-  const accepted = new Set([
-    '--port',
-    '--session',
-    '--ordinary-session',
-    '--sensitive-account-jid',
-    '--ordinary-account-jid',
-  ]);
+function exactObject(value, keys) {
+  return value && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => [key, stableValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+export function parseCanonicalArgs(argv, env = process.env) {
+  const accepted = new Set(['--port']);
   const values = new Map();
   for (let index = 0; index < argv.length; index += 2) {
     const name = argv[index];
@@ -36,13 +46,34 @@ export function parseCanonicalArgs(argv) {
     values.set(name, value);
   }
   const port = Number(values.get('--port'));
-  const sessionDir = values.get('--session');
-  const ordinarySessionDir = values.get('--ordinary-session');
-  const sensitiveAccountJid = values.get('--sensitive-account-jid');
-  const ordinaryAccountJid = values.get('--ordinary-account-jid');
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
     throw new Error('invalid sensitive bridge port');
   }
+  let launch;
+  try { launch = JSON.parse(env[LAUNCH_ENV]); } catch { throw new Error('sealed launch required'); }
+  if (!exactObject(launch, [
+    'version', 'process_generation', 'configured_account_jid',
+    'ordinary', 'sensitive',
+  ]) || launch.version !== 1
+      || typeof launch.process_generation !== 'string'
+      || !/^[a-f0-9]{64}$/.test(launch.process_generation)
+      || !exactObject(launch.ordinary, [
+        'adapter_generation', 'runtime_id', 'socket_generation',
+        'account_phone_jid', 'account_lid_jid', 'session_path',
+        'session_identity', 'manifest_sha256', 'source_sha256',
+        'launcher_sha256',
+      ])
+      || !exactObject(launch.sensitive, [
+        'session_path', 'session_identity', 'credential_identity',
+        'device_identity_sha256', 'credential_tree_sha256',
+        'account_phone_jid', 'account_lid_jid',
+      ])) {
+    throw new Error('sealed launch invalid');
+  }
+  const sessionDir = launch.sensitive.session_path;
+  const ordinarySessionDir = launch.ordinary.session_path;
+  const sensitiveAccountJid = launch.configured_account_jid;
+  const ordinaryAccountJid = launch.configured_account_jid;
   if (typeof sessionDir !== 'string' || !path.isAbsolute(sessionDir)
       || path.normalize(sessionDir) !== sessionDir) {
     throw new Error('canonical absolute sensitive session path is required');
@@ -64,6 +95,10 @@ export function parseCanonicalArgs(argv) {
   if (sensitiveAccountJid !== ordinaryAccountJid) {
     throw new Error('same canonical account required');
   }
+  if (![launch.ordinary.account_phone_jid, launch.ordinary.account_lid_jid]
+    .includes(ordinaryAccountJid)) {
+    throw new Error('sealed account topology mismatch');
+  }
   let sessionPathGuard;
   try {
     sessionPathGuard = prepareSessionPaths(sessionDir, ordinarySessionDir);
@@ -81,6 +116,7 @@ export function parseCanonicalArgs(argv) {
     sessionPathGuard,
     sensitiveAccountJid,
     ordinaryAccountJid,
+    launch,
   });
 }
 
@@ -103,18 +139,49 @@ export async function runSensitiveBridge({
     ordinarySessionDir,
     sensitiveAccountJid,
     ordinaryAccountJid,
-  } = parseCanonicalArgs(argv);
+    launch,
+  } = parseCanonicalArgs(argv, env);
   // Activation requires two independently generated linked-device auth
   // artifacts, not merely two different path strings.
   const sessionPathGuard = prepareSessionPaths(sessionDir, ordinarySessionDir, {
     requireDistinctCredentials: true,
   });
+  const sessionTopology = sessionPathGuard.topologyEvidence();
+  if (sessionTopology.ordinary.session_path !== launch.ordinary.session_path
+      || sessionTopology.ordinary.session_identity !== launch.ordinary.session_identity
+      || sessionTopology.ordinary.account_phone_jid !== launch.ordinary.account_phone_jid
+      || sessionTopology.ordinary.account_lid_jid !== launch.ordinary.account_lid_jid
+      || sessionTopology.sensitive.session_path !== launch.sensitive.session_path
+      || sessionTopology.sensitive.session_identity !== launch.sensitive.session_identity
+      || sessionTopology.sensitive.credential_identity
+        !== launch.sensitive.credential_identity
+      || sessionTopology.sensitive.device_identity_sha256
+        !== launch.sensitive.device_identity_sha256
+      || sessionTopology.sensitive.credential_tree_sha256
+        !== launch.sensitive.credential_tree_sha256
+      || sessionTopology.sensitive.account_phone_jid
+        !== launch.sensitive.account_phone_jid
+      || sessionTopology.sensitive.account_lid_jid
+        !== launch.sensitive.account_lid_jid
+      || ![sessionTopology.sensitive.account_phone_jid,
+        sessionTopology.sensitive.account_lid_jid].includes(sensitiveAccountJid)) {
+    throw new Error('sealed topology mismatch');
+  }
   if (!transportIdentity || typeof transportIdentity !== 'object'
       || !/^[a-f0-9]{64}$/.test(String(transportIdentity.manifest_sha256 || ''))) {
     throw new Error('verified sensitive transport identity is required');
   }
   const transport = new SensitiveDeliveryTransport({
-    runtimeId: `sensitive-${randomUUID()}`,
+    runtimeId: `sensitive-${launch.process_generation}`,
+    processGeneration: launch.process_generation,
+    topologyIdentity: Object.freeze({
+      ordinary: Object.freeze({ ...launch.ordinary }),
+      sensitive: sessionTopology.sensitive,
+      topology_sha256: createHash('sha256').update(JSON.stringify(stableValue({
+        ordinary: launch.ordinary,
+        sensitive: sessionTopology.sensitive,
+      }))).digest('hex'),
+    }),
     ordinaryAccountJid,
     transportIdentity,
     canonicalizeJid: jidNormalizedUser,

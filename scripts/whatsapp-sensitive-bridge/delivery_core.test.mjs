@@ -18,6 +18,8 @@ const PRIVATE = 'PRIVATE-CANARY-é-7b5031';
 const MESSAGE_ID = '3EB0ABCDEFABCDEFABCDEF';
 const NOW = 1_785_846_896_000_000;
 const TRANSPORT_IDENTITY = Object.freeze({ manifest_sha256: 'a'.repeat(64) });
+const PROCESS_GENERATION = 'b'.repeat(64);
+const TOPOLOGY_IDENTITY = Object.freeze({ topology_sha256: 'c'.repeat(64) });
 
 function canonicalize(jid) {
   return String(jid).replace(/:\d+@/, '@').replace('@c.us', '@s.whatsapp.net');
@@ -27,16 +29,21 @@ function submission({
   account = ACCOUNT,
   destination = CHAT,
   expiresAtUs = NOW + 4_000_000,
+  requestId = 'request-01HZX7M6Y2PE5F8K9W3R4T6V7X',
+  privateValue = PRIVATE,
+  session = EPOCH,
 } = {}) {
   return {
     contract_version: SENSITIVE_SUBMIT_CONTRACT_VERSION,
-    request_id: 'request-01HZX7M6Y2PE5F8K9W3R4T6V7X',
+    request_id: requestId,
     registration: RUNTIME,
-    session: EPOCH,
+    process_generation: PROCESS_GENERATION,
+    session,
+    topology_sha256: TOPOLOGY_IDENTITY.topology_sha256,
     account,
     destination,
     expires_at_us: expiresAtUs,
-    private_value: PRIVATE,
+    private_value: privateValue,
   };
 }
 
@@ -46,6 +53,7 @@ function harness({
   nowUs = () => NOW,
   lidForPhone = async () => null,
   sendMessage,
+  maxReplayTombstones,
 } = {}) {
   const calls = [];
   const operations = [];
@@ -70,11 +78,14 @@ function harness({
   };
   const transport = new SensitiveDeliveryTransport({
     runtimeId: RUNTIME,
+    processGeneration: PROCESS_GENERATION,
+    topologyIdentity: TOPOLOGY_IDENTITY,
     ordinaryAccountJid: ordinaryAccount,
     transportIdentity: TRANSPORT_IDENTITY,
     canonicalizeJid: canonicalize,
     generateMessageId: () => MESSAGE_ID,
     nowUs,
+    ...(maxReplayTombstones === undefined ? {} : { maxReplayTombstones }),
   });
   transport.bindConnection({ sock, accountJid: account, epoch: EPOCH });
   return { calls, operations, sock, transport };
@@ -208,4 +219,78 @@ test('same canonical account on a distinct sensitive session binds and sends onc
     state: 'submitted', message_id: MESSAGE_ID, account: ACCOUNT, destination: CHAT,
   });
   assert.equal(h.calls.length, 1);
+});
+
+test('receiver consumes an exact request nonce before provider invocation', async () => {
+  const h = harness();
+  assert.equal((await h.transport.submit(submission())).state, 'submitted');
+  assert.equal((await h.transport.submit(submission())).state, 'failed');
+  assert.equal(h.calls.length, 1);
+});
+
+test('receiver atomically rejects a concurrent duplicate before a second send', async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const h = harness({ lidForPhone: async () => blocked });
+  const request = submission({ destination: '70707070707@lid' });
+  const first = h.transport.submit(request);
+  await Promise.resolve();
+  const second = h.transport.submit(request);
+  const duplicate = await Promise.race([
+    second,
+    new Promise(resolve => setTimeout(() => resolve(null), 25)),
+  ]);
+  release('80808080808@lid');
+  assert.notEqual(duplicate, null, 'duplicate was not rejected before provider work completed');
+  assert.equal(duplicate.state, 'failed');
+  assert.equal((await first).state, 'submitted');
+  await second;
+  assert.equal(h.calls.length, 1);
+});
+
+test('same nonce with different private digest is terminally rejected', async () => {
+  const h = harness();
+  assert.equal((await h.transport.submit(submission())).state, 'submitted');
+  assert.equal((await h.transport.submit(submission({
+    privateValue: `${PRIVATE}-changed`,
+  }))).state, 'failed');
+  assert.equal(h.calls.length, 1);
+});
+
+test('ambiguous provider result burns the nonce and prevents retry', async () => {
+  const h = harness({ sendMessage: async () => { throw new Error('ambiguous'); } });
+  assert.equal((await h.transport.submit(submission())).state, 'unknown');
+  assert.equal((await h.transport.submit(submission())).state, 'failed');
+  assert.equal(h.calls.length, 1);
+});
+
+test('nonce tombstone survives socket reconnect and epoch rotation', async () => {
+  const h = harness();
+  assert.equal((await h.transport.submit(submission())).state, 'submitted');
+  const replacement = harness().sock;
+  const nextEpoch = `${EPOCH}-next`;
+  h.transport.bindConnection({ sock: replacement, accountJid: ACCOUNT, epoch: nextEpoch });
+  assert.equal((await h.transport.submit(submission({ session: nextEpoch }))).state, 'failed');
+  assert.equal(h.calls.length, 1);
+});
+
+test('unexpired tombstones are bounded without eviction', async () => {
+  const h = harness({ maxReplayTombstones: 1 });
+  assert.equal((await h.transport.submit(submission())).state, 'submitted');
+  assert.equal((await h.transport.submit(submission({
+    requestId: 'request-01HZX7M6Y2PE5F8K9W3R4T6V8Y',
+  }))).state, 'failed');
+  assert.equal(h.calls.length, 1);
+});
+
+test('expired tombstones are pruned before admitting a new bounded nonce', async () => {
+  let now = NOW;
+  const h = harness({ maxReplayTombstones: 1, nowUs: () => now });
+  assert.equal((await h.transport.submit(submission())).state, 'submitted');
+  now = NOW + 5_000_000;
+  assert.equal((await h.transport.submit(submission({
+    requestId: 'request-01HZX7M6Y2PE5F8K9W3R4T6V8Z',
+    expiresAtUs: now + 4_000_000,
+  }))).state, 'submitted');
+  assert.equal(h.calls.length, 2);
 });

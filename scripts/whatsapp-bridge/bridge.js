@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync, lstatSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash, createHmac } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -95,22 +95,41 @@ const PRIVATE_READ_FENCE = readPrivateReadFenceBootstrap();
 export function privateReadFenceEvidence(
   transportIdentity = TRANSPORT_IDENTITY,
 ) {
-  if (!PRIVATE_READ_FENCE || !transportIdentity) return null;
+  if (!PRIVATE_READ_FENCE || !transportIdentity || connectionState !== 'connected'
+      || !ordinaryAccountPhoneJid || !ordinaryAccountLidJid) return null;
+  let sessionIdentity;
+  try {
+    const info = lstatSync(SESSION_DIR, { bigint: true });
+    if (!info.isDirectory()) return null;
+    sessionIdentity = `${info.dev}:${info.ino}`;
+  } catch {
+    return null;
+  }
   const observedAtUs = Date.now() * 1000;
   const material = [
-    'juno-sender-companion-fence-v1',
+    'juno-sender-companion-fence-v2',
     PRIVATE_READ_FENCE.profile,
     PRIVATE_READ_FENCE.runtimeId,
+    String(socketGeneration),
+    ordinaryAccountPhoneJid,
+    ordinaryAccountLidJid,
+    SESSION_DIR,
+    sessionIdentity,
     String(observedAtUs),
     transportIdentity.manifest_sha256,
     transportIdentity.source_sha256,
     SCRIPT_HASH,
   ].join('\0');
   return {
-    version: 1,
+    version: 2,
     active: true,
     profile: PRIVATE_READ_FENCE.profile,
     runtimeId: PRIVATE_READ_FENCE.runtimeId,
+    socketGeneration,
+    accountPhoneJid: ordinaryAccountPhoneJid,
+    accountLidJid: ordinaryAccountLidJid,
+    sessionPath: SESSION_DIR,
+    sessionIdentity,
     observedAtUs,
     manifestSha256: transportIdentity.manifest_sha256,
     sourceSha256: transportIdentity.source_sha256,
@@ -427,6 +446,8 @@ function rememberSentId(id) {
 let sock = null;
 let socketGeneration = 0;
 let connectionState = 'disconnected';
+let ordinaryAccountPhoneJid = null;
+let ordinaryAccountLidJid = null;
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
@@ -564,6 +585,14 @@ export async function startSocket(dependencies = PRODUCTION_SOCKET_DEPENDENCIES)
     process.exitCode = 1;
     return;
   }
+  const canonicalPersistedLid = canonicalizeJid(persistedLid);
+  if (!/^\d{1,32}@s\.whatsapp\.net$/.test(phoneJid)
+      || !/^\d{1,32}@lid$/.test(canonicalPersistedLid)) {
+    process.exitCode = 1;
+    return;
+  }
+  ordinaryAccountPhoneJid = phoneJid;
+  ordinaryAccountLidJid = canonicalPersistedLid;
   const version = await resolveVersion();
 
   const connectionSocket = createSocket({

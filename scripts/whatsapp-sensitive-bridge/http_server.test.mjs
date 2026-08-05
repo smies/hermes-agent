@@ -295,6 +295,8 @@ test('real HTTP handler calls real MVP transport with live identity and fake soc
   };
   const transport = new SensitiveDeliveryTransport({
     runtimeId: runtime, ordinaryAccountJid: ordinary,
+    processGeneration: 'b'.repeat(64),
+    topologyIdentity: { topology_sha256: 'c'.repeat(64) },
     transportIdentity: { manifest_sha256: 'a'.repeat(64) },
     canonicalizeJid: (jid) => String(jid).replace(/:\d+@/, '@'),
     generateMessageId: () => messageId,
@@ -327,6 +329,7 @@ test('real HTTP handler calls real MVP transport with live identity and fake soc
   const request = JSON.stringify({
     contract_version: MVP_SUBMIT_CONTRACT,
     request_id: 'request-http-vertical', registration: runtime, session: epoch,
+    process_generation: 'b'.repeat(64), topology_sha256: 'c'.repeat(64),
     account, destination, expires_at_us: Date.now() * 1000 + 60_000_000,
     private_value: 'PRIVATE-HTTP-VERTICAL',
   });
@@ -389,4 +392,26 @@ test('aborted partial submit bodies release the active-request slot without pars
   });
   assert.equal(result.status, 200);
   assert.equal(submits, 1);
+});
+
+test('process capability rotation rejects every prior-generation submission', async () => {
+  let submits = 0;
+  const nextCapability = 'n'.repeat(48);
+  const handler = createSensitiveHttpHandler({
+    capability: nextCapability,
+    transport: { async submit() { submits += 1; return { state: 'failed' }; } },
+  });
+  const body = JSON.stringify({ private_value: 'PRIVATE-ROTATION-PROBE' });
+  const rejected = await invoke(handler, {
+    headers: {
+      host: '127.0.0.1',
+      [CAPABILITY_HEADER]: CAPABILITY,
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(body)),
+    },
+    chunks: [body],
+  });
+  assert.equal(rejected.status, 401);
+  assert.equal(submits, 0);
+  assert.equal(rejected.body.includes('PRIVATE-ROTATION-PROBE'), false);
 });

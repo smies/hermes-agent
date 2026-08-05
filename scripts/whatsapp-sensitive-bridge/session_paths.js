@@ -34,6 +34,10 @@ function identityOf(stat) {
   return Object.freeze({ dev: stat.dev, ino: stat.ino });
 }
 
+function printableIdentity(identity) {
+  return `${identity.dev}:${identity.ino}`;
+}
+
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -409,8 +413,30 @@ export class SessionPathGuard {
           || !sameAccountTopology(expected.ordinary.topology, ordinaryArtifacts.topology)) {
         reject('session_account_topology_changed');
       }
+      if (expected.sensitive.treeDigest !== sensitiveArtifacts.treeDigest
+          || expected.ordinary.treeDigest !== ordinaryArtifacts.treeDigest) {
+        reject('session_credentials_changed');
+      }
       assertDistinctAuthArtifacts(sensitiveArtifacts, ordinaryArtifacts);
     }
+  }
+
+  topologyEvidence() {
+    this.revalidate();
+    if (!this.#credentialSnapshots) reject('credential_identity_invalid');
+    const evidence = (snapshot, credentials) => Object.freeze({
+      session_path: snapshot.absolutePath,
+      session_identity: printableIdentity(snapshot.identity),
+      credential_identity: `${credentials.credsSeal.dev}:${credentials.credsSeal.ino}`,
+      device_identity_sha256: credentials.deviceDigest,
+      credential_tree_sha256: credentials.treeDigest,
+      account_phone_jid: credentials.topology.phone,
+      account_lid_jid: credentials.topology.lid,
+    });
+    return Object.freeze({
+      ordinary: evidence(this.#ordinarySnapshot, this.#credentialSnapshots.ordinary),
+      sensitive: evidence(this.#sensitiveSnapshot, this.#credentialSnapshots.sensitive),
+    });
   }
 }
 

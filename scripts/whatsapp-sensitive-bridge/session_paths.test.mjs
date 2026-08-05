@@ -169,6 +169,17 @@ test('production guard fails closed on post-activation credential drift', () => 
   expectPathRejection(() => guard.revalidate(), 'session_credentials_changed');
 });
 
+test('production guard fails closed on non-device auth-tree drift after activation', () => {
+  const { sensitive, ordinary } = credentialSessions();
+  const guard = prepareSessionPaths(sensitive, ordinary, {
+    requireDistinctCredentials: true,
+  });
+  const target = path.join(sensitive, 'sender-key-1.json');
+  writeFileSync(target, JSON.stringify({ synthetic: 'rotated-key' }), { mode: 0o600 });
+  chmodSync(target, 0o600);
+  expectPathRejection(() => guard.revalidate(), 'session_credentials_changed');
+});
+
 test('production guard fails closed on post-activation PN/LID topology drift', () => {
   const { sensitive, ordinary } = credentialSessions();
   const guard = prepareSessionPaths(sensitive, ordinary, {

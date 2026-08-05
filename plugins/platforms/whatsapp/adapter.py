@@ -496,6 +496,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._private_read_fence_bound_runtime_id: Optional[str] = None
         self._private_read_fence_runtime_id: Optional[str] = None
         self._private_read_fence_received_monotonic: float = 0.0
+        self._private_read_adapter_generation: Optional[str] = None
+        self._private_read_topology: Optional[dict[str, object]] = None
         # Set to True by disconnect() before we SIGTERM our child bridge so
         # _check_managed_bridge_exit() can distinguish an intentional
         # shutdown-time exit (returncode -15 / -2 / 0) from a real crash.
@@ -530,6 +532,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             raise RuntimeError("private-read sender-companion fence is already configured")
         self._private_read_fence_profile = profile
         self._private_read_fence_key = secrets.token_hex(32)
+        self._private_read_adapter_generation = secrets.token_hex(32)
         self._private_read_fence_bound_runtime_id = None
         self._private_read_fence_runtime_id = None
         self._private_read_fence_received_monotonic = 0.0
@@ -537,6 +540,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _clear_private_read_fence_evidence(self) -> None:
         self._private_read_fence_runtime_id = None
         self._private_read_fence_received_monotonic = 0.0
+        self._private_read_topology = None
 
     def _apply_private_read_fence_environment(self, bridge_env: dict[str, str]) -> None:
         """Replace inherited fence bootstrap with this adapter's authority."""
@@ -563,21 +567,43 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         evidence = health.get("senderCompanionFence")
         required = {
             "version", "active", "profile", "runtimeId", "observedAtUs",
-            "manifestSha256", "sourceSha256", "scriptHash", "proof",
+            "socketGeneration", "accountPhoneJid", "accountLidJid",
+            "sessionPath", "sessionIdentity", "manifestSha256",
+            "sourceSha256", "scriptHash", "proof",
         }
         if type(evidence) is not dict or set(evidence) != required:
             return False
         runtime_id = evidence.get("runtimeId")
         observed_at_us = evidence.get("observedAtUs")
+        socket_generation = evidence.get("socketGeneration")
+        account_phone = evidence.get("accountPhoneJid")
+        account_lid = evidence.get("accountLidJid")
+        session_path = evidence.get("sessionPath")
+        session_identity = evidence.get("sessionIdentity")
         script_hash = _file_content_hash(Path(self._bridge_script).parent / "bridge.js")
         now_us = time.time_ns() // 1000
+        try:
+            configured_session = Path(self._session_path)
+            canonical_session = configured_session.resolve(strict=True)
+            session_stat = canonical_session.stat()
+            expected_session_identity = f"{session_stat.st_dev}:{session_stat.st_ino}"
+        except (OSError, RuntimeError, ValueError):
+            return False
         if (
-            evidence.get("version") != 1
+            evidence.get("version") != 2
             or evidence.get("active") is not True
             or evidence.get("profile") != profile
             or type(runtime_id) is not str
             or re.fullmatch(r"[a-f0-9]{64}", runtime_id) is None
             or type(observed_at_us) is not int
+            or type(socket_generation) is not int
+            or socket_generation < 1
+            or type(account_phone) is not str
+            or re.fullmatch(r"\d{1,32}@s\.whatsapp\.net", account_phone) is None
+            or type(account_lid) is not str
+            or re.fullmatch(r"\d{1,32}@lid", account_lid) is None
+            or session_path != str(canonical_session)
+            or session_identity != expected_session_identity
             or now_us - int(_PRIVATE_READ_FENCE_MAX_AGE_SECONDS * 1_000_000) > observed_at_us
             or observed_at_us > now_us + _PRIVATE_READ_FENCE_FUTURE_SKEW_US
             or not script_hash
@@ -594,7 +620,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         ):
             return False
         material = "\0".join((
-            "juno-sender-companion-fence-v1", profile, runtime_id,
+            "juno-sender-companion-fence-v2", profile, runtime_id,
+            str(socket_generation), account_phone, account_lid,
+            session_path, session_identity,
             str(observed_at_us), ORDINARY_VERIFIED_MANIFEST_SHA256,
             ORDINARY_VERIFIED_SOURCE_SHA256, script_hash,
         ))
@@ -608,6 +636,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._private_read_fence_bound_runtime_id = runtime_id
         self._private_read_fence_runtime_id = runtime_id
         self._private_read_fence_received_monotonic = time.monotonic()
+        self._private_read_topology = {
+            "adapter_generation": self._private_read_adapter_generation,
+            "ordinary_runtime_id": runtime_id,
+            "ordinary_socket_generation": socket_generation,
+            "ordinary_account_phone": account_phone,
+            "ordinary_account_lid": account_lid,
+            "ordinary_session_path": session_path,
+            "ordinary_session_identity": session_identity,
+            "ordinary_manifest_sha256": ORDINARY_VERIFIED_MANIFEST_SHA256,
+            "ordinary_source_sha256": ORDINARY_VERIFIED_SOURCE_SHA256,
+            "ordinary_launcher_sha256": ORDINARY_VERIFIED_LAUNCHER_SHA256,
+        }
         return True
 
     def private_read_sender_companion_fence_healthy(self, profile: str) -> bool:
@@ -616,11 +656,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             profile == getattr(self, "_private_read_fence_profile", None) == "juno"
             and type(getattr(self, "_private_read_fence_runtime_id", None)) is str
             and getattr(self, "_private_read_fence_received_monotonic", 0.0) > 0
+            and type(getattr(self, "_private_read_topology", None)) is dict
             and time.monotonic() - getattr(
                 self, "_private_read_fence_received_monotonic", 0.0
             )
                 <= _PRIVATE_READ_FENCE_MAX_AGE_SECONDS
         )
+
+    def private_read_runtime_topology(self, profile: str) -> Optional[dict[str, object]]:
+        """Return current authenticated topology for this exact adapter."""
+        if not self.private_read_sender_companion_fence_healthy(profile):
+            return None
+        topology = getattr(self, "_private_read_topology", None)
+        return dict(topology) if type(topology) is dict else None
 
     def _fence_configuration_matches_health(self, health: object) -> bool:
         if getattr(self, "_private_read_fence_profile", None) is None:

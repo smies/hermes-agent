@@ -18,8 +18,10 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Awaitable, Callable, Protocol
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -52,9 +54,9 @@ SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
 SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
 ORDINARY_INBOUND_PROVENANCE = "messages.upsert:registered-emitting-socket:v1"
 _SENSITIVE_TRANSPORT_IDENTITY = {
-    "manifest_sha256": "4e63abb3b8081ee011f8be1d266bd1866f5a829c2ae3372920e1736dd8568b30",
-    "launcher_sha256": "74e08819dd9be987acdb9ff1512ae572c78b97e104b920efb4f1e3a05de75b7a",
-    "source_sha256": "774d8d1b556c3c21f525c6072d95d72d7af0f66334cc0d290074b35819c302eb",
+    "manifest_sha256": "f0fec17a6fa4e913e315f2dff35e536152f15d80a8d88398f42a92c60eb969fe",
+    "launcher_sha256": "7b8e88fe70c9e89c5b9fa348fd45ee4b771867c95569a50ae146c494a420570d",
+    "source_sha256": "d730028ba37ef7cd2a645200a7e19a60e250b7b2fab4d8f19f53c4cdabc82a4f",
     "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
     "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
     "verifier_sha256": "b2f77c04853eead92cfbc2614bb2ed474db714d04a73dd16b0f7013cfca431a5",
@@ -765,6 +767,24 @@ class MvpAuthorizationRepository:
             return changed
         return self.store._write(mutate, at_us=now_us)
 
+    def burn_active_runtime_authority(self, now_us: int) -> int:
+        """Terminalize every request bound to a depublished runtime generation."""
+        def mutate(conn):
+            changed = 0
+            rows = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests "
+                "WHERE status IN ('pending','approved','claimed')"
+            ).fetchall()
+            for row in rows:
+                changed += self._transition(
+                    conn, row, now_us, status="failed_consumed",
+                    notice_claimed=1, claim_token_digest=None,
+                    provider_message_id=None,
+                    terminal_code="runtime_authority_rotated",
+                ) is not None
+            return changed
+        return self.store._write(mutate, at_us=now_us)
+
     def recover_claimed_notices(self, now_us: int) -> int:
         """Consume notice sends interrupted after the durable claim boundary."""
         def mutate(conn):
@@ -1394,6 +1414,8 @@ class SensitiveRuntimeIdentity:
     session: str
     observed_at_us: int
     transport_identity: tuple[tuple[str, str], ...]
+    process_generation: str = ""
+    topology_identity: tuple[tuple[str, str], ...] = ()
 
     def __repr__(self) -> str:
         return "<SensitiveRuntimeIdentity redacted>"
@@ -1871,6 +1893,380 @@ class _GatewayOrdinaryNotifier:
         return str(message_id)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class JunoOrdinaryRuntimeTopology:
+    adapter: object
+    adapter_generation: str
+    ordinary_runtime_id: str
+    ordinary_socket_generation: int
+    ordinary_account_phone: str
+    ordinary_account_lid: str
+    ordinary_session_path: str
+    ordinary_session_identity: str
+    ordinary_manifest_sha256: str
+    ordinary_source_sha256: str
+    ordinary_launcher_sha256: str
+    sensitive_session_path: str
+    sensitive_session_identity: str
+    sensitive_credential_identity: str = ""
+    sensitive_device_identity_sha256: str = ""
+    sensitive_credential_tree_sha256: str = ""
+    sensitive_account_phone: str = ""
+    sensitive_account_lid: str = ""
+
+    def __repr__(self) -> str:
+        return "<JunoOrdinaryRuntimeTopology redacted>"
+
+    @property
+    def generation(self) -> tuple[object, ...]:
+        return (
+            id(self.adapter), self.adapter_generation, self.ordinary_runtime_id,
+            self.ordinary_socket_generation, self.ordinary_account_phone,
+            self.ordinary_account_lid, self.ordinary_session_path,
+            self.ordinary_session_identity, self.sensitive_session_path,
+            self.sensitive_session_identity, self.sensitive_credential_identity,
+            self.sensitive_device_identity_sha256,
+            self.sensitive_credential_tree_sha256,
+            self.sensitive_account_phone, self.sensitive_account_lid,
+        )
+
+
+def _expected_sensitive_session_topology(session_path: Path) -> dict[str, str] | None:
+    """Derive content-free sensitive credential authority before child launch."""
+    try:
+        owner = os.getuid() if hasattr(os, "getuid") else None
+        entries: list[tuple[str, str]] = []
+        credentials: dict[str, object] | None = None
+        credential_identity = ""
+
+        def walk(directory: Path, relative: str = "") -> None:
+            nonlocal credentials, credential_identity
+            for child in sorted(directory.iterdir(), key=lambda item: item.name):
+                child_relative = f"{relative}/{child.name}" if relative else child.name
+                info = child.lstat()
+                if child.is_symlink() or (owner is not None and info.st_uid != owner):
+                    raise ValueError("untrusted sensitive credential tree")
+                if child.is_dir():
+                    if info.st_mode & 0o7777 != 0o700:
+                        raise ValueError("untrusted sensitive credential directory")
+                    walk(child, child_relative)
+                    continue
+                if not child.is_file() or child.suffix != ".json" \
+                        or info.st_nlink != 1 or info.st_mode & 0o7777 != 0o600:
+                    raise ValueError("untrusted sensitive credential artifact")
+                if child.resolve(strict=True) != child:
+                    raise ValueError("non-canonical sensitive credential artifact")
+                value = child.read_bytes()
+                entries.append((child_relative, hashlib.sha256(value).hexdigest()))
+                if child_relative == "creds.json":
+                    credentials = json.loads(value)
+                    credential_identity = f"{info.st_dev}:{info.st_ino}"
+
+        walk(session_path)
+        if type(credentials) is not dict or not credential_identity:
+            return None
+        required = ("registrationId", "noiseKey", "signedIdentityKey", "advSecretKey")
+        if any(credentials.get(key) is None for key in required):
+            return None
+        me = credentials.get("me")
+        if credentials.get("registered") is not True or type(me) is not dict:
+            return None
+        phone = re.sub(r":\d+@", "@", str(me.get("id", "")))
+        lid = re.sub(r":\d+@", "@", str(me.get("lid", "")))
+        phone = _jid(phone, "sensitive phone")
+        lid = _jid(lid, "sensitive lid")
+        if not phone.endswith("@s.whatsapp.net") or not lid.endswith("@lid"):
+            return None
+        device_material = {key: credentials[key] for key in required}
+        canonical = lambda value: json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        return {
+            "credential_identity": credential_identity,
+            "device_identity_sha256": hashlib.sha256(canonical(device_material)).hexdigest(),
+            "credential_tree_sha256": hashlib.sha256(canonical(entries)).hexdigest(),
+            "account_phone_jid": phone,
+            "account_lid_jid": lid,
+        }
+    except BaseException:
+        return None
+
+
+def resolve_juno_ordinary_runtime_topology(
+    runner: object, config: JunoPrivateReadMvpConfig,
+) -> JunoOrdinaryRuntimeTopology | None:
+    """Resolve exact current ordinary and expected sensitive filesystem authority."""
+    if bool(getattr(getattr(runner, "config", None), "multiplex_profiles", False)):
+        return None
+    adapter = getattr(runner, "adapters", {}).get(Platform.WHATSAPP)
+    observe = getattr(adapter, "private_read_runtime_topology", None)
+    if adapter is None or not callable(observe):
+        return None
+    try:
+        raw = observe(config.profile)
+        fields = {
+            "adapter_generation", "ordinary_runtime_id",
+            "ordinary_socket_generation", "ordinary_account_phone",
+            "ordinary_account_lid", "ordinary_session_path",
+            "ordinary_session_identity", "ordinary_manifest_sha256",
+            "ordinary_source_sha256", "ordinary_launcher_sha256",
+        }
+        if type(raw) is not dict or set(raw) != fields:
+            return None
+        if type(raw["ordinary_socket_generation"]) is not int \
+                or raw["ordinary_socket_generation"] < 1:
+            return None
+        account_aliases = {raw["ordinary_account_phone"], raw["ordinary_account_lid"]}
+        if config.ordinary_account not in account_aliases:
+            return None
+        ordinary_path = Path(_text(raw["ordinary_session_path"], "ordinary session", 2048))
+        if not ordinary_path.is_absolute() or ordinary_path.resolve(strict=True) != ordinary_path:
+            return None
+        ordinary_stat = ordinary_path.stat()
+        if raw["ordinary_session_identity"] != f"{ordinary_stat.st_dev}:{ordinary_stat.st_ino}":
+            return None
+        from hermes_constants import get_hermes_home
+        sensitive_path = (
+            get_hermes_home() / "sensitive-delivery" / "whatsapp" / "session"
+        )
+        if sensitive_path.resolve(strict=True) != sensitive_path:
+            return None
+        sensitive_stat = sensitive_path.stat()
+        sensitive_topology = _expected_sensitive_session_topology(sensitive_path)
+        if sensitive_topology is None or config.sensitive_account not in {
+            sensitive_topology["account_phone_jid"], sensitive_topology["account_lid_jid"],
+        }:
+            return None
+        if ordinary_path == sensitive_path or ordinary_path.is_relative_to(sensitive_path) \
+                or sensitive_path.is_relative_to(ordinary_path):
+            return None
+        if (ordinary_stat.st_dev, ordinary_stat.st_ino) == (
+            sensitive_stat.st_dev, sensitive_stat.st_ino,
+        ):
+            return None
+        from gateway.platforms.whatsapp_common import (
+            ORDINARY_VERIFIED_LAUNCHER_SHA256,
+            ORDINARY_VERIFIED_MANIFEST_SHA256,
+            ORDINARY_VERIFIED_SOURCE_SHA256,
+        )
+        if (
+            raw["ordinary_manifest_sha256"] != ORDINARY_VERIFIED_MANIFEST_SHA256
+            or raw["ordinary_source_sha256"] != ORDINARY_VERIFIED_SOURCE_SHA256
+            or raw["ordinary_launcher_sha256"] != ORDINARY_VERIFIED_LAUNCHER_SHA256
+        ):
+            return None
+        return JunoOrdinaryRuntimeTopology(
+            adapter=adapter,
+            adapter_generation=_text(raw["adapter_generation"], "adapter generation"),
+            ordinary_runtime_id=_text(raw["ordinary_runtime_id"], "ordinary runtime"),
+            ordinary_socket_generation=raw["ordinary_socket_generation"],
+            ordinary_account_phone=_jid(raw["ordinary_account_phone"], "ordinary phone"),
+            ordinary_account_lid=_jid(raw["ordinary_account_lid"], "ordinary lid"),
+            ordinary_session_path=str(ordinary_path),
+            ordinary_session_identity=raw["ordinary_session_identity"],
+            ordinary_manifest_sha256=raw["ordinary_manifest_sha256"],
+            ordinary_source_sha256=raw["ordinary_source_sha256"],
+            ordinary_launcher_sha256=raw["ordinary_launcher_sha256"],
+            sensitive_session_path=str(sensitive_path),
+            sensitive_session_identity=f"{sensitive_stat.st_dev}:{sensitive_stat.st_ino}",
+            sensitive_credential_identity=sensitive_topology["credential_identity"],
+            sensitive_device_identity_sha256=sensitive_topology["device_identity_sha256"],
+            sensitive_credential_tree_sha256=sensitive_topology["credential_tree_sha256"],
+            sensitive_account_phone=sensitive_topology["account_phone_jid"],
+            sensitive_account_lid=sensitive_topology["account_lid_jid"],
+        )
+    except BaseException:
+        return None
+
+
+class _SensitiveBridgeSupervisor:
+    """Own one reviewed sensitive child and its fresh submission capability."""
+
+    def __init__(self, config: JunoPrivateReadMvpConfig,
+                 topology: JunoOrdinaryRuntimeTopology,
+                 *, launcher: Path | None = None, port: int = 3011,
+                 transport: JsonTransport | None = None):
+        self.config = config
+        self.topology = topology
+        self.launcher = launcher
+        self.port = port
+        self.transport = transport or FixedHttpJsonTransport()
+        self.process: subprocess.Popen | None = None
+        self.process_generation = secrets.token_hex(32)
+        self.capability = secrets.token_urlsafe(48)
+        self.topology_identity: tuple[tuple[str, str], ...] = ()
+        self._last_verified_monotonic = 0.0
+
+    def _launch_descriptor(self) -> dict[str, object]:
+        topology = self.topology
+        return {
+            "version": 1,
+            "process_generation": self.process_generation,
+            "configured_account_jid": self.config.sensitive_account,
+            "ordinary": {
+                "adapter_generation": topology.adapter_generation,
+                "runtime_id": topology.ordinary_runtime_id,
+                "socket_generation": topology.ordinary_socket_generation,
+                "account_phone_jid": topology.ordinary_account_phone,
+                "account_lid_jid": topology.ordinary_account_lid,
+                "session_path": topology.ordinary_session_path,
+                "session_identity": topology.ordinary_session_identity,
+                "manifest_sha256": topology.ordinary_manifest_sha256,
+                "source_sha256": topology.ordinary_source_sha256,
+                "launcher_sha256": topology.ordinary_launcher_sha256,
+            },
+            "sensitive": {
+                "session_path": topology.sensitive_session_path,
+                "session_identity": topology.sensitive_session_identity,
+                "credential_identity": topology.sensitive_credential_identity,
+                "device_identity_sha256": topology.sensitive_device_identity_sha256,
+                "credential_tree_sha256": topology.sensitive_credential_tree_sha256,
+                "account_phone_jid": topology.sensitive_account_phone,
+                "account_lid_jid": topology.sensitive_account_lid,
+            },
+        }
+
+    async def start(self) -> bool:
+        from gateway.trusted_private_read_host import (
+            SENSITIVE_RUNTIME_LAUNCHER_PATH,
+            SENSITIVE_VERIFIED_LAUNCHER_SHA256,
+        )
+        from hermes_constants import find_node_executable, with_hermes_node_path
+        from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+        launcher = self.launcher or SENSITIVE_RUNTIME_LAUNCHER_PATH
+        node = find_node_executable("node")
+        try:
+            if node is None or hashlib.sha256(launcher.read_bytes()).hexdigest() \
+                    != SENSITIVE_VERIFIED_LAUNCHER_SHA256:
+                return False
+            env = with_hermes_node_path()
+            env.pop("HERMES_WHATSAPP_SENSITIVE_CAPABILITY", None)
+            env.pop("HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH", None)
+            env["HERMES_WHATSAPP_SENSITIVE_CAPABILITY"] = self.capability
+            env["HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH"] = json.dumps(
+                self._launch_descriptor(), sort_keys=True, separators=(",", ":"),
+            )
+            self.process = subprocess.Popen(
+                [node, str(launcher), "--port", str(self.port)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=env,
+                **windows_detach_popen_kwargs(),
+            )
+            deadline = time.monotonic() + min(30.0, self.config.request_timeout * 5)
+            while time.monotonic() < deadline:
+                if self.process.poll() is not None:
+                    return False
+                identity = await self._probe_identity()
+                if identity is not None and self._identity_matches_launch(identity):
+                    self.topology_identity = identity.topology_identity
+                    self._last_verified_monotonic = time.monotonic()
+                    return True
+                await asyncio.sleep(0.1)
+        except BaseException:
+            pass
+        await self.stop()
+        return False
+
+    async def _probe_identity(self) -> SensitiveRuntimeIdentity | None:
+        request = SimpleNamespace(
+            request_id=f"supervisor-{secrets.token_hex(16)}",
+            destination_account=self.config.sensitive_account,
+            destination_chat=self.config.requesters[0].sensitive_destination,
+            expires_at_us=time.time_ns() // 1000 + 5_000_000,
+        )
+        return await _sealed_sensitive_identity(
+            self.config, self.transport, request,
+            capability=self.capability,
+            expected_process_generation=self.process_generation,
+            expected_topology_identity=self.topology_identity or None,
+        )
+
+    async def refresh(self) -> bool:
+        if self.process is None or self.process.poll() is not None:
+            return False
+        identity = await self._probe_identity()
+        if identity is None or not self._identity_matches_launch(identity):
+            self._last_verified_monotonic = 0.0
+            return False
+        self.topology_identity = identity.topology_identity
+        self._last_verified_monotonic = time.monotonic()
+        return True
+
+    def _identity_matches_launch(self, identity: SensitiveRuntimeIdentity) -> bool:
+        try:
+            evidence = dict(identity.topology_identity)
+            return bool(
+                identity.process_generation == self.process_generation
+                and evidence["ordinary_adapter_generation"]
+                    == self.topology.adapter_generation
+                and evidence["ordinary_runtime_id"] == self.topology.ordinary_runtime_id
+                and evidence["ordinary_socket_generation"]
+                    == str(self.topology.ordinary_socket_generation)
+                and evidence["ordinary_session_identity"]
+                    == self.topology.ordinary_session_identity
+                and evidence["sensitive_session_identity"]
+                    == self.topology.sensitive_session_identity
+                and evidence["sensitive_credential_identity"]
+                    == self.topology.sensitive_credential_identity
+                and evidence["sensitive_device_identity_sha256"]
+                    == self.topology.sensitive_device_identity_sha256
+                and evidence["sensitive_credential_tree_sha256"]
+                    == self.topology.sensitive_credential_tree_sha256
+                and evidence["sensitive_account_phone"]
+                    == self.topology.sensitive_account_phone
+                and evidence["sensitive_account_lid"]
+                    == self.topology.sensitive_account_lid
+                and self.config.sensitive_account in {
+                    evidence["sensitive_account_phone"],
+                    evidence["sensitive_account_lid"],
+                }
+            )
+        except BaseException:
+            return False
+
+    def healthy(self) -> bool:
+        return bool(self.process is not None and self.process.poll() is None
+                    and self.topology_identity
+                    and time.monotonic() - self._last_verified_monotonic <= 1.0)
+
+    async def stop(self) -> None:
+        process, self.process = self.process, None
+        self.capability = ""
+        self.topology_identity = ()
+        self._last_verified_monotonic = 0.0
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            await asyncio.wait_for(asyncio.to_thread(process.wait), timeout=3)
+        except BaseException:
+            try:
+                process.kill()
+            except BaseException:
+                pass
+
+    async def observe_identity(self, *, request: MvpRequest) -> SensitiveRuntimeIdentity | None:
+        if not self.healthy():
+            return None
+        return await _sealed_sensitive_identity(
+            self.config, self.transport, request, capability=self.capability,
+            expected_process_generation=self.process_generation,
+            expected_topology_identity=self.topology_identity,
+        )
+
+    async def submit(self, *, request: MvpRequest, plaintext: str,
+                     identity: SensitiveRuntimeIdentity) -> SensitiveSubmission:
+        if not self.healthy():
+            return SensitiveSubmission("failed", None, "", "")
+        return await _sealed_sensitive_submit(
+            self.config, self.transport, request, plaintext, identity,
+            capability=self.capability,
+            expected_process_generation=self.process_generation,
+            expected_topology_identity=self.topology_identity,
+        )
+
+
 class _SensitiveHttpSubmitter:
     def __init__(self, config: JunoPrivateReadMvpConfig, transport: JsonTransport,
                  *, _clock_us: Callable[[], int] | None = None):
@@ -1917,11 +2313,14 @@ def _read_sensitive_capability(config: JunoPrivateReadMvpConfig) -> str | None:
 
 
 async def _sealed_sensitive_identity(
-    config: JunoPrivateReadMvpConfig, transport: JsonTransport, request: MvpRequest
+    config: JunoPrivateReadMvpConfig, transport: JsonTransport, request: MvpRequest,
+    *, capability: str | None = None,
+    expected_process_generation: str | None = None,
+    expected_topology_identity: tuple[tuple[str, str], ...] | None = None,
 ) -> SensitiveRuntimeIdentity | None:
     try:
         requested_at_us = time.time_ns() // 1000
-        capability = _read_sensitive_capability(config)
+        capability = capability or _read_sensitive_capability(config)
         if capability is None:
             return None
         response = await transport.request(
@@ -1939,12 +2338,16 @@ async def _sealed_sensitive_identity(
         )
         required = {
             "outcome", "submitted", "provider_account_jid", "identity_observed_us",
-            "adapter_runtime_id", "connection_epoch", "transport_identity",
+            "adapter_runtime_id", "process_generation", "connection_epoch",
+            "topology_identity", "transport_identity",
         }
         if type(response) is not dict or set(response) != required:
             return None
         completed_at_us = time.time_ns() // 1000
         observed_at_us = response["identity_observed_us"]
+        process_generation = response["process_generation"]
+        topology = response["topology_identity"]
+        topology_flat = _flatten_sensitive_topology(topology)
         if (
             response["outcome"] != "available"
             or response["submitted"] is not False
@@ -1954,13 +2357,21 @@ async def _sealed_sensitive_identity(
             or observed_at_us > completed_at_us + SENSITIVE_IDENTITY_FUTURE_SKEW_US
             or completed_at_us - observed_at_us > SENSITIVE_IDENTITY_MAX_AGE_US
             or response["transport_identity"] != _SENSITIVE_TRANSPORT_IDENTITY
+            or topology_flat is None
+            or (expected_process_generation is not None
+                and process_generation != expected_process_generation)
+            or (expected_topology_identity is not None
+                and topology_flat != expected_topology_identity)
         ):
             return None
         registration = _text(response["adapter_runtime_id"], "runtime identity", 512)
+        if registration != f"sensitive-{process_generation}":
+            return None
         session = _text(response["connection_epoch"], "connection epoch", 512)
         return SensitiveRuntimeIdentity(
             registration, response["provider_account_jid"], session, observed_at_us,
             tuple(sorted(response["transport_identity"].items())),
+            process_generation, topology_flat,
         )
     except BaseException:
         return None
@@ -1971,6 +2382,9 @@ async def _sealed_sensitive_submit(
     plaintext: str, identity: SensitiveRuntimeIdentity,
     *, _clock_us: Callable[[], int] | None = None,
     _entry_now_us: int | None = None,
+    capability: str | None = None,
+    expected_process_generation: str | None = None,
+    expected_topology_identity: tuple[tuple[str, str], ...] | None = None,
 ) -> SensitiveSubmission:
     clock_us = _clock_us or (lambda: time.time_ns() // 1000)
     try:
@@ -1981,8 +2395,16 @@ async def _sealed_sensitive_submit(
                 "expired" if entry_deadline == "expired" else "failed",
                 None, request.destination_account, request.destination_chat,
             )
-        capability = _read_sensitive_capability(config)
+        capability = capability or _read_sensitive_capability(config)
         if capability is None:
+            return SensitiveSubmission("failed", None, "", "")
+        if (
+            expected_process_generation is not None
+            and identity.process_generation != expected_process_generation
+        ) or (
+            expected_topology_identity is not None
+            and identity.topology_identity != expected_topology_identity
+        ):
             return SensitiveSubmission("failed", None, "", "")
         issue_deadline = _sensitive_deadline_status(
             request.expires_at_us, clock_us(), previous_now_us=entry_now_us
@@ -1999,7 +2421,11 @@ async def _sealed_sensitive_submit(
             body={"contract_version": SENSITIVE_SUBMIT_CONTRACT_VERSION,
                   "request_id": request.request_id,
                   "registration": identity.registration,
+                  "process_generation": identity.process_generation,
                   "session": identity.session,
+                  "topology_sha256": dict(identity.topology_identity).get(
+                      "topology_sha256", ""
+                  ),
                   "account": request.destination_account,
                   "destination": request.destination_chat,
                   "expires_at_us": request.expires_at_us,
@@ -2014,6 +2440,73 @@ async def _sealed_sensitive_submit(
         )
     except BaseException:
         return SensitiveSubmission("unknown", None, "mismatch", "mismatch")
+
+
+def _flatten_sensitive_topology(value: object) -> tuple[tuple[str, str], ...] | None:
+    try:
+        if type(value) is not dict or set(value) != {
+            "ordinary", "sensitive", "topology_sha256",
+        }:
+            return None
+        ordinary = value["ordinary"]
+        sensitive = value["sensitive"]
+        if type(ordinary) is not dict or set(ordinary) != {
+            "adapter_generation", "runtime_id", "socket_generation",
+            "account_phone_jid", "account_lid_jid", "session_path",
+            "session_identity", "manifest_sha256", "source_sha256",
+            "launcher_sha256",
+        } or type(sensitive) is not dict or set(sensitive) != {
+            "session_path", "session_identity", "credential_identity",
+            "device_identity_sha256", "credential_tree_sha256",
+            "account_phone_jid", "account_lid_jid",
+        }:
+            return None
+        flattened = {
+            "topology_sha256": _text(value["topology_sha256"], "topology digest", 64),
+            "ordinary_adapter_generation": _text(
+                ordinary["adapter_generation"], "ordinary adapter generation"
+            ),
+            "ordinary_runtime_id": _text(ordinary["runtime_id"], "ordinary runtime"),
+            "ordinary_socket_generation": str(ordinary["socket_generation"]),
+            "ordinary_session_identity": _text(
+                ordinary["session_identity"], "ordinary session identity"
+            ),
+            "sensitive_session_identity": _text(
+                sensitive["session_identity"], "sensitive session identity"
+            ),
+            "sensitive_credential_identity": _text(
+                sensitive["credential_identity"], "sensitive credential identity"
+            ),
+            "sensitive_device_identity_sha256": _text(
+                sensitive["device_identity_sha256"], "sensitive device identity", 64
+            ),
+            "sensitive_credential_tree_sha256": _text(
+                sensitive["credential_tree_sha256"], "sensitive credential tree", 64
+            ),
+            "sensitive_account_phone": _jid(
+                sensitive["account_phone_jid"], "sensitive phone"
+            ),
+            "sensitive_account_lid": _jid(
+                sensitive["account_lid_jid"], "sensitive lid"
+            ),
+        }
+        if any(
+            re.fullmatch(r"[a-f0-9]{64}", flattened[key]) is None
+            for key in (
+                "topology_sha256", "sensitive_device_identity_sha256",
+                "sensitive_credential_tree_sha256",
+            )
+        ):
+            return None
+        expected_digest = hashlib.sha256(json.dumps(
+            {"ordinary": ordinary, "sensitive": sensitive}, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(flattened["topology_sha256"], expected_digest):
+            return None
+        return tuple(sorted(flattened.items()))
+    except BaseException:
+        return None
 
 
 def _sensitive_deadline_status(
@@ -2033,17 +2526,23 @@ def _sensitive_deadline_status(
 
 
 def compose_juno_private_read_mvp_services(
-    runner: object, config: JunoPrivateReadMvpConfig
+    runner: object, config: JunoPrivateReadMvpConfig,
+    *, sensitive_supervisor: _SensitiveBridgeSupervisor | None = None,
 ) -> JunoPrivateReadDependencies:
     """Concrete code-owned production composition; config supplies data only."""
+    if type(sensitive_supervisor) is not _SensitiveBridgeSupervisor \
+            or not sensitive_supervisor.healthy():
+        raise JunoPrivateReadError("sensitive supervisor unavailable")
     transport = FixedHttpJsonTransport()
     ordinary = _GatewayOrdinaryNotifier(runner, config)
     return JunoPrivateReadDependencies(
         openfga=OpenFgaChecker(config, transport),
         gmail=GmailNewestInboxProvider(config, transport),
         ordinary=ordinary,
-        sensitive=_SensitiveHttpSubmitter(config, transport),
-        ordinary_fence=ordinary.fence_healthy,
+        sensitive=sensitive_supervisor,
+        ordinary_fence=lambda: bool(
+            ordinary.fence_healthy() and sensitive_supervisor.healthy()
+        ),
     )
 
 

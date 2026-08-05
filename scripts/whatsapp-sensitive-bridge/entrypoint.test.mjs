@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
   mkdirSync,
+  lstatSync,
   mkdtempSync,
   realpathSync,
   symlinkSync,
@@ -22,21 +23,45 @@ const SESSION_ROOT = mkdtempSync(path.join(realpathSync.native(tmpdir()), 'herme
 const SENSITIVE_SESSION = path.join(SESSION_ROOT, 'sensitive');
 const ORDINARY_SESSION = path.join(SESSION_ROOT, 'ordinary');
 mkdirSync(ORDINARY_SESSION, { mode: 0o700 });
+mkdirSync(SENSITIVE_SESSION, { mode: 0o700 });
 
 function args(overrides = {}) {
   const values = {
     '--port': '31873',
-    '--session': SENSITIVE_SESSION,
-    '--ordinary-session': ORDINARY_SESSION,
-    '--sensitive-account-jid': SENSITIVE,
-    '--ordinary-account-jid': ORDINARY,
     ...overrides,
   };
   return Object.entries(values).flat();
 }
 
+function launchEnv(overrides = {}) {
+  const ordinaryStat = lstatSync(ORDINARY_SESSION, { bigint: true });
+  const sensitiveStat = lstatSync(SENSITIVE_SESSION, { bigint: true });
+  const launch = {
+    version: 1,
+    process_generation: 'a'.repeat(64),
+    configured_account_jid: SENSITIVE,
+    ordinary: {
+      adapter_generation: 'b'.repeat(64), runtime_id: 'ordinary-runtime',
+      socket_generation: 1, account_phone_jid: SENSITIVE,
+      account_lid_jid: '90909090909@lid', session_path: ORDINARY_SESSION,
+      session_identity: `${ordinaryStat.dev}:${ordinaryStat.ino}`,
+      manifest_sha256: 'c'.repeat(64), source_sha256: 'd'.repeat(64),
+      launcher_sha256: 'e'.repeat(64),
+    },
+    sensitive: {
+      session_path: SENSITIVE_SESSION,
+      session_identity: `${sensitiveStat.dev}:${sensitiveStat.ino}`,
+      credential_identity: '1:4', device_identity_sha256: 'f'.repeat(64),
+      credential_tree_sha256: '0'.repeat(64), account_phone_jid: SENSITIVE,
+      account_lid_jid: '90909090909@lid',
+    },
+    ...overrides,
+  };
+  return { HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH: JSON.stringify(launch) };
+}
+
 test('canonical launcher requires the same exact account identity and refuses injection arguments', () => {
-  const parsed = parseCanonicalArgs(args());
+  const parsed = parseCanonicalArgs(args(), launchEnv());
   assert.ok(parsed.sessionPathGuard instanceof SessionPathGuard);
   assert.deepEqual({ ...parsed, sessionPathGuard: undefined }, {
     port: 31873,
@@ -45,31 +70,29 @@ test('canonical launcher requires the same exact account identity and refuses in
     sessionPathGuard: undefined,
     sensitiveAccountJid: SENSITIVE,
     ordinaryAccountJid: ORDINARY,
+    launch: parsed.launch,
   });
   assert.throws(
-    () => parseCanonicalArgs(args({ '--ordinary-account-jid': DIFFERENT })),
-    /same canonical account required/,
+    () => parseCanonicalArgs(args(), launchEnv({ configured_account_jid: DIFFERENT })),
+    /sealed account topology mismatch/,
   );
   assert.throws(
-    () => parseCanonicalArgs([...args(), '--bridge-script', '/tmp/custom.js']),
+    () => parseCanonicalArgs([...args(), '--bridge-script', '/tmp/custom.js'], launchEnv()),
     /invalid canonical sensitive bridge arguments/,
   );
   assert.throws(
-    () => parseCanonicalArgs(args({ '--sensitive-account-jid': '15551234567:4@s.whatsapp.net' })),
-    /canonical sensitive account identity is required/,
-  );
-  assert.throws(
-    () => parseCanonicalArgs(args({ '--ordinary-account-jid': '987654321@lid' })),
-    /same canonical account required/,
-  );
-  assert.throws(
-    () => parseCanonicalArgs(args({ '--ordinary-session': SENSITIVE_SESSION })),
-    /separate sensitive session path required/,
+    () => parseCanonicalArgs([...args(), '--ordinary-session', ORDINARY_SESSION], launchEnv()),
+    /invalid canonical sensitive bridge arguments/,
   );
   const nestedOrdinary = path.join(SENSITIVE_SESSION, 'ordinary');
   mkdirSync(nestedOrdinary, { mode: 0o700 });
   assert.throws(
-    () => parseCanonicalArgs(args({ '--ordinary-session': nestedOrdinary })),
+    () => parseCanonicalArgs(args(), launchEnv({
+      ordinary: {
+        ...JSON.parse(launchEnv().HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH).ordinary,
+        session_path: nestedOrdinary,
+      },
+    })),
     /separate sensitive session path required/,
   );
 });
@@ -81,7 +104,7 @@ test('missing inherited capability remains disabled before argument parsing or f
   );
 });
 
-test('argument parsing rejects either session symlinked to the other real directory', () => {
+test('sealed launch rejects either session symlinked to the other real directory', () => {
   for (const direction of ['sensitive-to-ordinary', 'ordinary-to-sensitive']) {
     const root = mkdtempSync(path.join(realpathSync.native(tmpdir()), 'hermes-entry-alias-'));
     const sensitive = path.join(root, 'sensitive');
@@ -94,9 +117,16 @@ test('argument parsing rejects either session symlinked to the other real direct
       symlinkSync(sensitive, ordinary, 'dir');
     }
     assert.throws(
-      () => parseCanonicalArgs(args({
-        '--session': sensitive,
-        '--ordinary-session': ordinary,
+      () => parseCanonicalArgs(args(), launchEnv({
+        ordinary: {
+          ...JSON.parse(launchEnv().HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH).ordinary,
+          session_path: ordinary,
+        },
+        sensitive: {
+          ...JSON.parse(launchEnv().HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH).sensitive,
+          session_path: sensitive,
+          session_identity: '1:1',
+        },
       })),
       /sensitive session path validation failed/,
     );

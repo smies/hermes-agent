@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 export const PROVIDER_MESSAGE_ID_PATTERN = /^3EB0[0-9A-F]{18}$/;
 export const SENSITIVE_SUBMIT_CONTRACT_VERSION = 'juno-sensitive-submit-v2';
 
@@ -6,6 +8,7 @@ const MAX_OPAQUE_BYTES = 256;
 const MAX_DEADLINE_AHEAD_US = 300_000_000;
 const MIN_TRUSTED_EPOCH_US = 1_000_000_000_000_000;
 const MAX_TRUSTED_EPOCH_US = Number.MAX_SAFE_INTEGER;
+const DEFAULT_MAX_REPLAY_TOMBSTONES = 4096;
 
 function plainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -101,19 +104,29 @@ function jidNamespace(value) {
 export class SensitiveDeliveryTransport {
   constructor({
     runtimeId,
+    processGeneration,
+    topologyIdentity,
     ordinaryAccountJid,
     transportIdentity,
     canonicalizeJid,
     generateMessageId,
     nowUs = () => Date.now() * 1000,
+    maxReplayTombstones = DEFAULT_MAX_REPLAY_TOMBSTONES,
   }) {
-    if (!boundedString(runtimeId) || !plainObject(transportIdentity)) {
+    if (!boundedString(runtimeId) || !/^[a-f0-9]{64}$/.test(processGeneration)
+        || !plainObject(topologyIdentity) || !plainObject(transportIdentity)) {
       throw new TypeError('invalid sensitive transport identity');
     }
     if (typeof canonicalizeJid !== 'function' || typeof generateMessageId !== 'function') {
       throw new TypeError('missing pinned provider helpers');
     }
+    if (!Number.isSafeInteger(maxReplayTombstones) || maxReplayTombstones < 1
+        || maxReplayTombstones > DEFAULT_MAX_REPLAY_TOMBSTONES) {
+      throw new TypeError('invalid replay tombstone bound');
+    }
     this.runtimeId = runtimeId;
+    this.processGeneration = processGeneration;
+    this.topologyIdentity = Object.freeze({ ...topologyIdentity });
     this.transportIdentity = Object.freeze({ ...transportIdentity });
     this.canonicalizeJid = canonicalizeJid;
     const ordinaryAccount = canonicalAccountJid(ordinaryAccountJid, canonicalizeJid);
@@ -121,6 +134,8 @@ export class SensitiveDeliveryTransport {
     this.ordinaryAccountJid = ordinaryAccount.value;
     this.generateMessageId = generateMessageId;
     this.nowUs = nowUs;
+    this.maxReplayTombstones = maxReplayTombstones;
+    this.replayTombstones = new Map();
     this.connection = null;
     this.enabled = true;
   }
@@ -186,15 +201,18 @@ export class SensitiveDeliveryTransport {
       provider_account_jid: this.connection.accountJid,
       identity_observed_us: observed,
       adapter_runtime_id: this.runtimeId,
+      process_generation: this.processGeneration,
       connection_epoch: this.connection.epoch,
+      topology_identity: this.topologyIdentity,
       transport_identity: this.transportIdentity,
     });
   }
 
   async submit(request, { signal } = {}) {
     const fields = [
-      'contract_version', 'request_id', 'registration', 'session', 'account',
-      'destination', 'expires_at_us', 'private_value',
+      'contract_version', 'request_id', 'registration', 'process_generation',
+      'session', 'topology_sha256', 'account', 'destination',
+      'expires_at_us', 'private_value',
     ];
     if (!this.enabled || !this.connection) {
       return submitResult('failed');
@@ -203,7 +221,9 @@ export class SensitiveDeliveryTransport {
         || request.contract_version !== SENSITIVE_SUBMIT_CONTRACT_VERSION
         || !boundedString(request.request_id)
         || !boundedString(request.registration)
+        || !boundedString(request.process_generation)
         || !boundedString(request.session)
+        || !boundedString(request.topology_sha256)
         || !boundedString(request.account)
         || !boundedString(request.destination)
         || typeof request.private_value !== 'string'
@@ -217,6 +237,8 @@ export class SensitiveDeliveryTransport {
     const destination = canonicalDirectJid(request.destination, this.canonicalizeJid);
     if (account.error || destination.error || account.value !== connection.accountJid
         || request.registration !== this.runtimeId || request.session !== connection.epoch
+        || request.process_generation !== this.processGeneration
+        || request.topology_sha256 !== this.topologyIdentity.topology_sha256
         || this.#connectionDriftCode(connection, account.value)) {
       return Object.freeze({ state: 'failed', message_id: null,
         account: request.account, destination: request.destination });
@@ -227,6 +249,11 @@ export class SensitiveDeliveryTransport {
     }
     if (entryDeadline.state === 'expired') {
       return submitResult('expired', account.value, destination.value);
+    }
+    if (!this.#reserveSubmission(
+      request, connection, account.value, destination.value, entryDeadline.now,
+    )) {
+      return submitResult('failed', account.value, destination.value);
     }
     let messageId;
     try {
@@ -327,6 +354,37 @@ export class SensitiveDeliveryTransport {
     if (this.#liveAccountJid(connection.sock) !== expectedAccount
         || connection.accountJid !== expectedAccount) return 'account_drift';
     return null;
+  }
+
+  #reserveSubmission(request, connection, account, destination, now) {
+    for (const [nonce, record] of this.replayTombstones) {
+      if (record.expiresAtUs <= now) this.replayTombstones.delete(nonce);
+    }
+    const plaintextDigest = createHash('sha256')
+      .update(request.private_value, 'utf8')
+      .digest('hex');
+    const descriptorDigest = createHash('sha256').update(JSON.stringify({
+      runtime: this.runtimeId,
+      session: connection.epoch,
+      account,
+      destination,
+      expires_at_us: request.expires_at_us,
+      plaintext_sha256: plaintextDigest,
+    })).digest('hex');
+    const existing = this.replayTombstones.get(request.request_id);
+    if (existing) {
+      // Exact duplicates and mismatched reuse are both terminal. Comparing the
+      // content-free digest keeps the distinction available for diagnostics
+      // without retaining or logging the private payload.
+      void (existing.descriptorDigest === descriptorDigest);
+      return false;
+    }
+    if (this.replayTombstones.size >= this.maxReplayTombstones) return false;
+    this.replayTombstones.set(request.request_id, Object.freeze({
+      descriptorDigest,
+      expiresAtUs: request.expires_at_us,
+    }));
+    return true;
   }
 
   #closeConnection(reason) {
