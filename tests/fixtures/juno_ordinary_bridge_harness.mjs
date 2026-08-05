@@ -4,11 +4,13 @@ import { pathToFileURL } from 'node:url';
 
 const bridge = await import(pathToFileURL(process.env.JUNO_BRIDGE_MODULE));
 const ev = new EventEmitter();
+const sentMessages = [];
 const socket = {
   user: { id: '33333333333:19@s.whatsapp.net', lid: '44444444444@lid' },
   ev,
   updateMediaMessage: async () => {},
-  async sendMessage(chatId) {
+  async sendMessage(chatId, content) {
+    sentMessages.push({ chatId, text: content?.text || '' });
     return {
       key: {
         id: `OFFLINE-${Date.now()}`,
@@ -99,6 +101,10 @@ for await (const line of input) {
       status: response.status,
       messages: JSON.parse(response.body),
     })}\n`);
+    continue;
+  }
+  if (value.command === 'sent') {
+    process.stdout.write(`${JSON.stringify({ sent: [...sentMessages] })}\n`);
     continue;
   }
   const sender = value.sender;

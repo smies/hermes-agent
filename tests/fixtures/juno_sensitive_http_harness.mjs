@@ -9,60 +9,134 @@ import {
   listenLoopback,
 } from '../../scripts/whatsapp-sensitive-bridge/http_server.js';
 import { verifySensitiveTransport } from '../../scripts/whatsapp-sensitive-bridge/launcher.js';
+import { prepareSessionPaths } from '../../scripts/whatsapp-sensitive-bridge/session_paths.js';
 
-const account = '33333333333@s.whatsapp.net';
-const ordinary = account;
-const processGeneration = 'b'.repeat(64);
-const runtime = `sensitive-${processGeneration}`;
-const epoch = `vertical-epoch-${process.pid}`;
-const identity = await verifySensitiveTransport();
+const CAPABILITY_ENV = 'HERMES_WHATSAPP_SENSITIVE_CAPABILITY';
+const LAUNCH_ENV = 'HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH';
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => [key, stableValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+function exactObject(value, keys) {
+  return value && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+}
+
+function sealedLaunch() {
+  let launch;
+  try { launch = JSON.parse(process.env[LAUNCH_ENV]); } catch { throw new Error('sealed launch required'); }
+  if (!exactObject(launch, [
+    'version', 'process_generation', 'configured_account_jid', 'ordinary', 'sensitive',
+  ]) || launch.version !== 1
+      || typeof launch.process_generation !== 'string'
+      || !/^[a-f0-9]{64}$/.test(launch.process_generation)
+      || !exactObject(launch.ordinary, [
+        'adapter_generation', 'runtime_id', 'socket_generation',
+        'account_phone_jid', 'account_lid_jid', 'session_path',
+        'session_identity', 'manifest_sha256', 'source_sha256', 'launcher_sha256',
+      ])
+      || !exactObject(launch.sensitive, [
+        'session_path', 'session_identity', 'credential_identity',
+        'device_identity_sha256', 'credential_tree_sha256',
+        'account_phone_jid', 'account_lid_jid',
+      ])) {
+    throw new Error('sealed launch invalid');
+  }
+  const accountAliases = new Set([
+    launch.ordinary.account_phone_jid, launch.ordinary.account_lid_jid,
+  ]);
+  if (!accountAliases.has(launch.configured_account_jid)) {
+    throw new Error('sealed account topology mismatch');
+  }
+  return launch;
+}
+
+function requestedPort() {
+  const argv = process.argv.slice(2);
+  if (argv.length !== 2 || argv[0] !== '--port' || !/^\d{1,5}$/.test(argv[1])) {
+    throw new Error('canonical requested port required');
+  }
+  const port = Number(argv[1]);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error('canonical requested port required');
+  }
+  return port;
+}
+
+const launch = sealedLaunch();
+const capability = process.env[CAPABILITY_ENV];
+if (typeof capability !== 'string' || Buffer.byteLength(capability, 'utf8') < 32
+    || Buffer.byteLength(capability, 'utf8') > 512) {
+  throw new Error('sensitive capability required');
+}
 const capture = process.env.JUNO_TEST_DELIVERY_CAPTURE;
-const capability = process.env.JUNO_TEST_SENSITIVE_CAPABILITY;
+if (typeof capture !== 'string' || !capture) throw new Error('delivery capture required');
+
+const sessionGuard = prepareSessionPaths(
+  launch.sensitive.session_path,
+  launch.ordinary.session_path,
+  { requireDistinctCredentials: true },
+);
+const observed = sessionGuard.topologyEvidence();
+const ordinaryMatches = observed.ordinary.session_path === launch.ordinary.session_path
+  && observed.ordinary.session_identity === launch.ordinary.session_identity
+  && observed.ordinary.account_phone_jid === launch.ordinary.account_phone_jid
+  && observed.ordinary.account_lid_jid === launch.ordinary.account_lid_jid;
+const sensitiveMatches = Object.entries(launch.sensitive)
+  .every(([name, value]) => observed.sensitive[name] === value);
+if (!ordinaryMatches || !sensitiveMatches) throw new Error('sealed topology mismatch');
+
+const identity = await verifySensitiveTransport();
 const topologyIdentity = {
-  ordinary: {
-    adapter_generation: 'a'.repeat(64), runtime_id: 'ordinary-vertical-runtime',
-    socket_generation: 1, account_phone_jid: account,
-    account_lid_jid: '44444444444@lid', session_path: '/synthetic/ordinary',
-    session_identity: '1:2', manifest_sha256: 'c'.repeat(64),
-    source_sha256: 'd'.repeat(64), launcher_sha256: 'e'.repeat(64),
-  },
-  sensitive: {
-    session_path: '/synthetic/sensitive', session_identity: '1:3',
-    credential_identity: '1:4', device_identity_sha256: 'f'.repeat(64),
-    credential_tree_sha256: '0'.repeat(64), account_phone_jid: account,
-    account_lid_jid: '44444444444@lid',
-  },
+  ordinary: Object.freeze({ ...launch.ordinary }),
+  sensitive: observed.sensitive,
 };
-topologyIdentity.topology_sha256 = createHash('sha256').update(JSON.stringify({
-  ordinary: Object.fromEntries(Object.entries(topologyIdentity.ordinary).sort()),
-  sensitive: Object.fromEntries(Object.entries(topologyIdentity.sensitive).sort()),
-})).digest('hex');
+topologyIdentity.topology_sha256 = createHash('sha256').update(JSON.stringify(stableValue({
+  ordinary: topologyIdentity.ordinary,
+  sensitive: topologyIdentity.sensitive,
+}))).digest('hex');
+const reportedGeneration = process.env.JUNO_TEST_SENSITIVE_STALE_PROCESS_GENERATION === '1'
+  ? '0'.repeat(64) : launch.process_generation;
+const runtime = `sensitive-${reportedGeneration}`;
+const epoch = `vertical-epoch-${process.pid}`;
 const ev = new EventEmitter();
 const socket = {
-  user: { id: '33333333333:4@s.whatsapp.net' },
+  user: { id: launch.sensitive.account_phone_jid },
   ev,
   async sendMessage(chat, content, options) {
+    sessionGuard.revalidate();
     appendFileSync(capture, `${JSON.stringify({
       chat, text: content.text, messageId: options.messageId,
     })}\n`, { encoding: 'utf8', mode: 0o600 });
     return { key: { id: options.messageId, remoteJid: chat, fromMe: true } };
   },
 };
-const canonicalizeJid = (value) => String(value).replace(/:\d+@/, '@');
+const canonicalizeJid = value => String(value).replace(/:\d+@/, '@');
 const transport = new SensitiveDeliveryTransport({
   runtimeId: runtime,
-  processGeneration,
+  processGeneration: reportedGeneration,
   topologyIdentity,
-  ordinaryAccountJid: ordinary,
+  ordinaryAccountJid: launch.configured_account_jid,
   transportIdentity: identity,
   canonicalizeJid,
   generateMessageId: () => '3EB0ABCDEF0123456789AB',
 });
-transport.bindConnection({ socket, sock: socket, accountJid: account, epoch });
+transport.bindConnection({
+  socket, sock: socket,
+  accountJid: launch.sensitive.account_phone_jid,
+  epoch,
+});
 
 const server = http.createServer(createSensitiveHttpHandler({ capability, transport }));
 try {
-  await listenLoopback(server, { port: 0 });
+  await listenLoopback(server, { port: requestedPort() });
 } catch (error) {
   if (['EACCES', 'EPERM'].includes(error?.code) && error?.syscall === 'listen') {
     process.stderr.write(`JUNO_SOCKET_BIND_DENIED:${error.code}:listen\n`);
@@ -71,7 +145,6 @@ try {
   process.stderr.write('JUNO_HARNESS_STARTUP_FAILURE\n');
   process.exit(74);
 }
-process.stdout.write(`${JSON.stringify({ port: server.address().port, identity })}\n`);
 
 const stop = () => {
   transport.setEnabled(false);
