@@ -37,6 +37,9 @@ import os
 import hashlib
 import hmac
 import re
+import shutil
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -63,16 +66,260 @@ def _get_wsecret(name, default=None):
 
 logger = logging.getLogger(__name__)
 
-ORDINARY_VERIFIED_LAUNCHER_SHA256 = "6bfb088a883205f197300b224118e4d7906e0315f97b2066c1d9496cc271395b"
+ORDINARY_VERIFIED_LAUNCHER_SHA256 = "686b68896b0e7b4116ae751f0ab766e1e3857978d1c9eb591d7f15259ead3162"
+ORDINARY_VERIFIED_MANIFEST_SHA256 = "8df3c314aa5ed60e3d39c87090bc041d1d9d6fb52c5440e89fe6d1bbf5568fb1"
+ORDINARY_VERIFIED_PACKAGE_SHA256 = "c7593a5e4456c6133a0d5a8827d752771b1220c925d5ef4464198773106e40dc"
+ORDINARY_VERIFIED_LOCK_SHA256 = "2e62d7c1fe53747fd3148e374b639e23af120cdad295ca57a426d38384f72913"
+ORDINARY_VERIFIED_VERIFIER_SHA256 = "12d82b98216afefa516fcc4b1d077787d7c8396ea826e29bdedceee960f0cca9"
+ORDINARY_VERIFIED_SOURCE_SHA256 = "df4f2ba795dd981319740e0fa8dff5cc23397a09c21c0e9c388e6701cf284cdf"
+_ORDINARY_SOURCE_FILES = (
+    "allowlist.js", "bridge.js", "bridge_helpers.js", "inbound_producer.js",
+    "lid_bootstrap.js", "outbound_ids.js", "owner_message_gate.js",
+)
+_ORDINARY_MIRROR_FILES = (
+    "launcher.js", "transport-manifest.json", "transport_identity.js",
+    "package.json", "package-lock.json", *_ORDINARY_SOURCE_FILES,
+)
+_ORDINARY_MAX_SOURCE_FILE_BYTES = 4 * 1024 * 1024
 
 
 def verify_ordinary_launcher(path: Path) -> bool:
     """Bind the manifest-anchor launcher to the trusted Python host source."""
     try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            return False
+        digest = hashlib.sha256(_read_regular_file(path)).hexdigest()
     except OSError:
         return False
     return hmac.compare_digest(digest, ORDINARY_VERIFIED_LAUNCHER_SHA256)
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """Read one non-replaceable regular file through a checked descriptor."""
+    before = path.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o022
+        or before.st_size > _ORDINARY_MAX_SOURCE_FILE_BYTES
+    ):
+        raise OSError("unsafe ordinary bridge source")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise OSError("replaceable ordinary bridge source")
+        chunks: list[bytes] = []
+        remaining = _ORDINARY_MAX_SOURCE_FILE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) > _ORDINARY_MAX_SOURCE_FILE_BYTES:
+            raise OSError("oversized ordinary bridge source")
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def _framed_source_digest(files: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for name in _ORDINARY_SOURCE_FILES:
+        file_digest = hashlib.sha256(files[name]).hexdigest()
+        name_bytes = name.encode("utf-8")
+        digest.update(f"{len(name_bytes)}:".encode())
+        digest.update(name_bytes)
+        digest.update(f":{len(file_digest)}:{file_digest}\n".encode())
+    return digest.hexdigest()
+
+
+def _reviewed_bridge_files(root: Path) -> dict[str, bytes]:
+    """Return an independently anchored snapshot of the reviewed source."""
+    root_info = root.lstat()
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_IMODE(root_info.st_mode) & 0o022:
+        raise OSError("unsafe ordinary bridge source directory")
+    values = {name: _read_regular_file(root / name) for name in _ORDINARY_MIRROR_FILES}
+    observed = {
+        "launcher": hashlib.sha256(values["launcher.js"]).hexdigest(),
+        "manifest": hashlib.sha256(values["transport-manifest.json"]).hexdigest(),
+        "package": hashlib.sha256(values["package.json"]).hexdigest(),
+        "lock": hashlib.sha256(values["package-lock.json"]).hexdigest(),
+        "verifier": hashlib.sha256(values["transport_identity.js"]).hexdigest(),
+        "source": _framed_source_digest(values),
+    }
+    expected = {
+        "launcher": ORDINARY_VERIFIED_LAUNCHER_SHA256,
+        "manifest": ORDINARY_VERIFIED_MANIFEST_SHA256,
+        "package": ORDINARY_VERIFIED_PACKAGE_SHA256,
+        "lock": ORDINARY_VERIFIED_LOCK_SHA256,
+        "verifier": ORDINARY_VERIFIED_VERIFIER_SHA256,
+        "source": ORDINARY_VERIFIED_SOURCE_SHA256,
+    }
+    if any(not hmac.compare_digest(observed[name], expected[name]) for name in expected):
+        raise OSError("ordinary bridge source identity mismatch")
+    try:
+        manifest = json.loads(values["transport-manifest.json"])
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise OSError("ordinary bridge manifest is invalid") from None
+    if (
+        type(manifest) is not dict
+        or set(manifest) != {
+            "version", "package_name", "package_version", "package_sha256",
+            "lock_sha256", "verifier_sha256", "source_sha256",
+            "node_modules_tree_sha256", "baileys",
+        }
+        or manifest.get("version") != 3
+        or manifest.get("package_sha256") != expected["package"]
+        or manifest.get("lock_sha256") != expected["lock"]
+        or manifest.get("verifier_sha256") != expected["verifier"]
+        or manifest.get("source_sha256") != expected["source"]
+    ):
+        raise OSError("ordinary bridge manifest identity mismatch")
+    return values
+
+
+def _reviewed_bridge_identity() -> str:
+    value = (
+        "hermes-whatsapp-bridge-mirror-v1\0"
+        + ORDINARY_VERIFIED_LAUNCHER_SHA256 + "\0"
+        + ORDINARY_VERIFIED_MANIFEST_SHA256
+    )
+    return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def _safe_owned_directory(path: Path, *, create: bool = False, private: bool = False) -> None:
+    if create:
+        path.mkdir(mode=0o700 if private else 0o755, parents=False, exist_ok=True)
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+    ):
+        raise OSError("unsafe ordinary bridge mirror parent")
+    if private and stat.S_IMODE(info.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_staged_bridge(stage: Path, files: dict[str, bytes]) -> None:
+    for name in _ORDINARY_MIRROR_FILES:
+        destination = stage / name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(destination, flags, 0o700 if name == "launcher.js" else 0o600)
+        try:
+            view = memoryview(files[name])
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("ordinary bridge mirror write failed")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    _fsync_directory(stage)
+
+
+def _remove_exact_mirror_entry(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _install_bridge_is_writable(path: Path) -> bool:
+    temporary: str | None = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=".hermes-write-test-", dir=path)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return False
+        finally:
+            os.close(descriptor)
+        return True
+    except OSError:
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _publish_reviewed_bridge_mirror(install_bridge: Path, hermes_home: Path) -> Path:
+    files = _reviewed_bridge_files(install_bridge)
+    _safe_owned_directory(hermes_home)
+    scripts_dir = hermes_home / "scripts"
+    _safe_owned_directory(scripts_dir, create=True)
+    mirror_root = scripts_dir / ".whatsapp-bridge-mirrors"
+    _safe_owned_directory(mirror_root, create=True, private=True)
+    identity = _reviewed_bridge_identity()
+    destination = mirror_root / identity
+    if os.path.lexists(destination):
+        try:
+            _reviewed_bridge_files(destination)
+            return destination
+        except OSError:
+            pass
+
+    stage = Path(tempfile.mkdtemp(prefix=f".{identity}.stage-", dir=mirror_root))
+    os.chmod(stage, 0o700)
+    quarantine: Path | None = None
+    try:
+        _write_staged_bridge(stage, files)
+        _reviewed_bridge_files(stage)
+        try:
+            os.rename(stage, destination)
+        except FileExistsError:
+            _reviewed_bridge_files(destination)
+        except OSError:
+            try:
+                _reviewed_bridge_files(destination)
+                return destination
+            except OSError:
+                pass
+            # A corrupt entry at the content-addressed name is never selected.
+            # Move that exact entry aside, then atomically publish the complete
+            # staged directory. Concurrent readers either verify or fail closed.
+            if not os.path.lexists(destination):
+                raise
+            quarantine = mirror_root / (
+                f".{identity}.rejected-{os.getpid()}-{stage.name.rsplit('-', 1)[-1]}"
+            )
+            os.rename(destination, quarantine)
+            os.rename(stage, destination)
+        _fsync_directory(mirror_root)
+        _reviewed_bridge_files(destination)
+        return destination
+    finally:
+        _remove_exact_mirror_entry(stage)
+        if quarantine is not None:
+            _remove_exact_mirror_entry(quarantine)
 
 
 class WhatsAppBehaviorMixin:
@@ -518,49 +765,24 @@ class WhatsAppBehaviorMixin:
 # ---------------------------------------------------------------------------
 
 def resolve_whatsapp_bridge_dir() -> Path:
-    """Resolve the WhatsApp bridge directory, mirroring to HERMES_HOME if needed.
-
-    When the install tree is read-only (e.g., Docker /opt/hermes), this function
-    mirrors the bridge source to a writable HERMES_HOME location and returns that
-    path. This ensures npm install works in Docker environments.
-
-    Returns the resolved bridge directory path.
-    """
-    import shutil
+    """Resolve only a reviewed writable source or its atomic verified mirror."""
     from pathlib import Path as _Path
 
     # Default location in install tree (may be read-only)
     from hermes_constants import get_hermes_home
     install_bridge = _Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
 
-    # Try HERMES_HOME location first
     hermes_home = get_hermes_home()
-    hermes_home_bridge = hermes_home / "scripts" / "whatsapp-bridge"
 
-    # Check if install dir is writable
-    try:
-        test_file = install_bridge / ".write_test"
-        test_file.touch()
-        test_file.unlink()
-        install_writable = True
-    except (OSError, PermissionError):
-        install_writable = False
+    # Snapshot and verify the complete reviewed source before either returning
+    # it or using its bytes to construct a writable mirror.
+    _reviewed_bridge_files(install_bridge)
+
+    install_writable = _install_bridge_is_writable(install_bridge)
 
     if install_writable:
         return install_bridge
-
-    # Install dir is read-only, mirror to HERMES_HOME if needed
-    if hermes_home_bridge.exists():
-        return hermes_home_bridge
-
-    # Mirror the bridge source to HERMES_HOME
-    try:
-        hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            install_bridge,
-            hermes_home_bridge,
-            dirs_exist_ok=False,
-        )
-        return hermes_home_bridge
-    except Exception:
-        return install_bridge
+    # Never fall back to a stale static mirror or to a read-only tree that the
+    # adapter may need to mutate with npm ci. Synchronization failures are
+    # explicit fail-closed startup failures.
+    return _publish_reviewed_bridge_mirror(install_bridge, hermes_home)

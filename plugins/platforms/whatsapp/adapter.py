@@ -1656,6 +1656,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             account_id = to_whatsapp_jid(data.get("accountId"))
             if account_id:
                 metadata["whatsapp_account_id"] = account_id
+            inbound_provenance = data.get("inboundProvenance")
+            if inbound_provenance == "messages.upsert:registered-emitting-socket:v1":
+                metadata["whatsapp_inbound_provenance"] = inbound_provenance
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:

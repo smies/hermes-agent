@@ -45,6 +45,7 @@ MAX_GMAIL_DEPTH = 8
 MAX_GMAIL_HEADERS = 128
 SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
 SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
+ORDINARY_INBOUND_PROVENANCE = "messages.upsert:registered-emitting-socket:v1"
 _SENSITIVE_TRANSPORT_IDENTITY = {
     "manifest_sha256": "c10ec43325576c3bccd5027c3e46c85cb02050ea22334e36a3de6bb4909dffb2",
     "launcher_sha256": "6c0f3d594123fe268b943227e1182c79805ec96093bb0c32d97b76453f8dc356",
@@ -292,6 +293,7 @@ class MvpEventContext:
     source_account: str
     source_chat: str
     source_message: str
+    source_provenance: str
 
     def __repr__(self) -> str:
         return "<MvpEventContext redacted>"
@@ -583,6 +585,7 @@ class MvpAuthorizationRepository:
             "chat": context.source_chat,
             "message": context.source_message,
             "profile": context.source_profile,
+            "provenance": context.source_provenance,
             "sender": context.requester.sender,
         })
 
@@ -890,6 +893,7 @@ class MvpAuthorizationRepository:
                 source_context = MvpEventContext(
                     self._config.requester(row["requester"]), row["source_profile"],
                     row["source_account"], row["source_chat"], row["source_message"],
+                    ORDINARY_INBOUND_PROVENANCE,
                 )
                 invalid = (
                     source_context.requester is None
@@ -900,6 +904,7 @@ class MvpAuthorizationRepository:
                     approval_context = MvpEventContext(
                         self._config.requester(self._config.owner_sender), row["source_profile"],
                         row["source_account"], row["approval_chat"], row["approval_message"],
+                        ORDINARY_INBOUND_PROVENANCE,
                     )
                     invalid = invalid or approval_context.requester is None or not self._journal.contains(
                         "approval", self._approval_journal_id(approval_context)
@@ -1399,7 +1404,10 @@ class JunoPrivateReadMvpHost:
     async def start(self, *, _background_worker: bool = True) -> bool:
         if self._active_profile != self.config.profile:
             return False
-        master = _load_or_create_state_key(self.config.state_dir)
+        try:
+            master = _load_or_create_state_key(self.config.state_dir)
+        except JunoPrivateReadError:
+            return False
         store = AuthorizationTaskStore(
             db_path=self.config.state_dir / "authorization.db",
             audit_hmac_key=hashlib.sha256(master + b"audit").digest(),
@@ -1513,12 +1521,15 @@ class JunoPrivateReadMvpHost:
             return None
         profile = source.profile if source.profile is not None else self._active_profile
         account = event.metadata.get("whatsapp_account_id") if type(event.metadata) is dict else None
+        provenance = event.metadata.get("whatsapp_inbound_provenance") \
+            if type(event.metadata) is dict else None
         sender = source.user_id
         requester = self.config.requester(sender) if type(sender) is str else None
         if (
             requester is None
             or profile != self.config.profile
             or account != self.config.ordinary_account
+            or provenance != ORDINARY_INBOUND_PROVENANCE
             or source.chat_id != requester.source_chat
             or _event_id(event.message_id) is None
         ):
@@ -1526,6 +1537,7 @@ class JunoPrivateReadMvpHost:
         return MvpEventContext(
             requester=requester, source_profile=profile, source_account=account,
             source_chat=source.chat_id, source_message=_event_id(event.message_id),
+            source_provenance=provenance,
         )
 
     def request_from_tool(self, capability_id: str) -> tuple[str, str]:
@@ -1564,6 +1576,8 @@ class JunoPrivateReadMvpHost:
     def _approval_context_for_event(self, event: MessageEvent) -> MvpEventContext | None:
         source = getattr(event, "source", None)
         account = event.metadata.get("whatsapp_account_id") if type(event.metadata) is dict else None
+        provenance = event.metadata.get("whatsapp_inbound_provenance") \
+            if type(event.metadata) is dict else None
         if (
             not self.is_healthy()
             or source is None
@@ -1573,6 +1587,7 @@ class JunoPrivateReadMvpHost:
             or source.user_id != self.config.owner_sender
             or source.chat_id != self.config.owner_chat
             or account != self.config.ordinary_account
+            or provenance != ORDINARY_INBOUND_PROVENANCE
             or _event_id(event.message_id) is None
         ):
             return None
@@ -1582,7 +1597,7 @@ class JunoPrivateReadMvpHost:
         return MvpEventContext(
             requester=requester, source_profile=self.config.profile,
             source_account=account, source_chat=source.chat_id,
-            source_message=_event_id(event.message_id),
+            source_message=_event_id(event.message_id), source_provenance=provenance,
         )
 
     async def process_once(self) -> bool:
@@ -1947,6 +1962,7 @@ __all__ = [
     "FixedHttpJsonTransport", "GmailNewestInboxProvider", "JunoPrivateReadDependencies", "JunoPrivateReadError",
     "JunoPrivateReadMvpConfig", "JunoPrivateReadMvpHost", "MvpAuthorizationRepository",
     "MvpEventContext", "MvpRequest", "OPENFGA_CLIENT_CONTRACT_VERSION",
+    "ORDINARY_INBOUND_PROVENANCE",
     "OpenFgaChecker", "PrivateReadAuthorizer", "PrivateReadProvider",
     "SensitiveRuntimeIdentity", "SensitiveSubmission",
     "compose_juno_private_read_mvp_services", "private_read_tool_surface_is_closed",

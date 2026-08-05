@@ -31,7 +31,7 @@ import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
-import { produceInboundMessage } from './inbound_producer.js';
+import { registerInboundMessageHandler } from './inbound_producer.js';
 import { verifyLidBootstrap } from './lid_bootstrap.js';
 import {
   buildPollPayload,
@@ -390,6 +390,7 @@ function rememberSentId(id) {
 }
 
 let sock = null;
+let socketGeneration = 0;
 let connectionState = 'disconnected';
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
@@ -416,7 +417,7 @@ async function startSocket() {
   }
   const version = await getWAVersion();
 
-  sock = makeWASocket({
+  const connectionSocket = makeWASocket({
     ...(version ? { version } : {}),
     auth: state,
     logger,
@@ -430,10 +431,26 @@ async function startSocket() {
     // initial LID mapping are completed only by offline_provision.js.
     getMessage: async () => undefined,
   });
+  const generation = ++socketGeneration;
+  sock = connectionSocket;
+  connectionState = 'connecting';
+  const isCurrentSocket = candidate => (
+    candidate === connectionSocket
+    && sock === connectionSocket
+    && socketGeneration === generation
+  );
+  const isActiveSocket = candidate => (
+    isCurrentSocket(candidate) && connectionState !== 'disconnected'
+  );
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  connectionSocket.ev.on('creds.update', () => {
+    if (!isCurrentSocket(connectionSocket)) return;
+    saveCreds();
+    lidToPhone = buildLidMap();
+  });
 
-  sock.ev.on('connection.update', (update) => {
+  connectionSocket.ev.on('connection.update', (update) => {
+    if (!isCurrentSocket(connectionSocket)) return;
     const { connection, lastDisconnect } = update;
 
     if (connection === 'close') {
@@ -458,8 +475,10 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.update', async (updates) => {
+  connectionSocket.ev.on('messages.update', async (updates) => {
+    if (!isActiveSocket(connectionSocket)) return;
     for (const { key, update } of updates || []) {
+      if (!isActiveSocket(connectionSocket)) return;
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
       const pollCreation = messageStore.get(pollCreationId);
@@ -467,7 +486,7 @@ async function startSocket() {
       let pollUpdates = update.pollUpdates;
       try {
         if (pollCreation) {
-          const meId = jidNormalizedUser(sock.user?.id || 'me');
+          const meId = jidNormalizedUser(connectionSocket.user?.id || 'me');
           pollUpdates = update.pollUpdates.map(pollUpdate => (
             pollUpdateForAggregation({
               pollUpdateMessage: pollUpdate,
@@ -477,10 +496,10 @@ async function startSocket() {
               getKeyAuthor,
               meId,
               pollCreatorJids: [
-                jidNormalizedUser(sock.user?.lid || ''),
-                jidNormalizedUser(sock.user?.id || ''),
-                getKeyAuthor(pollUpdate.pollCreationMessageKey || key, jidNormalizedUser(sock.user?.lid || '')),
-                getKeyAuthor(pollUpdate.pollCreationMessageKey || key, jidNormalizedUser(sock.user?.id || '')),
+                jidNormalizedUser(connectionSocket.user?.lid || ''),
+                jidNormalizedUser(connectionSocket.user?.id || ''),
+                getKeyAuthor(pollUpdate.pollCreationMessageKey || key, jidNormalizedUser(connectionSocket.user?.lid || '')),
+                getKeyAuthor(pollUpdate.pollCreationMessageKey || key, jidNormalizedUser(connectionSocket.user?.id || '')),
               ],
               voterJids: [
                 normalizeWhatsAppId(pollUpdate.pollUpdateMessageKey?.participant || ''),
@@ -505,48 +524,39 @@ async function startSocket() {
         selectedOptions,
         aggregation,
       });
-      enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+      if (isActiveSocket(connectionSocket)) {
+        enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+      }
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    // In self-chat mode, your own messages commonly arrive as 'append' rather
-    // than 'notify'. Accept both and filter agent echo-backs below.
-    if (type !== 'notify' && type !== 'append') return;
-
-    for (const msg of messages) {
-      emitDebugEvent({
-        stage: 'upsert',
-        type,
-        fromMe: !!msg.key.fromMe,
-        chatId: redactWhatsAppId(msg.key?.remoteJid),
-        senderId: redactWhatsAppId(msg.key?.participant || msg.key?.remoteJid),
-        messageKeys: Object.keys(msg.message || {}),
-      });
-      const outcome = await produceInboundMessage({
-        msg,
-        socketUser: sock.user,
-        socket: sock,
-        mode: WHATSAPP_MODE,
-        dmPolicy: WHATSAPP_DM_POLICY,
-        forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
-        recentlySentIds,
-        allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
-        extractEvent: extractBridgeEvent,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(
-          mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage },
-        ),
-        cacheDirs: {
-          image: IMAGE_CACHE_DIR,
-          document: DOCUMENT_CACHE_DIR,
-          audio: AUDIO_CACHE_DIR,
-        },
-        replyPrefix: REPLY_PREFIX,
-        messageStore,
-        messageQueue,
-        maxQueueSize: MAX_QUEUE_SIZE,
-        emitDebugEvent,
-        handlePollUpdate: async ({ msg: pollMsg, chatId, senderId, socketUser }) => {
+  registerInboundMessageHandler({
+    emittingSocket: connectionSocket,
+    isActiveSocket,
+    emitDebugEvent,
+    producerDependencies: {
+      mode: WHATSAPP_MODE,
+      dmPolicy: WHATSAPP_DM_POLICY,
+      forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+      recentlySentIds,
+      allowlistMatches: id => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+      extractEvent: extractBridgeEvent,
+      downloadMedia: async mediaMsg => downloadMediaMessage(
+        mediaMsg, 'buffer', {},
+        { logger, reuploadRequest: connectionSocket.updateMediaMessage },
+      ),
+      cacheDirs: {
+        image: IMAGE_CACHE_DIR,
+        document: DOCUMENT_CACHE_DIR,
+        audio: AUDIO_CACHE_DIR,
+      },
+      replyPrefix: REPLY_PREFIX,
+      messageStore,
+      messageQueue,
+      maxQueueSize: MAX_QUEUE_SIZE,
+      debugEnabled: WHATSAPP_DEBUG,
+      redactWhatsAppId,
+      handlePollUpdate: async ({ msg: pollMsg, chatId, senderId, socketUser }) => {
           const messageContent = getMessageContent(pollMsg);
           if (!messageContent.pollUpdateMessage) return false;
           const pollUpdateMessage = messageContent.pollUpdateMessage;
@@ -589,22 +599,15 @@ async function startSocket() {
             sourcePath: 'messages.upsert', pollId: pollKey.id, pollCreation,
             pollUpdates, selectedOptions, aggregation,
           });
+          if (!isActiveSocket(connectionSocket)) return true;
           enqueuePollUpdateEvent({
             key: { ...pollKey, remoteJid: pollKey.remoteJid || chatId,
               participant: pollKey.participant || senderId },
             update: { pollUpdates }, selectedOptions, aggregation,
           });
           return true;
-        },
-      });
-      if (outcome.action === 'ignored' && WHATSAPP_DEBUG) {
-        emitDebugEvent({
-          stage: 'ignored', reason: outcome.reason,
-          chatId: redactWhatsAppId(msg.key?.remoteJid),
-          senderId: redactWhatsAppId(msg.key?.participant || msg.key?.remoteJid),
-        });
-      }
-    }
+      },
+    },
   });
 }
 

@@ -1,6 +1,22 @@
 import { normalizeWhatsAppId } from './bridge_helpers.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 
+export const REGISTERED_INBOUND_PROVENANCE =
+  'messages.upsert:registered-emitting-socket:v1';
+
+function socketAuthority(emittingSocket) {
+  if (!emittingSocket || typeof emittingSocket !== 'object') return null;
+  const user = emittingSocket.user;
+  if (!user || typeof user !== 'object') return null;
+  const accountId = normalizeWhatsAppId(user.id);
+  if (!accountId) return null;
+  return Object.freeze({
+    accountId,
+    id: user.id,
+    lid: user.lid,
+  });
+}
+
 /**
  * Production messages.upsert producer, dependency-injected for inert tests.
  *
@@ -10,8 +26,8 @@ import { classifyOwnerMessageGate } from './owner_message_gate.js';
  */
 export async function produceInboundMessage({
   msg,
-  socketUser,
-  socket,
+  emittingSocket,
+  isActiveSocket,
   mode,
   dmPolicy,
   forwardOwnerMessages,
@@ -27,6 +43,11 @@ export async function produceInboundMessage({
   emitDebugEvent = () => {},
   handlePollUpdate = null,
 }) {
+  if (typeof isActiveSocket !== 'function' || !isActiveSocket(emittingSocket)) {
+    return { action: 'ignored', reason: 'stale_emitting_socket' };
+  }
+  const socketUser = socketAuthority(emittingSocket);
+  if (!socketUser) return { action: 'ignored', reason: 'invalid_socket_authority' };
   if (!msg?.message) return { action: 'ignored', reason: 'empty_envelope' };
   const chatId = msg.key?.remoteJid;
   const senderId = msg.key?.participant || chatId;
@@ -92,7 +113,8 @@ export async function produceInboundMessage({
     cacheDirs,
   });
   event.fromOwner = fromOwner;
-  event.accountId = normalizeWhatsAppId(socketUser?.id);
+  event.accountId = socketUser.accountId;
+  event.inboundProvenance = REGISTERED_INBOUND_PROVENANCE;
   if (!event.accountId || event.messageId !== msg.key.id) {
     return { action: 'ignored', reason: 'authority_extraction_mismatch' };
   }
@@ -104,6 +126,13 @@ export async function produceInboundMessage({
   if (!event.body && !event.hasMedia) {
     return { action: 'ignored', reason: 'empty' };
   }
+  const currentAuthority = socketAuthority(emittingSocket);
+  if (!isActiveSocket(emittingSocket)
+      || !currentAuthority
+      || currentAuthority.accountId !== socketUser.accountId
+      || normalizeWhatsAppId(currentAuthority.lid) !== normalizeWhatsAppId(socketUser.lid)) {
+    return { action: 'ignored', reason: 'stale_emitting_socket' };
+  }
   messageStore.remember(msg);
   messageQueue.push(event);
   if (messageQueue.length > maxQueueSize) messageQueue.shift();
@@ -113,4 +142,69 @@ export async function produceInboundMessage({
     mediaType: event.mediaType, queueLength: messageQueue.length,
   });
   return { action: 'queued', event };
+}
+
+/**
+ * Register the production upsert callback on one exact socket generation.
+ *
+ * Tests inject an inert emitter and the same dependencies used by bridge.js;
+ * there is no parallel test-only callback path.
+ */
+export function registerInboundMessageHandler({
+  emittingSocket,
+  isActiveSocket,
+  producerDependencies,
+  emitDebugEvent = () => {},
+}) {
+  if (!emittingSocket?.ev || typeof emittingSocket.ev.on !== 'function'
+      || typeof isActiveSocket !== 'function'
+      || !producerDependencies || typeof producerDependencies !== 'object') {
+    throw new TypeError('exact inbound registration dependencies are required');
+  }
+  const registeredSocket = emittingSocket;
+  const active = candidate => (
+    candidate === registeredSocket && isActiveSocket(registeredSocket)
+  );
+  const handler = async ({ messages, type } = {}) => {
+    if (!active(registeredSocket)) {
+      return { action: 'ignored', reason: 'stale_emitting_socket' };
+    }
+    // In self-chat mode, your own messages commonly arrive as 'append'.
+    if (type !== 'notify' && type !== 'append') {
+      return { action: 'ignored', reason: 'unsupported_upsert_type' };
+    }
+    let lastOutcome = { action: 'ignored', reason: 'empty_upsert' };
+    for (const msg of messages || []) {
+      if (!active(registeredSocket)) {
+        return { action: 'ignored', reason: 'stale_emitting_socket' };
+      }
+      emitDebugEvent({
+        stage: 'upsert', type, fromMe: !!msg?.key?.fromMe,
+        chatId: producerDependencies.redactWhatsAppId?.(msg?.key?.remoteJid),
+        senderId: producerDependencies.redactWhatsAppId?.(
+          msg?.key?.participant || msg?.key?.remoteJid,
+        ),
+        messageKeys: Object.keys(msg?.message || {}),
+      });
+      lastOutcome = await produceInboundMessage({
+        ...producerDependencies,
+        msg,
+        emittingSocket: registeredSocket,
+        isActiveSocket: active,
+        emitDebugEvent,
+      });
+      if (lastOutcome.action === 'ignored' && producerDependencies.debugEnabled) {
+        emitDebugEvent({
+          stage: 'ignored', reason: lastOutcome.reason,
+          chatId: producerDependencies.redactWhatsAppId?.(msg?.key?.remoteJid),
+          senderId: producerDependencies.redactWhatsAppId?.(
+            msg?.key?.participant || msg?.key?.remoteJid,
+          ),
+        });
+      }
+    }
+    return lastOutcome;
+  };
+  emittingSocket.ev.on('messages.upsert', handler);
+  return handler;
 }

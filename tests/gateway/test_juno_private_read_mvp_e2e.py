@@ -18,6 +18,7 @@ from gateway.juno_private_read_mvp import (
     GMAIL_SCOPE,
     OPENFGA_AUTHORITY,
     OPENFGA_CLIENT_CONTRACT_VERSION,
+    ORDINARY_INBOUND_PROVENANCE,
     GmailNewestInboxProvider,
     JunoPrivateReadDependencies,
     JunoPrivateReadError,
@@ -113,7 +114,10 @@ def _event(sender: str, text: str, *, account: str = ORDINARY_ACCOUNT,
     return MessageEvent(
         text=text,
         message_id=message,
-        metadata={"whatsapp_account_id": account},
+        metadata={
+            "whatsapp_account_id": account,
+            "whatsapp_inbound_provenance": ORDINARY_INBOUND_PROVENANCE,
+        },
         source=SessionSource(
             platform=Platform.WHATSAPP, profile=profile, chat_id=chat,
             chat_type="dm", user_id=sender,

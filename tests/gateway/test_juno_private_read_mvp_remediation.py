@@ -4,6 +4,7 @@ import base64
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import hashlib
 import io
 import json
 import logging
@@ -27,6 +28,7 @@ from gateway.juno_private_read_mvp import (
     GMAIL_AUTHORITY,
     GMAIL_SCOPE,
     OPENFGA_AUTHORITY,
+    ORDINARY_INBOUND_PROVENANCE,
     FixedHttpJsonTransport,
     GmailNewestInboxProvider,
     JunoPrivateReadDependencies,
@@ -40,7 +42,7 @@ from gateway.juno_private_read_mvp import (
     compose_juno_private_read_mvp_services,
     render_gmail_message,
 )
-from gateway.juno_replay_journal import JOURNAL_NAME, MARKER_NAME
+from gateway.juno_replay_journal import JOURNAL_NAME, MARKER_NAME, _KEY_MAGIC
 from tests.gateway.test_juno_private_read_mvp_e2e import (
     FakeJsonTransport, FakeOrdinary, FakeSensitive, ORDINARY_ACCOUNT,
     OWNER, OWNER_CHAT, PRIVATE_SENTINEL, SENSITIVE_ACCOUNT,
@@ -78,14 +80,22 @@ const msg = {
 };
 const queue = [];
 const store = helper.createBoundedMessageStore();
-const outcome = await producer.produceInboundMessage({
-  msg, socketUser: { id: '33333333333:19@s.whatsapp.net' }, socket: {},
-  mode: 'bot', dmPolicy: 'allowlist', forwardOwnerMessages: true,
-  recentlySentIds: new Set(),
-  allowlistMatches: id => [input.sender, '11111111111@s.whatsapp.net'].includes(id),
-  extractEvent: helper.extractBridgeEvent, cacheDirs: {}, replyPrefix: '',
-  messageStore: store, messageQueue: queue, maxQueueSize: 100,
+const handlers = new Map();
+const socket = {
+  user: { id: '33333333333:19@s.whatsapp.net', lid: '44444444444@lid' },
+  ev: { on: (name, handler) => handlers.set(name, handler) },
+};
+producer.registerInboundMessageHandler({
+  emittingSocket: socket, isActiveSocket: candidate => candidate === socket,
+  producerDependencies: {
+    mode: 'bot', dmPolicy: 'allowlist', forwardOwnerMessages: true,
+    recentlySentIds: new Set(),
+    allowlistMatches: id => [input.sender, '11111111111@s.whatsapp.net'].includes(id),
+    extractEvent: helper.extractBridgeEvent, cacheDirs: {}, replyPrefix: '',
+    messageStore: store, messageQueue: queue, maxQueueSize: 100,
+  },
 });
+const outcome = await handlers.get('messages.upsert')({ type: 'notify', messages: [msg] });
 if (outcome.action !== 'queued' || queue.length !== 1) throw new Error('producer rejected');
 process.stdout.write(JSON.stringify(queue[0]));
 """
@@ -131,6 +141,32 @@ def _node_harness_failure(stderr: str, returncode: int | None) -> str:
     if returncode == 74 and value.strip() == "JUNO_HARNESS_STARTUP_FAILURE":
         return "startup_failure"
     return "unexpected_node_failure"
+
+
+def _assert_sealed_source_provenance(host, context) -> None:
+    assert context.source_provenance == ORDINARY_INBOUND_PROVENANCE
+    source_id = host.repository._source_journal_id(context)
+    journal_path = host.config.state_dir / JOURNAL_NAME
+    marker_path = host.config.state_dir / MARKER_NAME
+    records = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    assert records[0]["kind"] == "genesis"
+    assert any(
+        record["kind"] == "source" and source_id in record["ids"]
+        for record in records
+    )
+    assert all(
+        set(record) == {"v", "seq", "prev", "kind", "ids", "mac"}
+        and len(record["mac"]) == 64
+        for record in records
+    )
+    marker = json.loads(marker_path.read_text())
+    assert marker["seq"] == len(records)
+    assert marker["head"] == hashlib.sha256(
+        journal_path.read_bytes().splitlines()[-1]
+    ).hexdigest()
+    assert len(marker["mac"]) == 64
+    assert len((host.config.state_dir / "mvp-store.key").read_bytes()) \
+        == 32 + len(_KEY_MAGIC) + 32
 
 
 def test_node_harness_failure_classification_skips_only_exact_bind_denial() -> None:
@@ -495,6 +531,103 @@ async def test_required_replay_authority_damage_keeps_host_unpublished_and_offli
     assert transport.calls == []
     assert ordinary.messages == []
     assert sensitive.calls == []
+
+
+_KEY_DAMAGE_CASES = (
+    "deleted", "truncate-0", "truncate-1", "truncate-31",
+    "truncate-33", "truncate-mid-seal", "truncate-complete-minus-1",
+    "complete-plus-extra", "corrupt-key", "corrupt-magic",
+    "corrupt-version", "corrupt-seal-mac", "mode", "hardlink",
+    "symlink", "replaceable-parent", "owner",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", _KEY_DAMAGE_CASES)
+async def test_used_sealed_state_key_damage_fails_real_host_startup_offline(
+    tmp_path: Path, damage: str,
+) -> None:
+    """Durable regression evidence for already-correct sealed-key rejection.
+
+    The 32-byte raw-key checkpoint is intentionally not included: it is the
+    exact historical migration input. Every listed case starts from a key
+    whose seal has been created and whose replay authority has been appended.
+    """
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    config, dependencies = host.config, host.dependencies
+    result = _tool(_event(
+        TRUSTED, "request", message=f"sealed-key-source-{damage}"
+    ), host)
+    assert result.terminal.status == "deferred"
+    await host.stop()
+
+    key = config.state_dir / "mvp-store.key"
+    complete = key.read_bytes()
+    assert len(complete) == 32 + len(_KEY_MAGIC) + 32
+    assert (config.state_dir / JOURNAL_NAME).stat().st_size > 0
+    assert (config.state_dir / MARKER_NAME).stat().st_size > 0
+    transport.calls.clear()
+    ordinary.messages.clear()
+    sensitive.calls.clear()
+
+    if damage == "deleted":
+        key.unlink()
+    elif damage.startswith("truncate-"):
+        boundary = {
+            "truncate-0": 0,
+            "truncate-1": 1,
+            "truncate-31": 31,
+            "truncate-33": 33,
+            "truncate-mid-seal": 32 + max(1, len(_KEY_MAGIC) // 2),
+            "truncate-complete-minus-1": len(complete) - 1,
+        }[damage]
+        key.write_bytes(complete[:boundary])
+        key.chmod(0o600)
+    elif damage == "complete-plus-extra":
+        key.write_bytes(complete + b"x")
+        key.chmod(0o600)
+    elif damage.startswith("corrupt-"):
+        changed = bytearray(complete)
+        index = {
+            "corrupt-key": 0,
+            "corrupt-magic": 32,
+            "corrupt-version": 32 + _KEY_MAGIC.index(b"1"),
+            "corrupt-seal-mac": len(changed) - 1,
+        }[damage]
+        changed[index] ^= 1
+        key.write_bytes(changed)
+        key.chmod(0o600)
+    elif damage == "mode":
+        key.chmod(0o640)
+    elif damage == "hardlink":
+        os.link(key, config.state_dir / "mvp-store.key.link")
+    elif damage == "symlink":
+        original = config.state_dir / "mvp-store.key.original"
+        key.rename(original)
+        key.symlink_to(original.name)
+    elif damage == "replaceable-parent":
+        config.state_dir.chmod(0o777)
+    elif damage == "owner":
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            pytest.skip("file ownership damage is not constructible without privilege")
+        os.chown(key, 1, -1)
+
+    restarted = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
+    exposed: list[str] = []
+    try:
+        started = await restarted.start(_background_worker=False)
+    except BaseException as exc:  # assertion records any accidental exposure
+        exposed.extend((str(exc), repr(exc), traceback.format_exc()))
+        started = False
+    assert not started
+    assert not restarted.is_healthy()
+    assert not check_private_read_request_runtime()
+    assert transport.calls == []
+    assert ordinary.messages == []
+    assert sensitive.calls == []
+    assert all(len(value) <= 4096 for value in exposed)
+    assert all(PRIVATE_SENTINEL not in value for value in exposed)
+    assert all(CREDENTIAL_SENTINEL not in value for value in exposed)
 
 
 @pytest.mark.asyncio
@@ -1447,6 +1580,16 @@ async def test_real_gateway_runner_startup_dispatch_registry_and_cleanup_seam(
         )
         assert observed_results[-1].terminal.status == "deferred"
         request_id = dict(observed_results[-1].terminal.metadata)["request_id"]
+        durable = host.repository.get(request_id)
+        assert durable.gmail_account == "juno@example.test"
+        assert durable.openfga_store_id == "store-juno"
+        assert durable.openfga_model_id == "model-juno"
+        assert durable.provider_authority_digest == mvp._provider_authority_digest(
+            host.config
+        )
+        trusted_context = host.context_for_event(trusted)
+        assert trusted_context is not None
+        _assert_sealed_source_provenance(host, trusted_context)
         for wrong in wrong_events:
             await runner._run_agent(
                 wrong.text, "", [], wrong.source, "wrong-session",
@@ -1575,11 +1718,14 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
     )
     selector = selectors.DefaultSelector()
     selector.register(sensitive_process.stdout, selectors.EVENT_READ)
-    ready = selector.select(timeout=10)
+    # Cold imports from an isolated npm tree can be slow on encrypted/remote
+    # filesystems; this is startup, not a provider deadline.
+    ready = selector.select(timeout=60)
     selector.close()
     if not ready:
-        sensitive_process.terminate()
-        sensitive_process.wait(timeout=5)
+        if sensitive_process.poll() is None:
+            sensitive_process.terminate()
+            sensitive_process.wait(timeout=5)
         classification = _node_harness_failure(
             sensitive_process.stderr.read(), sensitive_process.returncode,
         )
@@ -1661,6 +1807,8 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         assert inbound is not None
         assert inbound.message_id == "VERTICAL-TRUSTED-PROVIDER-MESSAGE"
         assert inbound.metadata["whatsapp_account_id"] == ORDINARY_ACCOUNT
+        assert inbound.metadata["whatsapp_inbound_provenance"] \
+            == ORDINARY_INBOUND_PROVENANCE
         assert inbound.source.profile is None
 
         dispatch = await runner._run_agent(
@@ -1669,6 +1817,16 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         )
         result = tool_results[-1]
         request_id = dict(result.terminal.metadata)["request_id"]
+        durable = host.repository.get(request_id)
+        assert durable.gmail_account == "juno@example.test"
+        assert durable.openfga_store_id == "store-juno"
+        assert durable.openfga_model_id == "model-juno"
+        assert durable.provider_authority_digest == mvp._provider_authority_digest(
+            host.config
+        )
+        inbound_context = host.context_for_event(inbound)
+        assert inbound_context is not None
+        _assert_sealed_source_provenance(host, inbound_context)
         assert json.loads(result.content) == {
             "status": "deferred", "reason": "approval_required"
         }
