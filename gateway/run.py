@@ -6195,12 +6195,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 parsed_mvp = JunoPrivateReadMvpConfig.parse(raw)
                 if parsed_mvp is None:
                     return False
+                active_profile = self._active_profile_name()
+                if active_profile != parsed_mvp.profile:
+                    logger.error("Juno private-read MVP active profile mismatch")
+                    return False
                 services = compose_trusted_private_read_services(self, parsed_mvp)
                 if type(services) is not JunoPrivateReadDependencies:
                     return False
                 host = JunoPrivateReadMvpHost(
                     parsed_mvp,
                     services,
+                    active_profile=active_profile,
                 )
                 if not await host.start():
                     await host.stop()
@@ -19484,7 +19489,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (
                 type(_private_config) is JunoPrivateReadMvpConfig
                 and source.platform is Platform.WHATSAPP
-                and (source.profile or "default") == _private_config.profile
+                and (source.profile if source.profile is not None
+                     else self._active_profile_name()) == _private_config.profile
             ):
                 # The pilot profile has one model capability. Background
                 # execution still receives no authenticated event context, so
@@ -24364,7 +24370,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             type(_private_config) is JunoPrivateReadMvpConfig
             and source.platform is Platform.WHATSAPP
-            and (source.profile or "default") == _private_config.profile
+            and (source.profile if source.profile is not None
+                 else self._active_profile_name()) == _private_config.profile
         ):
             enabled_toolsets = ["private-read-request"]
             disabled_toolsets = None

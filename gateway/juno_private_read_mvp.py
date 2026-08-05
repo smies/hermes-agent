@@ -42,6 +42,28 @@ MAX_GMAIL_RESPONSE_BYTES = 128 * 1024
 MAX_GMAIL_PARTS = 64
 MAX_GMAIL_DEPTH = 8
 MAX_GMAIL_HEADERS = 128
+SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
+SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
+_SENSITIVE_TRANSPORT_IDENTITY = {
+    "manifest_sha256": "c10ec43325576c3bccd5027c3e46c85cb02050ea22334e36a3de6bb4909dffb2",
+    "launcher_sha256": "6c0f3d594123fe268b943227e1182c79805ec96093bb0c32d97b76453f8dc356",
+    "source_sha256": "816c7918c71441c4222eab15bb274c510c3aaff7a4f7e715fa82bb91f71a9a7b",
+    "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
+    "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
+    "verifier_sha256": "64d9c5318503eb752dfe4232cbee5eb6ede107778007004e4814ba7f234c8eb1",
+    "node_modules_tree_sha256": "48121207ef2e275e835b08cf58b264b8f0d4ef56eddb07298e833a2720dc62ef",
+    "package_name": "hermes-whatsapp-sensitive-bridge",
+    "package_version": "1.0.0",
+    "baileys_spec": "7.0.0-rc14",
+    "baileys_lock_version": "7.0.0-rc14",
+    "baileys_lock_resolved": "https://registry.npmjs.org/@whiskeysockets/baileys/-/baileys-7.0.0-rc14.tgz",
+    "baileys_lock_integrity": "sha512-WK+X8ju8TPGxvWIsP8hrY6JB6FltYuFe+vsqKfjOYX25JObij9qLf2c3ZGdl1Q+vhFwbnT+AZmWAB5pTvzmSiQ==",
+    "baileys_installed_name": "@whiskeysockets/baileys",
+    "baileys_version": "7.0.0-rc14",
+    "baileys_package_sha256": "b5f4f2d1a8af27239e0e9869594345b5d99ecc102193b98117332cadffcebc0d",
+    "baileys_tree_sha256": "bdb0b02cb790daa88421bf29700b43b1e449378a77f51edcfd8d524e9b9f0112",
+    "baileys_reviewed_release_git_head": "7e7b0757e3f9f3c7789fb1cfd2f241d5002a199a",
+}
 _APPROVAL_RE = re.compile(r"^/(approve|deny) ([A-Za-z0-9_-]{16,80})$")
 _SENSITIVE_MESSAGE_ID_RE = re.compile(r"^3EB0[0-9A-F]{18}$")
 _WHATSAPP_DIRECT_RE = re.compile(r"^\d{1,32}@(s\.whatsapp\.net|lid)$")
@@ -268,12 +290,18 @@ class MvpRequest:
     destination_chat: str
     owner_sender: str
     approval_chat: str
+    approval_message: str | None
     descriptor_digest: str
     created_at_us: int
     expires_at_us: int
     status: str
     notice_claimed: bool
+    claim_token_digest: str | None
+    provider_message_id: str | None
+    terminal_code: str | None
+    updated_at_us: int
     version: int
+    state_hmac: str
 
     def __repr__(self) -> str:
         return f"<MvpRequest status={self.status!r}>"
@@ -282,12 +310,32 @@ class MvpRequest:
 class MvpAuthorizationRepository:
     """MVP lifecycle operations on the existing AuthorizationTaskStore DB."""
 
+    _STATE_FIELDS = (
+        "request_id", "requester", "source_profile", "source_account",
+        "source_chat", "source_message", "capability_id",
+        "destination_account", "destination_chat", "owner_sender",
+        "approval_chat", "approval_message", "descriptor_digest",
+        "created_at_us", "expires_at_us", "status", "notice_claimed",
+        "claim_token_digest", "provider_message_id", "terminal_code",
+        "updated_at_us", "version",
+    )
+    _STATUSES = {
+        "pending", "approved", "denied", "expired", "claimed",
+        "consumed", "failed_consumed",
+    }
+
     def __init__(self, store: AuthorizationTaskStore, key: bytes,
+                 config: JunoPrivateReadMvpConfig,
                  *, clock_us: Callable[[], int] | None = None):
-        if type(store) is not AuthorizationTaskStore or len(key) < 32:
-            raise TypeError("exact authorization store and key are required")
+        if (
+            type(store) is not AuthorizationTaskStore
+            or type(config) is not JunoPrivateReadMvpConfig
+            or len(key) < 32
+        ):
+            raise TypeError("exact authorization store, key, and config are required")
         self.store = store
         self._key = bytes(key)
+        self._config = config
         self._clock_us = clock_us or (lambda: time.time_ns() // 1000)
 
     @staticmethod
@@ -299,196 +347,422 @@ class MvpAuthorizationRepository:
             capability_id=row["capability_id"],
             destination_account=row["destination_account"],
             destination_chat=row["destination_chat"], owner_sender=row["owner_sender"],
-            approval_chat=row["approval_chat"],
+            approval_chat=row["approval_chat"], approval_message=row["approval_message"],
             descriptor_digest=row["descriptor_digest"], created_at_us=row["created_at_us"],
             expires_at_us=row["expires_at_us"], status=row["status"],
-            notice_claimed=bool(row["notice_claimed"]), version=row["version"],
+            notice_claimed=bool(row["notice_claimed"]),
+            claim_token_digest=row["claim_token_digest"],
+            provider_message_id=row["provider_message_id"],
+            terminal_code=row["terminal_code"], updated_at_us=row["updated_at_us"],
+            version=row["version"], state_hmac=row["state_hmac"],
         )
 
     def _digest(self, value: str) -> str:
         return hmac.new(self._key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
+    @staticmethod
+    def _state_value(value: object) -> object:
+        if value is None or type(value) in (str, int):
+            return value
+        if type(value) is bytes:
+            return {"invalid_bytes": base64.b64encode(value).decode("ascii")}
+        return {"invalid_type": type(value).__name__}
+
+    def _state_digest(self, values: dict[str, object]) -> str:
+        framed = json.dumps(
+            [[name, self._state_value(values.get(name))] for name in self._STATE_FIELDS],
+            ensure_ascii=True, separators=(",", ":"),
+        )
+        return self._digest("juno-mvp-state-v2\n" + framed)
+
+    @staticmethod
+    def _values(row) -> dict[str, object]:
+        return {name: row[name] for name in MvpAuthorizationRepository._STATE_FIELDS}
+
+    def _descriptor(self, values: dict[str, object]) -> str:
+        return json.dumps(
+            {
+                "approval_chat": values["approval_chat"],
+                "approval_message": values["approval_message"],
+                "capability": values["capability_id"],
+                "created_at_us": values["created_at_us"],
+                "destination_account": values["destination_account"],
+                "destination": values["destination_chat"],
+                "owner_sender": values["owner_sender"],
+                "requester": values["requester"],
+                "request_id": values["request_id"],
+                "source_account": values["source_account"],
+                "source_chat": values["source_chat"],
+                "source_message": values["source_message"],
+                "source_profile": values["source_profile"],
+                "expires_at_us": values["expires_at_us"],
+            }, sort_keys=True, separators=(",", ":"),
+        )
+
+    def _authority_matches_config(self, values: dict[str, object]) -> bool:
+        requester_value = values["requester"]
+        requester = self._config.requester(requester_value) \
+            if type(requester_value) is str else None
+        return bool(
+            requester is not None
+            and values["source_profile"] == self._config.profile
+            and values["source_account"] == self._config.ordinary_account
+            and values["source_chat"] == requester.source_chat
+            and values["capability_id"] == CAPABILITY_ID
+            and values["destination_account"] == self._config.sensitive_account
+            and values["destination_chat"] == requester.sensitive_destination
+            and values["owner_sender"] == self._config.owner_sender
+            and values["approval_chat"] == self._config.owner_chat
+        )
+
+    def _authenticated(self, row) -> bool:
+        try:
+            values = self._values(row)
+            text_fields = {
+                "request_id", "requester", "source_profile", "source_account",
+                "source_chat", "source_message", "capability_id",
+                "destination_account", "destination_chat", "owner_sender",
+                "approval_chat", "descriptor_digest", "status",
+            }
+            if any(type(values[name]) is not str or not values[name] for name in text_fields):
+                return False
+            if values["approval_message"] is not None \
+                    and _event_id(values["approval_message"]) is None:
+                return False
+            if any(
+                values[name] is not None and type(values[name]) is not str
+                for name in ("claim_token_digest", "provider_message_id", "terminal_code")
+            ):
+                return False
+            if any(
+                type(values[name]) is not int or isinstance(values[name], bool)
+                for name in ("created_at_us", "expires_at_us", "notice_claimed",
+                              "updated_at_us", "version")
+            ):
+                return False
+            if (
+                values["status"] not in self._STATUSES
+                or values["notice_claimed"] not in (0, 1)
+                or values["created_at_us"] < 0
+                or values["expires_at_us"] <= values["created_at_us"]
+                or values["updated_at_us"] < values["created_at_us"]
+                or values["version"] < 1
+                or type(row["state_hmac"]) is not str
+                or not hmac.compare_digest(row["state_hmac"], self._state_digest(values))
+                or not self._authority_matches_config(values)
+                or not hmac.compare_digest(
+                    values["descriptor_digest"], self._digest(self._descriptor(values))
+                )
+            ):
+                return False
+            if values["status"] == "claimed" and values["claim_token_digest"] is None:
+                return False
+            return True
+        except BaseException:
+            return False
+
+    def _terminalize_invalid(self, conn, row, now_us: int) -> None:
+        values = self._values(row)
+        values.update({
+            "status": "failed_consumed",
+            "notice_claimed": 1,
+            "claim_token_digest": None,
+            "provider_message_id": None,
+            "terminal_code": "state_integrity_failed",
+            "updated_at_us": now_us,
+            "version": values["version"] + 1
+                if type(values["version"]) is int and values["version"] >= 0 else 1,
+        })
+        state_hmac = self._state_digest(values)
+        conn.execute(
+            "UPDATE private_read_mvp_requests SET status=?,notice_claimed=?,"
+            "claim_token_digest=NULL,provider_message_id=NULL,terminal_code=?,"
+            "updated_at_us=?,version=?,state_hmac=? WHERE rowid=? AND state_hmac=?",
+            (values["status"], values["notice_claimed"], values["terminal_code"],
+             values["updated_at_us"], values["version"], state_hmac,
+             row["rowid"], row["state_hmac"]),
+        )
+
+    def _verified(self, conn, row, now_us: int):
+        if row is None:
+            return None
+        if not self._authenticated(row):
+            self._terminalize_invalid(conn, row, now_us)
+            return None
+        return row
+
+    def _transition(self, conn, row, now_us: int, **changes):
+        if self._verified(conn, row, now_us) is None:
+            return None
+        values = self._values(row)
+        values.update(changes)
+        values["updated_at_us"] = now_us
+        values["version"] = int(values["version"]) + 1
+        stored_changes = dict(changes)
+        if "approval_message" in changes:
+            values["descriptor_digest"] = self._digest(self._descriptor(values))
+            stored_changes["descriptor_digest"] = values["descriptor_digest"]
+        state_hmac = self._state_digest(values)
+        assignments = list(stored_changes) + ["updated_at_us", "version", "state_hmac"]
+        parameters = [values[name] for name in stored_changes]
+        parameters.extend([values["updated_at_us"], values["version"], state_hmac,
+                           row["rowid"], row["version"], row["state_hmac"]])
+        cursor = conn.execute(
+            "UPDATE private_read_mvp_requests SET "
+            + ",".join(name + "=?" for name in assignments)
+            + " WHERE rowid=? AND version=? AND state_hmac=?",
+            parameters,
+        )
+        if cursor.rowcount != 1:
+            return None
+        return self._verified(conn, conn.execute(
+            "SELECT rowid,* FROM private_read_mvp_requests WHERE rowid=?", (row["rowid"],)
+        ).fetchone(), now_us)
+
     def create(self, context: MvpEventContext, config: JunoPrivateReadMvpConfig) -> MvpRequest:
         now_us = self._clock_us()
         expires_us = now_us + int(config.approval_timeout * 1_000_000)
         request_id = secrets.token_urlsafe(18)
-        descriptor = json.dumps(
-            {
-                "capability": CAPABILITY_ID,
-                "approval_chat": config.owner_chat,
-                "destination": context.requester.sensitive_destination,
-                "owner_sender": config.owner_sender,
-                "requester": context.requester.sender,
-                "source_account": context.source_account,
-                "source_chat": context.source_chat,
-                "source_message": context.source_message,
-                "source_profile": context.source_profile,
-                "expires_at_us": expires_us,
-            }, sort_keys=True, separators=(",", ":"),
-        )
-        digest = self._digest(descriptor)
         initial = "approved" if hmac.compare_digest(context.requester.sender, config.owner_sender) else "pending"
+        values = {
+            "request_id": request_id, "requester": context.requester.sender,
+            "source_profile": context.source_profile, "source_account": context.source_account,
+            "source_chat": context.source_chat, "source_message": context.source_message,
+            "capability_id": CAPABILITY_ID, "destination_account": config.sensitive_account,
+            "destination_chat": context.requester.sensitive_destination,
+            "owner_sender": config.owner_sender, "approval_chat": config.owner_chat,
+            "approval_message": None, "descriptor_digest": "", "created_at_us": now_us,
+            "expires_at_us": expires_us, "status": initial, "notice_claimed": 0,
+            "claim_token_digest": None, "provider_message_id": None,
+            "terminal_code": None, "updated_at_us": now_us, "version": 1,
+        }
+        values["descriptor_digest"] = self._digest(self._descriptor(values))
+        state_hmac = self._state_digest(values)
 
         def mutate(conn):
             conn.execute(
                 "INSERT INTO private_read_mvp_requests "
                 "(request_id,requester,source_profile,source_account,source_chat,source_message,"
                 "capability_id,destination_account,destination_chat,owner_sender,approval_chat,"
-                "descriptor_digest,created_at_us,expires_at_us,status,updated_at_us) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                "approval_message,descriptor_digest,created_at_us,expires_at_us,status,"
+                "notice_claimed,claim_token_digest,provider_message_id,terminal_code,"
+                "updated_at_us,version,state_hmac) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
                 (request_id, context.requester.sender, context.source_profile,
                  context.source_account, context.source_chat, context.source_message, CAPABILITY_ID,
                  config.sensitive_account, context.requester.sensitive_destination,
-                 config.owner_sender, config.owner_chat, digest, now_us, expires_us, initial, now_us),
+                 config.owner_sender, config.owner_chat, None, values["descriptor_digest"],
+                 now_us, expires_us, initial, 0, None, None, None, now_us, 1, state_hmac),
             )
-            return self._row(conn.execute(
-                "SELECT * FROM private_read_mvp_requests WHERE source_profile=? "
+            row = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE source_profile=? "
                 "AND source_account=? AND source_chat=? AND requester=? "
                 "AND source_message=? AND capability_id=?",
                 (context.source_profile, context.source_account, context.source_chat,
                  context.requester.sender, context.source_message, CAPABILITY_ID),
-            ).fetchone())
+            ).fetchone()
+            verified = self._verified(conn, row, now_us)
+            if verified is None:
+                raise JunoPrivateReadError("private request unavailable")
+            return self._row(verified)
 
         return self.store._write(mutate, at_us=now_us)
 
     def expire_due(self, now_us: int) -> int:
         def mutate(conn):
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status='expired',updated_at_us=?,version=version+1 "
-                "WHERE status IN ('pending','approved') AND expires_at_us<=?",
-                (now_us, now_us),
-            )
-            return cursor.rowcount
+            changed = 0
+            rows = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests "
+                "WHERE status IN ('pending','approved') AND expires_at_us<=?", (now_us,),
+            ).fetchall()
+            for row in rows:
+                changed += self._transition(conn, row, now_us, status="expired") is not None
+            return changed
+        return self.store._write(mutate, at_us=now_us)
+
+    def quarantine_invalid_active(self, now_us: int) -> int:
+        """Terminalize every actionable row whose state or authority is invalid."""
+        def mutate(conn):
+            changed = 0
+            rows = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests "
+                "WHERE status IN ('pending','approved','claimed')"
+            ).fetchall()
+            for row in rows:
+                if not self._authenticated(row):
+                    self._terminalize_invalid(conn, row, now_us)
+                    changed += 1
+            return changed
         return self.store._write(mutate, at_us=now_us)
 
     def recover_claimed(self, now_us: int) -> int:
         """Consume interrupted submissions; the MVP never retries ambiguity."""
         def mutate(conn):
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status='failed_consumed',"
-                "terminal_code='interrupted_after_claim',updated_at_us=?,version=version+1 "
-                "WHERE status='claimed'",
-                (now_us,),
-            )
-            return cursor.rowcount
+            changed = 0
+            for row in conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE status='claimed'"
+            ).fetchall():
+                changed += self._transition(
+                    conn, row, now_us, status="failed_consumed",
+                    claim_token_digest=None, terminal_code="interrupted_after_claim",
+                ) is not None
+            return changed
         return self.store._write(mutate, at_us=now_us)
 
     def recover_claimed_notices(self, now_us: int) -> int:
         """Consume notice sends interrupted after the durable claim boundary."""
         def mutate(conn):
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status='failed_consumed',"
-                "terminal_code='interrupted_notice_claim',updated_at_us=?,version=version+1 "
-                "WHERE status='pending' AND notice_claimed=1",
-                (now_us,),
-            )
-            return cursor.rowcount
+            changed = 0
+            for row in conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests "
+                "WHERE status='pending' AND notice_claimed=1"
+            ).fetchall():
+                changed += self._transition(
+                    conn, row, now_us, status="failed_consumed",
+                    terminal_code="interrupted_notice_claim",
+                ) is not None
+            return changed
         return self.store._write(mutate, at_us=now_us)
 
     def recover_incomplete_bindings(self, now_us: int) -> int:
         """Consume checkpoint rows that predate source/approval chat binding."""
         def mutate(conn):
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status='failed_consumed',"
-                "terminal_code='incomplete_authority_binding',updated_at_us=?,version=version+1 "
+            changed = 0
+            for row in conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests "
                 "WHERE status IN ('pending','approved','claimed') "
-                "AND (source_message='' OR approval_chat='')",
-                (now_us,),
-            )
-            return cursor.rowcount
+                "AND (source_message='' OR approval_chat='' OR state_hmac='')"
+            ).fetchall():
+                if self._verified(conn, row, now_us) is None:
+                    changed += 1
+            return changed
         return self.store._write(mutate, at_us=now_us)
 
     def claim_notice(self, now_us: int) -> MvpRequest | None:
         def mutate(conn):
-            row = conn.execute(
-                "SELECT * FROM private_read_mvp_requests WHERE status='pending' "
+            rows = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE status='pending' "
                 "AND notice_claimed=0 AND expires_at_us>? ORDER BY created_at_us LIMIT 1",
                 (now_us,),
-            ).fetchone()
-            if row is None:
-                return None
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET notice_claimed=1,updated_at_us=?,version=version+1 "
-                "WHERE request_id=? AND status='pending' AND notice_claimed=0",
-                (now_us, row["request_id"]),
-            )
-            if cursor.rowcount != 1:
-                return None
-            return self._row(conn.execute(
-                "SELECT * FROM private_read_mvp_requests WHERE request_id=?", (row["request_id"],)
-            ).fetchone())
+            ).fetchall()
+            for row in rows:
+                current = self._transition(conn, row, now_us, notice_claimed=1)
+                if current is not None:
+                    return self._row(current)
+            return None
         return self.store._write(mutate, at_us=now_us)
 
     def resolve(self, request_id: str, context: MvpEventContext, approve: bool, now_us: int) -> bool:
         target = "approved" if approve else "denied"
         def mutate(conn):
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status=?,updated_at_us=?,version=version+1 "
-                "WHERE request_id=? AND status='pending' AND expires_at_us>? AND owner_sender=? "
-                "AND source_profile=? AND source_account=? AND approval_chat=?",
-                (target, now_us, request_id, now_us, context.requester.sender,
-                 context.source_profile, context.source_account, context.source_chat),
-            )
-            return cursor.rowcount == 1
+            replay = conn.execute(
+                "SELECT 1 FROM private_read_mvp_requests WHERE source_profile=? "
+                "AND source_account=? AND owner_sender=? AND approval_chat=? "
+                "AND approval_message=? AND capability_id=? LIMIT 1",
+                (context.source_profile, context.source_account, context.requester.sender,
+                 context.source_chat, context.source_message, CAPABILITY_ID),
+            ).fetchone()
+            if replay is not None:
+                return False
+            row = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            row = self._verified(conn, row, now_us)
+            if (
+                row is None or row["status"] != "pending" or row["expires_at_us"] <= now_us
+                or row["owner_sender"] != context.requester.sender
+                or row["source_profile"] != context.source_profile
+                or row["source_account"] != context.source_account
+                or row["approval_chat"] != context.source_chat
+            ):
+                return False
+            return self._transition(
+                conn, row, now_us, status=target,
+                approval_message=context.source_message,
+            ) is not None
         return self.store._write(mutate, at_us=now_us)
 
     def fail_pending(self, request_id: str, now_us: int) -> bool:
         def mutate(conn):
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status='failed_consumed',"
-                "terminal_code='ordinary_notice_failed',updated_at_us=?,version=version+1 "
-                "WHERE request_id=? AND status='pending'",
-                (now_us, request_id),
+            row = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            row = self._verified(conn, row, now_us)
+            return bool(
+                row is not None and row["status"] == "pending"
+                and self._transition(
+                    conn, row, now_us, status="failed_consumed",
+                    terminal_code="ordinary_notice_failed",
+                ) is not None
             )
-            return cursor.rowcount == 1
         return self.store._write(mutate, at_us=now_us)
 
     def claim_approved(self, now_us: int) -> tuple[MvpRequest, str] | None:
         token = secrets.token_urlsafe(24)
         token_digest = self._digest(token)
         def mutate(conn):
-            row = conn.execute(
-                "SELECT * FROM private_read_mvp_requests WHERE status='approved' AND expires_at_us>? "
-                "ORDER BY created_at_us LIMIT 1", (now_us,),
-            ).fetchone()
-            if row is None:
-                return None
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status='claimed',claim_token_digest=?,"
-                "updated_at_us=?,version=version+1 WHERE request_id=? AND status='approved'",
-                (token_digest, now_us, row["request_id"]),
-            )
-            if cursor.rowcount != 1:
-                return None
-            current = conn.execute(
-                "SELECT * FROM private_read_mvp_requests WHERE request_id=?", (row["request_id"],)
-            ).fetchone()
-            return self._row(current), token
+            rows = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE status='approved' "
+                "AND expires_at_us>? ORDER BY created_at_us", (now_us,),
+            ).fetchall()
+            for row in rows:
+                current = self._transition(
+                    conn, row, now_us, status="claimed", claim_token_digest=token_digest,
+                )
+                if current is not None:
+                    return self._row(current), token
+            return None
         return self.store._write(mutate, at_us=now_us)
 
     def finish(self, request_id: str, claim_token: str, *, submitted: bool,
                provider_message_id: str | None, code: str, now_us: int) -> bool:
         final = "consumed" if submitted else "failed_consumed"
         def mutate(conn):
-            cursor = conn.execute(
-                "UPDATE private_read_mvp_requests SET status=?,provider_message_id=?,terminal_code=?,"
-                "updated_at_us=?,version=version+1 WHERE request_id=? AND status='claimed' "
-                "AND claim_token_digest=?",
-                (final, provider_message_id if submitted else None, code, now_us,
-                 request_id, self._digest(claim_token)),
-            )
-            return cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            row = self._verified(conn, row, now_us)
+            if (
+                row is None or row["status"] != "claimed"
+                or not hmac.compare_digest(row["claim_token_digest"], self._digest(claim_token))
+            ):
+                return False
+            return self._transition(
+                conn, row, now_us, status=final, claim_token_digest=None,
+                provider_message_id=provider_message_id if submitted else None,
+                terminal_code=code,
+            ) is not None
+        return self.store._write(mutate, at_us=now_us)
+
+    def validate_claim(
+        self, request: MvpRequest, claim_token: str, now_us: int
+    ) -> MvpRequest | None:
+        def mutate(conn):
+            row = conn.execute(
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE request_id=?",
+                (request.request_id,),
+            ).fetchone()
+            row = self._verified(conn, row, now_us)
+            if (
+                row is None or row["status"] != "claimed"
+                or not hmac.compare_digest(row["claim_token_digest"], self._digest(claim_token))
+            ):
+                return None
+            current = self._row(row)
+            return current if current == request else None
         return self.store._write(mutate, at_us=now_us)
 
     def get(self, request_id: str) -> MvpRequest | None:
-        conn = self.store._connect()
-        try:
+        def mutate(conn):
             row = conn.execute(
-                "SELECT * FROM private_read_mvp_requests WHERE request_id=?", (request_id,)
+                "SELECT rowid,* FROM private_read_mvp_requests WHERE request_id=?", (request_id,)
             ).fetchone()
+            row = self._verified(conn, row, self._clock_us())
             return self._row(row) if row is not None else None
-        finally:
-            conn.close()
+        return self.store._write(mutate, at_us=self._clock_us())
 
 
 class JsonTransport(Protocol):
@@ -824,6 +1098,9 @@ class OpenFgaChecker:
                 "source_account": request.source_account,
                 "source_chat": request.source_chat,
                 "source_message": request.source_message,
+                "owner_sender": request.owner_sender,
+                "approval_chat": request.approval_chat,
+                "approval_message": request.approval_message,
                 "expires_at_us": request.expires_at_us,
                 "descriptor_digest": request.descriptor_digest,
             },
@@ -866,6 +1143,8 @@ class SensitiveRuntimeIdentity:
     registration: str
     account: str
     session: str
+    observed_at_us: int
+    transport_identity: tuple[tuple[str, str], ...]
 
     def __repr__(self) -> str:
         return "<SensitiveRuntimeIdentity redacted>"
@@ -903,7 +1182,8 @@ class ApprovalIntercept:
 
 class JunoPrivateReadMvpHost:
     def __init__(self, config: JunoPrivateReadMvpConfig, dependencies: JunoPrivateReadDependencies,
-                 *, _clock_us: Callable[[], int] | None = None):
+                 *, active_profile: str | None = None,
+                 _clock_us: Callable[[], int] | None = None):
         self.config = config
         self.dependencies = dependencies
         self.store: AuthorizationTaskStore | None = None
@@ -917,8 +1197,11 @@ class JunoPrivateReadMvpHost:
         self._task: asyncio.Task | None = None
         self._coordinator: CoordinatorIdentity | None = None
         self._clock_us = _clock_us or (lambda: time.time_ns() // 1000)
+        self._active_profile = active_profile
 
     async def start(self, *, _background_worker: bool = True) -> bool:
+        if self._active_profile != self.config.profile:
+            return False
         master = _load_or_create_state_key(self.config.state_dir)
         store = AuthorizationTaskStore(
             db_path=self.config.state_dir / "authorization.db",
@@ -940,7 +1223,10 @@ class JunoPrivateReadMvpHost:
             store.close()
             return False
         self.store = store
-        self.repository = MvpAuthorizationRepository(store, master, clock_us=self._clock_us)
+        self.repository = MvpAuthorizationRepository(
+            store, master, self.config, clock_us=self._clock_us
+        )
+        self.repository.quarantine_invalid_active(self._clock_us())
         self.repository.recover_claimed(self._clock_us())
         self.repository.recover_claimed_notices(self._clock_us())
         self.repository.recover_incomplete_bindings(self._clock_us())
@@ -1010,7 +1296,7 @@ class JunoPrivateReadMvpHost:
         source = getattr(event, "source", None)
         if source is None or source.platform is not Platform.WHATSAPP:
             return None
-        profile = source.profile or "default"
+        profile = source.profile if source.profile is not None else self._active_profile
         account = event.metadata.get("whatsapp_account_id") if type(event.metadata) is dict else None
         sender = source.user_id
         requester = self.config.requester(sender) if type(sender) is str else None
@@ -1067,7 +1353,8 @@ class JunoPrivateReadMvpHost:
             not self.is_healthy()
             or source is None
             or source.platform is not Platform.WHATSAPP
-            or (source.profile or "default") != self.config.profile
+            or (source.profile if source.profile is not None else self._active_profile)
+                != self.config.profile
             or source.user_id != self.config.owner_sender
             or source.chat_id != self.config.owner_chat
             or account != self.config.ordinary_account
@@ -1102,6 +1389,7 @@ class JunoPrivateReadMvpHost:
             self._running = False
             self._healthy = False
             return False
+        repository.quarantine_invalid_active(now_us)
         repository.expire_due(now_us)
         notice = repository.claim_notice(now_us)
         if notice is not None:
@@ -1129,12 +1417,18 @@ class JunoPrivateReadMvpHost:
         code = "failed"
         plaintext = None
         try:
+            if repository.validate_claim(request, token, self._clock_us()) is None:
+                code = "state_integrity_failed"
+                return True
             identity = await asyncio.wait_for(
                 self.dependencies.sensitive.observe_identity(request=request),
                 self.config.request_timeout,
             )
             if not self._identity_matches_request(identity, request):
                 code = "identity_unavailable"
+                return True
+            if repository.validate_claim(request, token, self._clock_us()) is None:
+                code = "state_integrity_failed"
                 return True
             allowed = await asyncio.wait_for(
                 self.dependencies.openfga.check(request), self.config.request_timeout
@@ -1146,10 +1440,11 @@ class JunoPrivateReadMvpHost:
                 self.dependencies.sensitive.observe_identity(request=request),
                 self.config.request_timeout,
             )
-            if identity_before_read != identity or not self._identity_matches_request(
-                identity_before_read, request
-            ):
+            if not self._identity_continues(identity, identity_before_read, request):
                 code = "identity_drift"
+                return True
+            if repository.validate_claim(request, token, self._clock_us()) is None:
+                code = "state_integrity_failed"
                 return True
             plaintext = await asyncio.wait_for(
                 self.dependencies.gmail.read(), self.config.read_timeout
@@ -1161,13 +1456,14 @@ class JunoPrivateReadMvpHost:
                 self.dependencies.sensitive.observe_identity(request=request),
                 self.config.request_timeout,
             )
-            if identity_at_submit != identity_before_read or not self._identity_matches_request(
-                identity_at_submit, request
-            ):
+            if not self._identity_continues(identity_before_read, identity_at_submit, request):
                 code = "identity_drift"
                 return True
             if self._clock_us() >= request.expires_at_us:
                 code = "expired_before_submit"
+                return True
+            if repository.validate_claim(request, token, self._clock_us()) is None:
+                code = "state_integrity_failed"
                 return True
             result = await asyncio.wait_for(
                 self.dependencies.sensitive.submit(
@@ -1202,11 +1498,31 @@ class JunoPrivateReadMvpHost:
     def _identity_matches_request(
         self, identity: SensitiveRuntimeIdentity | None, request: MvpRequest
     ) -> bool:
+        now_us = self._clock_us()
         return bool(
             type(identity) is SensitiveRuntimeIdentity
             and identity.account == request.destination_account
             and identity.account == self.config.sensitive_account
             and identity.account != self.config.ordinary_account
+            and type(identity.observed_at_us) is int
+            and now_us - SENSITIVE_IDENTITY_MAX_AGE_US <= identity.observed_at_us
+            and identity.observed_at_us <= now_us + SENSITIVE_IDENTITY_FUTURE_SKEW_US
+            and identity.transport_identity
+                == tuple(sorted(_SENSITIVE_TRANSPORT_IDENTITY.items()))
+        )
+
+    def _identity_continues(
+        self, previous: SensitiveRuntimeIdentity | None,
+        current: SensitiveRuntimeIdentity | None, request: MvpRequest,
+    ) -> bool:
+        return bool(
+            self._identity_matches_request(current, request)
+            and type(previous) is SensitiveRuntimeIdentity
+            and current.registration == previous.registration
+            and current.account == previous.account
+            and current.session == previous.session
+            and current.transport_identity == previous.transport_identity
+            and current.observed_at_us >= previous.observed_at_us
         )
 
 
@@ -1218,8 +1534,10 @@ class _GatewayOrdinaryNotifier:
     async def send(self, destination: str, text: str) -> str:
         if not hmac.compare_digest(destination, self._config.owner_chat):
             raise JunoPrivateReadError("ordinary transport unavailable")
+        active_resolver = getattr(self._runner, "_active_profile_name", None)
+        active_profile = active_resolver() if callable(active_resolver) else None
         profile_maps = getattr(self._runner, "_profile_adapters", {})
-        if self._config.profile == getattr(self._runner, "profile", "default"):
+        if self._config.profile == active_profile:
             adapter = getattr(self._runner, "adapters", {}).get(Platform.WHATSAPP)
         else:
             adapter = profile_maps.get(self._config.profile, {}).get(Platform.WHATSAPP)
@@ -1264,6 +1582,7 @@ async def _sealed_sensitive_identity(
     config: JunoPrivateReadMvpConfig, transport: JsonTransport, request: MvpRequest
 ) -> SensitiveRuntimeIdentity | None:
     try:
+        requested_at_us = time.time_ns() // 1000
         capability = _read_sensitive_capability(config)
         if capability is None:
             return None
@@ -1279,19 +1598,26 @@ async def _sealed_sensitive_identity(
         }
         if type(response) is not dict or set(response) != required:
             return None
+        completed_at_us = time.time_ns() // 1000
+        observed_at_us = response["identity_observed_us"]
         if (
             response["outcome"] != "available"
             or response["submitted"] is not False
             or response["provider_account_jid"] != request.destination_account
             or response["provider_account_jid"] == config.ordinary_account
-            or type(response["identity_observed_us"]) is not int
-            or response["identity_observed_us"] < 0
-            or type(response["transport_identity"]) is not dict
+            or type(observed_at_us) is not int
+            or observed_at_us < requested_at_us - SENSITIVE_IDENTITY_FUTURE_SKEW_US
+            or observed_at_us > completed_at_us + SENSITIVE_IDENTITY_FUTURE_SKEW_US
+            or completed_at_us - observed_at_us > SENSITIVE_IDENTITY_MAX_AGE_US
+            or response["transport_identity"] != _SENSITIVE_TRANSPORT_IDENTITY
         ):
             return None
         registration = _text(response["adapter_runtime_id"], "runtime identity", 512)
         session = _text(response["connection_epoch"], "connection epoch", 512)
-        return SensitiveRuntimeIdentity(registration, response["provider_account_jid"], session)
+        return SensitiveRuntimeIdentity(
+            registration, response["provider_account_jid"], session, observed_at_us,
+            tuple(sorted(response["transport_identity"].items())),
+        )
     except BaseException:
         return None
 

@@ -385,6 +385,18 @@ class AuthorizationTaskStore(
                                 "ALTER TABLE private_read_mvp_requests "
                                 "ADD COLUMN approval_chat TEXT NOT NULL DEFAULT ''"
                             )
+                        if "approval_message" not in mvp_columns:
+                            conn.execute(
+                                "ALTER TABLE private_read_mvp_requests "
+                                "ADD COLUMN approval_message TEXT"
+                            )
+                        if "state_hmac" not in mvp_columns:
+                            # Pre-authenticator rows retain an invalid sentinel;
+                            # the MVP repository terminalizes them before use.
+                            conn.execute(
+                                "ALTER TABLE private_read_mvp_requests "
+                                "ADD COLUMN state_hmac TEXT NOT NULL DEFAULT ''"
+                            )
                     for statement in _PRIVATE_READ_MVP.split(";"):
                         if statement.strip():
                             conn.execute(statement)

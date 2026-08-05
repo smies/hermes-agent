@@ -263,6 +263,7 @@ CREATE TABLE IF NOT EXISTS private_read_mvp_requests (
     destination_chat TEXT NOT NULL,
     owner_sender TEXT NOT NULL,
     approval_chat TEXT NOT NULL,
+    approval_message TEXT,
     descriptor_digest TEXT NOT NULL,
     created_at_us INTEGER NOT NULL,
     expires_at_us INTEGER NOT NULL,
@@ -275,7 +276,8 @@ CREATE TABLE IF NOT EXISTS private_read_mvp_requests (
     provider_message_id TEXT,
     terminal_code TEXT,
     updated_at_us INTEGER NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1
+    version INTEGER NOT NULL DEFAULT 1,
+    state_hmac TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_private_read_mvp_state
     ON private_read_mvp_requests(status, expires_at_us, created_at_us);
@@ -284,7 +286,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_private_read_mvp_source_event
         source_profile, source_account, source_chat, requester,
         source_message, capability_id
     )
-    WHERE source_message <> ''
+    WHERE source_message <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_private_read_mvp_approval_event
+    ON private_read_mvp_requests(
+        source_profile, source_account, owner_sender, approval_chat,
+        approval_message, capability_id
+    )
+    WHERE approval_message IS NOT NULL
 """
 
 _INDEXES_V2 = """

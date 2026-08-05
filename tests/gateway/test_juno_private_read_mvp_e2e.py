@@ -5,6 +5,7 @@ import io
 import json
 import logging
 from pathlib import Path
+import time
 import traceback
 
 import pytest
@@ -25,6 +26,7 @@ from gateway.juno_private_read_mvp import (
     OpenFgaChecker,
     SensitiveRuntimeIdentity,
     SensitiveSubmission,
+    _SENSITIVE_TRANSPORT_IDENTITY,
     private_read_tool_surface_is_closed,
     render_gmail_message,
 )
@@ -181,14 +183,16 @@ class FakeSensitive:
     def __init__(self) -> None:
         self.calls: list[tuple[object, str]] = []
         self.mode = "submitted"
-        self.identity = SensitiveRuntimeIdentity(
-            "sensitive-runtime-test", SENSITIVE_ACCOUNT, "epoch-test"
-        )
+        self.identity = None
 
     async def observe_identity(self, *, request):
         if self.mode == "identity-unavailable":
             return None
-        return self.identity
+        return self.identity or SensitiveRuntimeIdentity(
+            "sensitive-runtime-test", SENSITIVE_ACCOUNT, "epoch-test",
+            time.time_ns() // 1000,
+            tuple(sorted(_SENSITIVE_TRANSPORT_IDENTITY.items())),
+        )
 
     async def submit(self, *, request, plaintext: str, identity) -> SensitiveSubmission:
         self.calls.append((request, plaintext))
@@ -227,6 +231,7 @@ async def _host(tmp_path: Path):
             ordinary,
             sensitive,
         ),
+        active_profile="juno",
     )
     assert await host.start(_background_worker=False)
     return host, transport, ordinary, sensitive
@@ -303,8 +308,11 @@ async def test_james_full_private_read_is_submitted_with_content_free_model_stat
                 "source_profile": "juno",
                 "source_account": ORDINARY_ACCOUNT,
                 "source_chat": OWNER_CHAT,
-                "source_message": "inbound-1",
-                "expires_at_us": request.expires_at_us,
+                    "source_message": "inbound-1",
+                    "owner_sender": OWNER,
+                    "approval_chat": OWNER_CHAT,
+                    "approval_message": None,
+                    "expires_at_us": request.expires_at_us,
                 "descriptor_digest": request.descriptor_digest,
             },
         }
@@ -468,11 +476,11 @@ async def test_interrupted_claim_is_consumed_on_restart_without_retry(tmp_path: 
     dependencies = host.dependencies
     result = _tool(_event(OWNER, "request", message="before-restart"), host)
     request_id = dict(result.terminal.metadata)["request_id"]
-    claimed = host.repository.claim_approved(0)
+    claimed = host.repository.claim_approved(host._clock_us())
     assert claimed is not None
     await host.stop()
 
-    restarted = JunoPrivateReadMvpHost(config, dependencies)
+    restarted = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
     assert await restarted.start(_background_worker=False)
     try:
         assert restarted.repository.get(request_id).status == "failed_consumed"
