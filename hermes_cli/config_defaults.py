@@ -2383,6 +2383,18 @@ DEFAULT_CONFIG = {
         "backup_count": 3,     # Number of rotated backup files to keep
     },
 
+    # Update pipeline settings.
+    "update": {
+        # Which releases `hermes update` tracks on source (git) installs:
+        #   auto   — defer to the install manifest (.hermes-install.json);
+        #            effectively "main" for every pre-existing install.
+        #   main   — git pull origin main (today's behavior).
+        #   stable — check out the latest tagged release instead of main.
+        # Bundled desktop installs ignore this and always track stable —
+        # their updates arrive through the desktop app's own updater.
+        "channel": "auto",
+    },
+
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
     # curated model lists for OpenRouter and Nous Portal from this URL,
     # falling back to the in-repo snapshot on network failure.  Lets us

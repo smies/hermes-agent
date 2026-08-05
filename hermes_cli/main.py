@@ -9127,6 +9127,17 @@ def cmd_update(args):
         print(recommended_update_command_for_method(install_method))
         sys.exit(1)
 
+    # Bundled desktop installs are materialized from payloads shipped inside
+    # the desktop app; the app's own updater re-materializes the checkout
+    # after updating itself. `hermes update` mutating that checkout would
+    # desync it from the shell's stamped tag, so refuse and point at the
+    # in-app updater (or eject, which flips the install to source mode).
+    from hermes_cli.install_manifest import format_bundled_update_message, is_bundled_install
+
+    if is_bundled_install(PROJECT_ROOT):
+        print(format_bundled_update_message())
+        sys.exit(1)
+
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
