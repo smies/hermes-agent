@@ -3757,6 +3757,106 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
+def cmd_update_eject(args) -> int:
+    """Implement ``hermes update --eject``.
+
+    Flips a desktop-bundled checkout to source management: unshallows the
+    git history (bundled payload clones are depth-1), fetches tags, and
+    rewrites the install manifest to ``installMode: source`` with the chosen
+    channel. After this, ``hermes update`` owns the checkout and the desktop
+    app's bootstrap skips its agent stages (it refuses to overwrite a
+    source-mode checkout).
+
+    Returns a process exit code.
+    """
+    from hermes_cli.install_manifest import (
+        CHANNEL_MAIN,
+        CHANNEL_STABLE,
+        MODE_SOURCE,
+        install_manifest_path,
+        read_install_manifest,
+        write_install_manifest,
+    )
+
+    project_root = _m().PROJECT_ROOT
+    manifest = read_install_manifest(project_root)
+    channel = getattr(args, "channel", None) or CHANNEL_MAIN
+    if channel not in (CHANNEL_MAIN, CHANNEL_STABLE):
+        print(f"✗ Unknown channel '{channel}' — use 'stable' or 'main'.")
+        return 1
+
+    if manifest.get("installMode") != "bundled":
+        # Already source-managed. Still honor an explicit --channel request so
+        # `hermes update --eject --channel stable` is a one-shot way to switch,
+        # but don't touch git history.
+        if getattr(args, "channel", None):
+            manifest["installMode"] = MODE_SOURCE
+            manifest["channel"] = channel
+            write_install_manifest(manifest, project_root)
+            print(f"✓ Install is already source-managed; channel set to '{channel}'.")
+        else:
+            print("✓ Nothing to eject — this install is already source-managed.")
+            print("  (Only desktop-bundled installs need ejecting.)")
+        return 0
+
+    git_dir = project_root / ".git"
+    if not git_dir.exists():
+        print("✗ Cannot eject: the checkout is not a git repository.")
+        print("  Reinstall from source instead:")
+        print("  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash")
+        return 1
+
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+
+    is_shallow = (
+        subprocess.run(
+            git_cmd + ["rev-parse", "--is-shallow-repository"],
+            cwd=project_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        ).stdout.strip()
+        == "true"
+    )
+
+    print("⚕ Ejecting from desktop-managed updates...")
+    fetch_args = ["fetch", "--tags", "origin"]
+    if is_shallow:
+        print("→ Fetching full git history (this can take a minute)...")
+        fetch_args.insert(1, "--unshallow")
+    else:
+        print("→ Fetching tags...")
+    fetch_result = subprocess.run(
+        git_cmd + fetch_args,
+        cwd=project_root,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if fetch_result.returncode != 0:
+        stderr = (fetch_result.stderr or "").strip()
+        print("✗ git fetch failed — eject aborted; the install is unchanged.")
+        if stderr:
+            print(f"  {stderr.splitlines()[0]}")
+        return 1
+
+    manifest["installMode"] = MODE_SOURCE
+    manifest["channel"] = channel
+    # The tag pin describes the *bundled* payload provenance; keep it for
+    # forensics but it no longer governs updates once mode is source.
+    write_install_manifest(manifest, project_root)
+
+    print("✓ Ejected. This checkout is now source-managed.")
+    print(f"  • Update channel: {channel}"
+          + (" (tagged releases)" if channel == CHANNEL_STABLE else " (git main)"))
+    print("  • Update with: hermes update")
+    print("  • The desktop app will keep updating itself, but will no longer")
+    print("    modify this checkout. Expect the app and agent versions to")
+    print("    drift apart until you update the agent yourself.")
+    print(f"  • Manifest: {install_manifest_path(project_root)}")
+    return 0
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""

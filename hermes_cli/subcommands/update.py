@@ -73,4 +73,27 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
+    update_parser.add_argument(
+        "--eject",
+        action="store_true",
+        default=False,
+        help=(
+            "Take over update management of a desktop-bundled install: mark "
+            "the checkout as source-managed (git updates via `hermes update`) "
+            "and fetch full git history. The desktop app keeps updating "
+            "itself, but no longer touches the agent checkout. No effect on "
+            "installs that are already source-managed."
+        ),
+    )
+    update_parser.add_argument(
+        "--channel",
+        default=None,
+        choices=("stable", "main"),
+        metavar="CHANNEL",
+        help=(
+            "With --eject: which releases the ejected install tracks — "
+            "'stable' (tagged releases) or 'main' (git main branch, the "
+            "pre-eject desktop cadence is 'stable'). Defaults to 'main'."
+        ),
+    )
     update_parser.set_defaults(func=cmd_update)

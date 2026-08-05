@@ -9127,6 +9127,15 @@ def cmd_update(args):
         print(recommended_update_command_for_method(install_method))
         sys.exit(1)
 
+    # --eject runs BEFORE the bundled-install refusal below: ejecting is the
+    # one update operation that must work on a bundled install (it's the way
+    # out of desktop management). On source installs it's a channel setter /
+    # no-op.
+    if getattr(args, "eject", False):
+        from hermes_cli.update_cmd import cmd_update_eject
+
+        sys.exit(cmd_update_eject(args))
+
     # Bundled desktop installs are materialized from payloads shipped inside
     # the desktop app; the app's own updater re-materializes the checkout
     # after updating itself. `hermes update` mutating that checkout would
