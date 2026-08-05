@@ -2,10 +2,10 @@
 
 - **Status:** proposed; implementation and deployment are not authorized
 - **Decision revision:** 2026-08-05
-- **Revision source commit:** `75f3d7a24654b270994a431bcf617de1b3669db2`
-- **Revision source tree:** `4253ee744ecde6c449ca81b10c55581b2de2ce9a`
+- **Revision source commit:** `be72114b7c32501d8c24cddae4d1dac9b8f47825`
+- **Revision source tree:** `d062c450ce72c2710cf2c17edcedd877e2fc83cc`
 - **Revision source ADR SHA-256:**
-  `70f30c4154704d74bf397f01ba5925886a5806f2f3ca04ab14c2d45865417974`
+  `7b7832be421b86402561d106bf75cd45de376ebdbd004209e2a5ecb372bee731`
 - **Reviewed WIP source commit:** `49d78bdc915e9e2c3ff78d7d4a3a7074ddb6ac85`
 - **Reviewed WIP source tree:** `c88ba9d705453561678b4e8ba2b501b4ff55a8bd`
 - **First reviewed ADR SHA-256:** `d9a413c3a44297ce02ed6e83f01a6f5de61b7be78f9a907677a223210367a700`
@@ -110,7 +110,7 @@ bytes. Labels, punctuation, spaces, field order, and LF delimiters are fixed.
 The notification envelope separately contains the exact ordinary destination
 binding without displaying a private Gmail identity.
 
-For every attempt, the private service computes a domain-separated HMAC over
+For every attempt, the gateway private host computes a domain-separated HMAC over
 the complete
 rendered question, the exact ordered option bytes, `selectableCount=1`, the
 `pollCreationMessageV3` variant, the fresh message-secret digest, pre-reserved
@@ -118,7 +118,7 @@ provider poll ID, exact destination, and canonical dynamic envelope: task ID,
 task display ID, request and challenge generations, exact expiry, destination
 binding digest, attempt ID, capability descriptor and stable-label digests,
 ordinary bridge/launcher/package identity, adapter instance, account binding,
-socket, connection and authority epoch, private service/coordinator/signing
+socket, connection and authority epoch, private-host/coordinator/signing
 generation, authenticated provenance version, and template version. The stable
 label retains its exact descriptor and HMAC semantics even
 though the rendered poll question is the single message shown to the owner.
@@ -195,85 +195,110 @@ Evidence captured read-only on 2026-08-05 is separated by kind:
 - **Absent or unverified active state:** no evidence established an active
   Gmail private-read composition, dedicated OAuth client/token, exact granted
   scope, Gmail account binding, OpenFGA service/model/policy, root-owned
-  isolated-service bundles/UIDs, paired sensitive session, or published
+  dedicated runtime bundles, paired sensitive session, or published
   Juno-only tool.
 - **Externally asserted facts:** any claim about provider-console state,
   account ownership, launchd environment, connector deployment, or live
   transport pairing that is not in the source/process proof above remains an
   operator assertion until separately evidenced.
 
-The reviewed WIP foundation is not an implementation PASS. In particular,
+The source checkpoint is an unaccepted design draft, not an implementation
+PASS. In particular,
 [`compose_trusted_private_read_services()`](../../gateway/trusted_private_read_host.py)
 returns `None` in the reviewed source, so enabled configuration cannot produce
-a private-service client composition. The proposed changes below replace that
+a working private-read composition. The proposed changes below replace that
 dormant boundary only after implementation review.
 
 ## 3. Privacy and threat contract
 
-### Principals and fixed boundaries
+### Owner-selected process and trust boundary
 
-The final architecture has three distinct non-login macOS service identities,
-each with one independently supervised process. Their names are conceptual
-until a separately reviewed deployment chooses concrete UIDs and launch
-labels:
+The owner selected **Option 2** on 2026-08-05 after reviewing the stronger
+alternative of separate service UIDs and its operational cost. The final
+architecture runs three independently supervised processes under the existing
+gateway macOS UID:
 
-1. the **ordinary Juno WhatsApp bridge UID/process**, which owns only the
-   ordinary Juno Baileys session and ordinary chat/approval transport state;
-2. the **private-read service UID/process**, which owns the immutable
-   capability registry, authorization task store, HMAC and signing private
-   keys, Gmail OAuth/token files, Gmail HTTP/MIME provider, OpenFGA check
-   client, task worker, and approval/sensitive-delivery orchestration; and
-3. the **sensitive WhatsApp bridge UID/process**, which owns only the sensitive
-   Baileys session and sensitive-delivery state.
+1. one **dedicated Juno gateway/private-host process** owns the immutable
+   capability registry, generic authorization task store, HMAC and commit-
+   signing private keys, Gmail OAuth/token files, Gmail HTTP/MIME provider,
+   OpenFGA client, worker, publication record, approval/sensitive-delivery
+   orchestration, and transient Gmail plaintext;
+2. one **ordinary Juno WhatsApp bridge process** owns and reuses the complete
+   ordinary Baileys session in place and handles ordinary chat plus the
+   authority-only approval protocol; and
+3. one **sensitive WhatsApp bridge process** owns the separately provisioned
+   sensitive account/session/socket/dependency graph and receives private
+   plaintext only through the dedicated sensitive-delivery protocol.
 
-The gateway/model UID owns none of those files and cannot traverse or read
-their directories. The three service UIDs cannot traverse or read one
-another's credential, session, or store directories. Each process has a
-separate fixed working directory, HOME/state root, socket namespace,
-dependency closure, launch record, content-free log sink, resource limits,
-and lifecycle supervision. Root-owned executable/runtime bundles are
-immutable to every service UID and to the gateway UID.
+Ordinary and sensitive identities are distinct and immutable. Their processes,
+sessions, authentication directories, sockets, IPC namespaces, queues, package
+roots, dependency graphs, manifests, and launch records remain separate; the
+two bundles never import or resolve one another. Sharing a UID does not collapse
+those application boundaries, but this ADR does not claim they provide OS
+confidentiality isolation.
 
-The existing complete ordinary authorization directory at
-`/Users/james/.hermes/profiles/juno/whatsapp/session` is reused in place. It is
-never copied, split, or reduced to `creds.json`. A separately authorized
-deployment transaction may verify the complete multi-file directory, transfer
-its ownership/access to the ordinary bridge identity while preserving that
-canonical path, and prove rollback. Engineering and this ADR perform and
-authorize no ownership, mode, or ACL mutation.
+The existing complete ordinary authorization directory
+`/Users/james/.hermes/profiles/juno/whatsapp/session` remains owner-only and is
+reused in place. It is never copied, moved, split, ownership-transferred,
+ACL-changed, or reduced to `creds.json`. No new service UID or session ownership
+migration is part of Option 2. The sensitive session remains separate and
+pairing-gated; pairing uses an alphanumeric phone-link code only and never a QR
+code.
 
-The private-read service and its reviewed code are the TCB for Gmail OAuth,
-Gmail plaintext, authorization state, policy attestation, and one-shot
-orchestration. The ordinary bridge is the TCB only for authenticated owner-turn
-and approval evidence. The sensitive bridge is the TCB only for final private
-delivery. The model, gateway tool implementations, plugins, skills, browser,
-terminal, file tools, other profiles, and every other gateway-UID component
-are outside the private TCB and have no OS file or socket access to private
-state. Same-UID model/tool attacks are excluded by OS identity separation,
-not by declaring the gateway UID trusted.
+Production composition is concrete, code-owned, and gateway-owned.
+`compose_trusted_private_read_services()` constructs only the built-in typed
+Gmail, OpenFGA, store, approval, and sensitive adapters from the dedicated
+closed decision record and exact runtime objects. It never accepts a callback,
+URL, command, import path, plugin factory, environment-selected provider, or
+arbitrary implementation.
+
+### Explicit broad TCB and owner risk acceptance
+
+The v1 trusted computing base includes the gateway UID; every process and code
+component running as that UID, including anything capable of reading its files
+or process-memory interfaces; all code loaded into the dedicated Juno gateway/
+private host; and the complete ordinary and sensitive bridge processes. Owner-
+only modes protect against other OS users, not malicious or compromised code
+running as the gateway UID.
+
+Accordingly, v1 makes no OS-confidentiality claim against another same-UID
+process, same-process memory inspection, debugger attachment, credential-file
+reads, or a compromised TCB component. Root/kernel compromise and compromise
+of any same-UID TCB process are outside v1 guarantees. Profile files, plugin
+directories, tool registries, credentials, sessions, stores, and integrity
+keys remain same-UID-readable or writable in principle. Hashes, manifests,
+HMACs, and seals detect accidental drift or corruption within this TCB; they
+are not claimed to defeat malicious same-UID code that can also read or replace
+state and keys.
+
+The owner explicitly accepts this residual risk in choosing Option 2 on
+2026-08-05. Separate service UIDs or a sandboxed private service remain the
+stronger future alternative and require a new ADR plus separate deployment
+approval.
+
+The guarantees that remain in scope are no deliberate private-data flow into
+model, tool, session, ordinary-message, log, or storage surfaces; exact
+authorization and transport evidence; bounded lifetime; root-owned executable
+integrity; strict Juno capability lockdown; deterministic private rendering;
+and synthetic/adversarial verification.
 
 The exact authenticated requester binding, dedicated Gmail Desktop OAuth
 client/grant and expected account, signed OpenFGA policy state, and exact
-bundle/service generations remain authority inputs. Display names, aliases,
+bundle/process generations remain authority inputs. Display names, aliases,
 ambient profiles, global Google credentials, self-reports, relay claims,
-model text, and environment-selected accounts never are. Root/kernel or Google
-compromise remains outside v1.
+model text, and environment-selected accounts never are. Google compromise is
+also outside v1.
 
-The private-read service sends private plaintext only over a dedicated
-sensitive-delivery Unix connection. The listener authenticates kernel peer
-credentials using `getpeereid` or an equivalently reviewed macOS primitive and
-accepts only the exact private-read UID; the private service requires the exact
-sensitive-bridge UID at the peer. The gateway and ordinary bridge cannot
-connect. The sensitive process never returns plaintext, rendered content, or
-provider error text: it returns only fixed authenticated terminal delivery
-evidence.
-
-The private-read service uses a different approval-authority Unix connection
-to the ordinary bridge. That listener accepts approval commands only from the
-exact private-read UID after kernel peer authentication; approval events return
-only on the same authenticated channel. Ordinary gateway chat IPC is a
-distinct endpoint that accepts only the gateway UID and has no approval
-prepare, commit, or authority-event operations.
+The ordinary gateway/model/tool layer receives no sensitive-delivery endpoint.
+The in-process private host writes private plaintext only through its inherited
+private endpoint; the root-owned supervisor passes the peer endpoint only to
+the sensitive bridge. No ordinary gateway object receives an endpoint
+reference. The sensitive process never returns plaintext, rendered content, or
+provider error text, only fixed authenticated delivery evidence.
+The approval-authority channel and ordinary generic chat channel are distinct:
+generic chat has no approval opcodes, while approval has no generic text-send
+or private-result operation beyond the exact content-free challenge and
+resolution schemas.
 
 ### Four data classes
 
@@ -362,12 +387,13 @@ Google uses reviewed CA validation. OpenFGA alone uses the code-fixed loopback
 HTTP endpoint. All clients disable redirects, proxy/environment trust,
 `.netrc`, ambient credentials, and provider-controlled authorities.
 
-### Honest isolated-process memory guarantee
+### Honest memory guarantee
 
-V1 guarantees process and UID isolation plus bounded logical reachability, not
-physical zeroization. Gmail content and tokens exist only inside the
-private-read service until the fixed rendered bytes cross the authenticated
-sensitive-delivery socket. They have the shortest practical lifetimes;
+V1 guarantees bounded logical reachability and deliberate data-flow exclusion,
+not UID isolation or physical zeroization. Gmail content and tokens exist only
+inside reviewed private frames in the dedicated Juno gateway/private host until
+the fixed rendered bytes cross the authenticated sensitive-delivery channel.
+They have the shortest practical lifetimes;
 references are released explicitly in `finally` paths; controlled mutable
 buffers are wiped where the application truly owns them. The sensitive bridge
 holds only the bytes required for the one send. No application persistence,
@@ -377,10 +403,12 @@ task results are permitted.
 V1 does not claim that immutable Python `bytes`/`str`, HTTPX request/response
 objects, TLS buffers, exception allocator storage, CPython allocator copies,
 or immutable Node buffers are physically erased. A memory-forensic attacker
-inside the private service is within the private TCB; one inside the sensitive
-bridge can observe only its bounded delivery plaintext. The gateway/model
-process never receives plaintext. A physical-erasure requirement needs a
-separate stronger memory-isolation ADR.
+inside the dedicated Juno process is within the private TCB; one inside the
+sensitive bridge can observe its bounded delivery plaintext. The model-facing
+frames never receive plaintext, but the private host and model-facing gateway
+code share a process and TCB. Another same-UID process may technically inspect
+memory or owner-only files. A physical-erasure or same-UID-adversary requirement
+needs a separate stronger isolation ADR.
 
 `GmailMessageReadDto` is a slots-based class with `repr=False`, a fixed
 redacted `__repr__` and `__str__`, and no dataclass `asdict`, pickle, or copy
@@ -389,7 +417,7 @@ reprs, attempted pickle/copy, and all exception/task surfaces.
 
 ### Exception and cancellation hygiene
 
-The private service never calls `raise_for_status()` and never transmits an
+The gateway private host never calls `raise_for_status()` and never transmits an
 HTTPX, OAuth, provider, JSON, MIME, renderer, approval, or sensitive-send
 exception across IPC. A private inner async frame owns request, response,
 token, body, parser, DTO, and render references. It catches every failure,
@@ -426,11 +454,73 @@ exactly `gateway_profile`, `agent_identity`, `platform`,
 other strings are separately reviewed opaque deployment identities.
 
 Unknown or missing requester keys fail parsing. Every value is sealed into the
-composition and requester-scope digest. The gateway checks all seven values at
+composition and requester-scope digest. The gateway checks all eight values at
 authenticated event bind and again when durably creating the task. Wrong
 profile, agent, platform, account, sender, chat, thread sentinel, provenance,
 or generation fails before model invocation, tool invocation, task mutation,
 or authorization mutation. No event-global or ambient profile may substitute.
+
+### Dedicated Juno process and capability lockdown
+
+The dedicated gateway process launches with the exact `juno` profile and an
+exact sealed profile/HERMES_HOME generation. It may not host, switch to, or
+load any other profile in the same process. Existing evidence does not prove
+that the observed gateway process used Juno; deployment must prove the exact
+future executable, argv, environment, profile, HERMES_HOME generation, and
+loaded source/bundle identity.
+
+Before model/provider/client initialization or credential/store access,
+startup computes a canonical `JunoCapabilityManifest` from code-owned constants
+and the sealed profile. The only model-callable v1 tools are:
+
+1. the service-gated `private_read_request` tool with exact
+   `{capability_id}` schema; and
+2. optionally the existing code-owned query-only `web_search` tool, but only
+   if review proves that its exact implementation exposes no URL, local-network
+   target, file, browser, code, shell, credential, arbitrary HTTP backend, or
+   backend-selection parameter.
+
+If the second predicate is not proved, v1 starts with only
+`private_read_request` and answers ordinary questions from model knowledge.
+The ordinary WhatsApp response path is gateway-owned output delivery, not a
+model-callable send tool. Approval and sensitive delivery are private runtime
+operations unreachable through model tool dispatch.
+
+The manifest explicitly forbids, and startup plus per-call tests prove absent:
+
+- terminal, shell, process, PTY, `execute_code`, Python/Jupyter, and coding-
+  agent tools;
+- file read/write/search/patch, local URLs, attachments, and filesystem-backed
+  media tools;
+- browser, desktop/computer-use, Apple automation, OCR/document tools, and
+  arbitrary HTTP fetch/extract;
+- `send_message`, email/Google Workspace, session search, memory mutation,
+  cron, delegation/subagents, skill creation/editing, and skill scripts;
+- Home Assistant, messaging side-effect tools, arbitrary MCP/catalog servers,
+  dynamic plugins, plugin-provided tools, user-installed hooks, runtime tool
+  discovery, and profile crossover; and
+- model-authored commands, import paths, callbacks, URLs, Gmail queries,
+  account identifiers, or provider choices.
+
+The manifest seals the exact tool-definition bytes, names, schemas, handler
+identities, registry sources, plugin and hook list, MCP list, model identity,
+profile identity/instruction digest, and profile/HERMES_HOME generation. These
+are attested before credentials/store access; when a genuinely new conversation
+generation captures `PrivateReadConversationCapability`; before every model
+call; before tool planning and execution; and immediately before private claim
+and read.
+
+Any extra, missing, or replaced tool, plugin, MCP server, hook, handler, schema,
+profile, model, registry source, or generation synchronously unpublishes
+private-read, terminalizes affected pre-side-effect tasks, and fails the
+dedicated Juno process closed. The model cannot enable tools or alter the
+allowlist. Agent eviction or rebuild reloads the same persisted content-free
+conversation capability and manifest identity; it never recaptures newer
+availability.
+
+Because manifest inputs and seal keys are within the broad same-UID TCB, these
+checks reliably detect accidental drift and reviewed-state mismatch but do not
+claim resistance to malicious same-UID code able to replace inputs and keys.
 
 ### Cache-stable discovery
 
@@ -449,32 +539,32 @@ conversation's tool list or system prompt. Activation requires a fresh Juno
 conversation/session generation after successful service publication. Existing
 conversations remain unavailable, preserving prompt-cache identity.
 
-The gateway publishes this one content-free tool only after authenticating the
-private service over a code-fixed Unix socket and verifying the exact
-root-bundle, service, schema, requester, and publication generation. A proposal
-RPC contains only the capability ID, an opaque bridge-minted one-use inbound-
-turn grant, exact session/conversation generation, and fixed content-free
-correlation. The ordinary bridge minted that grant from the authenticated
-owner inbound turn; the private service verifies and atomically consumes it.
-The private listener kernel-authenticates and accepts this closed proposal RPC
-only from the exact gateway UID. The gateway/model cannot mint, inspect,
-extend, or replay a grant. The private service returns only fixed content-free
-task and terminal outcome states. Gmail output never crosses the gateway
-socket.
+The gateway publishes this one content-free tool only after in-process private-
+host initialization verifies the exact root bundle, decision record, runtime
+objects, Juno capability manifest, schema, requester, and publication
+generation. A proposal contains only the capability ID, an opaque bridge-
+minted one-use inbound-turn grant, exact session/conversation generation, and
+fixed content-free correlation. The ordinary bridge mints that grant from the
+authenticated owner inbound turn; the private host verifies and atomically
+consumes it. Model-facing code cannot mint, inspect, extend, or replay a grant.
+The private host returns only fixed content-free task and terminal outcome
+states. Gmail output never enters a tool result or model-facing frame.
 
 At creation of a genuinely new gateway session/conversation generation, the
 gateway atomically captures an immutable, content-free
 `PrivateReadConversationCapability` together with the schema bytes. It
 contains the exact gateway session generation, profile/requester binding,
-private service/publication generation, root bundle/service identity, schema
-digest and bytes, terminal RPC capability identity, and explicit
+private-host/publication generation, root bundle/process identity,
+`JunoCapabilityManifest` digest and allowlist/plugin/model/profile identity,
+schema digest and bytes, terminal-handler capability identity, and explicit
 presence/absence state. The binding is persisted with session-generation
 metadata. Agent eviction, process reconstruction, or gateway restart reloads
 that binding; it never recaptures live availability for an existing session.
 
 A session born absent remains absent. A session born with publication
 generation G may execute only while the current publication is exactly G with
-identical service, bundle, schema, requester, and terminal capability identity.
+identical process, bundle, Juno manifest, schema, requester, and terminal
+capability identity.
 Removal or replacement fails closed and never falls forward. A new publication
 can become available only to a genuinely new session generation. Direct tool
 execution and deferred Tool Search definition/scope planning use only the
@@ -546,6 +636,42 @@ pre-claim, and pre-private-read checks use the same exact descriptor matcher.
 
 ## 5. Ordinary approval challenge and resolution
 
+### Same-UID IPC and application separation
+
+Unix peer UID cannot distinguish the gateway/private host, ordinary bridge,
+and sensitive bridge because all run as the existing gateway UID. Peer
+credentials may be recorded as process evidence but are never claimed as
+sufficient confidentiality or authentication among these processes.
+
+The root-owned supervisor creates connected socketpairs before dropping and
+execing the exact processes. It passes only each manifest-allowlisted endpoint
+file descriptor, closes every other copy, and binds a fresh random channel key
+and nonce to the exact bundle, process, start, socket, connection, and authority
+epochs. Capabilities are delivered only through already-open inherited file
+descriptors, never through filesystem token files, argv, or environment. There
+is no discoverable listening path another same-UID process can connect to.
+
+There are exactly three cryptographically independent channels:
+
+1. ordinary approval commands and authority events;
+2. ordinary generic chat; and
+3. sensitive delivery.
+
+Every protocol is closed-schema, length-bounded, sequence-numbered,
+transcript-HMACed, replay-protected, and epoch-bound. The generic chat protocol
+has no approval opcodes. The approval protocol has no generic text send or
+private-result opcode except exact content-free challenge/resolution payloads.
+Only the private-host component receives the plaintext-writing endpoint object
+for the sensitive bridge pair; the ordinary gateway/model/tool layer and
+ordinary bridge code receive no endpoint or reference. Sensitive responses
+contain fixed authenticated evidence only.
+
+This construction prevents accidental cross-channel use and routing through
+untrusted model/tool surfaces. A same-UID debugger or process-memory attacker
+could extract a channel capability and is inside the explicitly accepted TCB;
+the protocol is not represented as protection from malicious same-UID TCB
+compromise.
+
 ### Exact rc14 destination-delivery contract
 
 `OrdinaryWhatsAppApprovalAuthority` uses dedicated code-owned ordinary
@@ -602,16 +728,17 @@ attempt ID, task and generations, exact expiry, destination digest, canonical
 dynamic envelope, claim/coordinator fences, descriptor root, and HMAC root.
 No send-start fence has yet been crossed.
 
-The peer-authenticated ordinary approval connection then uses two distinct,
+The capability-authenticated ordinary approval channel then uses two distinct,
 closed-schema operations.
 
 #### Prepare
 
-The private service calls `prepare_approval_poll` with the exact fixed
+The gateway private host calls `prepare_approval_poll` with the exact fixed
 question, ordered options, destination, attempt/task/generations, expiry, and a
-fresh private-service nonce. The ordinary bridge:
+fresh private-host nonce. The ordinary bridge:
 
-1. verifies the exact private-service peer UID and the closed operation schema;
+1. verifies the exact approval-channel capability, transcript, epoch, and
+   closed operation schema;
 2. verifies destination, account, socket, connection/authority epoch, expiry,
    dynamic-field grammar, exact question bytes, ordered option bytes,
    `selectableCount=1`, and `pollCreationMessageV3`;
@@ -621,35 +748,38 @@ fresh private-service nonce. The ordinary bridge:
    secret, computes raw option identities and the complete payload digest;
 5. installs all delivery/vote listeners and a bounded, one-shot ephemeral
    preparation record before any send; and
-6. returns authenticated preparation evidence on the same peer-authenticated
-   connection.
+6. returns authenticated preparation evidence on the same capability-
+   authenticated channel.
 
 The evidence contains the preparation ID and generation, attempt/task/request/
 challenge generations, provider ID, secret digest but never the secret,
 complete payload digest, exact destination, ordinary bundle/account/socket/
-connection/authority epoch, expiry, service nonce, and option identities. The
-held record contains the byte-identical payload, secret, and custom provider
-ID. It is unavailable to ordinary chat IPC.
+connection/authority epoch, expiry, private-host nonce, and option identities.
+The held record contains the byte-identical payload, secret, and custom
+provider ID. It is unavailable to ordinary chat IPC.
 
-The private service independently reconstructs the expected canonical payload
-and evidence under the pinned rc14 compatibility contract, checks every fixed
-and dynamic field and digest, and rejects any mismatch. A private-store CAS,
+The gateway private host independently reconstructs the expected canonical
+payload and evidence under the pinned rc14 compatibility contract, checks every
+fixed and dynamic field and digest, and rejects any mismatch. A private-store CAS,
 bound to the live claim, coordinator fence, and whole descriptor, writes every
 preparation identity/digest into the attempt HMAC and audit state. A separate
 durable CAS then crosses send-start and records a fresh send-start generation.
-Only after that commit does the private service mint an opaque one-use signed
-commit grant. Its Ed25519 signing private key is readable only by the
-private-read UID; the ordinary root bundle contains only the pinned public
-verification key. The grant binds every prepared field, store attempt/version,
-send-start generation, exact expiry, ordinary authority epoch, and an exact
-single-use nonce.
+Only after that commit does the gateway private host mint an opaque one-use
+signed commit grant. The gateway private host is the only reviewed code path
+that opens its Ed25519 signing private key; the ordinary root bundle contains
+only the pinned public verification key. Same-UID access to the key file is
+within the accepted TCB; the key never appears in environment or argv. The
+grant binds every prepared
+field, store attempt/version, send-start generation, exact expiry, ordinary
+authority epoch, and an exact single-use nonce.
 
 #### Commit-send
 
-The private service passes the signed grant to
+The gateway private host passes the signed grant to
 `commit_prepared_approval_poll`. The ordinary bridge verifies the signature,
-exact private-service peer UID, exact preparation match, expiry, authority
-epoch, and unused state. It atomically consumes the preparation and commit
+exact channel capability/transcript/epoch, exact preparation match, expiry,
+authority epoch, and unused state. It atomically consumes the preparation and
+commit
 before calling rc14, then invokes `sendMessage()` exactly once with the held
 byte-identical payload, held `poll.messageSecret`, and held custom
 `messageId`. It constant-time compares the returned ID with the held ID.
@@ -753,7 +883,8 @@ with no poll, options, button, reaction, or other control. It uses the same
 pre-reserved-ID → authenticated prepare evidence → durable store bind →
 distinct send-start CAS → one-use signed commit protocol as a challenge,
 through closed `prepare_approval_resolution` and
-`commit_prepared_approval_resolution` RPCs, without a poll secret or options.
+`commit_prepared_approval_resolution` channel operations, without a poll secret
+or options.
 The ordinary bridge holds the exact rendered bytes and fresh custom provider
 ID, installs the one-to-one destination listener before prepare returns,
 atomically consumes the matching commit before one rc14 call, constant-time
@@ -780,33 +911,32 @@ duplicates, and post-CAS changes. Python mocks alone are insufficient.
 
 ### Restart and authority epochs
 
-All three services are independently supervised. A gateway restart neither
-stops nor authorizes either bridge or the private service. Existing gateway
-conversation capabilities remain bound to their old gateway publication and
-cannot fall forward: restart advances the gateway availability/publication
-generation before any client reattachment, and persisted old capabilities do
-not compare equal to it. The private service may nevertheless continue a valid
-already-created durable approval task independently.
+All three processes are independently supervised; the ordinary bridge is not
+assumed to die when the gateway/private host restarts. Every protocol binds
+exact process, start, socket, connection, authority, coordinator, signing,
+publication, and channel epochs.
 
-An ordinary bridge restart changes its kernel process/socket, connection, and
-authority epoch and destroys every preparation/listener. On peer-authenticated
-reattach it atomically purges all old preparations, authority events, and
-bounded queues before admitting a command. The private service rejects every
-prior-epoch event and reconciles each attempt using the send-fence states above.
+A gateway/private-host restart first unpublishes every conversation
+capability. It changes coordinator, signing, publication, process/start, and
+all channel epochs; reconnects only through a fresh supervisor-created channel
+set; authenticates the fresh epoch protocol; commands the ordinary bridge to
+purge all prior approval-authority state; and reconciles durable attempts.
+Existing session generations never gain a replacement publication. A genuinely
+fresh conversation generation is required.
 
-A private service restart changes its service, coordinator, signing, and
-publication epoch. Planned shutdown first requests synchronous gateway
-unpublication; unexpected socket loss makes the gateway synchronously
-unpublish before further dispatch. The restarted service reconnects to the
-ordinary bridge under a fresh authenticated lease, commands atomic purge of
-all prior private-service-epoch authority state, reconciles the durable store,
-and rejects every prior-epoch event or grant before republishing.
+An ordinary bridge restart changes its exact process/start/socket/connection/
+authority/channel epochs and destroys every preparation/listener. On fresh
+authenticated-channel attachment it atomically purges old preparations,
+authority events, and bounded queues before admitting a command. The private
+host rejects every prior-epoch event and reconciles each attempt using the
+definite-versus-ambiguous send-fence states above.
 
-A sensitive bridge restart changes its exact process/socket/connection/
-transport epoch and invalidates pending delivery registration under the
+A sensitive bridge restart changes its exact process/start/socket/connection/
+transport/channel epoch and invalidates pending delivery registration under the
 existing pre-submit versus post-submit ambiguity rules. Approval events never
 use generic ordinary `messageQueue`; their bounded queues are keyed to and
-purged by the exact private-service/ordinary-bridge lease epoch.
+purged by the exact private-host/ordinary-bridge lease epoch. No attempt,
+provider ID, secret, or signed commit is retried after an epoch change.
 
 ## 6. Gmail OAuth, HTTP, and MIME adapter
 
@@ -915,26 +1045,25 @@ the final 4,096-byte cap.
 
 ## 7. Exact task-bound OpenFGA contract
 
-The authenticated deployment uses exactly OpenFGA 1.18.2 under a separate
-non-login OpenFGA runtime UID and root-owned content-addressed runtime bundle.
-It binds only a code-fixed loopback address and requires one exact
-high-entropy runtime API credential. That credential is readable only by a
-separate non-login check-only proxy UID/process: neither the gateway nor the
-private-read service possesses it.
+The authenticated deployment uses exactly OpenFGA 1.18.2 from a root-owned
+content-addressed runtime bundle. It may run under the existing gateway UID or
+a separately existing deployment identity; UID isolation is not a Gmail v1
+security claim. It binds only the code-fixed loopback endpoint and requires one
+exact high-entropy runtime API credential stored in an owner-only file, never
+environment or argv. The gateway UID, OpenFGA process, runtime credential, and
+adapter are inside the explicitly accepted TCB.
 
-The private-read service reaches a code-owned Unix-socket proxy. Kernel peer
-authentication accepts only the exact private-read UID. The proxy has a
-closed, bounded protocol exposing only `Check`, exact model/store metadata
-read, exact authorization-model bytes read, and exact standing
-`approved_reader` tuple reads required here. All tuple/model/store write or
-mutation endpoints are absent and rejected. The OpenFGA runtime datastore role
-is read-only while the runtime, proxy, or private capability is running, so
-even possession of the runtime API credential cannot mutate tuples, models,
-or stores.
+The gateway private host uses a code-owned closed, bounded adapter exposing only
+`Check`, exact model/store metadata read, exact authorization-model bytes read,
+and exact standing `approved_reader` tuple reads. All tuple/model/store write
+or mutation operations are absent and rejected. The OpenFGA datastore runtime
+role is technically read-only for model and tuple data while publication is
+possible, so API write attempts fail at datastore authorization even if the
+runtime endpoint and credential are reached.
 
-Provisioning has a separate writer datastore role and credential unavailable
-to all runtime UIDs. It occurs only while the OpenFGA runtime, check proxy, and
-private capability are stopped and unpublished. A root/offline provisioning
+Provisioning has a separately held root/offline writer datastore credential
+unavailable in the running Juno environment. It occurs only while Juno private
+publication and the OpenFGA runtime are stopped. A root/offline provisioning
 authority owns an Ed25519 private signing key unavailable at runtime. Every
 policy transaction atomically updates the exact authorization model and the
 complete canonical standing `approved_reader` tuple set, increments a
@@ -942,7 +1071,8 @@ monotonic policy epoch, and emits a signed canonical policy manifest. That
 manifest binds store ID, model ID, exact model bytes/hash, exact sorted standing
 tuple-set hash/count, policy version/digest, epoch, provisioner key ID, and
 deployment generation. Runtime bundles contain only the pinned verification
-public key.
+public key. Provisioning ends with a monotonic epoch advance and the signed
+canonical manifest before the read-only runtime is restarted.
 
 The generic model has these semantics for each field object:
 
@@ -970,15 +1100,16 @@ may not create, restore, modify, or delete it. A contextual
 `approved_reader` self-grant is forbidden.
 
 At startup and immediately before each `pre_claim` and `pre_private_read`
-six-check group, the private service asks the check-only proxy for the exact
+six-check group, the private host reads the exact
 model bytes/identity and a complete, strictly bounded standing tuple set. It
 rejects pagination, duplicates, extras, unknown relations/users/objects,
 incomplete reads, count drift, noncanonical ordering, and any set beyond the
 small code-fixed maximum. It independently recomputes canonical hashes,
 verifies the offline signature and monotonic epoch, and requires byte-for-byte
-equality with the signed policy manifest. The read-only runtime/datastore
-generation attestation must also prove that no writer can coexist while the
-capability is published. Startup configuration alone is never policy proof.
+equality with the signed policy manifest before any `Check`. The read-only
+runtime/datastore generation attestation must also prove that no writer can
+coexist while the capability is published. Startup configuration alone is
+never policy proof.
 
 For each stage, the adapter issues exactly N=6 independent checks, one for each
 field in canonical order. It issues N=6 at `pre_claim` and N=6 again at
@@ -996,18 +1127,23 @@ epoch, whole descriptor, stage, and expiry after each complete six-check group.
 Drift consumes or denies according to the existing side-effect fence.
 
 `HIGHER_CONSISTENCY` is an OpenFGA preference, not a linearizability claim.
-The actual standing-policy boundary comes from the read-only runtime, exact
+The actual standing-policy boundary comes from the datastore-enforced read-only
+runtime role, exact
 live model/tuple attestation against the signed manifest before both stages,
 the absence of runtime mutation authority, and post-group store revalidation.
+
+If exact OpenFGA 1.18.2 plus the selected datastore cannot demonstrably operate
+with this read-only runtime role, deployment is blocked. It may not silently
+downgrade to application-only no-write discipline.
 
 Tests mutate every contextual binding independently and require deny/failure,
 prove the exact two tuples and condition on every call, prove no contextual
 standing grant, prove no field/batch shortcut exists, and exercise the full
-proxy protocol, tuple/model bounds, manifest signature/epoch, writer exclusion,
+adapter protocol, tuple/model bounds, manifest signature/epoch, writer exclusion,
 pagination/extra/incomplete failures, and both pre-stage attestations. During
-engineering the test harness uses only a fake check proxy and signed synthetic
-manifests. OpenFGA installation, provisioning, and policy epoch advancement are
-separate deployment approvals.
+engineering the test harness uses only a fake authenticated read-only
+datastore/proxy and signed synthetic manifests. OpenFGA installation,
+provisioning, and policy epoch advancement are separate deployment approvals.
 
 ## 8. Root-owned executable and clean-launch contract on macOS
 
@@ -1015,33 +1151,36 @@ Live macOS 26.5.2 Python exposes neither `os.fexecve` nor `os.execveat`.
 MacOS v1 therefore uses root-owned immutable content-addressed bundles plus
 double verification, never path recheck alone or user-writable staging.
 
-The private Python service, ordinary Node bridge, and sensitive Node bridge
-each have a different root-owned bundle under a code-fixed root such as:
+The dedicated Juno gateway Python process, ordinary Node bridge, and sensitive
+Node bridge each have a different root-owned bundle under a code-fixed root
+such as:
 
 ```text
 /Library/Application Support/Hermes/private-read-bundles/<service>/sha256-<digest>/
 ```
 
 Each bundle has its own closed, separately hashed manifest and complete
-dependency closure. The private bundle contains a pinned absolute CPython
+dependency closure. The gateway bundle contains a pinned absolute CPython
 interpreter and venv/package closure. Each Node bundle contains a pinned
 absolute Node executable and its own package/lock/`node_modules` closure.
 Ordinary and sensitive Node graphs are installed and verified independently
-and may never import, resolve, or traverse one another.
+and may never import, resolve, or traverse one another. Both independently pin
+exactly `@whiskeysockets/baileys@7.0.0-rc14`.
 
 All ancestors and bundle entries are root-owned, non-symlinked, not group/world
-writable, and immutable to the gateway and service UIDs. Every entry has the
-reviewed type, mode, link count, mount identity, and content hash; regular
+writable, and immutable to the gateway UID. Every entry has the reviewed type,
+mode, link count, mount identity, and content hash; regular
 files are one-link; unknown or missing entries and path/mount substitution fail
 closed. Decision records may name only an allowlisted manifest identity
 relative to the code-fixed bundle root, never an arbitrary path, command,
 executable, module, or import.
 
 For each of the three launchers, the root manifest determines the absolute
-verified executable and complete argv, fixed root-owned bundle cwd, service
-UID/GID, and exact descriptor list. The launcher constructs an allowlisted
-environment from empty. It admits only code-fixed locale, timezone, HOME/state,
-and socket values. It explicitly rejects/removes `NODE_OPTIONS`, `NODE_PATH`,
+verified executable and complete argv, fixed root-owned bundle cwd, the
+existing gateway UID/GID, and exact descriptor list. The launcher constructs
+an allowlisted environment from empty. It admits only code-fixed locale,
+timezone, HOME/state, profile-generation, and inherited-channel values. It
+explicitly rejects/removes `NODE_OPTIONS`, `NODE_PATH`,
 `PYTHONPATH`, `PYTHONHOME`, every `DYLD_*` and `LD_*` variable, npm lifecycle/
 hook/config injection, inspector/debug/preload/require switches, proxy
 variables, ambient credential variables, and every unreviewed value.
@@ -1050,60 +1189,66 @@ No launcher inherits a shell, `PATH` resolution, caller cwd, `.env`, default
 keychain lookup, `.netrc`, plugin path, user-writable module path, or ambient
 configuration. Stdin is `/dev/null`; stdout/stderr go to a dedicated
 content-free sink. Every descriptor is close-on-exec and closed before exec
-except the exact manifest-allowlisted IPC, listener, and already-open validated
-configuration descriptors. Native loaders and package resolvers cannot search
-user-writable locations.
+except the exact manifest-allowlisted socketpair endpoints and already-open
+validated configuration descriptors. Native loaders and package resolvers
+cannot search user-writable locations. The supervisor creates connected
+socketpairs before dropping/execing, passes only the allowlisted endpoint FD to
+each process, and closes all other copies.
 
 The supervising verifier performs identity, ancestry, ownership, mode, link,
 mount, manifest, executable, argv, and full closure validation immediately
 before spawn. The in-bundle launcher repeats the same validation before any
-dynamic import. Root-owned immutability prevents the unprivileged UIDs from
+dynamic import. Root-owned immutability prevents the gateway UID from
 replacing verified bytes between verification and execution within the stated
 threat model. Copying into a service- or gateway-writable staging directory is
 forbidden.
 
 Deployment evidence binds each launchd record and bootstrap domain to the
-exact label, service UID/GID, bundle/manifest digest, executable/argv/cwd,
-environment digest, descriptor policy, socket paths and owners, sandbox
+exact label, gateway UID/GID, bundle/manifest digest, executable/argv/cwd,
+environment digest, descriptor policy, inherited socketpair endpoints, sandbox
 profile, memory/CPU/process/file/network limits, log sink, supervision policy,
 and rollback identity. Root and kernel compromise remain outside v1.
 
-No bundle, UID, socket directory, launch record, ownership rule, ACL, or
-service is installed or mutated during engineering, normal gateway startup, or
-this ADR revision. Installation and removal need separate root-authorized
+No bundle, UID, socketpair launch context, launch record, ownership rule, ACL,
+or process is installed or mutated during engineering, normal gateway startup,
+or this ADR revision. Installation and removal need separate root-authorized
 deployment review and rollback proof. Unit tests use an explicit test-only
 expected-owner seam; deployment acceptance additionally needs real root-owned
 bundle and clean-launch probes.
 
 Native Windows startup fails before credential, session, store, or service
-access with an accurate “root-owned macOS isolated-service bundles required;
-native Windows unsupported” status unless another ADR supplies an equivalent
+access with an accurate “root-owned macOS runtime bundles required; native
+Windows unsupported” status unless another ADR supplies an equivalent
 ACL-aware boundary. Pairing is never part of service startup and uses
 alphanumeric code only. Sensitive post-submit ambiguity consumes the
 authorization; no result retry occurs.
 
-## 9. Isolated initialization, publication, and cleanup
+## 9. Dedicated initialization, publication, and cleanup
 
 ### Real initialization seam
 
 All constructors remain inert: they perform no network, SQLite, session,
-subprocess, socket, path creation, OAuth, Gmail, or OpenFGA work. The root
-launcher, not the gateway, starts each independently supervised service from
-its anchored manifest. For the private service it first verifies the exact
-bundle and clean-launch context, descriptor-opens the one code-fixed decision
-record, verifies its file seal, and passes only that allowlisted descriptor
-across exec.
+subprocess, socket, path creation, OAuth, Gmail, or OpenFGA work. The root-owned
+supervisor starts each process from its anchored manifest and pre-creates the
+exact socketpair/channel set. For the dedicated gateway it verifies the exact
+bundle and clean-launch context, descriptor-opens the code-fixed decision
+record and required owner-only credential/store files, verifies their seals,
+and passes only manifest-allowlisted descriptors across exec.
 
-Private-service initialization then runs in this exact order:
+Dedicated gateway/private-host initialization then runs in this exact order:
 
 1. Parse the raw UTF-8 decision-record bytes with the closed duplicate-
    rejecting JSON parser. Verify version, canonical encoding, manifest/seal,
-   service UID/socket identities, disjoint state roots, requester descriptor,
-   and all code-fixed file identities without creating or mutating them.
-2. Revalidate the private, ordinary, and sensitive root-bundle/service
-   manifests, launch contexts, exact UID/GID and peer socket identities, and
-   confirm that the ordinary session remains the complete canonical directory.
-3. Through the authenticated check-only proxy, verify exact OpenFGA runtime,
+   existing gateway UID, process/start/channel identities, distinct state
+   roots, requester descriptor, and all code-fixed file identities without
+   creating or mutating them.
+2. Before model/provider/client initialization or credential/store access,
+   compute and attest the exact `JunoCapabilityManifest`, exact `juno` profile
+   and HERMES_HOME generation, then revalidate the gateway, ordinary, and
+   sensitive root-bundle/process manifests, clean launch contexts, and
+   inherited endpoint descriptors; confirm that the ordinary session remains
+   the complete canonical directory.
+3. Through the code-owned read-only adapter, verify exact OpenFGA runtime,
    store/model bytes, signed policy manifest, complete standing tuple set,
    policy epoch, and read-only/no-writer generation.
 4. Perform the initial OAuth exchange or refresh, exact scope validation, and
@@ -1116,25 +1261,27 @@ Private-service initialization then runs in this exact order:
    coordinator fence only after commit, then create the worker and fresh
    ordinary/sensitive authenticated leases. Reconciliation never precedes the
    singleton lock and fence-acquisition transaction.
-6. Recheck every seal, descriptor, policy attestation, peer epoch, requester
-   binding, service generation, and health predicate. Only then expose a
-   content-free attestation to the gateway's code-fixed socket and permit the
-   gateway publication transaction below.
+6. Recheck every seal, descriptor, policy attestation, channel epoch,
+   requester binding, process generation, Juno capability manifest, and health
+   predicate. Only then permit the in-process publication transaction below.
 
 Partial failure closes every acquired slot in strict reverse order. No failed
 step can leave a store, lock, coordinator, worker, approval lease, sensitive
 registration, client, or publication live. The private provider, store,
-worker, and credentials never enter the gateway process.
+worker, credentials, and plaintext remain inside reviewed private frames in the
+dedicated gateway process and never enter model-facing frames or results.
 
-In the gateway, synchronous `compose_trusted_private_read_services()` performs
-only inert code-owned construction of the built-in private-service client. At
-the existing async `GatewayRunner._start_trusted_private_read_host()` seam in
-[`gateway/run.py`](../../gateway/run.py), it authenticates the exact service,
-root-bundle, requester, protocol, schema, and publication generation over the
-code-fixed Unix socket. It returns a concrete built-in client composition only
-after exact attestation; it cannot accept a callback, factory, import, URL,
-command, arbitrary socket, or provider/store implementation. Pre-publication
-failure closes that client directly.
+Synchronous `compose_trusted_private_read_services()` performs inert code-owned
+construction of the built-in Gmail, OpenFGA, authorization-store, ordinary-
+approval, and sensitive-delivery adapters. At the existing async
+`GatewayRunner._start_trusted_private_read_host()` seam in
+[`gateway/run.py`](../../gateway/run.py), it binds the exact closed decision
+record, root bundle, runtime objects, inherited channel endpoints, requester,
+Juno capability manifest, protocol, schema, and publication generation. It
+returns a concrete built-in in-process composition, never `None`, only after
+exact attestation; it cannot accept a callback, factory, import, URL, command,
+arbitrary socket, environment-selected provider, or arbitrary provider/store
+implementation. Pre-publication failure closes the composition directly.
 
 ### Atomic publication
 
@@ -1143,16 +1290,18 @@ A reviewed publication-registry module owns one process-global synchronous
 `PrivateReadPublicationSnapshot`. The snapshot contains at least:
 
 - publication state (`empty`, `published`, or permanently `failed`),
-  private-service client authority and health identity;
-- event authority, service/bundle identity, and monotonic publication
+  private-host authority and health identity;
+- event authority, process/bundle identity, and monotonic publication
   generation;
-- the RPC-bound terminal handler and immutable public operation registry;
+- the in-process terminal handler and immutable public operation registry;
 - exact schema generation, canonical tool schema bytes, and tool metadata;
-- requester/profile generation and authenticated provenance; and
+- requester/profile generation and authenticated provenance;
+- exact `JunoCapabilityManifest` digest, allowlist, registry-source, plugin,
+  hook, MCP, model, profile, instruction, and HERMES_HOME identities; and
 - the empty/failed reason code without private data.
 
-After all preparation and ownership transfer, async startup performs one short
-non-awaiting snapshot swap under that lock. No network, filesystem access,
+After all preparation, async startup performs one short non-awaiting snapshot
+swap under that lock. No network, filesystem access,
 health check, logging callback, cleanup, event dispatch, tool-registry
 mutation, or `await` occurs while it is held. Rollback and shutdown first swap
 to an empty or failed snapshot at a higher generation under the same lock and
@@ -1160,7 +1309,7 @@ only then perform awaited cleanup. No partial client/event/tool interval exists.
 
 Every synchronous authority reader obtains one immutable snapshot through the
 same registry and lock: authenticated event binding, busy-principal checks,
-new-session capability/schema capture, service-gated discovery, terminal RPC
+new-session capability/schema capture, service-gated discovery, terminal-handler
 dispatch, shutdown, and runner diagnostics. A publication swap advances the
 availability generation before any new conversation can be constructed.
 `GatewayRunner._trusted_private_read_host` and any other runner fields are
@@ -1172,13 +1321,15 @@ Its availability bypasses generic TTL and last-good caches. Every genuinely
 new session capture reads exactly one publication snapshot. The tool registry
 is not mutated on publication. `model_tools.py` includes publication identity,
 generation/state, requester identity, and schema digest in the definition
-cache key, so stale present or absent results cannot cross an availability
-generation.
+cache key together with the `JunoCapabilityManifest` digest and exact
+allowlist/plugin/model/profile identity, so stale present or absent results
+cannot cross an availability generation.
 
 `agent/agent_init.py` atomically captures the immutable
 `PrivateReadConversationCapability` with definitions, schema bytes, registry
-generation, and the new gateway session/conversation generation. The gateway
-persists that content-free capability in session-generation metadata before
+generation, the full Juno manifest identity, and the new gateway session/
+conversation generation. The gateway persists that content-free capability in
+session-generation metadata before
 model construction. Rebuilding an evicted agent or restarting the gateway for
 an existing session reloads it; it cannot recapture current availability.
 
@@ -1206,16 +1357,17 @@ and every runner diagnostic. No separate live pointer is authority at any seam.
 
 Cleanup is bounded, shielded, reverse-order, and owned within each process.
 Gateway cleanup first synchronously unpublishes at a higher generation, then
-closes only its private-service client and content-free capability bindings.
-Private-service cleanup records slots as acquired and attempts all of them even
-after an earlier failure: worker, coordinator, store, sensitive registration/
-socket, ordinary authority lease/socket, OpenFGA proxy client, Gmail/OAuth
-streams/clients, token/DTO/body references, decision-record/bundle descriptors,
+closes its in-process private-host composition and content-free capability
+bindings. Private-host cleanup records slots as acquired and attempts all of
+them even after an earlier failure: worker, coordinator, store, sensitive
+registration/channel, ordinary authority lease/channel, OpenFGA adapter,
+Gmail/OAuth streams/clients, token/DTO/body references, decision-record/bundle
+descriptors,
 and controlled buffers. Each bridge independently purges epoch-scoped
 registrations/listeners/queues and closes its sockets without exposing session
 state. Cleanup errors are aggregated only as content-free codes.
 
-Cancellation cannot discard cleanup. Each supervisor/service starts one owned
+Cancellation cannot discard cleanup. Each supervisor/process starts one owned
 cleanup task, shields and awaits it within a fixed bound, and proves each
 absence or closure visible to that identity. Failure or timeout leaves gateway
 publication empty or failed at a higher generation and service health
@@ -1224,60 +1376,63 @@ cancellation/control flow is recreated.
 
 ### Exact proposed file changes
 
-- `services/private_read/server.py`, `protocol.py`, and `schemas.py`: own the
-  separately launched private-service server, exact closed RPC framing, peer
-  authentication, proposal/grant consumption, content-free outcomes, worker,
-  and sensitive/approval orchestration.
-- `services/private_read/config.py` and `seals.py`: parse raw canonical
-  `config-v1.json` with duplicate rejection and verify its exact root/bundle/
-  file identities before object construction.
-- `services/private_read/gmail_provider.py`, `authorization_store.py`, and
-  `coordinator.py`: move all Gmail HTTP/MIME/OAuth, HMAC task state, descriptor
-  reconciliation, claim/send fences, and coordinator ordering behind the
-  private-service UID. No provider or store object exists in the gateway.
-- `services/private_read/openfga_proxy_client.py` and
-  `policy_manifest.py`: implement the peer-authenticated check-only protocol,
-  live model/standing-tuple reads, and signed canonical policy verification.
-- `services/openfga_check_proxy/`: provide the separately launched, closed
-  check/model/standing-tuple read proxy with no mutation surface.
+- `gateway/private_read_host/` code-owned modules: own generic proposal/grant
+  consumption, content-free outcomes, worker/coordinator ordering, exception
+  frames, and the concrete in-process composition. They are not a service
+  server and expose no arbitrary injection surface.
+- `gateway/private_read_host/config.py` and `seals.py`: parse the raw canonical
+  duplicate-rejecting decision record and verify its exact owner file, bundle,
+  and manifest identities before object construction.
+- `gateway/private_read_host/gmail_provider.py`, `oauth.py`, `mime.py`, and
+  `renderer.py`: implement generic Gmail HTTP/OAuth/MIME/privacy behavior,
+  deterministic output, and the private fake-transport test seam.
+- `gateway/private_read_host/authorization_store.py` and `coordinator.py`:
+  extend the generic store protocol for prepare, durable bind, send-start,
+  signed commit, reconciliation, restart recovery, claim fences, and HMACs.
+- `gateway/private_read_host/openfga_runtime.py` and `policy_manifest.py`:
+  implement the authenticated read-only adapter, exact live model/standing-
+  tuple reads, 12 checks, and signed canonical policy verification.
 - `scripts/whatsapp-bridge/approval_authority.mjs` plus its bridge wiring: add
-  the peer-authenticated private-service endpoint, prepare/commit/event lease,
-  exact successful voter-JID return, one-shot records, queue suppression, and
+  the dedicated capability-authenticated approval channel, prepare/commit/
+  event lease, exact successful voter-JID return, one-shot records, queue
+  suppression, and
   epoch purge. Ordinary gateway chat IPC stays separate.
-- `services/private_read/ordinary_approval_client.py`: implement the private
-  service's exact peer-credential, preparation-evidence, signed-commit, and
-  epoch-scoped event client for that Node authority.
+- `gateway/private_read_host/ordinary_approval.py`: implement exact channel-
+  capability verification, preparation evidence, signed commit, and epoch-
+  scoped event handling for the ordinary authority.
 - `scripts/whatsapp-sensitive-bridge/delivery_authority.mjs` plus its bridge
-  wiring: add the peer-authenticated private-plaintext delivery endpoint and
-  fixed terminal evidence response without any plaintext return.
-- `services/private_read/sensitive_delivery_client.py`: own the private
-  service's fixed plaintext-send request, exact sensitive peer/epoch checks,
-  and content-free terminal evidence validation.
-- `services/private_read_service_client.py`: provide the gateway's code-fixed
-  attesting client and closed content-free proposal/status RPC only.
+  wiring: add the capability-authenticated inherited private-plaintext channel
+  and fixed terminal evidence response without plaintext return.
+- `gateway/private_read_host/sensitive_delivery.py`: own the fixed plaintext-
+  send request, channel/epoch checks, and content-free terminal evidence.
 - `gateway/private_read_publication.py`: own the process-global synchronous
   `threading.RLock`, immutable `PrivateReadPublicationSnapshot`, monotonic
   availability generation, swap/unpublish, and sole authority read API.
 - `gateway/private_read_conversation_capability.py`: define and persist the
   immutable content-free session-generation capability and exact-current
-  equality/revocation rule.
+  equality/revocation rule, including Juno manifest identity.
+- `gateway/juno_capability_manifest.py`: canonicalize and attest the exact
+  profile, model, tool definitions/handlers/registries, plugin/hook/MCP lists,
+  HERMES_HOME generation, and strict absence allowlist at every required seam.
 - [`gateway/trusted_private_read_host.py`](../../gateway/trusted_private_read_host.py):
-  reduce production composition to the concrete built-in attested service
-  client; remove provider/store internals and arbitrary factories.
+  make `compose_trusted_private_read_services()` the concrete built-in in-
+  process composition; remove `None` and arbitrary factories.
 - [`gateway/run.py`](../../gateway/run.py): publish/unpublish only through the
   synchronous registry; migrate new-session persistence, rebuild, busy-
   principal, event-binding, shutdown, and diagnostics to one snapshot.
 - [`tools/private_read_request_tool.py`](../../tools/private_read_request_tool.py):
   keep one static service-gated, content-free registration and execute only the
-  session-bound RPC capability.
+  session-bound in-process terminal capability.
 - [`tools/registry.py`](../../tools/registry.py),
   [`model_tools.py`](../../model_tools.py), `agent/agent_init.py`, and
-  `agent/tool_executor.py`: add publication identity/state/schema digest to
-  definition caching and carry the session-bound capability through direct and
-  deferred Tool Search planning without runtime re-resolution.
-- `services/launch/` and three closed root-bundle manifests: verify exact
-  executable/argv/cwd/environment/descriptors/UID/GID/hash closures and clean
-  launch for private, ordinary, and sensitive services.
+  `agent/tool_executor.py`: add publication/Juno-manifest identity, state, and
+  schema digest to definition caching and carry the session-bound capability
+  through direct and deferred Tool Search planning without runtime
+  re-resolution.
+- `services/launch/` and three closed root-bundle manifests: implement the root
+  supervisor/socketpair capability bootstrap and verify exact executable/argv/
+  cwd/environment/descriptors/gateway-UID/hash closures for the dedicated Juno
+  gateway, ordinary bridge, and sensitive bridge.
 - `scripts/release/verify_juno_private_read.py`,
   `scripts/release/juno-private-read-release-v1.json`, and
   `scripts/release/validate_node_runtime_docs.py`: implement the closed release
@@ -1315,18 +1470,19 @@ smuggled into the Gmail activation gate.
 ## 11. Dedicated closed decision record
 
 There is exactly one deployment source for this feature: the versioned JSON
-decision record at the launcher-compiled absolute path
-`/Library/Application Support/Hermes/private-read/config-v1.json`. Main
+decision record named `config-v1.json` at a launcher-compiled absolute path in
+the canonical owner-only Juno private-read state directory. Main
 `config.yaml`, profile overlays, managed configuration, environment, CLI,
 plugins, and legacy `gateway.trusted_private_read` cannot redirect, populate,
 or override it.
 
-The file must be a bounded regular one-link non-symlink, owned by the exact
-private-service UID, mode `0600`, inside root-owned non-writable ancestry. Its
-device/inode, owner, mode, link count, byte length, SHA-256, and relative sealed
-file identities are bound by the private root manifest and deployment seal.
-The root launcher descriptor-opens and validates it before exec; the private
-service revalidates the passed descriptor and bytes before parsing.
+The file must be a bounded regular one-link non-symlink, owned by the gateway
+UID, mode `0600`, with root-owned ancestry and bundle-manifest binding where
+practical. Its device/inode, owner, mode, link count, byte length, SHA-256, and
+relative sealed file identities are bound by the gateway root manifest and
+deployment seal. The root launcher descriptor-opens and validates it before
+exec; the gateway private host revalidates the passed descriptor and bytes
+before parsing.
 
 Raw bytes are strict UTF-8 JSON. Parsing rejects a BOM, invalid UTF-8,
 duplicate keys at any depth, unknown/missing/wrongly typed keys, booleans used
@@ -1343,11 +1499,11 @@ The closed version-1 object contains only these groups:
 - `version` exactly `1` and required boolean `enabled`; engineering artifacts
   contain `false`, and only a separately approved deployment transaction may
   replace and reseal this same canonical record with `true`;
-- exact `service_identities` for gateway, ordinary bridge, private service,
-  sensitive bridge, OpenFGA runtime, and check-only proxy UIDs/GIDs, plus their
-  code-fixed socket identities and required peer matrix;
+- exact `process_identities` for the dedicated Juno gateway, ordinary bridge,
+  sensitive bridge, and OpenFGA runtime, including expected UID/GID values,
+  bundle/process/start/channel identities, and the required channel matrix;
 - exact `service_bundles` manifest version/digest/deployment generation for
-  private, ordinary, sensitive, OpenFGA runtime, and check proxy;
+  gateway, ordinary, sensitive, and OpenFGA runtime;
 - the closed eight-field `requester` descriptor from section 4;
 - exact `state_files` root-relative sealed identities for the private store,
   HMAC key, commit-signing key, policy manifest, Gmail OAuth client/token, and
@@ -1362,10 +1518,10 @@ The closed version-1 object contains only these groups:
 - `openfga` fixed to version 1.18.2 with exact store/model identities, model
   hash, signed policy-manifest identity/digest, policy version/digest,
   monotonic epoch, sorted standing-tuple hash/count, provisioner public-key ID,
-  read-only runtime generation, and check-proxy identity;
-- `ordinary_approval` with exact ordinary account/session/bundle/socket/
+  read-only runtime generation, and authenticated adapter identity;
+- `ordinary_approval` with exact ordinary account/session/bundle/channel/
   authority identities and owner DM destination binding;
-- `sensitive_delivery` with exact sensitive account/session/bundle/socket/
+- `sensitive_delivery` with exact sensitive account/session/bundle/channel/
   transport identity and destination/thread binding; and
 - `limits`, containing only integer milliseconds/byte/count values that can
   reduce, never enlarge, the code maxima in section 3. Decimal floating-point
@@ -1377,14 +1533,17 @@ Python paths, alternate authorities, arbitrary queries/fields/copy, or any
 extension object. File identities are only code-fixed-root-relative sealed
 names from a closed enum. Code fixes Gmail/OAuth authorities and selectors,
 OpenFGA loopback authority, relations, templates, bundle roots, executables,
-and RPC schemas.
+and closed in-process/channel schemas.
 
 Presence of any legacy private-read YAML/config key or environment variable is
 an activation failure with one fixed content-free migration code; it is never
-merged. The gateway sees only the authenticated content-free publication
-attestation over its code-fixed socket. It cannot open this record and does not
-receive private account, destination, policy, credential, session, or UID
-identities.
+merged. Only the reviewed gateway private host opens the record. Model-facing
+frames receive only the content-free publication and never account,
+destination, policy, credential, session, or key identities.
+
+A malicious same-UID process can technically read or alter owner files and is
+inside the accepted TCB. HMACs and seals are drift/corruption detection within
+that TCB, not same-UID adversary isolation.
 
 ## 12. Verification and implementation plan
 
@@ -1400,6 +1559,15 @@ deferred execution, whole-descriptor reconciliation matrix, and two unrelated
 synthetic provider adapters. They prove no Gmail branch enters generic
 authorization and no query/account plaintext enters model, schema, store,
 policy, audit, gateway IPC, or ordinary notifications.
+
+Dedicated-Juno tests prove the exact profile/HERMES_HOME generation and
+canonical `JunoCapabilityManifest` before client initialization and at every
+attestation seam. They exhaustively reject every forbidden terminal, file,
+code, browser, computer-use, messaging, memory, cron, delegation, skill,
+plugin, hook, MCP, discovery, profile-crossover, and arbitrary-backend route;
+extra/missing/replaced tools or handlers; schema/registry drift; and model or
+profile drift. They test the exact optional `web_search` predicate and the
+only-private-tool fallback.
 
 ### Gmail and OAuth boundary
 
@@ -1436,10 +1604,11 @@ exact destination status mapping, successful canonical owner voter-JID return,
 authority-only queue suppression, out-of-order evidence, every reconciliation
 state, epoch purge, retry/ambiguity/expiry, and pinned Node behavior. Root-
 bundle tests cover all three executable/closure/clean-launch contracts,
-identity separation, test-owner seams, and real deployment probes. Sensitive
-tests cover peer credentials, no-plaintext response, account/session
+application separation, inherited socketpair capability bootstrap, test-owner
+seams, and real deployment probes. Sensitive tests cover channel
+authentication, no-plaintext response, account/session
 separation, and exact ACK meanings. Lifecycle tests inject `BaseException`,
-cancellation, and service restarts at every construction, initialization,
+cancellation, and process restarts at every construction, initialization,
 lease, publication, read, send, unpublish, and cleanup slot. Relay tests prove
 Discord components are inert and Juno is independent.
 
@@ -1685,13 +1854,13 @@ selected by the runner.
 
 The release manifest defines these exact focused groups as closed arrays:
 
-- `provider_privacy`: `tests/services/private_read/test_gmail_provider.py`,
-  `tests/services/private_read/test_gmail_mime_privacy.py`, and
-  `tests/services/private_read/test_oauth_boundary.py`;
+- `provider_privacy`: `tests/gateway/private_read_host/test_gmail_provider.py`,
+  `tests/gateway/private_read_host/test_gmail_mime_privacy.py`, and
+  `tests/gateway/private_read_host/test_oauth_boundary.py`;
 - `authorization_store_notifications`:
   `tests/gateway/test_private_read_authorization.py`,
   `tests/gateway/test_authorization_task_store.py`, and
-  `tests/services/private_read/test_notification_protocol.py`;
+  `tests/gateway/private_read_host/test_notification_protocol.py`;
 - `publication_session_tool_search`:
   `tests/gateway/test_trusted_private_read_host.py`,
   `tests/gateway/test_trusted_private_read_event_scoping.py`,
@@ -1701,13 +1870,13 @@ The release manifest defines these exact focused groups as closed arrays:
   `tests/gateway/relay/test_relay_passthrough.py`,
   `tests/gateway/relay/test_relay_per_platform_caps.py`, and
   `tests/gateway/relay/test_ws_callback_dispatch.py`;
-- `config_installers`: `tests/services/private_read/test_config_v1.py`,
+- `config_installers`: `tests/gateway/private_read_host/test_config_v1.py`,
   `tests/services/test_root_bundle_launch.py`, and
   `tests/test_install_ps1_whatsapp_home_and_node_contract.py`;
 - `ordinary_bridge` and `sensitive_bridge`: the exact Node manifests above;
   and
 - `lifecycle`: `tests/gateway/test_lifecycle_ledger.py` and
-  `tests/services/private_read/test_isolated_service_lifecycle.py`.
+  `tests/gateway/private_read_host/test_process_lifecycle.py`.
 
 Each Python group runs as a separate exact
 `[revision_project_python, "-m", "pytest", "-q", *group_paths]` process;
@@ -1734,76 +1903,55 @@ files, model/session/memory, argv/environment, caches, and result objects.
 These approvals are separate, ordered, and non-transitive. Approval of one
 does not imply any later action:
 
-1. Product accepts the exact query `in:inbox`, stable label, six ordered fields,
-   requester scope, single-select approval poll, resolution templates, and
-   outcome copy.
-2. Land the separately reviewed implementation commit.
-3. Install the candidate default-off.
-4. Separately authorize creation of the conceptual ordinary, private-read,
-   sensitive, OpenFGA runtime, and check-only proxy non-login UIDs/GIDs and
-   their disjoint state roots. Review exact concrete names before creation.
-5. Separately install each root-owned private/ordinary/sensitive/OpenFGA/proxy
-   bundle and launch record, proving manifest closure, clean-launch context,
-   sandbox/resource limits, immutable ownership, rollback, and removal.
-6. Separately create the root-owned socket directories/endpoints and prove the
-   exact peer-credential matrix; no service starts yet.
-7. In one separately authorized, reversible transaction, verify and transfer
-   ownership/access of the complete ordinary session directory in place at
-   `/Users/james/.hermes/profiles/juno/whatsapp/session`; do not copy, trim, or
-   move it, and prove rollback before proceeding.
-8. Generate, review, install, and seal the default-off dedicated
-   `config-v1.json` and private HMAC/commit-signing material without publishing
-   the feature.
-9. Separately provision the offline-signed OpenFGA model and complete standing
-   tuple set with the writer authority while all runtime components are stopped,
-   then remove writer availability and seal the resulting manifest/epoch.
-10. Separately start and attest the read-only OpenFGA 1.18.2 runtime and
-    check-only proxy, proving the exact no-concurrent-writer generation.
-11. Create the dedicated Gmail Desktop OAuth client/token, satisfy current
-    restricted-scope policy, and prove the exact `gmail.readonly` grant only.
-12. Provision/pair sensitive WhatsApp by alphanumeric code only; QR is absent.
-13. Separately start and attest the ordinary bridge, proving its exact
-    UID/bundle/session/chat-versus-approval-socket/authority epoch.
-14. Separately start and attest the sensitive bridge, proving its exact
-    UID/bundle/session/delivery socket/transport epoch and separation from the
-    ordinary bridge.
-15. Separately replace and reseal the same canonical decision record with
-    `enabled=true`; this changes no gateway publication and starts no service.
-16. Separately start and attest the private service, proving its exact
-    UID/bundle/config/store/policy/credential and both peer leases with
-    content-free health before gateway access.
-17. Separately authorize the exact gateway client/publication launch change
-    and start or restart the gateway. This stage alone permits a new gateway
-    publication generation.
-18. Verify content-free private-service attestation and Juno-only tool
-    publication in a genuinely fresh conversation/session generation; old,
-    absent, evicted, and reconstructed generations remain unchanged.
-19. Separately authorize and send the exact non-private sensitive-delivery
-    canary, requiring fixed terminal destination evidence only.
-20. Use the first separately authorized live request as the ordinary approval
-    protocol canary. Archive content-free evidence for prepare, durable bind,
-    send-start, signed commit, exact custom poll ID, owner-DM destination
-    status, authority-only suppression, successful canonical owner voter-JID,
-    raw `Approve` identity, and decision CAS. There is no synthetic/text
-    fallback approval canary.
-21. Separately authorize the first private Gmail read and archive only its
-    content-free terminal and resolution-attempt evidence. Acceptance requires
-    `ordinary_destination_delivered` for the exact resolution; ambiguity is a
-    consumed failed canary and never retries the same message.
+1. Accept this ADR and land the separately reviewed implementation, including
+   the exact query, output, poll, risk acceptance, and default-off behavior.
+2. Install and approve the root-owned gateway, ordinary, and sensitive bundles
+   plus the clean supervisor/socketpair launch context, manifest closure,
+   resource limits, rollback, and removal. All run as the existing gateway UID;
+   no service UID is created and the ordinary session is only verified in
+   place, never copied or ownership-transferred.
+3. Approve and attest the exact Juno profile/HERMES_HOME generation and
+   `JunoCapabilityManifest`, including source/bundle, model, tool, handler,
+   registry, plugin, hook, MCP, schema, and profile-instruction identities.
+4. Generate, review, install, and seal the owner-only default-off private
+   decision record, HMAC/commit-signing keys, and authorization store without
+   publishing the feature.
+5. Provision the offline-signed OpenFGA model and complete standing tuples with
+   the separate root/offline writer while Juno publication and the runtime are
+   stopped; advance and seal the epoch; remove writer availability; then start
+   and attest exact OpenFGA 1.18.2 with the datastore-enforced read-only runtime
+   role and owner-file runtime credential.
+6. Create the dedicated Gmail Desktop OAuth client/token, satisfy the then-
+   current restricted-scope policy, and prove the exact `gmail.readonly` grant.
+7. Provision and pair sensitive WhatsApp by alphanumeric phone-link code only;
+   QR is absent.
+8. Separately start and attest the ordinary bridge and sensitive bridge,
+   proving their exact bundles, separate accounts/sessions/dependency graphs,
+   process/start/socket/connection/channel/authority epochs, ordinary chat-
+   versus-approval separation, and sensitive delivery separation.
+9. Install the candidate default-off. Separately approve enable/restart, fresh-
+   conversation publication, a fixed non-private sensitive-delivery canary, the
+   first live ordinary approval canary, and only then the first live read. The
+   approval canary archives content-free prepare, durable bind, send-start,
+   signed commit, exact custom poll ID, owner-DM destination status, authority-
+   only suppression, successful canonical owner voter JID, raw `Approve`
+   identity, and decision CAS. The first read archives only content-free
+   terminal and resolution-attempt evidence and requires exact
+   `ordinary_destination_delivered`; ambiguity is consumed and never retried.
 
-Rollback or failure leaves later stages unauthorized. Product approval does
-not land code; landing does not install; installation does not create UIDs,
-root bundles, sockets, or launch records; bundle installation does not mutate
-session ownership; ownership transfer does not authorize configuration,
-OpenFGA, OAuth, pairing, service start, gateway publication, a canary, or a
-read. Pairing does not connect or send. Enabling does not authorize a canary.
-A canary does not authorize Gmail. Only the final exact task-bound owner
-approval and policy checks authorize one read.
+Rollback or failure leaves every later stage unauthorized. ADR acceptance does
+not land code; landing does not install; installation does not change root
+bundles, launch records, socketpair context, configuration, keys, stores,
+OpenFGA, OAuth, sessions, pairing, connections, messages, or publication.
+Pairing does not connect or send. Enabling does not authorize a canary. A
+canary does not authorize Gmail. Only the final exact task-bound owner approval
+and policy checks authorize one read.
 
-Choosing this isolated architecture is engineering architecture only. This ADR
-and its engineering work authorize no root change, service identity, ownership
-or ACL mutation, session transfer, launchd change, service start, publication,
-credential creation, account access, or production operation.
+Choosing Option 2 is an architecture and risk decision only. This ADR and its
+engineering work authorize no root/bundle/config/key/store/OpenFGA/OAuth/
+session/pairing/connection/message/deployment change, no ownership or ACL
+mutation, no launchd change, no process start or restart, no publication, no
+credential creation, no account access, and no production operation.
 
 ## 14. Alternatives, non-goals, and acceptance
 
@@ -1812,27 +1960,36 @@ skill, browser, Google SDK discovery client, or CLI subprocess; IMAP/App
 Passwords; broader/modify/send scopes; model summarization/redaction; ordinary
 WhatsApp result delivery; HTML/attachments; multi-account selection; model-
 proposed query/message IDs; provider factories/import paths/commands/URLs; a
-gateway-owned private provider/store/credential path; shared service UID or
-Node dependency graph; main-YAML/legacy configuration; gateway-user-writable
+model-facing or arbitrarily injectable private provider/store/credential path;
+shared ordinary/sensitive Node dependency graph; main-YAML/legacy
+configuration; gateway-user-writable
 staging; `fexecve`/`execveat` on the stated macOS host; or making relay
 negotiation a Gmail dependency.
+
+Separate service UIDs or a sandboxed private service are the stronger
+confidentiality alternative. The owner chose Option 2 instead on 2026-08-05
+with the explicit residual-risk acceptance in section 3. Migrating later is a
+new architecture and deployment decision, not an implicit v1 requirement.
 
 Non-goals are mailbox browsing or summaries, thread search, pagination,
 history, settings, labels, contacts, background polling, watch/webhooks,
 indexing, replay, provider writes, Discord component rollout, physical
 byte erasure, native Windows support, and multi-account use.
 
-Implementation acceptance requires all specified product, privacy, UID/socket,
-OAuth, Gmail, signed-policy/proxy, approval, three-service bundle/launch,
+Implementation acceptance requires all specified product, privacy, process/
+channel, OAuth, Gmail, signed-policy/read-only-runtime, approval, three-process
+bundle/launch,
 lifecycle/epoch, conversation-cache, relay, type, Node, package,
 documentation, and regression evidence. It also requires separate security,
 product, gateway, policy, runtime, and release approval. This ADR claims none
 of those gates have passed.
 
-Unresolved deployment values include all concrete service UID/GID/launch
-labels, socket identities, OAuth/account/chat/session/store/model/policy
+Unresolved deployment values include the existing gateway UID/GID binding,
+concrete launch labels, socketpair/channel identities, OAuth/account/chat/
+session/store/model/policy
 identities, policy epoch, bundle and artifact digests, adapter/connection/
 authority generations, signing and provisioner key IDs, final seal, and exact
 launch profile evidence. Conceptual names in this ADR are not deployment
 values. Those values must be created and reviewed only at their explicit
-activation boundary and may never fall back to ambient state.
+activation boundary and may never fall back to ambient state. Separate service
+UIDs are neither unresolved nor selected for v1.
