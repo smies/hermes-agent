@@ -54,6 +54,24 @@ async function existingAccount(session, canonicalizeJid) {
   } catch { return null; }
 }
 
+async function sessionTopology(auth, canonicalizeJid, sock = {}) {
+  if (auth?.state?.creds?.registered !== true) return null;
+  const phone = canonicalAccount(auth.state.creds?.me?.id || '', canonicalizeJid);
+  if (!phone?.endsWith('@s.whatsapp.net')) return null;
+  const lid = await verifyLidBootstrap({ auth, sock, phoneJid: phone, canonicalizeJid });
+  if (!lid?.endsWith('@lid')) return null;
+  const storedLidValue = auth.state.creds?.me?.lid;
+  const storedLid = storedLidValue
+    ? canonicalAccount(storedLidValue, canonicalizeJid)
+    : null;
+  if (storedLidValue && storedLid !== lid) return null;
+  return Object.freeze({ phone, lid });
+}
+
+function sameTopology(left, right) {
+  return Boolean(left && right && left.phone === right.phone && left.lid === right.lid);
+}
+
 function validateCredentialFile(session) {
   const target = path.join(session, 'creds.json');
   const info = lstatSync(target);
@@ -366,21 +384,34 @@ export async function validateExistingOffline({
   useAuthState = useMultiFileAuthState,
   canonicalizeJid = jidNormalizedUser,
 }) {
-  await validateSessionDirectories(request, { create: false });
-  const selected = await useAuthState(request.session);
-  if (selected?.state?.creds?.registered !== true) return null;
-  const account = canonicalAccount(selected.state.creds?.me?.id || '', canonicalizeJid);
-  if (!account) return null;
-  const otherSession = request.role === 'ordinary' ? request.sensitiveSession : request.ordinarySession;
-  if (existsSync(path.join(otherSession, 'creds.json'))) validateAuthFiles(otherSession);
-  if (existsSync(path.join(request.session, 'creds.json'))) validateAuthFiles(request.session);
-  const otherAccount = await existingAccount(otherSession, canonicalizeJid);
-  if (otherAccount && otherAccount === account) return null;
-  const phoneJid = account.endsWith('@s.whatsapp.net') ? account : null;
-  if (!phoneJid) return null;
-  const lid = await verifyLidBootstrap({ auth: selected, sock: {}, phoneJid, canonicalizeJid });
-  if (!lid) return null;
-  return Object.freeze({ account_namespace: account.split('@')[1], lid_ready: true });
+  try {
+    await validateSessionDirectories(request, { create: false });
+    const selected = await useAuthState(request.session);
+    const selectedTopology = await sessionTopology(selected, canonicalizeJid);
+    if (!selectedTopology) return null;
+    const otherSession = request.role === 'ordinary'
+      ? request.sensitiveSession : request.ordinarySession;
+    const otherReady = existsSync(path.join(otherSession, 'creds.json'));
+    if (!otherReady) {
+      return request.role === 'ordinary'
+        ? Object.freeze({ account_namespace: 's.whatsapp.net', lid_ready: true })
+        : null;
+    }
+    validateAuthFiles(otherSession);
+    validateAuthFiles(request.session);
+    const other = await useAuthState(otherSession);
+    const otherTopology = await sessionTopology(other, canonicalizeJid);
+    if (!sameTopology(selectedTopology, otherTopology)) return null;
+    const artifactGuard = prepareSessionPaths(
+      request.sensitiveSession,
+      request.ordinarySession,
+      { requireDistinctCredentials: true },
+    );
+    artifactGuard.revalidate();
+    return Object.freeze({ account_namespace: 's.whatsapp.net', lid_ready: true });
+  } catch {
+    return null;
+  }
 }
 
 export async function provisionOffline({
@@ -493,8 +524,8 @@ export async function provisionOffline({
           if (!account || account !== phoneJid) return fail('account_binding_failed');
           const otherAccountAfterPairing = await existingAccount(otherSession, canonicalizeJid);
           if ((otherAccountBeforePairing && otherAccountAfterPairing !== otherAccountBeforePairing)
-              || (otherAccountAfterPairing && account === otherAccountAfterPairing)) {
-            return fail('account_separation_required');
+              || (otherAccountAfterPairing && account !== otherAccountAfterPairing)) {
+            return fail('session_process_isolation_required');
           }
           lid = await verifyLidBootstrap({ auth, sock, phoneJid, canonicalizeJid });
           if (!lid) return fail('lid_bootstrap_incomplete');
@@ -505,22 +536,54 @@ export async function provisionOffline({
             canonicalizeJid,
           });
           if (!persistedLid || persistedLid !== lid) return fail('lid_bootstrap_incomplete');
+          if (otherAccountAfterPairing) {
+            const otherAuth = await useAuthState(otherSession);
+            const otherTopology = await sessionTopology(otherAuth, canonicalizeJid);
+            if (!sameTopology({ phone: account, lid }, otherTopology)) {
+              return fail('account_topology_mismatch');
+            }
+          }
           await normalizeNewAuthTree(stage);
           validateAuthFiles(stage);
+          if (otherAccountAfterPairing) {
+            const stagedGuard = request.role === 'sensitive'
+              ? prepareSessionPaths(stage, otherSession, { requireDistinctCredentials: true })
+              : prepareSessionPaths(otherSession, stage, { requireDistinctCredentials: true });
+            stagedGuard.revalidate();
+          }
           // Re-read the other role immediately before commit while the
           // cross-role lock is still held.  A same-account race therefore has
           // exactly one possible winner.
           const otherAccountBeforeCommit = await existingAccount(otherSession, canonicalizeJid);
           if ((otherAccountAfterPairing && otherAccountBeforeCommit !== otherAccountAfterPairing)
-              || (otherAccountBeforeCommit && account === otherAccountBeforeCommit)) {
-            return fail('account_separation_required');
+              || (otherAccountBeforeCommit && account !== otherAccountBeforeCommit)) {
+            return fail('session_process_isolation_required');
           }
+          const confirmIsolation = async () => {
+            if (otherAccountBeforeCommit) {
+              const committedGuard = prepareSessionPaths(
+                request.sensitiveSession,
+                request.ordinarySession,
+                { requireDistinctCredentials: true },
+              );
+              committedGuard.revalidate();
+              const committed = await useAuthState(request.session);
+              const other = await useAuthState(otherSession);
+              if (!sameTopology(
+                await sessionTopology(committed, canonicalizeJid),
+                await sessionTopology(other, canonicalizeJid),
+              )) throw new Error('account_topology_mismatch');
+            }
+            if (typeof beforeDurableConfirmation === 'function') {
+              await beforeDurableConfirmation();
+            }
+          };
           await commitStagedSession(
             stage,
             request.session,
             ownerRoot,
             legacySeal,
-            beforeDurableConfirmation,
+            confirmIsolation,
             commitOps,
           );
           stage = null;

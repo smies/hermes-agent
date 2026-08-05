@@ -22,7 +22,8 @@ import {
 import { prepareSessionPaths } from './session_paths.js';
 
 const SENSITIVE_ACCOUNT = '15551234567@s.whatsapp.net';
-const ORDINARY_ACCOUNT = '15559876543@s.whatsapp.net';
+const ORDINARY_ACCOUNT = SENSITIVE_ACCOUNT;
+const DIFFERENT_ACCOUNT = '15559876543@s.whatsapp.net';
 const REAL_TMP = realpathSync.native(tmpdir());
 
 function fakeSocket() {
@@ -152,16 +153,40 @@ test('closed generation cannot reopen and duplicate close schedules one tracked 
   assert.equal(lifecycle.connectionEpoch, null);
 });
 
-test('same ordinary and sensitive account identities reject lifecycle construction', () => {
+test('different ordinary and sensitive account identities reject lifecycle construction', () => {
   const { sessionPathGuard } = freshSessionPaths();
   assert.throws(() => new SensitiveSocketLifecycle({
     sessionPathGuard,
     expectedSensitiveAccountJid: SENSITIVE_ACCOUNT,
-    ordinaryAccountJid: SENSITIVE_ACCOUNT,
+    ordinaryAccountJid: DIFFERENT_ACCOUNT,
     useAuthState: async () => ({ state: {}, saveCreds() {} }),
     makeSocket: () => fakeSocket(),
     canonicalizeJid: (jid) => jid.replace(/:\d+@/, '@'),
-  }), /separate sensitive account required/);
+  }), /same canonical account required/);
+});
+
+test('same canonical account with a distinct linked-device session binds', async () => {
+  const { sessionPathGuard } = freshSessionPaths();
+  const sock = fakeSocket();
+  const bound = [];
+  const lifecycle = new SensitiveSocketLifecycle({
+    sessionPathGuard,
+    expectedSensitiveAccountJid: SENSITIVE_ACCOUNT,
+    ordinaryAccountJid: SENSITIVE_ACCOUNT,
+    useAuthState: async () => ({
+      state: { creds: { me: { id: sock.user.id } } },
+      saveCreds() {},
+    }),
+    makeSocket: () => sock,
+    canonicalizeJid: (jid) => jid.replace(/:\d+@/, '@'),
+    onBound: value => bound.push(value),
+    epochFactory: generation => `same-account-epoch-${generation}`,
+  });
+  await lifecycle.start();
+  sock.ev.emit('connection.update', { connection: 'open' });
+  assert.equal(bound.length, 1);
+  assert.equal(bound[0].accountJid, SENSITIVE_ACCOUNT);
+  lifecycle.stop();
 });
 
 test('account identities in different provider namespaces reject as unverifiable', () => {
@@ -173,7 +198,7 @@ test('account identities in different provider namespaces reject as unverifiable
     useAuthState: async () => ({ state: {}, saveCreds() {} }),
     makeSocket: () => fakeSocket(),
     canonicalizeJid: (jid) => jid.replace(/:\d+@/, '@'),
-  }), /account identity namespace mismatch/);
+  }), /same canonical account required/);
 });
 
 test('loaded auth identity must match the expected sensitive account before socket creation', async () => {
@@ -185,7 +210,7 @@ test('loaded auth identity must match the expected sensitive account before sock
     expectedSensitiveAccountJid: SENSITIVE_ACCOUNT,
     ordinaryAccountJid: ORDINARY_ACCOUNT,
     useAuthState: async () => ({
-      state: { creds: { me: { id: `${ORDINARY_ACCOUNT.split('@')[0]}:4@s.whatsapp.net` } } },
+      state: { creds: { me: { id: `${DIFFERENT_ACCOUNT.split('@')[0]}:4@s.whatsapp.net` } } },
       saveCreds() {},
     }),
     makeSocket: () => { madeSocket = true; return fakeSocket(); },
@@ -211,7 +236,7 @@ test('loaded auth cannot hide the ordinary account behind a matching sensitive i
         creds: {
           me: {
             id: `${SENSITIVE_ACCOUNT.split('@')[0]}:4@s.whatsapp.net`,
-            lid: `${ORDINARY_ACCOUNT.split('@')[0]}:8@s.whatsapp.net`,
+            lid: `${DIFFERENT_ACCOUNT.split('@')[0]}:8@s.whatsapp.net`,
           },
         },
       },
@@ -230,7 +255,7 @@ test('loaded auth cannot hide the ordinary account behind a matching sensitive i
 test('live socket identity mismatch is fatal and never binds or reconnects', async () => {
   const { sessionPathGuard } = freshSessionPaths();
   const sock = fakeSocket();
-  sock.user.id = `${ORDINARY_ACCOUNT.split('@')[0]}:4@s.whatsapp.net`;
+  sock.user.id = `${DIFFERENT_ACCOUNT.split('@')[0]}:4@s.whatsapp.net`;
   const bound = [];
   const fatal = [];
   const timers = [];

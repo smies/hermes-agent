@@ -81,11 +81,8 @@ export class SensitiveSocketLifecycle {
     if (!this.expectedSensitiveAccountJid || !this.ordinaryAccountJid) {
       throw new TypeError('canonical sensitive and ordinary account identities are required');
     }
-    if (this.expectedSensitiveAccountJid === this.ordinaryAccountJid) {
-      throw new TypeError('separate sensitive account required');
-    }
-    if (this.expectedSensitiveAccountJid.split('@')[1] !== this.ordinaryAccountJid.split('@')[1]) {
-      throw new TypeError('account identity namespace mismatch');
+    if (this.expectedSensitiveAccountJid !== this.ordinaryAccountJid) {
+      throw new TypeError('same canonical account required');
     }
     this.onBound = typeof onBound === 'function' ? onBound : () => {};
     this.onUnbound = typeof onUnbound === 'function' ? onUnbound : () => {};
@@ -153,13 +150,10 @@ export class SensitiveSocketLifecycle {
       return;
     }
     if (!this.running || generation !== this.generation) return;
-    const storedAccounts = [
-      auth?.state?.creds?.me?.id,
-      auth?.state?.creds?.me?.lid,
-    ].map((value) => this.#canonicalAccount(value)).filter(Boolean);
-    if (storedAccounts.length > 0
-        && (!storedAccounts.includes(this.expectedSensitiveAccountJid)
-          || storedAccounts.includes(this.ordinaryAccountJid))) {
+    const storedPhone = this.#canonicalAccount(auth?.state?.creds?.me?.id);
+    const storedLid = this.#canonicalAccount(auth?.state?.creds?.me?.lid);
+    if ((storedPhone && storedPhone !== this.expectedSensitiveAccountJid)
+        || (auth?.state?.creds?.me?.lid && (!storedLid || !storedLid.endsWith('@lid')))) {
       this.#fatal('sensitive_account_mismatch');
       return;
     }
@@ -209,8 +203,7 @@ export class SensitiveSocketLifecycle {
       } catch {
         accountJid = '';
       }
-      if (!accountJid || accountJid !== this.expectedSensitiveAccountJid
-          || accountJid === this.ordinaryAccountJid) {
+      if (!accountJid || accountJid !== this.expectedSensitiveAccountJid) {
         this.#failRecord(record, 'sensitive_account_mismatch');
         return;
       }

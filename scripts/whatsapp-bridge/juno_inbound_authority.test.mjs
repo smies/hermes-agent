@@ -88,7 +88,81 @@ test('exact production registration extracts, gates, stamps socket, and queues',
   });
 });
 
-test('owner gate and provider message id are enforced by registered callback', async () => {
+test('all authenticated sender-companion upsert shapes are fenced before plaintext surfaces', async () => {
+  const sentinel = 'PRIVATE-SENDER-COMPANION-SENTINEL';
+  const shapes = [
+    { type: 'notify', requestId: undefined, label: 'live sender fan-out' },
+    { type: 'append', requestId: undefined, label: 'offline sender fan-out' },
+    { type: 'append', requestId: 'pdo-retry-1', label: 'phone retry/PDO append' },
+    { type: 'notify', requestId: 'provider-retry-2', label: 'retry notify' },
+  ];
+  for (const shape of shapes) {
+    const emittingSocket = socket();
+    const activeSocket = { current: emittingSocket };
+    const queue = [];
+    const debug = [];
+    let extractions = 0;
+    const store = createBoundedMessageStore();
+    registerInboundMessageHandler({
+      emittingSocket,
+      isActiveSocket: candidate => candidate === activeSocket.current,
+      emitDebugEvent: value => debug.push(value),
+      producerDependencies: {
+        mode: 'bot', dmPolicy: 'allowlist', forwardOwnerMessages: true,
+        recentlySentIds: new Set(), allowlistMatches: () => true,
+        extractEvent: async () => {
+          extractions += 1;
+          throw new Error(`extractor received ${sentinel}`);
+        },
+        cacheDirs: {}, replyPrefix: '', messageStore: store,
+        messageQueue: queue, maxQueueSize: 100,
+        debugEnabled: true,
+      },
+    });
+    const outcome = await emittingSocket.ev.emit('messages.upsert', {
+      type: shape.type,
+      ...(shape.requestId ? { requestId: shape.requestId } : {}),
+      messages: [message({
+        id: `SENDER-${shape.type}-${shape.requestId || 'direct'}`,
+        sender: '11111111111@s.whatsapp.net',
+        fromMe: true,
+        text: sentinel,
+      })],
+    });
+    assert.deepEqual(outcome, {
+      action: 'ignored', reason: 'sender_companion_fenced',
+    }, shape.label);
+    assert.equal(extractions, 0, shape.label);
+    assert.deepEqual(queue, [], shape.label);
+    assert.equal(store.get(`SENDER-${shape.type}-${shape.requestId || 'direct'}`), null, shape.label);
+    assert.equal(JSON.stringify(debug).includes(sentinel), false, shape.label);
+    assert.deepEqual(debug, [], shape.label);
+  }
+});
+
+test('concurrent ordinary inbound and sensitive sender echo cannot cross-suppress', async () => {
+  const emittingSocket = socket();
+  const activeSocket = { current: emittingSocket };
+  const { queue } = register({ emittingSocket, activeSocket });
+  const [ordinary, sensitive] = await Promise.all([
+    emittingSocket.ev.emit('messages.upsert', {
+      type: 'notify', messages: [message({ id: 'ORDINARY-CONCURRENT', fromMe: false })],
+    }),
+    emittingSocket.ev.emit('messages.upsert', {
+      type: 'notify', messages: [message({
+        id: 'SENSITIVE-CONCURRENT', fromMe: true,
+        text: 'PRIVATE-CONCURRENT-SENTINEL',
+      })],
+    }),
+  ]);
+  assert.equal(ordinary.action, 'queued');
+  assert.deepEqual(sensitive, {
+    action: 'ignored', reason: 'sender_companion_fenced',
+  });
+  assert.deepEqual(queue.map(item => item.messageId), ['ORDINARY-CONCURRENT']);
+});
+
+test('sender-companion events are fenced regardless of owner allowlist', async () => {
   const emittingSocket = socket();
   const activeSocket = { current: emittingSocket };
   const { queue } = register({ emittingSocket, activeSocket });
@@ -98,16 +172,15 @@ test('owner gate and provider message id are enforced by registered callback', a
       sender: '11111111111@s.whatsapp.net', fromMe: true,
     })],
   });
-  assert.equal(owner.action, 'queued');
-  assert.equal(queue[0].fromOwner, true);
+  assert.deepEqual(owner, { action: 'ignored', reason: 'sender_companion_fenced' });
   const rejected = await emittingSocket.ev.emit('messages.upsert', {
     type: 'notify', messages: [message({
       id: 'JUNO-OWNER-PROVIDER-MESSAGE-2',
       sender: '99999999999@s.whatsapp.net', fromMe: true,
     })],
   });
-  assert.equal(rejected.reason, 'drop_allowlist');
-  assert.equal(queue.length, 1);
+  assert.equal(rejected.reason, 'sender_companion_fenced');
+  assert.equal(queue.length, 0);
 });
 
 test('replaced socket generation rejects late old-socket upserts', async () => {

@@ -64,23 +64,6 @@ const WHATSAPP_DEBUG =
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
 
-// Opt-in: when true (and WHATSAPP_MODE === 'bot'), fromMe inbound messages
-// that are NOT echoes of our own /send or /send-media calls are forwarded
-// to the Python adapter with `fromOwner: true`. This lets plugins detect
-// "owner just typed in this customer chat" — needed for handover / sliding
-// TTL flows. Default OFF: existing deployments see no behavior change.
-//
-// Heuristic limitation: we distinguish bot-API-sent from owner-typed by
-// looking up `key.id` in `recentlySentIds` (populated when /send returns).
-// On bridge restart that set is empty, so a few in-flight bot replies may
-// briefly look like owner-typed until they age out. Acceptable; we don't
-// persist the set.
-const FORWARD_OWNER_MESSAGES =
-  typeof process !== 'undefined' &&
-  process.env &&
-  typeof process.env.WHATSAPP_FORWARD_OWNER_MESSAGES === 'string' &&
-  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_FORWARD_OWNER_MESSAGES.toLowerCase());
-
 const SEND_READ_RECEIPTS =
   typeof process !== 'undefined' &&
   process.env &&
@@ -275,13 +258,8 @@ const logger = pino({ level: 'warn' });
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 
-// Track recently sent message IDs.  Two purposes:
-//   1. Prevent echo-back loops with media in self-chat mode.
-//   2. (When WHATSAPP_FORWARD_OWNER_MESSAGES=true) distinguish our own
-//      bot-API outbound messages from owner-typed messages on the linked
-//      device so we can forward only the latter.
-// Capacity bounded (see outbound_ids.js) to keep memory flat under
-// sustained sending.
+// Track recently sent message IDs for poll-origin correlation. Capacity is
+// bounded (see outbound_ids.js) to keep memory flat under sustained sending.
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
@@ -420,8 +398,6 @@ export function registerProductionInboundMessageHandler({
     producerDependencies: {
       mode: WHATSAPP_MODE,
       dmPolicy: WHATSAPP_DM_POLICY,
-      forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
-      recentlySentIds,
       allowlistMatches: id => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
       extractEvent: extractBridgeEvent,
       downloadMedia: async mediaMsg => downloadMediaMessage(
@@ -433,7 +409,6 @@ export function registerProductionInboundMessageHandler({
         document: DOCUMENT_CACHE_DIR,
         audio: AUDIO_CACHE_DIR,
       },
-      replyPrefix: REPLY_PREFIX,
       messageStore,
       messageQueue,
       maxQueueSize: MAX_QUEUE_SIZE,
@@ -540,6 +515,7 @@ export async function startSocket(dependencies = PRODUCTION_SOCKET_DEPENDENCIES)
     fireInitQueries: false,
     shouldSyncHistoryMessage: () => false,
     markOnlineOnConnect: false,
+    emitOwnEvents: false,
     // Production never recovers offline payloads. Authentication and the
     // initial LID mapping are completed only by offline_provision.js.
     getMessage: async () => undefined,
@@ -1009,9 +985,6 @@ export function runBridge({ transportIdentity } = {}) {
       console.log(`🔒 No WHATSAPP_ALLOWED_USERS set — incoming messages are rejected.`);
       console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
       console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
-    }
-    if (WHATSAPP_MODE === 'bot' && FORWARD_OWNER_MESSAGES) {
-      console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
   scheduleReconnect(0);

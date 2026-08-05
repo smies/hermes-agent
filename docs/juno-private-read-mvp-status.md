@@ -10,7 +10,10 @@ existing authorization SQLite database for a short-lived one-shot request,
 intercepts exact `/approve <id>` and `/deny <id>` commands before ordinary
 gateway dispatch, performs one fresh OpenFGA check immediately before the
 Gmail read, renders the fixed six-field plaintext form, and submits it through
-the separate sensitive WhatsApp process. Model and ordinary surfaces receive
+the separate sensitive linked-device process. Juno keeps one public WhatsApp
+account, number, and visible identity. The ordinary and sensitive processes
+use independently paired credentials, auth roots, sockets, generations, and
+runtime capabilities for that same canonical account. Model and ordinary surfaces receive
 only fixed status text. A successful transport result is called `submitted`;
 it is not a delivery or read claim.
 
@@ -19,12 +22,25 @@ loopback authority, and exact `juno-sensitive-submit-v2` contract through its
 provider-authority and descriptor digests. Submission carries the request's
 microsecond deadline through the authenticated loopback body and rechecks it at
 the Python coroutine, HTTP issue, Node handler, delivery-core, and provider-send
-boundaries. Sensitive destinations are rejected when they resolve to the
-ordinary account, and version-2 hosting is unavailable in multiplexed gateway
-processes; it requires a dedicated non-multiplexed Juno runner.
+boundaries. Every private request is bound to the exact configured James 1:1
+destination; groups and alternate users are rejected. Version-2 hosting is
+unavailable in multiplexed gateway processes; it requires a dedicated
+non-multiplexed Juno runner.
+
+The enforceable guarantee is application containment: private Gmail plaintext
+must not reach the low-trust model, prompt/tool/session history, ordinary
+inbound queue, extractor, quote/sent index, mirrors, hooks, logs, standard
+output/error, audit/PDP/authorization data, retry/dead-letter storage, or
+ordinary delivery APIs. The ordinary production callback fences authenticated
+Baileys `key.fromMe` events before those surfaces. This is not an account-level
+plaintext boundary: sender-companion fan-out can expose plaintext to another
+linked Juno device and shared WhatsApp history, and the ordinary bridge may
+decrypt it in process memory before the callback fence. WhatsApp-account and
+same-UID/process-memory compromise remain outside the boundary.
 
 The implementation is deliberately smaller than the accepted high-assurance
-ADR. The ADR is unchanged and remains the hardening roadmap. In particular,
+ADR. This product decision revises the ADR's WhatsApp topology and threat
+boundary; the rest remains the hardening roadmap. In particular,
 this MVP does not implement native polls, signed prepare/commit evidence,
 destination ACK/READ/PLAYED proof, immutable publication generations, signed
 OpenFGA policy manifests, policy epoch attestation, two-stage checks, custom
@@ -39,9 +55,11 @@ are hygiene only; code running as the same macOS UID remains in the TCB.
 - Provision the OpenFGA 1.18.2 store/model/tuples and local API credential;
   review the exact `HIGHER_CONSISTENCY` check body. No live store is created by
   this change.
-- Pair and qualify the already-separate sensitive WhatsApp account/session,
-  supply its loopback capability, and verify it differs from the ordinary
-  account before connection. No auth state is read or mutated by this change.
+- Pair and qualify a second linked-device session for the same canonical Juno
+  account using pairing code only. Prove the two auth trees, credential sets,
+  device identities, processes, sockets, and generations are distinct, and
+  fail closed on unknown PN/LID topology or drift. No live auth state is read
+  or mutated by this change.
 - Create the owner-only Juno version-2 config and credential files, configure
   the dedicated `juno` profile/process, and run a supervised synthetic canary
   before any mailbox use.

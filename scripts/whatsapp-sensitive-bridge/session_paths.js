@@ -6,8 +6,11 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readFileSync,
+  readdirSync,
   realpathSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 const DIRECTORY_MODE = 0o700;
@@ -29,6 +32,123 @@ function reject(code) {
 
 function identityOf(stat) {
   return Object.freeze({ dev: stat.dev, ino: stat.ino });
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => [key, stableValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+function deviceIdentityDigest(creds) {
+  if (!creds || Object.getPrototypeOf(creds) !== Object.prototype) {
+    reject('credential_identity_invalid');
+  }
+  const required = [
+    'registrationId', 'noiseKey', 'signedIdentityKey', 'advSecretKey',
+  ];
+  if (required.some(name => creds[name] === undefined || creds[name] === null)) {
+    reject('credential_identity_invalid');
+  }
+  return sha256(JSON.stringify(stableValue(Object.fromEntries(
+    required.map(name => [name, creds[name]]),
+  ))));
+}
+
+function accountTopology(creds) {
+  const canonical = (value, namespace) => {
+    if (typeof value !== 'string') return null;
+    const normalized = value.replace(/:\d+@/, '@');
+    return new RegExp(`^\\d{1,32}@${namespace}$`).test(normalized) ? normalized : null;
+  };
+  const phone = canonical(creds?.me?.id, 's\\.whatsapp\\.net');
+  const lid = canonical(creds?.me?.lid, 'lid');
+  if (creds?.registered !== true || !phone || !lid) {
+    reject('credential_account_topology_invalid');
+  }
+  return Object.freeze({ phone, lid });
+}
+
+function sameAccountTopology(left, right) {
+  return left.phone === right.phone && left.lid === right.lid;
+}
+
+function captureAuthArtifacts(root, uid) {
+  const entries = [];
+  const identities = new Set();
+  let credsSeal = null;
+  let deviceDigest = null;
+  let topology = null;
+  const walk = (directory, relative = '') => {
+    for (const name of readdirSync(directory).sort()) {
+      const childRelative = relative ? path.posix.join(relative, name) : name;
+      const child = path.join(root, ...childRelative.split('/'));
+      const info = lstatSync(child, { bigint: true });
+      if (info.isSymbolicLink()) reject('auth_tree_symlink_rejected');
+      if (uid !== null && Number(info.uid) !== uid) reject('auth_tree_owner_rejected');
+      if (info.isDirectory()) {
+        if ((Number(info.mode) & PERMISSION_BITS) !== DIRECTORY_MODE) {
+          reject('auth_directory_permissions_rejected');
+        }
+        walk(child, childRelative);
+        continue;
+      }
+      if (!info.isFile() || !name.endsWith('.json')) reject('auth_tree_entry_rejected');
+      if (Number(info.nlink) !== 1) reject('auth_file_hardlink_rejected');
+      if ((Number(info.mode) & PERMISSION_BITS) !== 0o600) {
+        reject('auth_file_permissions_rejected');
+      }
+      if (realpathSync.native(child) !== child) reject('auth_tree_non_canonical');
+      const identity = `${info.dev}:${info.ino}`;
+      if (identities.has(identity)) reject('auth_file_inode_alias_rejected');
+      identities.add(identity);
+      const bytes = readFileSync(child);
+      entries.push([childRelative, sha256(bytes)]);
+      if (childRelative === 'creds.json') {
+        let creds;
+        try { creds = JSON.parse(bytes.toString('utf8')); } catch { reject('credential_identity_invalid'); }
+        deviceDigest = deviceIdentityDigest(creds);
+        topology = accountTopology(creds);
+        credsSeal = Object.freeze({
+          dev: info.dev,
+          ino: info.ino,
+          mode: Number(info.mode) & PERMISSION_BITS,
+        });
+      }
+    }
+  };
+  walk(root);
+  if (!credsSeal || !deviceDigest || !topology) reject('credential_identity_invalid');
+  return Object.freeze({
+    treeDigest: sha256(JSON.stringify(entries)),
+    deviceDigest,
+    topology,
+    credsSeal,
+    identities,
+  });
+}
+
+function assertDistinctAuthArtifacts(sensitive, ordinary) {
+  if (!sameAccountTopology(sensitive.topology, ordinary.topology)) {
+    reject('session_account_topology_mismatch');
+  }
+  for (const identity of sensitive.identities) {
+    if (ordinary.identities.has(identity)) reject('auth_file_inode_alias_rejected');
+  }
+  if (sensitive.treeDigest === ordinary.treeDigest) reject('copied_session_credentials');
+  if (sensitive.deviceDigest === ordinary.deviceDigest) reject('linked_device_identity_reused');
+}
+
+function sameCredentialSeal(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
 }
 
 export function sameFilesystemIdentity(left, right) {
@@ -253,10 +373,13 @@ export class SessionPathGuard {
 
   #uid;
 
-  constructor(sensitiveSnapshot, ordinarySnapshot, uid) {
+  #credentialSnapshots;
+
+  constructor(sensitiveSnapshot, ordinarySnapshot, uid, credentialSnapshots = null) {
     this.#sensitiveSnapshot = sensitiveSnapshot;
     this.#ordinarySnapshot = ordinarySnapshot;
     this.#uid = uid;
+    this.#credentialSnapshots = credentialSnapshots;
     this.sensitiveDir = sensitiveSnapshot.absolutePath;
     this.ordinaryDir = ordinarySnapshot.absolutePath;
     Object.freeze(this);
@@ -272,11 +395,28 @@ export class SessionPathGuard {
     );
     assertSameSnapshot(this.#ordinarySnapshot, ordinary, 'ordinary_session_path_identity_changed');
     assertSeparated(sensitive, ordinary);
+    if (this.#credentialSnapshots) {
+      const sensitiveArtifacts = captureAuthArtifacts(this.sensitiveDir, this.#uid);
+      const ordinaryArtifacts = captureAuthArtifacts(this.ordinaryDir, this.#uid);
+      const expected = this.#credentialSnapshots;
+      if (!sameCredentialSeal(expected.sensitive.credsSeal, sensitiveArtifacts.credsSeal)
+          || !sameCredentialSeal(expected.ordinary.credsSeal, ordinaryArtifacts.credsSeal)
+          || expected.sensitive.deviceDigest !== sensitiveArtifacts.deviceDigest
+          || expected.ordinary.deviceDigest !== ordinaryArtifacts.deviceDigest) {
+        reject('session_credentials_changed');
+      }
+      if (!sameAccountTopology(expected.sensitive.topology, sensitiveArtifacts.topology)
+          || !sameAccountTopology(expected.ordinary.topology, ordinaryArtifacts.topology)) {
+        reject('session_account_topology_changed');
+      }
+      assertDistinctAuthArtifacts(sensitiveArtifacts, ordinaryArtifacts);
+    }
   }
 }
 
 export function prepareSessionPaths(sensitiveDir, ordinaryDir, {
   uid = typeof process.getuid === 'function' ? process.getuid() : null,
+  requireDistinctCredentials = false,
 } = {}) {
   assertCanonicalAbsolute(sensitiveDir, 'canonical_absolute_sensitive_session_path_required');
   assertCanonicalAbsolute(ordinaryDir, 'canonical_absolute_ordinary_session_path_required');
@@ -310,5 +450,17 @@ export function prepareSessionPaths(sensitiveDir, ordinaryDir, {
   assertSameSnapshot(sensitive, sensitiveStable, 'sensitive_session_path_identity_changed');
   assertSameSnapshot(ordinaryAfterCreation, ordinaryStable, 'ordinary_session_path_identity_changed');
   assertSeparated(sensitiveStable, ordinaryStable);
-  return new SessionPathGuard(sensitiveStable, ordinaryStable, uid);
+  let credentialSnapshots = null;
+  if (requireDistinctCredentials) {
+    const sensitiveArtifacts = captureAuthArtifacts(sensitiveDir, uid);
+    const ordinaryArtifacts = captureAuthArtifacts(ordinaryDir, uid);
+    assertDistinctAuthArtifacts(sensitiveArtifacts, ordinaryArtifacts);
+    credentialSnapshots = Object.freeze({
+      sensitive: sensitiveArtifacts,
+      ordinary: ordinaryArtifacts,
+    });
+  }
+  return new SessionPathGuard(
+    sensitiveStable, ordinaryStable, uid, credentialSnapshots,
+  );
 }

@@ -181,13 +181,66 @@ test('authenticated legacy and alternate routes are unpublished and never dispat
     'content-type': 'application/json',
     'content-length': String(Buffer.byteLength(body)),
   };
-  for (const path of ['/v1/send', '/send', '/v1/deliver', '/v1/submit/']) {
+  for (const path of [
+    '/v1/send', '/send', '/v1/deliver', '/v1/submit/',
+    '/messages', '/v1/messages', '/model', '/v1/model', '/inbound',
+  ]) {
     const result = await invoke(handler, { path, headers, chunks: [body] });
     assert.equal(result.status, 404, path);
     assert.equal(result.body.includes('PRIVATE-LEGACY-ROUTE'), false, path);
   }
   assert.equal(submits, 0);
   assert.equal(legacySends, 0);
+});
+
+test('identity preflight is an expiring operation on exact POST /v1/submit only', async () => {
+  const now = 1_785_846_896_000_000;
+  let observations = 0;
+  const handler = createSensitiveHttpHandler({
+    capability: CAPABILITY,
+    nowUs: () => now,
+    transport: {
+      identityEvidence(request) {
+        observations += 1;
+        assert.equal(request.operation, 'observe_identity');
+        return {
+          outcome: 'available', submitted: false,
+          provider_account_jid: request.account,
+          identity_observed_us: now,
+          adapter_runtime_id: 'runtime-identity-only',
+          connection_epoch: 'epoch-identity-only',
+          transport_identity: { manifest_sha256: 'a'.repeat(64) },
+        };
+      },
+      async submit() { assert.fail('identity preflight must not dispatch plaintext submit'); },
+    },
+  });
+  const get = await invoke(handler, {
+    method: 'GET', path: '/v1/identity',
+    headers: { host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY },
+  });
+  assert.equal(get.status, 404);
+
+  const body = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    operation: 'observe_identity',
+    request_id: 'request-identity-preflight',
+    account: '15551234567@s.whatsapp.net',
+    destination: '15557654321@s.whatsapp.net',
+    expires_at_us: now + 5_000_000,
+  });
+  const result = await invoke(handler, {
+    method: 'POST', path: '/v1/submit',
+    headers: {
+      host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY,
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(body)),
+    },
+    chunks: [body],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(JSON.parse(result.body).adapter_runtime_id, 'runtime-identity-only');
+  assert.equal(observations, 1);
 });
 
 test('MVP handler rejects exact expiry immediately before delivery dispatch', async () => {
@@ -228,7 +281,7 @@ test('real HTTP handler calls real MVP transport with live identity and fake soc
   const ev = new EventEmitter();
   const sends = [];
   const account = '15551234567@s.whatsapp.net';
-  const ordinary = '15559876543@s.whatsapp.net';
+  const ordinary = account;
   const destination = '15557654321@s.whatsapp.net';
   const runtime = 'runtime-live-synthetic';
   const epoch = 'epoch-live-synthetic';
@@ -249,9 +302,22 @@ test('real HTTP handler calls real MVP transport with live identity and fake soc
   transport.bindConnection({ sock, accountJid: account, epoch });
   const handler = createSensitiveHttpHandler({ capability: CAPABILITY, transport });
 
+  const identityRequest = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    operation: 'observe_identity',
+    request_id: 'request-http-vertical',
+    account,
+    destination,
+    expires_at_us: Date.now() * 1000 + 60_000_000,
+  });
   const identity = await invoke(handler, {
-    method: 'GET', path: '/v1/identity',
-    headers: { host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY },
+    method: 'POST', path: '/v1/submit',
+    headers: {
+      host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY,
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(identityRequest)),
+    },
+    chunks: [identityRequest],
   });
   const evidence = JSON.parse(identity.body);
   assert.equal(evidence.adapter_runtime_id, runtime);

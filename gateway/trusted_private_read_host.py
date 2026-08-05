@@ -50,7 +50,7 @@ from tools.private_read_request_tool import configure_private_read_request_runti
 
 
 SENSITIVE_VERIFIED_LAUNCHER_SHA256 = (
-    "edf824421c02f2b8bfd2495b76fe63a94b8b48cf739c37524b85d724c82baff9"
+    "74e08819dd9be987acdb9ff1512ae572c78b97e104b920efb4f1e3a05de75b7a"
 )
 SENSITIVE_RUNTIME_LAUNCHER_PATH = (
     Path(__file__).absolute().parent.parent
@@ -500,7 +500,7 @@ class TrustedPrivateReadGatewayHost:
                 and type(sensitive) is str
                 and ordinary
                 and sensitive
-                and not hmac.compare_digest(ordinary, sensitive)
+                and hmac.compare_digest(ordinary, sensitive)
                 and type(namespace) is str
                 and namespace
                 and ordinary.endswith("@" + namespace)
@@ -907,7 +907,7 @@ def compose_trusted_private_read_services(
     """Gateway-owned production composition boundary.
 
     The WIP accepted an arbitrary import path whose factory could self-assert
-    requester identity, policy evidence, account separation, and delivery
+    requester identity, policy evidence, session/process isolation, and delivery
     authority. That is not a trustworthy composition mechanism. Version 2
     resolves only to the built-in Juno MVP adapters below; the version-1
     high-assurance design remains dormant for future hardening. Configuration

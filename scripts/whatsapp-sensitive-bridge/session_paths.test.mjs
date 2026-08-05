@@ -59,6 +59,41 @@ function treeSnapshot(root, relative = '') {
   return { metadata, contents: readFileSync(current) };
 }
 
+function deviceCredentials(label, extra = {}) {
+  const bytes = value => ({ type: 'Buffer', data: [value, value + 1, value + 2] });
+  return {
+    registered: true,
+    me: { id: '15551234567:4@s.whatsapp.net', lid: '90909090909:7@lid' },
+    registrationId: 1000 + label,
+    noiseKey: { private: bytes(label), public: bytes(label + 3) },
+    signedIdentityKey: { private: bytes(label + 6), public: bytes(label + 9) },
+    signedPreKey: {
+      keyPair: { private: bytes(label + 12), public: bytes(label + 15) },
+      signature: bytes(label + 18), keyId: label,
+    },
+    advSecretKey: `synthetic-device-secret-${label}`,
+    ...extra,
+  };
+}
+
+function credentialSessions({ copied = false, reusedDevice = false } = {}) {
+  const root = freshRoot();
+  const sensitive = path.join(root, 'sensitive');
+  const ordinary = path.join(root, 'ordinary');
+  mkdirSync(sensitive, { mode: 0o700 });
+  mkdirSync(ordinary, { mode: 0o700 });
+  const ordinaryCreds = deviceCredentials(11);
+  const sensitiveCreds = copied
+    ? ordinaryCreds
+    : reusedDevice ? deviceCredentials(11, { independentMarker: true }) : deviceCredentials(47);
+  for (const [directory, creds] of [[ordinary, ordinaryCreds], [sensitive, sensitiveCreds]]) {
+    const target = path.join(directory, 'creds.json');
+    writeFileSync(target, JSON.stringify(creds), { mode: 0o600 });
+    chmodSync(target, 0o600);
+  }
+  return { root, sensitive, ordinary };
+}
+
 test('accepts separate owner-only real directories without modifying ordinary auth contents', () => {
   const root = freshRoot();
   const sensitive = path.join(root, 'sensitive');
@@ -78,6 +113,74 @@ test('accepts separate owner-only real directories without modifying ordinary au
   assert.equal(ordinaryAfter.dev, ordinaryBefore.dev);
   assert.equal(ordinaryAfter.ino, ordinaryBefore.ino);
   assert.equal(Number(ordinaryAfter.mode) & 0o7777, 0o755);
+});
+
+test('production guard accepts same-account sessions only when credential and device artifacts differ', () => {
+  const { sensitive, ordinary } = credentialSessions();
+  const guard = prepareSessionPaths(sensitive, ordinary, {
+    requireDistinctCredentials: true,
+  });
+  guard.revalidate();
+});
+
+test('production guard rejects copied credential trees and reused device identities', () => {
+  for (const [fixture, code] of [
+    [credentialSessions({ copied: true }), 'copied_session_credentials'],
+    [credentialSessions({ reusedDevice: true }), 'linked_device_identity_reused'],
+  ]) {
+    expectPathRejection(
+      () => prepareSessionPaths(fixture.sensitive, fixture.ordinary, {
+        requireDistinctCredentials: true,
+      }),
+      code,
+    );
+  }
+});
+
+test('production guard rejects cross-root credential hardlinks before activation', (t) => {
+  const { sensitive, ordinary } = credentialSessions();
+  const sensitiveCreds = path.join(sensitive, 'creds.json');
+  const displaced = path.join(sensitive, 'displaced.json');
+  try {
+    linkSync(path.join(ordinary, 'creds.json'), displaced);
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOTSUP'].includes(error?.code)) {
+      t.diagnostic(`file hard-link alias is not constructible: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  expectPathRejection(
+    () => prepareSessionPaths(sensitive, ordinary, {
+      requireDistinctCredentials: true,
+    }),
+    'auth_file_hardlink_rejected',
+  );
+  assert.equal(readFileSync(sensitiveCreds, 'utf8').includes('synthetic-device-secret-47'), true);
+});
+
+test('production guard fails closed on post-activation credential drift', () => {
+  const { sensitive, ordinary } = credentialSessions();
+  const guard = prepareSessionPaths(sensitive, ordinary, {
+    requireDistinctCredentials: true,
+  });
+  writeFileSync(path.join(sensitive, 'creds.json'), JSON.stringify(deviceCredentials(88)));
+  chmodSync(path.join(sensitive, 'creds.json'), 0o600);
+  expectPathRejection(() => guard.revalidate(), 'session_credentials_changed');
+});
+
+test('production guard fails closed on post-activation PN/LID topology drift', () => {
+  const { sensitive, ordinary } = credentialSessions();
+  const guard = prepareSessionPaths(sensitive, ordinary, {
+    requireDistinctCredentials: true,
+  });
+  const target = path.join(sensitive, 'creds.json');
+  const creds = JSON.parse(readFileSync(target, 'utf8'));
+  creds.me.lid = '80808080808:7@lid';
+  writeFileSync(target, JSON.stringify(creds), { mode: 0o600 });
+  chmodSync(target, 0o600);
+
+  expectPathRejection(() => guard.revalidate(), 'session_account_topology_changed');
 });
 
 test('rejects sensitive-to-ordinary and ordinary-to-sensitive symbolic-link aliases', () => {

@@ -32,9 +32,10 @@ claim.
 
 A future concrete composition must derive immutable requester context from the
 exact authenticated inbound `MessageEvent`, perform two uncached checks using
-the `HIGHER_CONSISTENCY` request preference, monitor distinct live ordinary and
-sensitive accounts in one provider namespace, and supply the exact allowlisted
-sensitive transport only after durable claim. Provider credentials and
+the `HIGHER_CONSISTENCY` request preference, monitor two distinct linked-device
+sessions whose live provider-canonical account identities match, and supply the
+exact allowlisted sensitive transport only after durable claim. Unknown,
+mismatched, or drifting PN/LID/device topology fails closed. Provider credentials and
 connection details belong in owner-only host-managed files or inherited
 descriptors, never in `config.yaml`.
 
@@ -55,3 +56,10 @@ and reuses a ready session before requesting a phone-number pairing code. Use
 `--validate-only` for non-sensitive machine-readable readiness and
 `--reprovision` only for an intentional replacement. Production sockets cannot
 request a pairing code, and there is no QR fallback.
+
+Both linked-device sessions intentionally authenticate the same public Juno
+account. Their auth roots, device credentials, processes, sockets, generations,
+and capabilities remain separate. This reduces application capability and
+process coupling; it does not prevent sender-companion plaintext fan-out into
+WhatsApp account history or another linked device, and it provides no boundary
+against WhatsApp-account or same-UID/process-memory compromise.

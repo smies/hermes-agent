@@ -3016,7 +3016,7 @@ async def test_synthetic_authenticated_private_read_e2e_never_persists_plaintext
         close=close_services,
         transport_identity=lambda: dict(config.transport_identity),
         account_state=lambda: (
-            "ordinary-account@example.test",
+            ACCOUNT,
             ACCOUNT,
             "example.test",
             True,

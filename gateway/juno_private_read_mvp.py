@@ -52,9 +52,9 @@ SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
 SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
 ORDINARY_INBOUND_PROVENANCE = "messages.upsert:registered-emitting-socket:v1"
 _SENSITIVE_TRANSPORT_IDENTITY = {
-    "manifest_sha256": "1d6430d23923e9b962c81312afca2f1283562bdb0f05021730e8b050191cd7e9",
-    "launcher_sha256": "edf824421c02f2b8bfd2495b76fe63a94b8b48cf739c37524b85d724c82baff9",
-    "source_sha256": "2b85a5d0fde2333c318e2474134b6a43236b2de0c717991cca4208012d3126da",
+    "manifest_sha256": "4e63abb3b8081ee011f8be1d266bd1866f5a829c2ae3372920e1736dd8568b30",
+    "launcher_sha256": "74e08819dd9be987acdb9ff1512ae572c78b97e104b920efb4f1e3a05de75b7a",
+    "source_sha256": "774d8d1b556c3c21f525c6072d95d72d7af0f66334cc0d290074b35819c302eb",
     "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
     "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
     "verifier_sha256": "b2f77c04853eead92cfbc2614bb2ed474db714d04a73dd16b0f7013cfca431a5",
@@ -269,9 +269,22 @@ class JunoPrivateReadMvpConfig:
         owner = _jid(ordinary["owner_sender"], "owner sender")
         if owner not in seen:
             raise JunoPrivateReadError("owner must be an allowlisted requester")
+        owner_destination = next(
+            item.sensitive_destination for item in requesters
+            if hmac.compare_digest(item.sender, owner)
+        )
+        if any(
+            not hmac.compare_digest(item.sensitive_destination, owner_destination)
+            for item in requesters
+        ):
+            raise JunoPrivateReadError(
+                "all private delivery must use the owner destination"
+            )
         sensitive_account = _jid(sensitive["account"], "sensitive account")
-        if ordinary_aliases & _direct_identity_aliases(sensitive_account):
-            raise JunoPrivateReadError("ordinary and sensitive accounts must differ")
+        if not hmac.compare_digest(ordinary_account, sensitive_account):
+            raise JunoPrivateReadError(
+                "ordinary and sensitive sessions must use the same account"
+            )
         state_dir = _owner_directory(Path(_text(raw["state_dir"], "state directory", 2048)))
         credential = _owner_file(
             Path(_text(openfga["api_credential_file"], "OpenFGA credential", 2048))
@@ -1783,7 +1796,6 @@ class JunoPrivateReadMvpHost:
             type(identity) is SensitiveRuntimeIdentity
             and identity.account == request.destination_account
             and identity.account == self.config.sensitive_account
-            and identity.account != self.config.ordinary_account
             and type(identity.observed_at_us) is int
             and now_us - SENSITIVE_IDENTITY_MAX_AGE_US <= identity.observed_at_us
             and identity.observed_at_us <= now_us + SENSITIVE_IDENTITY_FUTURE_SKEW_US
@@ -1884,9 +1896,16 @@ async def _sealed_sensitive_identity(
         if capability is None:
             return None
         response = await transport.request(
-            method="GET", authority=SENSITIVE_AUTHORITY, path="/v1/identity",
+            method="POST", authority=SENSITIVE_AUTHORITY, path="/v1/submit",
             query=(), headers={"x-hermes-sensitive-capability": capability,
-                               "accept": "application/json"}, body=None,
+                               "content-type": "application/json",
+                               "accept": "application/json"},
+            body={"contract_version": SENSITIVE_SUBMIT_CONTRACT_VERSION,
+                  "operation": "observe_identity",
+                  "request_id": request.request_id,
+                  "account": request.destination_account,
+                  "destination": request.destination_chat,
+                  "expires_at_us": request.expires_at_us},
             timeout=config.request_timeout, max_bytes=4096,
         )
         required = {
@@ -1901,7 +1920,6 @@ async def _sealed_sensitive_identity(
             response["outcome"] != "available"
             or response["submitted"] is not False
             or response["provider_account_jid"] != request.destination_account
-            or response["provider_account_jid"] == config.ordinary_account
             or type(observed_at_us) is not int
             or observed_at_us < requested_at_us - SENSITIVE_IDENTITY_FUTURE_SKEW_US
             or observed_at_us > completed_at_us + SENSITIVE_IDENTITY_FUTURE_SKEW_US

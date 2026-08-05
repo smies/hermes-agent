@@ -226,16 +226,22 @@ gateway macOS UID:
 2. one **ordinary Juno WhatsApp bridge process** owns and reuses the complete
    ordinary Baileys session in place and handles ordinary chat plus the
    authority-only approval protocol; and
-3. one **sensitive WhatsApp bridge process** owns the separately provisioned
-   sensitive account/session/socket/dependency graph and receives private
-   plaintext only through the dedicated sensitive-delivery protocol.
+3. one **sensitive WhatsApp bridge process** owns a separately provisioned
+   linked-device session/socket/dependency graph for the same public Juno
+   account and receives private plaintext only through the dedicated
+   sensitive-delivery protocol.
 
-Ordinary and sensitive identities are distinct and immutable. Their processes,
-sessions, authentication directories, sockets, IPC namespaces, queues, package
-roots, dependency graphs, manifests, and launch records remain separate; the
-two bundles never import or resolve one another. Sharing a UID does not collapse
-those application boundaries, but this ADR does not claim they provide OS
-confidentiality isolation.
+The provider-canonical ordinary and sensitive account identities must match:
+Juno remains one WhatsApp account, number, and visible user/group identity.
+Their linked-device credentials, processes, sessions, authentication
+directories, sockets and generations, IPC namespaces, queues, package roots,
+dependency graphs, manifests, launch records, and runtime capabilities are
+distinct and immutable; the two bundles never import or resolve one another.
+Equality, nesting, symlink/hardlink/inode aliasing, copied credentials or stable
+device identity, incomplete PN/LID mapping, unknown topology, and topology or
+path drift fail closed before activation. Sharing an account or UID does not
+erase the application capability boundary, but this ADR does not claim OS or
+account-level confidentiality isolation.
 
 The existing complete ordinary authorization directory
 `/Users/james/.hermes/profiles/juno/whatsapp/session` remains owner-only and is
@@ -244,6 +250,31 @@ ACL-changed, or reduced to `creds.json`. No new service UID or session ownership
 migration is part of Option 2. The sensitive session remains separate and
 pairing-gated; pairing uses an alphanumeric phone-link code only and never a QR
 code.
+
+Pinned Baileys `7.0.0-rc14` authenticates sender-device provenance as
+`message.key.fromMe` after decryption. Sender-companion messages can arrive in
+`messages.upsert` as live `notify`, offline/own-event `append`, notification
+`append`, and retry or peer-data-order derived `append` records. Direct history
+sync is a separate `messaging-history.set` event and is disabled for these
+sockets. The ordinary bridge therefore rejects every active-generation event
+unless `key.fromMe === false` at the first production `messages.upsert`
+callback, before debug logging, text extraction, queueing, sent/quote indexing,
+model/session dispatch, hooks, or persistence. Stale and replayed socket
+generations are rejected independently. Content, message IDs, and model fields
+are never used as provenance. Ordinary authenticated user-originated events
+continue through the normal extractor and queue.
+
+This fence does not stop WhatsApp sender-companion fan-out. Private plaintext
+can reach another linked Juno device and shared WhatsApp account history, and
+the ordinary bridge may necessarily decrypt it in process memory before the
+callback runs. Compromise of the WhatsApp account, another linked device, or
+same-UID/process memory remains outside the guarantee. The guarantee is that
+private Gmail plaintext does not cross from the trusted path into the
+low-trust model, prompt/tool/session history, ordinary inbound queue,
+extractor, quote/sent index, mirrors, hooks, logs, stdout/stderr,
+audit/PDP/authorization data, retry/dead-letter storage, or ordinary delivery
+APIs. Private replies target only the one configured James 1:1 destination;
+groups and other users are ineligible.
 
 Production composition is concrete, code-owned, and gateway-owned.
 `compose_trusted_private_read_services()` constructs only the built-in typed
@@ -1264,8 +1295,9 @@ Dedicated gateway/private-host initialization then runs in this exact order:
    policy epoch, and read-only/no-writer generation.
 4. Perform the initial OAuth exchange or refresh, exact scope validation, and
    Gmail profile/account verification without reading a message; then verify
-   ordinary account/authority readiness and offline sensitive account/session
-   readiness without sending.
+   ordinary account/authority readiness and offline sensitive linked-device
+   readiness, exact same-account PN/LID topology, and distinct credential and
+   device identity without sending.
 5. Open the private authorization store; acquire the fork-safe singleton OS
    lock; then atomically reconstruct/acquire the coordinator fence and run
    descriptor reconciliation in the same database transaction. Publish the
@@ -1535,8 +1567,9 @@ The closed version-1 object contains only these groups:
   provisioned canonical `expected_owner_voter_jid`; this value is required for
   the constant-time post-decryption equality check and is distinct from both
   requester `owner_sender` and the destination binding;
-- `sensitive_delivery` with exact sensitive account/session/bundle/channel/
-  transport identity and destination/thread binding; and
+- `sensitive_delivery` with the same exact canonical account as ordinary, a
+  distinct linked-device session/device/bundle/channel/transport identity, and
+  exact owner 1:1 destination/thread binding; and
 - `limits`, containing only integer milliseconds/byte/count values that can
   reduce, never enlarge, the code maxima in section 3. Decimal floating-point
   seconds are not accepted.
@@ -1944,7 +1977,8 @@ does not imply any later action:
 7. Provision and pair sensitive WhatsApp by alphanumeric phone-link code only;
    QR is absent.
 8. Separately start and attest the ordinary bridge and sensitive bridge,
-   proving their exact bundles, separate accounts/sessions/dependency graphs,
+   proving one exact canonical public account with distinct linked-device
+   credentials, auth roots, sessions, device identities, dependency graphs,
    process/start/socket/connection/channel/authority epochs, ordinary chat-
    versus-approval separation, and sensitive delivery separation.
 9. Install the candidate default-off. Separately approve enable/restart, fresh-

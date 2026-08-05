@@ -75,6 +75,17 @@ function submitDeadlineState(body, nowUs) {
   return now < expires ? 'live' : 'expired';
 }
 
+function identityRequest(value) {
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const fields = [
+    'contract_version', 'operation', 'request_id', 'account',
+    'destination', 'expires_at_us',
+  ];
+  return Object.keys(value).length === fields.length
+    && fields.every(field => Object.hasOwn(value, field))
+    && value.operation === 'observe_identity';
+}
+
 function deadlineFailure(res, state) {
   writeJson(res, state === 'expired' ? 200 : 400, {
     state: state === 'expired' ? 'expired' : 'failed',
@@ -138,18 +149,6 @@ export function createSensitiveHttpHandler({
       return;
     }
 
-    if (req.method === 'GET' && req.url === '/v1/identity') {
-      active += 1;
-      try {
-        const evidence = transport.identityEvidence();
-        writeJson(res, responseStatus(evidence), evidence);
-      } catch {
-        boundedError(res, 503, 'transport_unavailable');
-      } finally {
-        active -= 1;
-      }
-      return;
-    }
     if (req.method !== 'POST' || req.url !== '/v1/submit') {
       boundedError(res, 404, 'route_not_found');
       return;
@@ -228,7 +227,8 @@ export function createSensitiveHttpHandler({
         return;
       }
       try {
-        const operation = transport.submit;
+        const observing = identityRequest(body);
+        const operation = observing ? transport.identityEvidence : transport.submit;
         if (typeof operation !== 'function') {
           finishActive();
           boundedError(res, 503, 'transport_unavailable');
@@ -242,7 +242,9 @@ export function createSensitiveHttpHandler({
         }
         // No await or event-loop yield may separate the authenticated final
         // deadline sample above from entry into the delivery core.
-        const evidence = await operation.call(transport, body, { signal: abort.signal });
+        const evidence = observing
+          ? operation.call(transport, body)
+          : await operation.call(transport, body, { signal: abort.signal });
         finishActive();
         writeJson(res, responseStatus(evidence), evidence);
       } catch {

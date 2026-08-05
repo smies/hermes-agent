@@ -9,8 +9,8 @@ import {
 } from '../../scripts/whatsapp-sensitive-bridge/http_server.js';
 import { verifySensitiveTransport } from '../../scripts/whatsapp-sensitive-bridge/launcher.js';
 
-const account = '55555555555@s.whatsapp.net';
-const ordinary = '33333333333@s.whatsapp.net';
+const account = '33333333333@s.whatsapp.net';
+const ordinary = account;
 const runtime = `vertical-runtime-${process.pid}`;
 const epoch = `vertical-epoch-${process.pid}`;
 const identity = await verifySensitiveTransport();
@@ -18,7 +18,7 @@ const capture = process.env.JUNO_TEST_DELIVERY_CAPTURE;
 const capability = process.env.JUNO_TEST_SENSITIVE_CAPABILITY;
 const ev = new EventEmitter();
 const socket = {
-  user: { id: '55555555555:4@s.whatsapp.net' },
+  user: { id: '33333333333:4@s.whatsapp.net' },
   ev,
   async sendMessage(chat, content, options) {
     appendFileSync(capture, `${JSON.stringify({

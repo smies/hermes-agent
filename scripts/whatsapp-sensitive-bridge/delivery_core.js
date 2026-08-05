@@ -132,11 +132,8 @@ export class SensitiveDeliveryTransport {
     }
     const account = canonicalAccountJid(accountJid, this.canonicalizeJid);
     if (account.error || !boundedString(epoch)) throw new TypeError('invalid sensitive connection');
-    if (account.value === this.ordinaryAccountJid) {
-      throw new TypeError('separate sensitive account required');
-    }
-    if (jidNamespace(account.value) !== jidNamespace(this.ordinaryAccountJid)) {
-      throw new TypeError('account identity namespace mismatch');
+    if (account.value !== this.ordinaryAccountJid) {
+      throw new TypeError('same canonical account required');
     }
     if (this.connection) {
       const reason = this.connection.sock !== sock ? 'socket_replaced'
@@ -158,9 +155,25 @@ export class SensitiveDeliveryTransport {
     if (!this.enabled) this.connection = null;
   }
 
-  identityEvidence() {
+  identityEvidence(request) {
     if (!this.enabled || !this.connection) {
       return baseOutcome('unavailable', false, this.enabled ? 'not_connected' : 'service_disabled');
+    }
+    const fields = [
+      'contract_version', 'operation', 'request_id', 'account',
+      'destination', 'expires_at_us',
+    ];
+    const account = canonicalAccountJid(request?.account, this.canonicalizeJid);
+    const destination = canonicalDirectJid(request?.destination, this.canonicalizeJid);
+    const deadline = deadlineState(request?.expires_at_us, this.nowUs);
+    if (!plainObject(request) || !exactKeys(request, fields)
+        || request.contract_version !== SENSITIVE_SUBMIT_CONTRACT_VERSION
+        || request.operation !== 'observe_identity'
+        || !boundedString(request.request_id)
+        || account.error || destination.error
+        || account.value !== this.connection.accountJid
+        || deadline.state !== 'live') {
+      return baseOutcome('unavailable', false, 'identity_request_invalid');
     }
     const observed = safeNow(this.nowUs);
     const drift = this.#connectionDriftCode(this.connection);

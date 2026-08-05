@@ -302,7 +302,8 @@ def test_sensitive_destination_must_be_verifiably_distinct_from_ordinary_account
     tmp_path: Path, destination: str, valid: bool,
 ) -> None:
     raw = _raw_config(tmp_path)
-    raw["requesters"][0]["sensitive_destination"] = destination
+    for requester in raw["requesters"]:
+        requester["sensitive_destination"] = destination
     if not valid:
         with pytest.raises(JunoPrivateReadError):
             JunoPrivateReadMvpConfig.parse(raw)
@@ -312,6 +313,29 @@ def test_sensitive_destination_must_be_verifiably_distinct_from_ordinary_account
     assert parsed.requesters[0].source_chat == OWNER
     assert parsed.owner_chat == OWNER
     assert parsed.requesters[1].source_chat != parsed.owner_chat
+
+
+def test_same_account_topology_is_required_while_destination_stays_distinct(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_config(tmp_path)
+    raw["sensitive"]["account"] = ORDINARY_ACCOUNT
+    parsed = JunoPrivateReadMvpConfig.parse(raw)
+    assert parsed.ordinary_account == parsed.sensitive_account == ORDINARY_ACCOUNT
+    assert parsed.requesters[0].sensitive_destination != ORDINARY_ACCOUNT
+
+    raw["sensitive"]["account"] = "55555555555@s.whatsapp.net"
+    with pytest.raises(JunoPrivateReadError):
+        JunoPrivateReadMvpConfig.parse(raw)
+
+
+def test_every_requester_is_bound_to_the_exact_owner_private_destination(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_config(tmp_path)
+    raw["requesters"][1]["sensitive_destination"] = "77777777777@s.whatsapp.net"
+    with pytest.raises(JunoPrivateReadError):
+        JunoPrivateReadMvpConfig.parse(raw)
 
 
 def test_sensitive_destination_rejects_persisted_phone_to_lid_provider_alias(

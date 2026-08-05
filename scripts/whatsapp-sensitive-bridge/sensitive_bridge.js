@@ -61,11 +61,8 @@ export function parseCanonicalArgs(argv) {
       || jidNormalizedUser(ordinaryAccountJid) !== ordinaryAccountJid) {
     throw new Error('canonical ordinary account identity is required');
   }
-  if (sensitiveAccountJid === ordinaryAccountJid) {
-    throw new Error('separate sensitive account required');
-  }
-  if (sensitiveAccountJid.split('@')[1] !== ordinaryAccountJid.split('@')[1]) {
-    throw new Error('account identity namespace mismatch');
+  if (sensitiveAccountJid !== ordinaryAccountJid) {
+    throw new Error('same canonical account required');
   }
   let sessionPathGuard;
   try {
@@ -92,6 +89,9 @@ export async function runSensitiveBridge({
   env = process.env,
   transportIdentity,
 } = {}) {
+  // This is a dedicated process. Keep every subsequently created auth/session
+  // artifact owner-only even if the service manager inherited a looser mask.
+  process.umask(0o077);
   const capability = env[CAPABILITY_ENV];
   if (typeof capability !== 'string' || Buffer.byteLength(capability, 'utf8') < 32
       || Buffer.byteLength(capability, 'utf8') > 512) {
@@ -99,10 +99,16 @@ export async function runSensitiveBridge({
   }
   const {
     port,
-    sessionPathGuard,
+    sessionDir,
+    ordinarySessionDir,
     sensitiveAccountJid,
     ordinaryAccountJid,
   } = parseCanonicalArgs(argv);
+  // Activation requires two independently generated linked-device auth
+  // artifacts, not merely two different path strings.
+  const sessionPathGuard = prepareSessionPaths(sessionDir, ordinarySessionDir, {
+    requireDistinctCredentials: true,
+  });
   if (!transportIdentity || typeof transportIdentity !== 'object'
       || !/^[a-f0-9]{64}$/.test(String(transportIdentity.manifest_sha256 || ''))) {
     throw new Error('verified sensitive transport identity is required');

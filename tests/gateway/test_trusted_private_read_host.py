@@ -270,8 +270,8 @@ async def test_gateway_host_installs_only_while_healthy_and_reconciles_restart(
         close=close,
         transport_identity=lambda: dict(config.transport_identity),
         account_state=lambda: (
-            "ordinary@fixture",
-            "sensitive@fixture",
+            "juno@fixture",
+            "juno@fixture",
             "fixture",
             True,
         ),
@@ -295,6 +295,41 @@ async def test_gateway_host_installs_only_while_healthy_and_reconciles_restart(
     restarted = TrustedPrivateReadGatewayHost(config, services)
     assert await restarted.start() is True
     await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_gateway_host_accepts_same_account_distinct_session_topology(
+    tmp_path: Path,
+) -> None:
+    config = TrustedPrivateReadHostConfig.parse(_config(tmp_path))
+    assert config is not None
+
+    async def unused(*_args):
+        raise AssertionError
+
+    async def close() -> None:
+        return None
+
+    services = TrustedPrivateReadHostServices(
+        healthy=lambda: True,
+        context_for_current_event=lambda: None,
+        pdp_check=unused,
+        transport_registration=unused,
+        private_read=unused,
+        deliver_notification=unused,
+        decision_for_event=lambda _event: None,
+        close=close,
+        transport_identity=lambda: dict(config.transport_identity),
+        account_state=lambda: (
+            "juno@fixture",
+            "juno@fixture",
+            "fixture",
+            True,
+        ),
+    )
+    host = TrustedPrivateReadGatewayHost(config, services)
+    assert await host.start() is True
+    await host.stop()
 
 
 @pytest.mark.asyncio
@@ -329,8 +364,8 @@ async def test_baseexception_in_worker_revokes_schema(tmp_path: Path) -> None:
             close=close,
             transport_identity=lambda: dict(config.transport_identity),
             account_state=lambda: (
-                "ordinary@fixture",
-                "sensitive@fixture",
+                "juno@fixture",
+                "juno@fixture",
                 "fixture",
                 True,
             ),
@@ -346,12 +381,13 @@ async def test_baseexception_in_worker_revokes_schema(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "account_state",
     [
-        ("same@fixture", "same@fixture", "fixture", True),
         ("ordinary@fixture", "sensitive@other", "fixture", True),
+        ("ordinary@fixture", "sensitive@fixture", "fixture", True),
         ("ordinary@fixture", "sensitive@fixture", "fixture", False),
+        ("juno@fixture", "juno@fixture", "fixture", False),
     ],
 )
-async def test_account_equality_namespace_and_lid_readiness_fail_closed(
+async def test_account_mismatch_namespace_and_lid_readiness_fail_closed(
     tmp_path: Path, account_state: tuple[str, str, str, bool]
 ) -> None:
     config = TrustedPrivateReadHostConfig.parse(_config(tmp_path))

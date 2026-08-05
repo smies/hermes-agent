@@ -1,5 +1,4 @@
 import { normalizeWhatsAppId } from './bridge_helpers.js';
-import { classifyOwnerMessageGate } from './owner_message_gate.js';
 
 export const REGISTERED_INBOUND_PROVENANCE =
   'messages.upsert:registered-emitting-socket:v1';
@@ -30,13 +29,10 @@ export async function produceInboundMessage({
   isActiveSocket,
   mode,
   dmPolicy,
-  forwardOwnerMessages,
-  recentlySentIds,
   allowlistMatches,
   extractEvent,
   downloadMedia,
   cacheDirs,
-  replyPrefix,
   messageStore,
   messageQueue,
   maxQueueSize,
@@ -45,6 +41,15 @@ export async function produceInboundMessage({
 }) {
   if (typeof isActiveSocket !== 'function' || !isActiveSocket(emittingSocket)) {
     return { action: 'ignored', reason: 'stale_emitting_socket' };
+  }
+  // Pinned Baileys rc14 derives key.fromMe while decrypting the authenticated
+  // provider stanza. It is true both for local own events and for messages
+  // sent by another companion linked to this same account. Keep this
+  // defense-in-depth fence ahead of socket metadata, extraction, poll logic,
+  // stores, queues, and diagnostics; the registered callback applies the
+  // same decision even earlier.
+  if (msg?.key?.fromMe !== false) {
+    return { action: 'ignored', reason: 'sender_companion_fenced' };
   }
   const socketUser = socketAuthority(emittingSocket);
   if (!socketUser) return { action: 'ignored', reason: 'invalid_socket_authority' };
@@ -60,40 +65,13 @@ export async function produceInboundMessage({
     normalizeWhatsAppId(socketUser?.id),
     normalizeWhatsAppId(socketUser?.lid),
   ].filter(Boolean)));
-  let fromOwner = false;
+  const fromOwner = false;
 
-  if (msg.key.fromMe) {
-    if (isGroup || chatId.includes('status')) {
-      return { action: 'ignored', reason: isGroup ? 'from_me_group' : 'from_me_status' };
-    }
-    if (mode === 'bot') {
-      const decision = classifyOwnerMessageGate({
-        fromMe: true,
-        fromOwnerEnabled: forwardOwnerMessages,
-        recentlySent: recentlySentIds,
-        allowlistMatches,
-        messageId: msg.key.id,
-        chatId,
-      });
-      if (decision.action !== 'forward_owner') {
-        return { action: 'ignored', reason: decision.action };
-      }
-      fromOwner = true;
-    } else {
-      const myNumber = (socketUser?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-      const myLid = (socketUser?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-      const chatNumber = chatId.replace(/@.*/, '');
-      if (!((myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid))) {
-        return { action: 'ignored', reason: 'self_chat_mismatch' };
-      }
-    }
-  } else {
-    if (mode === 'self-chat') {
-      return { action: 'ignored', reason: 'self_chat_mode_rejects_non_self' };
-    }
-    if (dmPolicy !== 'pairing' && !allowlistMatches(senderId)) {
-      return { action: 'ignored', reason: 'allowlist_mismatch' };
-    }
+  if (mode === 'self-chat') {
+    return { action: 'ignored', reason: 'self_chat_mode_rejects_non_self' };
+  }
+  if (dmPolicy !== 'pairing' && !allowlistMatches(senderId)) {
+    return { action: 'ignored', reason: 'allowlist_mismatch' };
   }
 
   if (typeof handlePollUpdate === 'function' && await handlePollUpdate({
@@ -117,11 +95,6 @@ export async function produceInboundMessage({
   event.inboundProvenance = REGISTERED_INBOUND_PROVENANCE;
   if (!event.accountId || event.messageId !== msg.key.id) {
     return { action: 'ignored', reason: 'authority_extraction_mismatch' };
-  }
-  if (msg.key.fromMe && (
-    (replyPrefix && event.body.startsWith(replyPrefix)) || recentlySentIds.has(msg.key.id)
-  )) {
-    return { action: 'ignored', reason: 'agent_echo' };
   }
   if (!event.body && !event.hasMedia) {
     return { action: 'ignored', reason: 'empty' };
@@ -177,6 +150,15 @@ export function registerInboundMessageHandler({
     for (const msg of messages || []) {
       if (!active(registeredSocket)) {
         return { action: 'ignored', reason: 'stale_emitting_socket' };
+      }
+      // This is the earliest application callback reached by every rc14
+      // messages.upsert producer: live notify, offline append,
+      // sender-companion fan-out, local own event, and PDO/retry response.
+      // Missing/unknown provenance is rejected with the same no-observation
+      // behavior. Nothing below this branch may inspect message content.
+      if (msg?.key?.fromMe !== false) {
+        lastOutcome = { action: 'ignored', reason: 'sender_companion_fenced' };
+        continue;
       }
       emitDebugEvent({
         stage: 'upsert', type, fromMe: !!msg?.key?.fromMe,

@@ -16,7 +16,8 @@ import { SessionPathGuard } from './session_paths.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SENSITIVE = '15551234567@s.whatsapp.net';
-const ORDINARY = '15559876543@s.whatsapp.net';
+const ORDINARY = SENSITIVE;
+const DIFFERENT = '15559876543@s.whatsapp.net';
 const SESSION_ROOT = mkdtempSync(path.join(realpathSync.native(tmpdir()), 'hermes-entrypoint-'));
 const SENSITIVE_SESSION = path.join(SESSION_ROOT, 'sensitive');
 const ORDINARY_SESSION = path.join(SESSION_ROOT, 'ordinary');
@@ -34,7 +35,7 @@ function args(overrides = {}) {
   return Object.entries(values).flat();
 }
 
-test('canonical launcher requires distinct exact account identities and refuses injection arguments', () => {
+test('canonical launcher requires the same exact account identity and refuses injection arguments', () => {
   const parsed = parseCanonicalArgs(args());
   assert.ok(parsed.sessionPathGuard instanceof SessionPathGuard);
   assert.deepEqual({ ...parsed, sessionPathGuard: undefined }, {
@@ -46,8 +47,8 @@ test('canonical launcher requires distinct exact account identities and refuses 
     ordinaryAccountJid: ORDINARY,
   });
   assert.throws(
-    () => parseCanonicalArgs(args({ '--ordinary-account-jid': SENSITIVE })),
-    /separate sensitive account required/,
+    () => parseCanonicalArgs(args({ '--ordinary-account-jid': DIFFERENT })),
+    /same canonical account required/,
   );
   assert.throws(
     () => parseCanonicalArgs([...args(), '--bridge-script', '/tmp/custom.js']),
@@ -59,7 +60,7 @@ test('canonical launcher requires distinct exact account identities and refuses 
   );
   assert.throws(
     () => parseCanonicalArgs(args({ '--ordinary-account-jid': '987654321@lid' })),
-    /account identity namespace mismatch/,
+    /same canonical account required/,
   );
   assert.throws(
     () => parseCanonicalArgs(args({ '--ordinary-session': SENSITIVE_SESSION })),

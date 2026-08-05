@@ -505,19 +505,19 @@ class _SensitiveHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def do_GET(self):
-        self.observed.append((self.path, None))
-        self._json({
-            "outcome": "available", "submitted": False,
-            "provider_account_jid": SENSITIVE_ACCOUNT,
-            "identity_observed_us": time.time_ns() // 1000,
-            "adapter_runtime_id": "runtime-fresh", "connection_epoch": "epoch-fresh",
-            "transport_identity": _SENSITIVE_TRANSPORT_IDENTITY,
-        })
-
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         self.observed.append((self.path, body))
+        if body.get("operation") == "observe_identity":
+            self._json({
+                "outcome": "available", "submitted": False,
+                "provider_account_jid": SENSITIVE_ACCOUNT,
+                "identity_observed_us": time.time_ns() // 1000,
+                "adapter_runtime_id": "runtime-fresh",
+                "connection_epoch": "epoch-fresh",
+                "transport_identity": _SENSITIVE_TRANSPORT_IDENTITY,
+            })
+            return
         self._json({
             "state": "submitted", "message_id": "3EB0ABCDEF0123456789AB",
             "account": SENSITIVE_ACCOUNT, "destination": body["destination"],
@@ -1874,7 +1874,13 @@ async def test_python_submitter_real_http_route_uses_fresh_identity(tmp_path: Pa
             request=request, plaintext=PRIVATE_SENTINEL, identity=identity,
         )
         assert submitted.state == "submitted"
-        assert _SensitiveHandler.observed[0] == ("/v1/identity", None)
+        identity_path, identity_body = _SensitiveHandler.observed[0]
+        assert identity_path == "/v1/submit"
+        assert set(identity_body) == {
+            "contract_version", "operation", "request_id", "account",
+            "destination", "expires_at_us",
+        }
+        assert identity_body["operation"] == "observe_identity"
         path, body = _SensitiveHandler.observed[1]
         assert path == "/v1/submit"
         assert set(body) == {
@@ -1942,7 +1948,7 @@ async def test_real_gateway_runner_startup_dispatch_registry_and_cleanup_seam(
     class RunnerTransport(FakeJsonTransport):
         async def request(self, **call):
             if call["authority"] == "http://127.0.0.1:3011":
-                if call["path"] == "/v1/identity":
+                if call["body"].get("operation") == "observe_identity":
                     return {
                         "outcome": "available", "submitted": False,
                         "provider_account_jid": SENSITIVE_ACCOUNT,

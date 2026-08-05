@@ -9,7 +9,8 @@ import {
 
 const CHAT = '15557654321@s.whatsapp.net';
 const ACCOUNT = '15551234567@s.whatsapp.net';
-const ORDINARY_ACCOUNT = '15559876543@s.whatsapp.net';
+const ORDINARY_ACCOUNT = ACCOUNT;
+const DIFFERENT_ACCOUNT = '15559876543@s.whatsapp.net';
 const ORDINARY_LID = '90909090909@lid';
 const RUNTIME = 'runtime-01HZX7M6Y2PE5F8K9W3R4T6V7X';
 const EPOCH = 'epoch-01HZX7M6Y2PE5F8K9W3R4T6V7X';
@@ -101,8 +102,8 @@ test('legacy transport.send is absent and cannot reach the provider', () => {
 test('final transport boundary rejects every direct ordinary-account alias', async () => {
   for (const destination of [
     ORDINARY_ACCOUNT,
-    '15559876543:9@s.whatsapp.net',
-    '15559876543@c.us',
+    '15551234567:9@s.whatsapp.net',
+    '15551234567@c.us',
   ]) {
     const h = harness();
     const result = await h.transport.submit(submission({ destination }));
@@ -122,7 +123,7 @@ test('final boundary resolves phone-to-LID ordinary aliases and rejects with zer
 });
 
 test('final boundary resolves LID-to-phone ordinary aliases and rejects with zero sends', async () => {
-  const sensitiveLid = '80808080808@lid';
+  const sensitiveLid = ORDINARY_LID;
   const h = harness({
     account: sensitiveLid,
     ordinaryAccount: ORDINARY_LID,
@@ -130,7 +131,7 @@ test('final boundary resolves LID-to-phone ordinary aliases and rejects with zer
   });
   const result = await h.transport.submit(submission({
     account: sensitiveLid,
-    destination: '15559876543:3@s.whatsapp.net',
+    destination: '15551234567:3@s.whatsapp.net',
   }));
   assert.equal(result.state, 'failed');
   assert.deepEqual(h.operations, [['mapping', ORDINARY_ACCOUNT]]);
@@ -192,10 +193,19 @@ test('expiry is sampled again after alias resolution immediately before send', a
   assert.equal(samples.length, 0);
 });
 
-test('same sensitive and ordinary accounts remain impossible to bind', () => {
-  assert.throws(() => harness({ ordinaryAccount: ACCOUNT }), /separate sensitive account/);
+test('different canonical accounts remain impossible to bind', () => {
+  assert.throws(() => harness({ ordinaryAccount: DIFFERENT_ACCOUNT }), /same canonical account/);
   assert.throws(
     () => harness({ ordinaryAccount: ORDINARY_LID }),
-    /account identity namespace mismatch/,
+    /same canonical account/,
   );
+});
+
+test('same canonical account on a distinct sensitive session binds and sends once', async () => {
+  const h = harness({ ordinaryAccount: ACCOUNT });
+  const result = await h.transport.submit(submission());
+  assert.deepEqual(result, {
+    state: 'submitted', message_id: MESSAGE_ID, account: ACCOUNT, destination: CHAT,
+  });
+  assert.equal(h.calls.length, 1);
 });

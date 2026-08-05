@@ -21,24 +21,32 @@ listener, or auth state.
 
 Production is disabled unless the host supplies a fresh inherited capability
 and all canonical launcher arguments. The sensitive session must be paired and
-provisioned offline to a **different WhatsApp account** from the ordinary
-bridge. Pairing is intentionally absent here. Startup requires both exact
-provider-canonical account identities and fails closed if they match, if stored
-auth identifies the wrong account, or if the live socket identity drifts. The
-two identities must use the same provider namespace (`s.whatsapp.net` or
-`lid`); a cross-namespace comparison is rejected as unverifiable rather than
-assumed to represent different accounts.
+provisioned offline as a second linked device for the **same WhatsApp account**
+as the ordinary bridge. Pairing is intentionally absent here. Startup requires
+both exact provider-canonical account identities and fails closed if they do
+not match, if either identity is unknown, if PN/LID topology is incomplete, if
+stored auth identifies the wrong account, or if the live socket identity
+drifts.
 The launcher must also supply the canonical ordinary session path solely for
 filesystem identity and separation checks. Both paths must be canonical and
 absolute, with no symbolic-link or non-directory existing component. The
 ordinary directory must already exist. A missing sensitive directory is
 created as `0700` only after a no-write preflight proves lexical and resolved
 separation from the captured ordinary directory. The process rejects resolved
-equality or nesting and device/inode aliases. It never inspects auth contents
-under the ordinary path. The sensitive directory must be owned by the
+equality or nesting and device/inode aliases. Before activation it also rejects
+cross-tree hard links, byte-for-byte credential copies, and reused stable
+linked-device identity material. The sensitive directory must be owned by the
 launching UID and have mode exactly `0700`; unsafe parent ownership or write
 permissions, pre-existing broader sensitive permissions, and identity drift
 around auth loading or later auth operations all fail closed.
+
+This is a session/process capability boundary, not a WhatsApp-account
+plaintext boundary. Baileys sender-companion fan-out can place the private
+message in the shared account history and deliver it to another linked Juno
+device. The ordinary bridge may necessarily decrypt that fan-out in process
+memory before its earliest callback fence discards the authenticated
+`key.fromMe` event. Other linked devices, account compromise, and compromise
+by code running under the same UID remain outside this guarantee.
 
 ## Trusted-host obligations
 
@@ -58,9 +66,10 @@ integrity warning. The host integration supplies and protects the allowlist.
 The trusted host must impose and enforce a hard process deadline, terminating
 the bridge when that deadline expires. It must also continuously and
 independently monitor the live ordinary-account identity and disable/terminate
-sensitive delivery if that identity drifts. These remain mandatory integration
-controls: filesystem path validation proves neither process lifetime nor the
-live identity of the separate ordinary account. Portable Node path checks do
+sensitive delivery if either identity drifts or the same-account relationship
+cannot be proved. These remain mandatory integration controls: filesystem path
+validation proves neither process lifetime nor live account topology. Portable
+Node path checks do
 not provide a descriptor-anchored `openat` guarantee; replacement by the same
 UID in the small check-to-operation window remains within trusted-host and OS
 isolation scope.
@@ -85,7 +94,9 @@ startup contains no pairing operation and there is no QR fallback.
 
 ## Evidence semantics
 
-The only authenticated plaintext delivery route is `/v1/submit`. Legacy
+The only authenticated route is exact `POST /v1/submit`. Both identity
+observation and plaintext submission use closed, authenticated request bodies
+on that route. Legacy
 `/v1/send` and direct `transport.send()` delivery are not published. Submit
 pre-reserves one exact pinned-format message ID, invokes one `sendMessage` with
 exact text and `linkPreview: null`, and returns `submitted` only after that

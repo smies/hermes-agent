@@ -11,6 +11,7 @@ import {
   commitStagedSession,
   ProvisioningCommitError,
   provisionOffline,
+  validateExistingOffline,
 } from './offline_provision.js';
 import { parseProvisioningRequest } from './provisioning_core.js';
 
@@ -18,6 +19,93 @@ function identities() {
   const phone = `1${'6'.repeat(10)}`;
   return { phone, phoneJid: `${phone}@s.whatsapp.net`, lidJid: `${'8'.repeat(9)}@lid` };
 }
+
+function authIdentity(account, lid, device) {
+  const material = value => ({ type: 'Buffer', data: [value, value + 1] });
+  return {
+    registered: true,
+    me: { id: account, lid },
+    registrationId: device,
+    noiseKey: { private: material(device), public: material(device + 2) },
+    signedIdentityKey: { private: material(device + 4), public: material(device + 6) },
+    signedPreKey: {
+      keyPair: { private: material(device + 8), public: material(device + 10) },
+      signature: material(device + 12), keyId: device,
+    },
+    advSecretKey: `synthetic-adv-${device}`,
+  };
+}
+
+async function existingTopologyFixture({ differentAccount = false, copiedDevice = false,
+  missingOtherLid = false } = {}) {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-topology-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  await chmod(root, 0o700);
+  await mkdir(ordinary, { mode: 0o700 });
+  await mkdir(sensitive, { mode: 0o700 });
+  const account = '15551234567@s.whatsapp.net';
+  const otherAccount = differentAccount ? '15557654321@s.whatsapp.net' : account;
+  const lid = '90909090909@lid';
+  const otherLid = differentAccount ? '80808080808@lid' : lid;
+  const ordinaryCreds = authIdentity(account, lid, 17);
+  const sensitiveCreds = copiedDevice
+    ? { ...ordinaryCreds, independentMarker: true }
+    : authIdentity(otherAccount, otherLid, 53);
+  for (const [directory, creds] of [[ordinary, ordinaryCreds], [sensitive, sensitiveCreds]]) {
+    await writeFile(path.join(directory, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+    await chmod(path.join(directory, 'creds.json'), 0o600);
+  }
+  const auth = new Map([
+    [ordinary, {
+      state: { creds: ordinaryCreds, keys: { get: async () => (
+        missingOtherLid ? {} : { [account.split('@')[0]]: lid.split('@')[0] }
+      ) } }, saveCreds: async () => {},
+    }],
+    [sensitive, {
+      state: { creds: sensitiveCreds, keys: { get: async () => ({
+        [otherAccount.split('@')[0]]: otherLid.split('@')[0],
+      }) } }, saveCreds: async () => {},
+    }],
+  ]);
+  const request = parseProvisioningRequest({
+    version: 1, action: 'validate', role: 'sensitive',
+    ordinary_session: ordinary, sensitive_session: sensitive,
+  });
+  return { root, request, useAuthState: async session => auth.get(session) };
+}
+
+test('existing same-account independently paired sessions validate as production-ready', async () => {
+  const fixture = await existingTopologyFixture();
+  try {
+    assert.deepEqual(await validateExistingOffline({
+      request: fixture.request,
+      useAuthState: fixture.useAuthState,
+      canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+    }), { account_namespace: 's.whatsapp.net', lid_ready: true });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('different account, unknown LID topology, and copied device identity fail closed', async () => {
+  for (const options of [
+    { differentAccount: true },
+    { missingOtherLid: true },
+    { copiedDevice: true },
+  ]) {
+    const fixture = await existingTopologyFixture(options);
+    try {
+      assert.equal(await validateExistingOffline({
+        request: fixture.request,
+        useAuthState: fixture.useAuthState,
+        canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+      }), null);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
 
 function fakeSocket({ phoneJid, lidJid, update, onPairingCode }) {
   const ev = new EventEmitter();
@@ -169,18 +257,19 @@ test('offline provisioning uses only requestPairingCode and persists canonical L
   const ordinary = path.join(root, 'ordinary');
   const sensitive = path.join(root, 'sensitive');
   const { phone, phoneJid, lidJid } = identities();
-  const ordinaryPhoneJid = `${`2${'4'.repeat(10)}`}@s.whatsapp.net`;
-  const ordinaryLidJid = `${'7'.repeat(9)}@lid`;
+  const ordinaryPhoneJid = phoneJid;
+  const ordinaryLidJid = lidJid;
+  const ordinaryCreds = authIdentity(ordinaryPhoneJid, ordinaryLidJid, 17);
+  const sensitiveCreds = authIdentity(phoneJid, lidJid, 53);
   let pairingCalls = 0;
   let sendCalls = 0;
   let socket;
   try {
     await chmod(root, 0o700);
     await mkdir(ordinary, { mode: 0o700 });
-    await writeFile(path.join(ordinary, 'creds.json'), JSON.stringify({
-      registered: true,
-      me: { id: ordinaryPhoneJid },
-    }), { mode: 0o600 });
+    await writeFile(
+      path.join(ordinary, 'creds.json'), JSON.stringify(ordinaryCreds), { mode: 0o600 },
+    );
     const request = parseProvisioningRequest({
       version: 1,
       action: 'provision',
@@ -194,19 +283,20 @@ test('offline provisioning uses only requestPairingCode and persists canonical L
       canonicalizeJid: (value) => String(value).replace(/:\d+@/, '@'),
       useAuthState: async (session) => ({
         state: session === ordinary ? {
-          creds: { registered: true, me: { id: ordinaryPhoneJid } },
+          creds: ordinaryCreds,
           keys: { get: async () => ({
             [ordinaryPhoneJid.split('@')[0]]: ordinaryLidJid.split('@')[0],
           }) },
         } : {
-          creds: { registered: false },
+          creds: sensitiveCreds,
           keys: {
             get: async () => ({ [phoneJid.split('@')[0]]: lidJid.split('@')[0] }),
             set: async () => {},
           },
         },
         saveCreds: async () => {
-          await writeFile(path.join(session, 'creds.json'), '{}', { mode: 0o600 });
+          const creds = session === ordinary ? ordinaryCreds : sensitiveCreds;
+          await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
           await chmod(path.join(session, 'creds.json'), 0o600);
         },
       }),
