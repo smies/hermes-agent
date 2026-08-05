@@ -73,6 +73,15 @@ class JunoReplayAuthority:
         self._seen: dict[str, set[str]] = {kind: set() for kind in _KINDS}
         self._open_or_create()
 
+    def _write(self, fd: int, value: bytes) -> None:
+        _write_all(fd, value)
+
+    def _fsync_file(self, fd: int) -> None:
+        os.fsync(fd)
+
+    def _fsync_directory(self) -> None:
+        os.fsync(self._dir_fd)
+
     def close(self) -> None:
         descriptor, self._dir_fd = self._dir_fd, -1
         if descriptor >= 0:
@@ -203,11 +212,11 @@ class JunoReplayAuthority:
                 or opened.st_size != 32
             ):
                 raise ReplayAuthorityError("private replay authority unavailable")
-            _write_all(fd, suffix)
-            os.fsync(fd)
+            self._write(fd, suffix)
+            self._fsync_file(fd)
         finally:
             os.close(fd)
-        os.fsync(self._dir_fd)
+        self._fsync_directory()
         sealed = self._regular_owner_file("mvp-store.key")
         if (sealed.st_dev, sealed.st_ino) != (current.st_dev, current.st_ino):
             raise ReplayAuthorityError("private replay authority unavailable")
@@ -264,8 +273,8 @@ class JunoReplayAuthority:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(JOURNAL_NAME, flags, 0o600, dir_fd=self._dir_fd)
         try:
-            _write_all(fd, line)
-            os.fsync(fd)
+            self._write(fd, line)
+            self._fsync_file(fd)
         finally:
             os.close(fd)
         self._regular_owner_file(JOURNAL_NAME)
@@ -278,15 +287,15 @@ class JunoReplayAuthority:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(temporary, flags, 0o600, dir_fd=self._dir_fd)
         try:
-            _write_all(fd, value)
-            os.fsync(fd)
+            self._write(fd, value)
+            self._fsync_file(fd)
         finally:
             os.close(fd)
         try:
             if create_only and self._exists(MARKER_NAME):
                 raise ReplayAuthorityError("private replay authority unavailable")
             os.replace(temporary, MARKER_NAME, src_dir_fd=self._dir_fd, dst_dir_fd=self._dir_fd)
-            os.fsync(self._dir_fd)
+            self._fsync_directory()
         except BaseException:
             try:
                 os.unlink(temporary, dir_fd=self._dir_fd)
@@ -372,8 +381,8 @@ class JunoReplayAuthority:
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
                 raise ReplayAuthorityError("private replay authority unavailable")
-            _write_all(fd, line)
-            os.fsync(fd)
+            self._write(fd, line)
+            self._fsync_file(fd)
         finally:
             os.close(fd)
         next_seq, next_head = self._seq + 1, _digest(record)

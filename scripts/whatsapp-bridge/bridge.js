@@ -396,6 +396,102 @@ let connectionState = 'disconnected';
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
+/**
+ * Register the exact production inbound composition used by startSocket().
+ * Tests may replace only the registration primitive to sabotage the live
+ * caller wiring; every producer dependency and the queue remain production
+ * objects owned by this module.
+ */
+export function registerProductionInboundMessageHandler({
+  connectionSocket,
+  isActiveSocket,
+  registerHandler = registerInboundMessageHandler,
+}) {
+  return registerHandler({
+    emittingSocket: connectionSocket,
+    isActiveSocket,
+    emitDebugEvent,
+    producerDependencies: {
+      mode: WHATSAPP_MODE,
+      dmPolicy: WHATSAPP_DM_POLICY,
+      forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+      recentlySentIds,
+      allowlistMatches: id => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+      extractEvent: extractBridgeEvent,
+      downloadMedia: async mediaMsg => downloadMediaMessage(
+        mediaMsg, 'buffer', {},
+        { logger, reuploadRequest: connectionSocket.updateMediaMessage },
+      ),
+      cacheDirs: {
+        image: IMAGE_CACHE_DIR,
+        document: DOCUMENT_CACHE_DIR,
+        audio: AUDIO_CACHE_DIR,
+      },
+      replyPrefix: REPLY_PREFIX,
+      messageStore,
+      messageQueue,
+      maxQueueSize: MAX_QUEUE_SIZE,
+      debugEnabled: WHATSAPP_DEBUG,
+      redactWhatsAppId,
+      handlePollUpdate: async ({ msg: pollMsg, chatId, senderId, socketUser }) => {
+        const messageContent = getMessageContent(pollMsg);
+        if (!messageContent.pollUpdateMessage) return false;
+        const pollUpdateMessage = messageContent.pollUpdateMessage;
+        const pollKey = pollUpdateMessage.pollCreationMessageKey || {
+          id: pollUpdateMessage.key?.id || pollMsg.key.id,
+          remoteJid: chatId,
+          participant: senderId,
+        };
+        const pollCreation = messageStore.get(pollKey.id);
+        let aggregation = [];
+        let pollUpdates = [pollUpdateMessage];
+        try {
+          if (pollCreation) {
+            const meId = jidNormalizedUser(socketUser?.id || 'me');
+            const pollUpdate = pollUpdateForAggregation({
+              pollUpdateMessage, pollUpdateMessageKey: pollMsg.key, pollCreation,
+              decryptPollVote, getKeyAuthor, meId,
+              pollCreatorJids: [
+                jidNormalizedUser(socketUser?.lid || ''),
+                jidNormalizedUser(socketUser?.id || ''),
+                getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(socketUser?.lid || '')),
+                getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(socketUser?.id || '')),
+              ],
+              voterJids: [
+                normalizeWhatsAppId(pollMsg.key?.participant || ''),
+                normalizeWhatsAppId(pollMsg.key?.remoteJid || chatId || ''),
+                normalizeWhatsAppId(senderId || ''),
+              ],
+            });
+            if (pollUpdate) pollUpdates = [pollUpdate];
+            aggregation = getAggregateVotesInPollMessage({
+              message: pollCreation.message, pollUpdates,
+            });
+          }
+        } catch (err) {
+          console.warn('[bridge] failed to aggregate poll upsert:', err.message);
+        }
+        const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates[0]);
+        logPollUpdateDiagnostic({
+          sourcePath: 'messages.upsert', pollId: pollKey.id, pollCreation,
+          pollUpdates, selectedOptions, aggregation,
+        });
+        if (!isActiveSocket(connectionSocket)) return true;
+        enqueuePollUpdateEvent({
+          key: { ...pollKey, remoteJid: pollKey.remoteJid || chatId,
+            participant: pollKey.participant || senderId },
+          update: { pollUpdates }, selectedOptions, aggregation,
+        });
+        return true;
+      },
+    },
+  });
+}
+
+export function takeProductionInboundMessages() {
+  return messageQueue.splice(0, messageQueue.length);
+}
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   if (state?.creds?.registered !== true) {
@@ -530,85 +626,7 @@ async function startSocket() {
     }
   });
 
-  registerInboundMessageHandler({
-    emittingSocket: connectionSocket,
-    isActiveSocket,
-    emitDebugEvent,
-    producerDependencies: {
-      mode: WHATSAPP_MODE,
-      dmPolicy: WHATSAPP_DM_POLICY,
-      forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
-      recentlySentIds,
-      allowlistMatches: id => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
-      extractEvent: extractBridgeEvent,
-      downloadMedia: async mediaMsg => downloadMediaMessage(
-        mediaMsg, 'buffer', {},
-        { logger, reuploadRequest: connectionSocket.updateMediaMessage },
-      ),
-      cacheDirs: {
-        image: IMAGE_CACHE_DIR,
-        document: DOCUMENT_CACHE_DIR,
-        audio: AUDIO_CACHE_DIR,
-      },
-      replyPrefix: REPLY_PREFIX,
-      messageStore,
-      messageQueue,
-      maxQueueSize: MAX_QUEUE_SIZE,
-      debugEnabled: WHATSAPP_DEBUG,
-      redactWhatsAppId,
-      handlePollUpdate: async ({ msg: pollMsg, chatId, senderId, socketUser }) => {
-          const messageContent = getMessageContent(pollMsg);
-          if (!messageContent.pollUpdateMessage) return false;
-          const pollUpdateMessage = messageContent.pollUpdateMessage;
-          const pollKey = pollUpdateMessage.pollCreationMessageKey || {
-            id: pollUpdateMessage.key?.id || pollMsg.key.id,
-            remoteJid: chatId,
-            participant: senderId,
-          };
-          const pollCreation = messageStore.get(pollKey.id);
-          let aggregation = [];
-          let pollUpdates = [pollUpdateMessage];
-          try {
-            if (pollCreation) {
-              const meId = jidNormalizedUser(socketUser?.id || 'me');
-              const pollUpdate = pollUpdateForAggregation({
-                pollUpdateMessage, pollUpdateMessageKey: pollMsg.key, pollCreation,
-                decryptPollVote, getKeyAuthor, meId,
-                pollCreatorJids: [
-                  jidNormalizedUser(socketUser?.lid || ''),
-                  jidNormalizedUser(socketUser?.id || ''),
-                  getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(socketUser?.lid || '')),
-                  getKeyAuthor(pollUpdateMessage.pollCreationMessageKey || pollKey, jidNormalizedUser(socketUser?.id || '')),
-                ],
-                voterJids: [
-                  normalizeWhatsAppId(pollMsg.key?.participant || ''),
-                  normalizeWhatsAppId(pollMsg.key?.remoteJid || chatId || ''),
-                  normalizeWhatsAppId(senderId || ''),
-                ],
-              });
-              if (pollUpdate) pollUpdates = [pollUpdate];
-              aggregation = getAggregateVotesInPollMessage({
-                message: pollCreation.message, pollUpdates,
-              });
-            }
-          } catch (err) {
-            console.warn('[bridge] failed to aggregate poll upsert:', err.message);
-          }
-          const selectedOptions = normalizePollUpdateOptions(aggregation, pollUpdates[0]);
-          logPollUpdateDiagnostic({
-            sourcePath: 'messages.upsert', pollId: pollKey.id, pollCreation,
-            pollUpdates, selectedOptions, aggregation,
-          });
-          if (!isActiveSocket(connectionSocket)) return true;
-          enqueuePollUpdateEvent({
-            key: { ...pollKey, remoteJid: pollKey.remoteJid || chatId,
-              participant: pollKey.participant || senderId },
-            update: { pollUpdates }, selectedOptions, aggregation,
-          });
-          return true;
-      },
-    },
-  });
+  registerProductionInboundMessageHandler({ connectionSocket, isActiveSocket });
 }
 
 // HTTP server
@@ -648,7 +666,7 @@ app.use((req, res, next) => {
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
-  const msgs = messageQueue.splice(0, messageQueue.length);
+  const msgs = takeProductionInboundMessages();
   res.json(msgs);
 });
 

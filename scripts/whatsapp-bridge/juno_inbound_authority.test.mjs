@@ -147,9 +147,11 @@ test('socket replacement during extraction cannot cross-attribute or queue', asy
   assert.equal(queue.length, 0);
 });
 
-test('production bridge registers the exported immutable-socket seam', () => {
+test('production bridge calls its exported exact production composition', () => {
   const source = readFileSync(new URL('./bridge.js', import.meta.url), 'utf8');
   assert.match(source, /import \{ registerInboundMessageHandler \}/);
-  assert.match(source, /registerInboundMessageHandler\(\{\s*emittingSocket: connectionSocket,/);
+  assert.match(source, /export function registerProductionInboundMessageHandler/);
+  assert.match(source, /registerProductionInboundMessageHandler\(\{ connectionSocket, isActiveSocket \}\)/);
+  assert.match(source, /const msgs = takeProductionInboundMessages\(\)/);
   assert.doesNotMatch(source, /sock\.ev\.on\(['"]messages\.upsert/);
 });

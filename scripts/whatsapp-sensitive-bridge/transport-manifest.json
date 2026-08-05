@@ -6,7 +6,7 @@
   "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
   "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
   "verifier_sha256": "b2f77c04853eead92cfbc2614bb2ed474db714d04a73dd16b0f7013cfca431a5",
-  "source_sha256": "8e63bcf560da154a698a6a40c6f56bc1ad0dba8fa72e133255a9330f5e796cc9",
+  "source_sha256": "2b85a5d0fde2333c318e2474134b6a43236b2de0c717991cca4208012d3126da",
   "node_modules_tree_sha256": "48121207ef2e275e835b08cf58b264b8f0d4ef56eddb07298e833a2720dc62ef",
   "baileys": {
     "spec": "7.0.0-rc14",

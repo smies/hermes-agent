@@ -8,7 +8,7 @@ import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const EXPECTED_MANIFEST_SHA256 = '8df3c314aa5ed60e3d39c87090bc041d1d9d6fb52c5440e89fe6d1bbf5568fb1';
+export const EXPECTED_MANIFEST_SHA256 = '9368ac8903723594786666fa141a5e5715396244b2c4e477b0aef95a8cbd10ce';
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');

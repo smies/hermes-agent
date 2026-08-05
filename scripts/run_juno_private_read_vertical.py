@@ -95,8 +95,14 @@ def main() -> int:
         fixtures.mkdir(parents=True)
         ordinary = scripts / "whatsapp-bridge"
         sensitive = scripts / "whatsapp-sensitive-bridge"
-        shutil.copytree(ROOT / "scripts/whatsapp-bridge", ordinary)
-        shutil.copytree(ROOT / "scripts/whatsapp-sensitive-bridge", sensitive)
+        ignore_installed = shutil.ignore_patterns("node_modules")
+        shutil.copytree(
+            ROOT / "scripts/whatsapp-bridge", ordinary, ignore=ignore_installed,
+        )
+        shutil.copytree(
+            ROOT / "scripts/whatsapp-sensitive-bridge", sensitive,
+            ignore=ignore_installed,
+        )
         shutil.copy2(
             ROOT / "tests/fixtures/juno_sensitive_http_harness.mjs",
             fixtures / "juno_sensitive_http_harness.mjs",
@@ -125,18 +131,23 @@ def main() -> int:
             "HOME": str(isolated_home),
             "HERMES_HOME": str(isolated_hermes),
             "XDG_CACHE_HOME": str(private / "cache"),
-            "JUNO_ISOLATED_BRIDGE_HELPER": str(ordinary / "bridge_helpers.js"),
-            "JUNO_ISOLATED_BRIDGE_PRODUCER": str(ordinary / "inbound_producer.js"),
+            "PYTHONPYCACHEPREFIX": str(private / "pycache"),
+            "JUNO_ISOLATED_BRIDGE_MODULE": str(ordinary / "bridge.js"),
             "JUNO_ISOLATED_SENSITIVE_HARNESS": str(
                 fixtures / "juno_sensitive_http_harness.mjs"
             ),
+            "JUNO_ISOLATED_SENSITIVE_PACKAGE": str(sensitive),
         }
         completed = subprocess.run(
             [
                 sys.executable, "-m", "pytest", "-q",
                 "-rs",
                 "tests/gateway/test_juno_private_read_mvp_remediation.py",
-                "-k", "offline_cross_runtime_producer_to_private_delivery_vertical",
+                "-k", (
+                    "production_registration_sabotage or "
+                    "offline_cross_runtime_producer_to_private_delivery_vertical or "
+                    "no_socket_vertical_preserves_producer_adapter_and_replay_contract"
+                ),
             ],
             cwd=ROOT,
             env=env,

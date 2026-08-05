@@ -150,7 +150,7 @@ export function createSensitiveHttpHandler({
       }
       return;
     }
-    if (req.method !== 'POST' || !new Set(['/v1/send', '/v1/submit']).has(req.url)) {
+    if (req.method !== 'POST' || req.url !== '/v1/submit') {
       boundedError(res, 404, 'route_not_found');
       return;
     }
@@ -228,19 +228,17 @@ export function createSensitiveHttpHandler({
         return;
       }
       try {
-        const operation = req.url === '/v1/submit' ? transport.submit : transport.send;
+        const operation = transport.submit;
         if (typeof operation !== 'function') {
           finishActive();
           boundedError(res, 503, 'transport_unavailable');
           return;
         }
-        if (req.url === '/v1/submit') {
-          const deadline = submitDeadlineState(body, nowUs);
-          if (deadline !== 'live') {
-            finishActive();
-            deadlineFailure(res, deadline);
-            return;
-          }
+        const deadline = submitDeadlineState(body, nowUs);
+        if (deadline !== 'live') {
+          finishActive();
+          deadlineFailure(res, deadline);
+          return;
         }
         // No await or event-loop yield may separate the authenticated final
         // deadline sample above from entry into the delivery core.

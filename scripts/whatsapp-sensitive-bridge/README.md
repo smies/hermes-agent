@@ -85,18 +85,14 @@ startup contains no pairing operation and there is no QR fallback.
 
 ## Evidence semantics
 
-One request pre-reserves one exact pinned-format message ID and invokes one
-`sendMessage` with exact text and `linkPreview: null`. Numeric `SERVER_ACK` is
-only sender-companion/provider-fanout evidence and cannot succeed an attempt.
-Only an exact destination `DELIVERY_ACK`, `READ`, or `PLAYED` update can produce
-the internal `provider_accepted` outcome. Send and acknowledgement timeouts are
-never retried and remain post-submission ambiguous.
-
-The Juno MVP also exposes `/v1/submit`. It returns `submitted` only after the
-single exact `sendMessage` promise resolves with matching message/account/
-destination correlation. It does not wait for an acknowledgement and never
-labels that result delivered or read. A timeout, mismatch, or unknown result
-is terminal for that request and is not automatically retried. Its authenticated
+The only authenticated plaintext delivery route is `/v1/submit`. Legacy
+`/v1/send` and direct `transport.send()` delivery are not published. Submit
+pre-reserves one exact pinned-format message ID, invokes one `sendMessage` with
+exact text and `linkPreview: null`, and returns `submitted` only after that
+promise resolves with matching message/account/destination correlation. It
+does not wait for an acknowledgement and never labels that result delivered or
+read. A timeout, mismatch, or unknown result is terminal for that request and
+is not automatically retried. Its authenticated
 JSON body carries the exact integer `expires_at_us` deadline and
 `contract_version: juno-sensitive-submit-v2`. The Python coroutine checks the
 deadline at entry and immediately before HTTP issue; the authenticated Node

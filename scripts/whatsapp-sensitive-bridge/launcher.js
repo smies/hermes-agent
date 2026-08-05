@@ -5,7 +5,7 @@ import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const EXPECTED_MANIFEST_SHA256 = 'cb49995c1fb9697ff917b99feb73b4646386f886346bde260c45aa6d9c3428e1';
+export const EXPECTED_MANIFEST_SHA256 = '1d6430d23923e9b962c81312afca2f1283562bdb0f05021730e8b050191cd7e9';
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -41,8 +41,10 @@ function parseAnchoredManifest(manifestBytes) {
   return manifest;
 }
 
-export async function launchSensitiveBridge(argv = process.argv.slice(2), env = process.env) {
-  const root = path.dirname(fileURLToPath(import.meta.url));
+export async function verifySensitiveTransport(
+  root = path.dirname(fileURLToPath(import.meta.url)),
+) {
+  root = realpathSync.native(root);
   const manifestBytes = readFileSync(path.join(root, 'transport-manifest.json'));
   if (sha256(manifestBytes) !== EXPECTED_MANIFEST_SHA256) {
     throw new Error('sensitive transport manifest anchor mismatch');
@@ -65,6 +67,11 @@ export async function launchSensitiveBridge(argv = process.argv.slice(2), env = 
     ...verified,
     launcher_sha256: sha256(readFileSync(fileURLToPath(import.meta.url))),
   });
+  return identity;
+}
+
+export async function launchSensitiveBridge(argv = process.argv.slice(2), env = process.env) {
+  const identity = await verifySensitiveTransport();
   const core = await import('./sensitive_bridge.js');
   return core.runSensitiveBridge({ argv, env, transportIdentity: identity });
 }

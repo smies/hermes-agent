@@ -7,12 +7,13 @@ import {
   createSensitiveHttpHandler,
   listenLoopback,
 } from '../../scripts/whatsapp-sensitive-bridge/http_server.js';
+import { verifySensitiveTransport } from '../../scripts/whatsapp-sensitive-bridge/launcher.js';
 
 const account = '55555555555@s.whatsapp.net';
 const ordinary = '33333333333@s.whatsapp.net';
 const runtime = `vertical-runtime-${process.pid}`;
 const epoch = `vertical-epoch-${process.pid}`;
-const identity = JSON.parse(process.env.JUNO_TEST_TRANSPORT_IDENTITY);
+const identity = await verifySensitiveTransport();
 const capture = process.env.JUNO_TEST_DELIVERY_CAPTURE;
 const capability = process.env.JUNO_TEST_SENSITIVE_CAPABILITY;
 const ev = new EventEmitter();
@@ -47,7 +48,7 @@ try {
   process.stderr.write('JUNO_HARNESS_STARTUP_FAILURE\n');
   process.exit(74);
 }
-process.stdout.write(`${JSON.stringify({ port: server.address().port })}\n`);
+process.stdout.write(`${JSON.stringify({ port: server.address().port, identity })}\n`);
 
 const stop = () => {
   transport.setEnabled(false);

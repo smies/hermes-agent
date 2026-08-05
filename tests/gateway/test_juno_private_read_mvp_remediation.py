@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ast
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -15,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sqlite3
 import subprocess
+import tempfile
 from threading import Thread
 import time
 import traceback
@@ -22,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import gateway.juno_replay_journal as replay_journal
 from gateway.config import Platform, PlatformConfig
 from gateway.juno_private_read_mvp import (
     CAPABILITY_ID,
@@ -66,11 +69,17 @@ def _runtime_identity(
     )
 
 
-def _node_forwarded_event(*, sender: str, text: str, message_id: str) -> dict:
+def _node_forwarded_event(
+    *, sender: str, text: str, message_id: str, sabotage_registration: bool = False,
+) -> dict:
+    module_value = os.environ.get("JUNO_ISOLATED_BRIDGE_MODULE")
+    if not module_value:
+        pytest.fail("copied ordinary Node package is required")
+    bridge_module = Path(module_value).resolve(strict=True)
+    assert not bridge_module.is_relative_to(Path(__file__).parents[2].resolve())
     source = r"""
 import { pathToFileURL } from 'node:url';
-const helper = await import(pathToFileURL(process.env.JUNO_BRIDGE_HELPER));
-const producer = await import(pathToFileURL(process.env.JUNO_BRIDGE_PRODUCER));
+const bridge = await import(pathToFileURL(process.env.JUNO_BRIDGE_MODULE));
 const input = JSON.parse(process.env.JUNO_BRIDGE_INPUT);
 const msg = {
   key: { id: input.messageId, remoteJid: input.sender,
@@ -78,46 +87,47 @@ const msg = {
   pushName: 'Synthetic User', messageTimestamp: 1786000000,
   message: { conversation: input.text },
 };
-const queue = [];
-const store = helper.createBoundedMessageStore();
 const handlers = new Map();
 const socket = {
   user: { id: '33333333333:19@s.whatsapp.net', lid: '44444444444@lid' },
   ev: { on: (name, handler) => handlers.set(name, handler) },
 };
-producer.registerInboundMessageHandler({
-  emittingSocket: socket, isActiveSocket: candidate => candidate === socket,
-  producerDependencies: {
-    mode: 'bot', dmPolicy: 'allowlist', forwardOwnerMessages: true,
-    recentlySentIds: new Set(),
-    allowlistMatches: id => [input.sender, '11111111111@s.whatsapp.net'].includes(id),
-    extractEvent: helper.extractBridgeEvent, cacheDirs: {}, replyPrefix: '',
-    messageStore: store, messageQueue: queue, maxQueueSize: 100,
-  },
+const sabotage = process.env.JUNO_SABOTAGE_REGISTRATION === '1'
+  ? ({ emittingSocket }) => emittingSocket.ev.on(
+      'messages.upsert', async () => ({ action: 'ignored', reason: 'sabotaged_live_wiring' }),
+    )
+  : undefined;
+bridge.registerProductionInboundMessageHandler({
+  connectionSocket: socket,
+  isActiveSocket: candidate => candidate === socket,
+  ...(sabotage ? { registerHandler: sabotage } : {}),
 });
 const outcome = await handlers.get('messages.upsert')({ type: 'notify', messages: [msg] });
-if (outcome.action !== 'queued' || queue.length !== 1) throw new Error('producer rejected');
+const queue = bridge.takeProductionInboundMessages();
+if (outcome.action !== 'queued' || queue.length !== 1) throw new Error('production composition rejected');
 process.stdout.write(JSON.stringify(queue[0]));
 """
-    completed = subprocess.run(
-        ["node", "--input-type=module", "-e", source],
-        check=True, capture_output=True, text=True, timeout=10,
-        env={
-            **os.environ,
-            "JUNO_BRIDGE_HELPER": str(
-                os.environ.get("JUNO_ISOLATED_BRIDGE_HELPER")
-                or Path(__file__).parents[2] / "scripts/whatsapp-bridge/bridge_helpers.js"
-            ),
-            "JUNO_BRIDGE_PRODUCER": str(
-                os.environ.get("JUNO_ISOLATED_BRIDGE_PRODUCER")
-                or Path(__file__).parents[2] / "scripts/whatsapp-bridge/inbound_producer.js"
-            ),
-            "JUNO_BRIDGE_INPUT": json.dumps({
-                "sender": sender, "text": text, "messageId": message_id,
-            }),
-        },
-    )
-    return json.loads(completed.stdout)
+    with tempfile.TemporaryDirectory(prefix="juno-ordinary-composition-") as raw:
+        isolated = Path(raw)
+        completed = subprocess.run(
+            ["node", "--input-type=module", "-e", source],
+            check=True, capture_output=True, text=True, timeout=20,
+            env={
+                **os.environ,
+                "HOME": str(isolated),
+                "HERMES_HOME": str(isolated / "hermes"),
+                "XDG_CACHE_HOME": str(isolated / "cache"),
+                "WHATSAPP_MODE": "bot",
+                "WHATSAPP_DM_POLICY": "allowlist",
+                "WHATSAPP_ALLOWED_USERS": f"{sender},{OWNER}",
+                "JUNO_BRIDGE_MODULE": str(bridge_module),
+                "JUNO_SABOTAGE_REGISTRATION": "1" if sabotage_registration else "0",
+                "JUNO_BRIDGE_INPUT": json.dumps({
+                    "sender": sender, "text": text, "messageId": message_id,
+                }),
+            },
+        )
+        return json.loads(completed.stdout)
 
 
 def _loopback_server(handler) -> HTTPServer:
@@ -178,6 +188,23 @@ def test_node_harness_failure_classification_skips_only_exact_bind_denial() -> N
     ) == "module_not_found"
     assert _node_harness_failure("SyntaxError: synthetic", 1) == "syntax_error"
     assert _node_harness_failure("", 1) == "unexpected_node_failure"
+
+
+def test_production_registration_sabotage_breaks_the_live_caller_composition() -> None:
+    baseline = _node_forwarded_event(
+        sender=TRUSTED,
+        text="production-registration-baseline",
+        message_id="PRODUCTION-REGISTRATION-BASELINE",
+    )
+    assert baseline["messageId"] == "PRODUCTION-REGISTRATION-BASELINE"
+    assert baseline["inboundProvenance"] == ORDINARY_INBOUND_PROVENANCE
+    with pytest.raises(subprocess.CalledProcessError):
+        _node_forwarded_event(
+            sender=TRUSTED,
+            text="production-registration-sabotage",
+            message_id="PRODUCTION-REGISTRATION-SABOTAGE",
+            sabotage_registration=True,
+        )
 
 
 class _SensitiveHandler(BaseHTTPRequestHandler):
@@ -494,13 +521,18 @@ async def test_deleted_row_does_not_free_consumed_owner_provider_message(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["journal_missing", "journal_truncated", "journal_corrupt",
-                                    "marker_missing", "marker_corrupt", "both_missing"])
+@pytest.mark.parametrize("damage", [
+    "journal_missing", "journal_truncated", "journal_partial_record",
+    "journal_oversized", "journal_corrupt", "marker_missing", "marker_corrupt",
+    "marker_valid_stale", "marker_unknown_version", "both_missing",
+    "self_consistent_replacement_key",
+])
 async def test_required_replay_authority_damage_keeps_host_unpublished_and_offline(
     tmp_path: Path, damage: str,
 ) -> None:
     host, transport, ordinary, sensitive = await _host(tmp_path)
     config, dependencies = host.config, host.dependencies
+    stale_marker = (config.state_dir / MARKER_NAME).read_bytes()
     _tool(_event(OWNER, "request", message="journal-damage-source"), host)
     await host.stop()
     journal = config.state_dir / JOURNAL_NAME
@@ -513,14 +545,39 @@ async def test_required_replay_authority_damage_keeps_host_unpublished_and_offli
     elif damage == "journal_truncated":
         value = journal.read_bytes()
         journal.write_bytes(value.splitlines(keepends=True)[0])
+    elif damage == "journal_partial_record":
+        value = journal.read_bytes()
+        journal.write_bytes(value[:-7])
+    elif damage == "journal_oversized":
+        journal.write_bytes(b"x" * (replay_journal.MAX_JOURNAL_BYTES + 1))
     elif damage == "journal_corrupt":
         value = bytearray(journal.read_bytes())
         value[min(10, len(value) - 1)] ^= 1
         journal.write_bytes(value)
     elif damage == "marker_missing":
         marker.unlink()
-    else:
+    elif damage == "marker_corrupt":
         marker.write_text("corrupt\n", encoding="utf-8")
+    elif damage == "marker_valid_stale":
+        marker.write_bytes(stale_marker)
+    elif damage == "marker_unknown_version":
+        key = (config.state_dir / "mvp-store.key").read_bytes()[:32]
+        current = json.loads(marker.read_bytes())
+        unsigned = {"head": current["head"], "seq": current["seq"], "v": 999}
+        current = {
+            **unsigned,
+            "mac": replay_journal._mac(
+                key, b"juno-replay-head-v1", replay_journal._canonical(unsigned)
+            ),
+        }
+        marker.write_bytes(replay_journal._canonical(current) + b"\n")
+    elif damage == "self_consistent_replacement_key":
+        key = b"R" * 32
+        seal = bytes.fromhex(replay_journal._mac(
+            key, b"juno-replay-key-seal-v1", key + _KEY_MAGIC
+        ))
+        (config.state_dir / "mvp-store.key").write_bytes(key + _KEY_MAGIC + seal)
+        (config.state_dir / "mvp-store.key").chmod(0o600)
     for path in (journal, marker):
         if path.exists():
             path.chmod(0o600)
@@ -531,6 +588,91 @@ async def test_required_replay_authority_damage_keeps_host_unpublished_and_offli
     assert transport.calls == []
     assert ordinary.messages == []
     assert sensitive.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["journal_write", "journal_fsync", "marker_directory_fsync"]
+)
+async def test_replay_genesis_startup_faults_remain_unpublished_and_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    config = JunoPrivateReadMvpConfig.parse(_raw_config(tmp_path))
+    transport = FakeJsonTransport()
+    ordinary = FakeOrdinary()
+    sensitive = FakeSensitive()
+    dependencies = JunoPrivateReadDependencies(
+        OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
+        ordinary, sensitive,
+    )
+    # Supply the exact historical raw-key migration input. Production creates
+    # and fsyncs genesis journal+marker before it seals this key, so each
+    # injected failure necessarily reaches the named genesis boundary.
+    key_path = config.state_dir / "mvp-store.key"
+    config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config.state_dir.chmod(0o700)
+    key_path.write_bytes(b"G" * 32)
+    key_path.chmod(0o600)
+
+    def fail(*_args, **_kwargs):
+        raise OSError(f"synthetic startup {fault} failure")
+
+    target = {
+        "journal_write": "_write",
+        "journal_fsync": "_fsync_file",
+        "marker_directory_fsync": "_fsync_directory",
+    }[fault]
+    monkeypatch.setattr(replay_journal.JunoReplayAuthority, target, fail)
+    host = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
+    assert not await host.start(_background_worker=False)
+    journal_path = config.state_dir / JOURNAL_NAME
+    marker_path = config.state_dir / MARKER_NAME
+    if fault == "journal_write":
+        assert journal_path.is_file() and journal_path.stat().st_size == 0
+        assert not marker_path.exists()
+    elif fault == "journal_fsync":
+        assert journal_path.is_file() and journal_path.stat().st_size > 0
+        assert not marker_path.exists()
+    else:
+        assert journal_path.is_file() and journal_path.stat().st_size > 0
+        assert marker_path.is_file() and marker_path.stat().st_size > 0
+    assert not host.is_healthy()
+    assert not check_private_read_request_runtime()
+    assert transport.calls == []
+    assert ordinary.messages == []
+    assert sensitive.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["journal_write", "journal_fsync", "marker_directory_fsync"]
+)
+async def test_replay_append_crash_ordering_faults_depublish_before_any_provider_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    host, transport, ordinary, sensitive = await _host(tmp_path)
+    journal = host._journal
+    assert journal is not None
+
+    def fail(*_args, **_kwargs):
+        raise OSError(f"synthetic {fault} failure")
+
+    target = {
+        "journal_write": "_write",
+        "journal_fsync": "_fsync_file",
+        "marker_directory_fsync": "_fsync_directory",
+    }[fault]
+    monkeypatch.setattr(journal, target, fail)
+    result = _tool(_event(
+        OWNER, "request", message=f"replay-ordering-{fault}"
+    ), host)
+    assert result.terminal.status == "safe_failure"
+    assert not host.is_healthy()
+    assert not check_private_read_request_runtime()
+    assert transport.calls == []
+    assert ordinary.messages == []
+    assert sensitive.calls == []
+    await host.stop()
 
 
 _KEY_DAMAGE_CASES = (
@@ -1688,6 +1830,7 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
     from tools.registry import registry
 
     caplog.set_level(logging.DEBUG)
+    assert "JUNO_TEST_TRANSPORT_IDENTITY" not in os.environ
     home = tmp_path / "home"
     profile_home = home / ".hermes" / "profiles" / "juno"
     profile_home.mkdir(parents=True, mode=0o700)
@@ -1707,14 +1850,19 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
 
     capture = tmp_path / "private-delivery-capture.jsonl"
     capture.touch(mode=0o600)
-    harness = Path(os.environ.get("JUNO_ISOLATED_SENSITIVE_HARNESS") or (
-        Path(__file__).parents[1] / "fixtures/juno_sensitive_http_harness.mjs"
-    ))
+    harness_value = os.environ.get("JUNO_ISOLATED_SENSITIVE_HARNESS")
+    package_value = os.environ.get("JUNO_ISOLATED_SENSITIVE_PACKAGE")
+    if not harness_value or not package_value:
+        pytest.fail("copied sensitive Node package and harness are required")
+    harness = Path(harness_value).resolve(strict=True)
+    sensitive_package = Path(package_value).resolve(strict=True)
+    worktree_root = Path(__file__).parents[2].resolve()
+    assert not harness.is_relative_to(worktree_root)
+    assert not sensitive_package.is_relative_to(worktree_root)
     sensitive_process = subprocess.Popen(
         ["node", str(harness)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env={
             **os.environ,
-            "JUNO_TEST_TRANSPORT_IDENTITY": json.dumps(_SENSITIVE_TRANSPORT_IDENTITY),
             "JUNO_TEST_DELIVERY_CAPTURE": str(capture),
             "JUNO_TEST_SENSITIVE_CAPABILITY": "s" * 48,
         },
@@ -1742,7 +1890,9 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         if classification == "socket_bind_denied":
             pytest.skip("execution sandbox positively denied Node loopback listen")
         pytest.fail(f"Node vertical harness failed: {classification}")
-    sensitive_port = json.loads(first_line)["port"]
+    ready_evidence = json.loads(first_line)
+    sensitive_port = ready_evidence["port"]
+    assert ready_evidence["identity"] == _SENSITIVE_TRANSPORT_IDENTITY
     try:
         provider = HTTPServer(("127.0.0.1", 0), _VerticalProviderHandler)
     except PermissionError:
@@ -1900,6 +2050,47 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         assert CREDENTIAL_SENTINEL not in repr(ordinary_adapter.sent)
         assert PRIVATE_SENTINEL not in caplog.text
         assert CREDENTIAL_SENTINEL not in caplog.text
+
+        # The same installed private package is now mutated. The production
+        # launcher/verifier must reject before returning identity to code that
+        # would construct a provider or publish an HTTP identity response.
+        mutated_artifact = sensitive_package / "http_server.js"
+        mutated_artifact.write_bytes(mutated_artifact.read_bytes() + b"\n// mutation probe\n")
+        accepted_marker = tmp_path / "mutated-identity-accepted"
+        verifier_probe = r"""
+import { pathToFileURL } from 'node:url';
+import { writeFileSync } from 'node:fs';
+const launcher = await import(pathToFileURL(process.env.JUNO_LAUNCHER));
+let identityAccepted = false;
+let providerConstructed = 0;
+try {
+  await launcher.verifySensitiveTransport();
+  identityAccepted = true;
+  providerConstructed += 1;
+  writeFileSync(process.env.JUNO_ACCEPTED_MARKER, 'unexpected');
+} catch {}
+process.stdout.write(JSON.stringify({ identityAccepted, providerConstructed }));
+"""
+        before_mutation_probe = capture.read_bytes()
+        provider_accesses = list(_VerticalProviderHandler.observed)
+        mutation = subprocess.run(
+            ["node", "--input-type=module", "-e", verifier_probe],
+            check=True, capture_output=True, text=True, timeout=30,
+            env={
+                **os.environ,
+                "HOME": str(home),
+                "HERMES_HOME": str(profile_home),
+                "XDG_CACHE_HOME": str(tmp_path / "mutation-cache"),
+                "JUNO_LAUNCHER": str(sensitive_package / "launcher.js"),
+                "JUNO_ACCEPTED_MARKER": str(accepted_marker),
+            },
+        )
+        assert json.loads(mutation.stdout) == {
+            "identityAccepted": False, "providerConstructed": 0,
+        }
+        assert not accepted_marker.exists()
+        assert capture.read_bytes() == before_mutation_probe
+        assert _VerticalProviderHandler.observed == provider_accesses
     finally:
         if session_db is not None:
             session_db.close()
@@ -1978,179 +2169,192 @@ async def test_non_juno_active_profile_cannot_start_or_bind_v2_host(tmp_path: Pa
     assert runner._trusted_private_read_host is None
 
 
-def _checkpoint_metadata(checkpoint: int):
-    columns = [
-        ("request_id", "TEXT", 0, None, 1),
-        ("requester", "TEXT", 1, None, 0),
-        ("source_profile", "TEXT", 1, None, 0),
-        ("source_account", "TEXT", 1, None, 0),
-        ("source_chat", "TEXT", 1, None, 0),
-    ]
-    if checkpoint >= 1:
-        columns.extend([
-            ("source_message", "TEXT", 1, None, 0),
-        ])
-    columns.extend([
-        ("capability_id", "TEXT", 1, None, 0),
-        ("destination_account", "TEXT", 1, None, 0),
-        ("destination_chat", "TEXT", 1, None, 0),
-        ("owner_sender", "TEXT", 1, None, 0),
-    ])
-    if checkpoint >= 1:
-        columns.append(("approval_chat", "TEXT", 1, None, 0))
-    if checkpoint >= 2:
-        columns.append(("approval_message", "TEXT", 0, None, 0))
-    columns.extend([
-        ("descriptor_digest", "TEXT", 1, None, 0),
-        ("created_at_us", "INTEGER", 1, None, 0),
-        ("expires_at_us", "INTEGER", 1, None, 0),
-        ("status", "TEXT", 1, None, 0),
-        ("notice_claimed", "INTEGER", 1, "0", 0),
-        ("claim_token_digest", "TEXT", 0, None, 0),
-        ("provider_message_id", "TEXT", 0, None, 0),
-        ("terminal_code", "TEXT", 0, None, 0),
-        ("updated_at_us", "INTEGER", 1, None, 0),
-        ("version", "INTEGER", 1, "1", 0),
-    ])
-    if checkpoint >= 2:
-        columns.append(("state_hmac", "TEXT", 1, None, 0))
-    return [
-        (cid, name, kind, notnull, default, primary)
-        for cid, (name, kind, notnull, default, primary) in enumerate(columns)
-    ]
+IMMUTABLE_MIGRATION_CHECKPOINTS = (
+    (
+        "e0795f07b2a750617b65b099c6caebb6ed5678e9",
+        "first committed private-read MVP table; no source/approval event columns",
+    ),
+    (
+        "884872dd2e95cac7b1c7973cd552b8f05b94c193",
+        "source-event and approval-chat schema predecessor",
+    ),
+    (
+        "d9d03cf0004f6b610aeab2175fd0a8546d082821",
+        "approval-message and state-HMAC schema predecessor",
+    ),
+    (
+        "d52d6e43e8843fd00bf7cdb9d6697f8c75ddc848",
+        "provider-binding schema immediately preceding cycle 4",
+    ),
+    (
+        "a5c98f4debf367f965a67f55187d7bc88b0e39cc",
+        "cycle-4 immutable tree retained as a candidate migration source",
+    ),
+)
 
 
-def _install_legacy_mvp_table(db_path: Path, *, checkpoint: int) -> None:
+def _git_blob_bytes(revision: str, path: str) -> bytes:
+    root = Path(__file__).parents[2]
+    subprocess.run(
+        ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+        cwd=root, check=True, capture_output=True,
+    )
+    completed = subprocess.run(
+        ["git", "cat-file", "blob", f"{revision}:{path}"],
+        cwd=root, check=True, capture_output=True,
+    )
+    assert completed.stdout, f"required immutable blob is empty: {revision}:{path}"
+    return completed.stdout
+
+
+def _literal_assignment(blob: bytes, name: str) -> tuple[bytes, object]:
+    source = blob.decode("utf-8")
+    tree = ast.parse(source)
+    matches = [
+        node for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+        )
+    ]
+    assert len(matches) == 1, f"required immutable schema assignment missing: {name}"
+    value_node = matches[0].value
+    segment = ast.get_source_segment(source, value_node)
+    assert segment is not None
+    literal_bytes = segment.encode("utf-8")
+    value = ast.literal_eval(segment)
+    return literal_bytes, value
+
+
+def _immutable_private_schema(revision: str) -> tuple[bytes, bytes, int]:
+    schema_blob = _git_blob_bytes(revision, "gateway/authorization_schema.py")
+    literal_bytes, ddl = _literal_assignment(schema_blob, "_PRIVATE_READ_MVP")
+    assert type(ddl) is str and "private_read_mvp_requests" in ddl
+    ddl_bytes = ddl.encode("utf-8")
+    assert ast.literal_eval(literal_bytes.decode("utf-8")).encode("utf-8") == ddl_bytes
+
+    contracts_blob = _git_blob_bytes(revision, "gateway/authorization_contracts.py")
+    _version_literal, version = _literal_assignment(contracts_blob, "SCHEMA_VERSION")
+    assert type(version) is int and version > 0
+    return ddl_bytes, literal_bytes, version
+
+
+def _normalize_sql(value: str | None) -> str | None:
+    return None if value is None else " ".join(value.split())
+
+
+def _private_schema_snapshot(conn: sqlite3.Connection) -> dict[str, object]:
+    table_info = tuple(tuple(row) for row in conn.execute(
+        "PRAGMA table_info(private_read_mvp_requests)"
+    ))
+    index_metadata = []
+    for index_row in conn.execute("PRAGMA index_list(private_read_mvp_requests)"):
+        index = tuple(index_row)
+        name = index[1]
+        assert type(name) is str and '"' not in name
+        xinfo = tuple(tuple(row) for row in conn.execute(
+            f'PRAGMA index_xinfo("{name}")'
+        ))
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+        ).fetchone()
+        index_metadata.append((index, xinfo, _normalize_sql(sql_row[0] if sql_row else None)))
+    table_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='private_read_mvp_requests'"
+    ).fetchone()
+    return {
+        "table_info": table_info,
+        "indexes": tuple(index_metadata),
+        "table_sql": _normalize_sql(table_sql[0] if table_sql else None),
+        "user_version": conn.execute("PRAGMA user_version").fetchone()[0],
+    }
+
+
+def _install_immutable_checkpoint(
+    db_path: Path, *, revision: str,
+) -> tuple[bytes, bytes, dict[str, object]]:
+    ddl_bytes, literal_bytes, user_version = _immutable_private_schema(revision)
     conn = sqlite3.connect(db_path)
+    oracle = sqlite3.connect(":memory:")
     try:
-        conn.execute("DROP INDEX IF EXISTS idx_private_read_mvp_state")
-        conn.execute("DROP INDEX IF EXISTS idx_private_read_mvp_source_event")
-        conn.execute("DROP INDEX IF EXISTS idx_private_read_mvp_approval_event")
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='private_read_mvp_requests'"
+        ).fetchall():
+            if not row[0].startswith("sqlite_autoindex_"):
+                conn.execute(f'DROP INDEX "{row[0]}"')
         conn.execute("DROP TABLE IF EXISTS private_read_mvp_requests")
-        source_column = "source_message TEXT NOT NULL," if checkpoint >= 1 else ""
-        approval_columns = "approval_chat TEXT NOT NULL," if checkpoint >= 1 else ""
-        if checkpoint >= 2:
-            approval_columns += "approval_message TEXT,"
-        state_column = ",state_hmac TEXT NOT NULL" if checkpoint >= 2 else ""
-        conn.execute(
-            "CREATE TABLE private_read_mvp_requests ("
-            "request_id TEXT PRIMARY KEY,requester TEXT NOT NULL,"
-            "source_profile TEXT NOT NULL,source_account TEXT NOT NULL,"
-            "source_chat TEXT NOT NULL," + source_column +
-            "capability_id TEXT NOT NULL,destination_account TEXT NOT NULL,"
-            "destination_chat TEXT NOT NULL,owner_sender TEXT NOT NULL,"
-            + approval_columns +
-            "descriptor_digest TEXT NOT NULL,created_at_us INTEGER NOT NULL,"
-            "expires_at_us INTEGER NOT NULL,status TEXT NOT NULL CHECK (status IN ("
-            "'pending','approved','denied','expired','claimed','consumed','failed_consumed'"
-            ")),notice_claimed INTEGER NOT NULL DEFAULT 0 CHECK (notice_claimed IN (0,1)),"
-            "claim_token_digest TEXT,provider_message_id TEXT,terminal_code TEXT,"
-            "updated_at_us INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1"
-            + state_column + ")"
-        )
-        conn.execute(
-            "CREATE INDEX idx_private_read_mvp_state ON private_read_mvp_requests("
-            "status,expires_at_us,created_at_us)"
-        )
-        if checkpoint >= 1:
-            conn.execute(
-                "CREATE UNIQUE INDEX idx_private_read_mvp_source_event "
-                "ON private_read_mvp_requests(source_profile,source_account,source_chat,"
-                "requester,source_message,capability_id) WHERE source_message <> ''"
-            )
-        if checkpoint >= 2:
-            conn.execute(
-                "CREATE UNIQUE INDEX idx_private_read_mvp_approval_event "
-                "ON private_read_mvp_requests(source_profile,source_account,owner_sender,"
-                "approval_chat,approval_message,capability_id) "
-                "WHERE approval_message IS NOT NULL"
-            )
-        # All three source checkpoints used authorization schema version 7;
-        # the MVP table was an additive table outside that version number.
-        conn.execute("PRAGMA user_version=7")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
-        assert [tuple(row) for row in conn.execute(
-            "PRAGMA table_info(private_read_mvp_requests)"
-        )] == _checkpoint_metadata(checkpoint)
-        expected_indexes = {
-            "sqlite_autoindex_private_read_mvp_requests_1": (
-                1, "pk", 0, ("request_id",),
-            ),
-            "idx_private_read_mvp_state": (
-                0, "c", 0, ("status", "expires_at_us", "created_at_us"),
-            ),
-        }
-        if checkpoint >= 1:
-            expected_indexes["idx_private_read_mvp_source_event"] = (
-                1, "c", 1,
-                ("source_profile", "source_account", "source_chat", "requester",
-                 "source_message", "capability_id"),
-            )
-        if checkpoint >= 2:
-            expected_indexes["idx_private_read_mvp_approval_event"] = (
-                1, "c", 1,
-                ("source_profile", "source_account", "owner_sender", "approval_chat",
-                 "approval_message", "capability_id"),
-            )
-        observed_indexes = {}
-        for row in conn.execute("PRAGMA index_list(private_read_mvp_requests)"):
-            observed_indexes[row[1]] = (
-                row[2], row[3], row[4], tuple(
-                    item[2] for item in conn.execute(f"PRAGMA index_info('{row[1]}')")
-                ),
-            )
-        assert observed_indexes == expected_indexes
-        columns = ["request_id", "requester", "source_profile", "source_account", "source_chat"]
-        if checkpoint >= 1:
-            columns.append("source_message")
-        columns.extend((
-            "capability_id", "destination_account", "destination_chat", "owner_sender",
-        ))
-        if checkpoint >= 1:
-            columns.append("approval_chat")
-        if checkpoint >= 2:
-            columns.append("approval_message")
-        columns.extend((
-            "descriptor_digest", "created_at_us", "expires_at_us", "status",
-            "notice_claimed", "claim_token_digest", "provider_message_id", "terminal_code",
-            "updated_at_us", "version",
-        ))
-        if checkpoint >= 2:
-            columns.append("state_hmac")
+        conn.executescript(ddl_bytes.decode("utf-8"))
+        conn.execute(f"PRAGMA user_version={user_version}")
+
+        oracle.executescript(ddl_bytes.decode("utf-8"))
+        oracle.execute(f"PRAGMA user_version={user_version}")
+        expected = _private_schema_snapshot(oracle)
+        observed = _private_schema_snapshot(conn)
+        assert observed == expected
+        assert observed["table_info"]
+        assert observed["table_sql"]
+        assert observed["user_version"] == user_version
+        assert all(len(index[0]) >= 5 and len(index[1]) > 0 for index in observed["indexes"])
+
+        column_info = observed["table_info"]
+        columns = [row[1] for row in column_info]
         for index, status in enumerate(("pending", "approved", "claimed")):
-            values = [f"legacy-{index}", TRUSTED, "juno", ORDINARY_ACCOUNT, TRUSTED_CHAT]
-            if checkpoint >= 1:
-                values.append(f"legacy-source-{index}")
-            values.extend((
-                CAPABILITY_ID, SENSITIVE_ACCOUNT, "77777777777@s.whatsapp.net", OWNER,
-            ))
-            if checkpoint >= 1:
-                values.append(OWNER_CHAT)
-            if checkpoint >= 2:
-                values.append(None)
-            values.extend((
-                "0" * 64, 1_000_000 + index, 9_000_000_000_000_000, status, 0,
-                "legacy-claim" if status == "claimed" else None,
-                None, None, 1_000_000 + index, 1,
-            ))
-            if checkpoint >= 2:
-                values.append("")
+            known = {
+                "request_id": f"legacy-{index}",
+                "requester": TRUSTED,
+                "source_profile": "juno",
+                "source_account": ORDINARY_ACCOUNT,
+                "source_chat": TRUSTED_CHAT,
+                "source_message": f"legacy-source-{index}",
+                "capability_id": CAPABILITY_ID,
+                "destination_account": SENSITIVE_ACCOUNT,
+                "destination_chat": "77777777777@s.whatsapp.net",
+                "owner_sender": OWNER,
+                "approval_chat": OWNER_CHAT,
+                "approval_message": None,
+                "gmail_account": "juno@example.test",
+                "openfga_store_id": "store-test",
+                "openfga_model_id": "model-test",
+                "provider_authority_digest": "0" * 64,
+                "descriptor_digest": "0" * 64,
+                "created_at_us": 1_000_000 + index,
+                "expires_at_us": 9_000_000_000_000_000,
+                "status": status,
+                "notice_claimed": 0,
+                "claim_token_digest": "legacy-claim" if status == "claimed" else None,
+                "provider_message_id": None,
+                "terminal_code": None,
+                "updated_at_us": 1_000_000 + index,
+                "version": 1,
+                "state_hmac": "",
+            }
+            unknown = set(columns) - set(known)
+            assert not unknown, f"unhandled immutable checkpoint columns: {sorted(unknown)}"
             conn.execute(
-                "INSERT INTO private_read_mvp_requests (" + ",".join(columns) + ") VALUES ("
-                + ",".join("?" for _ in columns) + ")", values,
+                "INSERT INTO private_read_mvp_requests (" + ",".join(columns) + ") "
+                "VALUES (" + ",".join("?" for _ in columns) + ")",
+                [known[name] for name in columns],
             )
         conn.commit()
+        return ddl_bytes, literal_bytes, observed
     finally:
+        oracle.close()
         conn.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("checkpoint", [0, 1, 2])
-async def test_exact_checkpoint_schema_migrates_legacy_rows_fail_closed(
-    tmp_path: Path, checkpoint: int,
+@pytest.mark.parametrize(("revision", "applicability"), IMMUTABLE_MIGRATION_CHECKPOINTS)
+async def test_immutable_checkpoint_schema_migrates_legacy_rows_fail_closed(
+    tmp_path: Path, revision: str, applicability: str,
 ) -> None:
     from gateway.authorization_tasks import AuthorizationTaskStore
 
+    assert applicability
     config = JunoPrivateReadMvpConfig.parse(_raw_config(tmp_path))
     transport = FakeJsonTransport()
     ordinary = FakeOrdinary()
@@ -2163,14 +2367,21 @@ async def test_exact_checkpoint_schema_migrates_legacy_rows_fail_closed(
     key_path = config.state_dir / "mvp-store.key"
     key_path.write_bytes(b"k" * 32)
     key_path.chmod(0o600)
-    assert not (config.state_dir / JOURNAL_NAME).exists()
-    assert not (config.state_dir / MARKER_NAME).exists()
     bootstrap = AuthorizationTaskStore(
         db_path=db_path, audit_hmac_key=b"a" * 32,
         request_hmac_key=b"r" * 32, key_version="checkpoint-fixture",
     )
     bootstrap.close()
-    _install_legacy_mvp_table(db_path, checkpoint=checkpoint)
+    ddl_bytes, literal_bytes, before = _install_immutable_checkpoint(
+        db_path, revision=revision
+    )
+    assert ddl_bytes
+    assert literal_bytes
+    before_conn = sqlite3.connect(db_path)
+    try:
+        assert before == _private_schema_snapshot(before_conn)
+    finally:
+        before_conn.close()
 
     migrated = JunoPrivateReadMvpHost(config, dependencies, active_profile="juno")
     assert await migrated.start(_background_worker=False)
@@ -2183,28 +2394,25 @@ async def test_exact_checkpoint_schema_migrates_legacy_rows_fail_closed(
             columns = {row[1] for row in conn.execute(
                 "PRAGMA table_info(private_read_mvp_requests)"
             )}
-            assert {"source_message", "approval_chat", "approval_message", "state_hmac"} <= columns
+            assert {
+                "source_message", "approval_chat", "approval_message", "state_hmac",
+                "gmail_account", "openfga_store_id", "openfga_model_id",
+                "provider_authority_digest",
+            } <= columns
             assert conn.execute(
                 "SELECT count(*) FROM private_read_mvp_requests "
                 "WHERE status='failed_consumed' AND terminal_code='state_integrity_failed'"
             ).fetchone()[0] == 3
-            indexes = {row[1] for row in conn.execute(
-                "PRAGMA index_list(private_read_mvp_requests)"
-            )}
-            assert {
-                "idx_private_read_mvp_state", "idx_private_read_mvp_source_event",
-                "idx_private_read_mvp_approval_event",
-            } <= indexes
             assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         finally:
             conn.close()
         assert await migrated.process_once() is False
         fresh = _tool(_event(
-            TRUSTED, "request", message=f"authenticated-after-migration-{checkpoint}"
+            TRUSTED, "request", message=f"authenticated-after-{revision[:8]}"
         ), migrated)
         fresh_id = dict(fresh.terminal.metadata)["request_id"]
         assert migrated.intercept_approval(_event(
-            OWNER, f"/deny {fresh_id}", message=f"deny-after-migration-{checkpoint}"
+            OWNER, f"/deny {fresh_id}", message=f"deny-after-{revision[:8]}"
         )).mutated
         authenticated = migrated.repository.get(fresh_id)
         assert authenticated.status == "denied"

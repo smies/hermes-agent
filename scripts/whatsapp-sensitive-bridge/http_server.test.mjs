@@ -13,7 +13,7 @@ import { SensitiveDeliveryTransport } from './delivery_core.js';
 const CAPABILITY = 'capability-8f0e9d16c2ac4ab096e9d30db0371fcba4c2cde36b424db8';
 const MVP_SUBMIT_CONTRACT = SENSITIVE_SUBMIT_CONTRACT_VERSION;
 
-function invoke(handler, { method = 'POST', path = '/v1/send', headers = {}, chunks = [] } = {}) {
+function invoke(handler, { method = 'POST', path = '/v1/submit', headers = {}, chunks = [] } = {}) {
   return new Promise((resolve) => {
     const req = new EventEmitter();
     req.method = method;
@@ -38,7 +38,7 @@ test('capability authentication is timing-safe and completes before JSON parsing
   const handler = createSensitiveHttpHandler({
     capability: CAPABILITY,
     parseJson(bytes) { parses += 1; return JSON.parse(bytes); },
-    transport: { async send() { return { outcome: 'denied', submitted: false }; } },
+    transport: { async submit() { return { state: 'failed' }; } },
   });
   const body = '{not-json-and-private';
   const result = await invoke(handler, {
@@ -60,11 +60,15 @@ test('handler enforces loopback peer/host, exact content type/length, body and a
   const pending = new Promise((resolve) => { release = resolve; });
   const handler = createSensitiveHttpHandler({
     capability: CAPABILITY,
-    maxBodyBytes: 64,
+    maxBodyBytes: 512,
     activeRequestLimit: 1,
-    transport: { async send() { await pending; return { outcome: 'denied', submitted: false }; } },
+    nowUs: () => 1_785_846_896_000_000,
+    transport: { async submit() { await pending; return { state: 'failed' }; } },
   });
-  const valid = JSON.stringify({ a: 1 });
+  const valid = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    expires_at_us: 1_785_846_900_000_000,
+  });
   const baseHeaders = {
     host: '127.0.0.1',
     [CAPABILITY_HEADER]: CAPABILITY,
@@ -81,7 +85,7 @@ test('handler enforces loopback peer/host, exact content type/length, body and a
   for (const [headers, status] of [
     [{ ...baseHeaders, host: 'attacker.example' }, 400],
     [{ ...baseHeaders, 'content-type': 'text/plain' }, 415],
-    [{ ...baseHeaders, 'content-length': '65' }, 413],
+    [{ ...baseHeaders, 'content-length': '513' }, 413],
     [{ ...baseHeaders, 'content-length': undefined }, 411],
   ]) {
     const cleaned = Object.fromEntries(Object.entries(headers).filter(([, value]) => value !== undefined));
@@ -94,7 +98,7 @@ test('rate cap and malformed bodies produce bounded content-free outcomes', asyn
     capability: CAPABILITY,
     rateLimit: 2,
     rateWindowMs: 60_000,
-    transport: { async send() { return { outcome: 'denied', submitted: false }; } },
+    transport: { async submit() { return { state: 'failed' }; } },
   });
   const headers = {
     host: 'localhost',
@@ -150,6 +154,40 @@ test('MVP submit route dispatches only to the submission operation', async () =>
   assert.equal(submits, 1);
   assert.equal(sends, 0);
   assert.equal(result.body.includes('PRIVATE'), false);
+});
+
+test('authenticated legacy and alternate routes are unpublished and never dispatch', async () => {
+  let submits = 0;
+  let legacySends = 0;
+  const body = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    request_id: 'otherwise-valid-legacy-payload',
+    registration: 'runtime', session: 'epoch',
+    account: '15551234567@s.whatsapp.net',
+    destination: '15557654321@s.whatsapp.net',
+    expires_at_us: 1_785_846_900_000_000,
+    private_value: 'PRIVATE-LEGACY-ROUTE',
+  });
+  const handler = createSensitiveHttpHandler({
+    capability: CAPABILITY,
+    nowUs: () => 1_785_846_896_000_000,
+    transport: {
+      async submit() { submits += 1; return { state: 'submitted' }; },
+      async send() { legacySends += 1; return { outcome: 'provider_accepted' }; },
+    },
+  });
+  const headers = {
+    host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY,
+    'content-type': 'application/json',
+    'content-length': String(Buffer.byteLength(body)),
+  };
+  for (const path of ['/v1/send', '/send', '/v1/deliver', '/v1/submit/']) {
+    const result = await invoke(handler, { path, headers, chunks: [body] });
+    assert.equal(result.status, 404, path);
+    assert.equal(result.body.includes('PRIVATE-LEGACY-ROUTE'), false, path);
+  }
+  assert.equal(submits, 0);
+  assert.equal(legacySends, 0);
 });
 
 test('MVP handler rejects exact expiry immediately before delivery dispatch', async () => {
@@ -243,16 +281,17 @@ test('real HTTP handler calls real MVP transport with live identity and fake soc
   }, { messageId }]]);
 });
 
-test('aborted partial bodies release the active-request slot without parsing', async () => {
-  let sends = 0;
+test('aborted partial submit bodies release the active-request slot without parsing', async () => {
+  let submits = 0;
   const handler = createSensitiveHttpHandler({
     capability: CAPABILITY,
     activeRequestLimit: 1,
-    transport: { async send() { sends += 1; return { outcome: 'denied', submitted: false }; } },
+    nowUs: () => 1_785_846_896_000_000,
+    transport: { async submit() { submits += 1; return { state: 'failed' }; } },
   });
   const partial = new EventEmitter();
   partial.method = 'POST';
-  partial.url = '/v1/send';
+  partial.url = '/v1/submit';
   partial.headers = {
     host: '127.0.0.1',
     [CAPABILITY_HEADER]: CAPABILITY,
@@ -269,7 +308,10 @@ test('aborted partial bodies release the active-request slot without parsing', a
   partial.emit('data', Buffer.from('{'));
   partial.emit('aborted');
 
-  const body = '{}';
+  const body = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    expires_at_us: 1_785_846_900_000_000,
+  });
   const result = await invoke(handler, {
     headers: {
       host: '127.0.0.1',
@@ -280,5 +322,5 @@ test('aborted partial bodies release the active-request slot without parsing', a
     chunks: [body],
   });
   assert.equal(result.status, 200);
-  assert.equal(sends, 1);
+  assert.equal(submits, 1);
 });

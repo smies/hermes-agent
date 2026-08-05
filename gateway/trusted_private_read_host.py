@@ -50,7 +50,7 @@ from tools.private_read_request_tool import configure_private_read_request_runti
 
 
 SENSITIVE_VERIFIED_LAUNCHER_SHA256 = (
-    "f1a062b75768e4cd2423a329e8284ea4f1451796e11cfdf45ac4b639f9c536d5"
+    "edf824421c02f2b8bfd2495b76fe63a94b8b48cf739c37524b85d724c82baff9"
 )
 SENSITIVE_RUNTIME_LAUNCHER_PATH = (
     Path(__file__).absolute().parent.parent
