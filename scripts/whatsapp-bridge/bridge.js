@@ -396,18 +396,24 @@ let connectionState = 'disconnected';
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
+const PRODUCTION_SOCKET_DEPENDENCIES = Object.freeze({
+  useAuthState: useMultiFileAuthState,
+  verifyBootstrap: verifyLidBootstrap,
+  resolveVersion: getWAVersion,
+  createSocket: makeWASocket,
+  canonicalizeJid: jidNormalizedUser,
+});
+
 /**
  * Register the exact production inbound composition used by startSocket().
- * Tests may replace only the registration primitive to sabotage the live
- * caller wiring; every producer dependency and the queue remain production
- * objects owned by this module.
+ * Every producer dependency and the queue remain production objects owned by
+ * this module.
  */
 export function registerProductionInboundMessageHandler({
   connectionSocket,
   isActiveSocket,
-  registerHandler = registerInboundMessageHandler,
 }) {
-  return registerHandler({
+  return registerInboundMessageHandler({
     emittingSocket: connectionSocket,
     isActiveSocket,
     emitDebugEvent,
@@ -492,28 +498,39 @@ export function takeProductionInboundMessages() {
   return messageQueue.splice(0, messageQueue.length);
 }
 
-async function startSocket() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+export async function startSocket(dependencies = PRODUCTION_SOCKET_DEPENDENCIES) {
+  const {
+    useAuthState,
+    verifyBootstrap,
+    resolveVersion,
+    createSocket,
+    canonicalizeJid,
+  } = dependencies || {};
+  if (![useAuthState, verifyBootstrap, resolveVersion, createSocket, canonicalizeJid]
+    .every(dependency => typeof dependency === 'function')) {
+    throw new Error('complete socket dependencies are required');
+  }
+  const { state, saveCreds } = await useAuthState(SESSION_DIR);
   if (state?.creds?.registered !== true) {
     console.log('❌ WhatsApp session requires offline provisioning.');
     process.exitCode = 1;
     return;
   }
-  const phoneJid = jidNormalizedUser(state?.creds?.me?.id || '');
-  const persistedLid = await verifyLidBootstrap({
+  const phoneJid = canonicalizeJid(state?.creds?.me?.id || '');
+  const persistedLid = await verifyBootstrap({
     auth: { state },
     sock: {},
     phoneJid,
-    canonicalizeJid: jidNormalizedUser,
+    canonicalizeJid,
   });
   if (!persistedLid) {
     console.log('❌ WhatsApp session LID bootstrap is incomplete.');
     process.exitCode = 1;
     return;
   }
-  const version = await getWAVersion();
+  const version = await resolveVersion();
 
-  const connectionSocket = makeWASocket({
+  const connectionSocket = createSocket({
     ...(version ? { version } : {}),
     auth: state,
     logger,
@@ -632,6 +649,11 @@ async function startSocket() {
 // HTTP server
 const app = express();
 app.use(express.json());
+
+// The offline acceptance harness listens with this exact application after
+// startSocket() has registered the production callback. Production startup
+// continues to go only through runBridge() below.
+export { app as bridgeHttpApp };
 
 // Host-header validation — defends against DNS rebinding.
 // The bridge binds loopback-only (127.0.0.1) but a victim browser on

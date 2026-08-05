@@ -1,5 +1,4 @@
 import { strict as assert } from 'node:assert';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -147,11 +146,40 @@ test('socket replacement during extraction cannot cross-attribute or queue', asy
   assert.equal(queue.length, 0);
 });
 
-test('production bridge calls its exported exact production composition', () => {
-  const source = readFileSync(new URL('./bridge.js', import.meta.url), 'utf8');
-  assert.match(source, /import \{ registerInboundMessageHandler \}/);
-  assert.match(source, /export function registerProductionInboundMessageHandler/);
-  assert.match(source, /registerProductionInboundMessageHandler\(\{ connectionSocket, isActiveSocket \}\)/);
-  assert.match(source, /const msgs = takeProductionInboundMessages\(\)/);
-  assert.doesNotMatch(source, /sock\.ev\.on\(['"]messages\.upsert/);
+test('actual startSocket production body registers the authoritative callback', async () => {
+  const previous = new Map([
+    ['WHATSAPP_MODE', process.env.WHATSAPP_MODE],
+    ['WHATSAPP_DM_POLICY', process.env.WHATSAPP_DM_POLICY],
+    ['WHATSAPP_ALLOWED_USERS', process.env.WHATSAPP_ALLOWED_USERS],
+  ]);
+  process.env.WHATSAPP_MODE = 'bot';
+  process.env.WHATSAPP_DM_POLICY = 'allowlist';
+  process.env.WHATSAPP_ALLOWED_USERS = '22222222222@s.whatsapp.net';
+  try {
+    const bridge = await import(`./bridge.js?start-socket-authority=${Date.now()}`);
+    const connectionSocket = socket();
+    await bridge.startSocket({
+      useAuthState: async () => ({
+        state: { creds: { registered: true, me: { id: connectionSocket.user.id } } },
+        saveCreds: async () => {},
+      }),
+      verifyBootstrap: async () => connectionSocket.user.lid,
+      resolveVersion: async () => [2, 3000, 0],
+      createSocket: () => connectionSocket,
+      canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+    });
+    const outcome = await connectionSocket.ev.emit('messages.upsert', {
+      type: 'notify', messages: [message()],
+    });
+    const queue = bridge.takeProductionInboundMessages();
+    assert.equal(outcome.action, 'queued');
+    assert.equal(queue.length, 1);
+    assert.equal(queue[0].messageId, 'JUNO-PROVIDER-MESSAGE-1');
+    assert.equal(queue[0].inboundProvenance, REGISTERED_INBOUND_PROVENANCE);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });

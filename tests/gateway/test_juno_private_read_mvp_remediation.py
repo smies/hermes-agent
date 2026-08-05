@@ -17,7 +17,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
-from threading import Thread
+from threading import Lock, Thread
 import time
 import traceback
 from types import SimpleNamespace
@@ -69,65 +69,178 @@ def _runtime_identity(
     )
 
 
-def _node_forwarded_event(
-    *, sender: str, text: str, message_id: str, sabotage_registration: bool = False,
+def _synthetic_ordinary_bridge_payload(
+    *, sender: str, text: str, message_id: str,
 ) -> dict:
-    module_value = os.environ.get("JUNO_ISOLATED_BRIDGE_MODULE")
-    if not module_value:
-        pytest.fail("copied ordinary Node package is required")
-    bridge_module = Path(module_value).resolve(strict=True)
-    assert not bridge_module.is_relative_to(Path(__file__).parents[2].resolve())
+    """Supplementary no-socket adapter fixture; not caller-binding evidence."""
+    return {
+        "messageId": message_id,
+        "chatId": sender,
+        "senderId": sender,
+        "senderName": "Synthetic User",
+        "chatName": "Synthetic User",
+        "isGroup": False,
+        "body": text,
+        "hasMedia": False,
+        "mediaType": "",
+        "mediaUrls": [],
+        "mentionedIds": [],
+        "accountId": ORDINARY_ACCOUNT,
+        "inboundProvenance": ORDINARY_INBOUND_PROVENANCE,
+    }
+
+
+def _start_ordinary_bridge_harness(
+    *, bridge_module: Path, harness: Path, home: Path,
+) -> tuple[subprocess.Popen, dict]:
+    process = subprocess.Popen(
+        ["node", str(harness)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "HERMES_HOME": str(home / "hermes"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "WHATSAPP_MODE": "bot",
+            "WHATSAPP_DM_POLICY": "allowlist",
+            "WHATSAPP_ALLOWED_USERS": f"{TRUSTED},{OWNER}",
+            "JUNO_BRIDGE_MODULE": str(bridge_module),
+        },
+    )
+    process._juno_stdio_lock = Lock()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
+    ready = selector.select(timeout=30)
+    selector.close()
+    if not ready:
+        process.terminate()
+        process.wait(timeout=5)
+        pytest.fail("ordinary bridge harness did not start")
+    if ready[0][0].fileobj is process.stderr:
+        stderr = process.stderr.readline()
+        classification = _node_harness_failure(stderr, 73)
+        if classification == "socket_bind_denied":
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            fallback_ready = selector.select(timeout=5)
+            selector.close()
+            if not fallback_ready:
+                pytest.fail("ordinary in-process HTTP fallback did not start")
+        else:
+            returncode = process.wait(timeout=5)
+            pytest.fail(
+                "ordinary bridge harness failed: "
+                f"{_node_harness_failure(stderr, returncode)}"
+            )
+    line = process.stdout.readline()
+    if not line:
+        returncode = process.wait(timeout=5)
+        pytest.fail(
+            "ordinary bridge harness failed: "
+            f"{_node_harness_failure(process.stderr.read(), returncode)}"
+        )
+    return process, json.loads(line)
+
+
+def _emit_ordinary_bridge_message(
+    process: subprocess.Popen, *, sender: str, text: str, message_id: str,
+) -> dict:
+    with process._juno_stdio_lock:
+        process.stdin.write(json.dumps({
+            "sender": sender, "text": text, "messageId": message_id,
+        }) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+    if not line:
+        pytest.fail(f"ordinary callback process exited: {process.stderr.read()[:4096]}")
+    return json.loads(line)
+
+
+def _poll_ordinary_bridge_route(process: subprocess.Popen) -> dict:
+    with process._juno_stdio_lock:
+        process.stdin.write('{"command":"poll"}\n')
+        process.stdin.flush()
+        line = process.stdout.readline()
+    if not line:
+        pytest.fail(f"ordinary route process exited: {process.stderr.read()[:4096]}")
+    return json.loads(line)
+
+
+def _stop_ordinary_bridge_harness(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.stdin.close()
+    process.wait(timeout=5)
+
+
+class _InProcessBridgeResponse:
+    def __init__(self, process: subprocess.Popen):
+        self._process = process
+        self.status = 0
+        self._messages = None
+
+    async def __aenter__(self):
+        evidence = await asyncio.to_thread(
+            _poll_ordinary_bridge_route, self._process
+        )
+        assert evidence["poll"] is True
+        self.status = evidence["status"]
+        self._messages = evidence["messages"]
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def json(self):
+        return self._messages
+
+
+class _InProcessBridgeSession:
+    def __init__(self, process: subprocess.Popen):
+        self._process = process
+        self.closed = False
+
+    def get(self, *_args, **_kwargs):
+        return _InProcessBridgeResponse(self._process)
+
+    async def close(self):
+        self.closed = True
+
+
+def _run_sensitive_launcher_probe(
+    *, launcher: Path, loader: Path, marker: Path, home: Path,
+) -> dict:
     source = r"""
 import { pathToFileURL } from 'node:url';
-const bridge = await import(pathToFileURL(process.env.JUNO_BRIDGE_MODULE));
-const input = JSON.parse(process.env.JUNO_BRIDGE_INPUT);
-const msg = {
-  key: { id: input.messageId, remoteJid: input.sender,
-    participant: input.sender, fromMe: false },
-  pushName: 'Synthetic User', messageTimestamp: 1786000000,
-  message: { conversation: input.text },
-};
-const handlers = new Map();
-const socket = {
-  user: { id: '33333333333:19@s.whatsapp.net', lid: '44444444444@lid' },
-  ev: { on: (name, handler) => handlers.set(name, handler) },
-};
-const sabotage = process.env.JUNO_SABOTAGE_REGISTRATION === '1'
-  ? ({ emittingSocket }) => emittingSocket.ev.on(
-      'messages.upsert', async () => ({ action: 'ignored', reason: 'sabotaged_live_wiring' }),
-    )
-  : undefined;
-bridge.registerProductionInboundMessageHandler({
-  connectionSocket: socket,
-  isActiveSocket: candidate => candidate === socket,
-  ...(sabotage ? { registerHandler: sabotage } : {}),
-});
-const outcome = await handlers.get('messages.upsert')({ type: 'notify', messages: [msg] });
-const queue = bridge.takeProductionInboundMessages();
-if (outcome.action !== 'queued' || queue.length !== 1) throw new Error('production composition rejected');
-process.stdout.write(JSON.stringify(queue[0]));
+const launcher = await import(pathToFileURL(process.env.JUNO_LAUNCHER));
+let rejected = false;
+let returned = false;
+try {
+  await launcher.launchSensitiveBridge([], {});
+  returned = true;
+} catch {
+  rejected = true;
+}
+process.stdout.write(JSON.stringify({ rejected, returned }));
 """
-    with tempfile.TemporaryDirectory(prefix="juno-ordinary-composition-") as raw:
-        isolated = Path(raw)
-        completed = subprocess.run(
-            ["node", "--input-type=module", "-e", source],
-            check=True, capture_output=True, text=True, timeout=20,
-            env={
-                **os.environ,
-                "HOME": str(isolated),
-                "HERMES_HOME": str(isolated / "hermes"),
-                "XDG_CACHE_HOME": str(isolated / "cache"),
-                "WHATSAPP_MODE": "bot",
-                "WHATSAPP_DM_POLICY": "allowlist",
-                "WHATSAPP_ALLOWED_USERS": f"{sender},{OWNER}",
-                "JUNO_BRIDGE_MODULE": str(bridge_module),
-                "JUNO_SABOTAGE_REGISTRATION": "1" if sabotage_registration else "0",
-                "JUNO_BRIDGE_INPUT": json.dumps({
-                    "sender": sender, "text": text, "messageId": message_id,
-                }),
-            },
-        )
-        return json.loads(completed.stdout)
+    completed = subprocess.run(
+        [
+            "node", "--no-warnings", "--experimental-loader", str(loader),
+            "--input-type=module", "-e", source,
+        ],
+        check=True, capture_output=True, text=True, timeout=30,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "HERMES_HOME": str(home / "hermes"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "JUNO_LAUNCHER": str(launcher),
+            "JUNO_CORE_BOUNDARY_MARKER": str(marker),
+        },
+    )
+    return json.loads(completed.stdout)
 
 
 def _loopback_server(handler) -> HTTPServer:
@@ -190,21 +303,195 @@ def test_node_harness_failure_classification_skips_only_exact_bind_denial() -> N
     assert _node_harness_failure("", 1) == "unexpected_node_failure"
 
 
-def test_production_registration_sabotage_breaks_the_live_caller_composition() -> None:
-    baseline = _node_forwarded_event(
-        sender=TRUSTED,
-        text="production-registration-baseline",
-        message_id="PRODUCTION-REGISTRATION-BASELINE",
+@pytest.mark.asyncio
+async def test_actual_start_socket_route_adapter_dispatch(
+    tmp_path: Path,
+) -> None:
+    import aiohttp
+    from gateway.run import GatewayRunner
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    bridge_value = os.environ.get("JUNO_ISOLATED_BRIDGE_MODULE")
+    harness_value = os.environ.get("JUNO_ISOLATED_ORDINARY_HARNESS")
+    if not bridge_value or not harness_value:
+        pytest.fail("copied lockfile-installed ordinary package is required")
+    bridge_module = Path(bridge_value).resolve(strict=True)
+    harness = Path(harness_value).resolve(strict=True)
+    worktree_root = Path(__file__).parents[2].resolve()
+    assert not bridge_module.is_relative_to(worktree_root)
+    assert not harness.is_relative_to(worktree_root)
+    process, ready = _start_ordinary_bridge_harness(
+        bridge_module=bridge_module,
+        harness=harness,
+        home=tmp_path / "ordinary-dispatch-home",
     )
-    assert baseline["messageId"] == "PRODUCTION-REGISTRATION-BASELINE"
-    assert baseline["inboundProvenance"] == ORDINARY_INBOUND_PROVENANCE
-    with pytest.raises(subprocess.CalledProcessError):
-        _node_forwarded_event(
+    adapter = WhatsAppAdapter(PlatformConfig(
+        enabled=True,
+        extra={
+            "allow_from": [TRUSTED, OWNER],
+            "dm_policy": "allowlist",
+            "bridge_port": ready["port"],
+            "text_batch_delay_seconds": 0,
+            "text_batch_split_delay_seconds": 0,
+        },
+    ))
+    adapter._running = True
+    adapter._http_session = (
+        aiohttp.ClientSession()
+        if ready["transport"] == "loopback"
+        else _InProcessBridgeSession(process)
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    dispatched = []
+
+    async def observed_handler(event):
+        dispatched.append(event)
+
+    runner._handle_message = observed_handler
+    adapter.set_message_handler(runner._primary_message_handler())
+    poll_task = asyncio.create_task(adapter._poll_messages())
+    try:
+        callback = await asyncio.to_thread(
+            _emit_ordinary_bridge_message,
+            process,
             sender=TRUSTED,
-            text="production-registration-sabotage",
-            message_id="PRODUCTION-REGISTRATION-SABOTAGE",
-            sabotage_registration=True,
+            text="ordinary production dispatch",
+            message_id="ORDINARY-PRODUCTION-DISPATCH",
         )
+        assert callback["outcome"]["action"] == "queued"
+        for _ in range(500):
+            if dispatched:
+                break
+            await asyncio.sleep(0.01)
+        assert len(dispatched) == 1
+        event = dispatched[0]
+        assert event.message_id == "ORDINARY-PRODUCTION-DISPATCH"
+        assert event.metadata["whatsapp_account_id"] == ORDINARY_ACCOUNT
+        assert event.metadata["whatsapp_inbound_provenance"] \
+            == ORDINARY_INBOUND_PROVENANCE
+    finally:
+        adapter._running = False
+        poll_task.cancel()
+        await asyncio.gather(poll_task, return_exceptions=True)
+        await adapter._http_session.close()
+        adapter._http_session = None
+        _stop_ordinary_bridge_harness(process)
+
+
+@pytest.mark.asyncio
+async def test_actual_start_socket_registration_mutation_blocks_dispatch(
+    tmp_path: Path,
+) -> None:
+    import aiohttp
+    from gateway.run import GatewayRunner
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    bridge_value = os.environ.get("JUNO_ISOLATED_SABOTAGED_BRIDGE_MODULE")
+    harness_value = os.environ.get("JUNO_ISOLATED_ORDINARY_HARNESS")
+    if not bridge_value or not harness_value:
+        pytest.fail("copied registration-sabotage package is required")
+    process, ready = _start_ordinary_bridge_harness(
+        bridge_module=Path(bridge_value).resolve(strict=True),
+        harness=Path(harness_value).resolve(strict=True),
+        home=tmp_path / "ordinary-sabotage-home",
+    )
+    adapter = WhatsAppAdapter(PlatformConfig(
+        enabled=True,
+        extra={
+            "allow_from": [TRUSTED, OWNER],
+            "dm_policy": "allowlist",
+            "bridge_port": ready["port"],
+            "text_batch_delay_seconds": 0,
+            "text_batch_split_delay_seconds": 0,
+        },
+    ))
+    adapter._running = True
+    adapter._http_session = (
+        aiohttp.ClientSession()
+        if ready["transport"] == "loopback"
+        else _InProcessBridgeSession(process)
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    dispatched = []
+
+    async def must_not_dispatch(event):
+        dispatched.append(event)
+
+    runner._handle_message = must_not_dispatch
+    adapter.set_message_handler(runner._primary_message_handler())
+    poll_task = asyncio.create_task(adapter._poll_messages())
+    try:
+        callback = await asyncio.to_thread(
+            _emit_ordinary_bridge_message,
+            process,
+            sender=TRUSTED,
+            text="must not dispatch",
+            message_id="ORDINARY-LIVE-CALL-SABOTAGE",
+        )
+        assert callback["outcome"] == {
+            "action": "ignored", "reason": "stale_emitting_socket",
+        }
+        await asyncio.sleep(1.25)
+        assert poll_task.done() is False
+        assert dispatched == []
+    finally:
+        adapter._running = False
+        poll_task.cancel()
+        await asyncio.gather(poll_task, return_exceptions=True)
+        await adapter._http_session.close()
+        adapter._http_session = None
+        _stop_ordinary_bridge_harness(process)
+
+
+def test_sensitive_launcher_mutation_rejects_before_core_import(
+    tmp_path: Path,
+) -> None:
+    package_value = os.environ.get("JUNO_ISOLATED_SENSITIVE_PACKAGE")
+    loader_value = os.environ.get("JUNO_ISOLATED_SENSITIVE_BOUNDARY_LOADER")
+    if not package_value or not loader_value:
+        pytest.fail("copied lockfile-installed sensitive package is required")
+    installed_package = Path(package_value).resolve(strict=True)
+    loader = Path(loader_value).resolve(strict=True)
+    worktree_root = Path(__file__).parents[2].resolve()
+    assert not installed_package.is_relative_to(worktree_root)
+    assert not loader.is_relative_to(worktree_root)
+
+    probe_package = tmp_path / "sensitive-launcher-probe-package"
+    shutil.copytree(installed_package, probe_package, symlinks=True)
+    for child in probe_package.rglob("*"):
+        if child.is_symlink():
+            assert child.resolve(strict=True).is_relative_to(probe_package.resolve())
+    launcher = probe_package / "launcher.js"
+    positive_marker = tmp_path / "positive-sensitive-core-import"
+    positive = _run_sensitive_launcher_probe(
+        launcher=launcher,
+        loader=loader,
+        marker=positive_marker,
+        home=tmp_path / "positive-launcher-home",
+    )
+    assert positive == {"rejected": True, "returned": False}
+    assert positive_marker.read_text(encoding="utf-8") \
+        == "sensitive_bridge.js\n"
+
+    mutated_artifact = probe_package / "http_server.js"
+    mutated_artifact.write_bytes(
+        mutated_artifact.read_bytes() + b"\n// mutation probe\n"
+    )
+    rejected_marker = tmp_path / "mutated-sensitive-core-import"
+    rejected = _run_sensitive_launcher_probe(
+        launcher=launcher,
+        loader=loader,
+        marker=rejected_marker,
+        home=tmp_path / "mutated-launcher-home",
+    )
+    assert rejected == {"rejected": True, "returned": False}
+    # This is the production dynamic-import boundary, not a counter after the
+    # verifier. With sensitive_bridge.js never requested, its static core graph
+    # (lifecycle, HTTP listener/identity publication, provider, send) cannot be
+    # evaluated or constructed.
+    assert not rejected_marker.exists()
 
 
 class _SensitiveHandler(BaseHTTPRequestHandler):
@@ -1821,6 +2108,7 @@ async def test_dedicated_juno_profile_binds_profileless_events_and_real_adapter_
 async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
     tmp_path: Path, caplog, monkeypatch,
 ) -> None:
+    import aiohttp
     import gateway.juno_private_read_mvp as mvp
     from gateway.config import GatewayConfig
     from hermes_state import SessionDB
@@ -1850,15 +2138,42 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
 
     capture = tmp_path / "private-delivery-capture.jsonl"
     capture.touch(mode=0o600)
+    bridge_value = os.environ.get("JUNO_ISOLATED_BRIDGE_MODULE")
+    sabotaged_bridge_value = os.environ.get(
+        "JUNO_ISOLATED_SABOTAGED_BRIDGE_MODULE"
+    )
+    ordinary_harness_value = os.environ.get("JUNO_ISOLATED_ORDINARY_HARNESS")
     harness_value = os.environ.get("JUNO_ISOLATED_SENSITIVE_HARNESS")
     package_value = os.environ.get("JUNO_ISOLATED_SENSITIVE_PACKAGE")
-    if not harness_value or not package_value:
-        pytest.fail("copied sensitive Node package and harness are required")
+    boundary_loader_value = os.environ.get(
+        "JUNO_ISOLATED_SENSITIVE_BOUNDARY_LOADER"
+    )
+    if not all((
+        bridge_value, sabotaged_bridge_value, ordinary_harness_value,
+        harness_value, package_value, boundary_loader_value,
+    )):
+        pytest.fail("copied ordinary and sensitive Node packages are required")
+    bridge_module = Path(bridge_value).resolve(strict=True)
+    sabotaged_bridge_module = Path(sabotaged_bridge_value).resolve(strict=True)
+    ordinary_harness = Path(ordinary_harness_value).resolve(strict=True)
     harness = Path(harness_value).resolve(strict=True)
     sensitive_package = Path(package_value).resolve(strict=True)
+    boundary_loader = Path(boundary_loader_value).resolve(strict=True)
     worktree_root = Path(__file__).parents[2].resolve()
-    assert not harness.is_relative_to(worktree_root)
-    assert not sensitive_package.is_relative_to(worktree_root)
+    for isolated_path in (
+        bridge_module, sabotaged_bridge_module, ordinary_harness, harness,
+        sensitive_package, boundary_loader,
+    ):
+        assert not isolated_path.is_relative_to(worktree_root)
+    ordinary_process, ordinary_ready = _start_ordinary_bridge_harness(
+        bridge_module=bridge_module,
+        harness=ordinary_harness,
+        home=tmp_path / "ordinary-node-home",
+    )
+    assert ordinary_ready["ready"] is True
+    assert ordinary_ready["callbackRegistered"] is True
+    assert ordinary_ready["transport"] in {"loopback", "in_process"}
+    ordinary_port = ordinary_ready["port"]
     sensitive_process = subprocess.Popen(
         ["node", str(harness)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env={
@@ -1877,6 +2192,7 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         if sensitive_process.poll() is None:
             sensitive_process.terminate()
             sensitive_process.wait(timeout=5)
+        _stop_ordinary_bridge_harness(ordinary_process)
         classification = _node_harness_failure(
             sensitive_process.stderr.read(), sensitive_process.returncode,
         )
@@ -1888,7 +2204,9 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             sensitive_process.stderr.read(), returncode,
         )
         if classification == "socket_bind_denied":
+            _stop_ordinary_bridge_harness(ordinary_process)
             pytest.skip("execution sandbox positively denied Node loopback listen")
+        _stop_ordinary_bridge_harness(ordinary_process)
         pytest.fail(f"Node vertical harness failed: {classification}")
     ready_evidence = json.loads(first_line)
     sensitive_port = ready_evidence["port"]
@@ -1898,6 +2216,7 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
     except PermissionError:
         sensitive_process.terminate()
         sensitive_process.wait(timeout=5)
+        _stop_ordinary_bridge_harness(ordinary_process)
         pytest.skip("execution sandbox positively denied Python provider loopback listen")
     provider_thread = Thread(target=provider.serve_forever, daemon=True)
     provider_thread.start()
@@ -1906,8 +2225,8 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         def __init__(self):
             self.sent = []
 
-        async def send(self, destination, text):
-            self.sent.append((destination, text))
+        async def send(self, destination, text, metadata=None):
+            self.sent.append((destination, text, metadata))
             return SimpleNamespace(success=True, message_id="ordinary-vertical-notice")
 
     authority = f"http://127.0.0.1:{provider.server_port}"
@@ -1948,15 +2267,53 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
 
     monkeypatch.setattr(runner, "_run_agent_inner", fake_model)
     session_db = None
+    inbound_adapter = WhatsAppAdapter(PlatformConfig(
+        enabled=True,
+        extra={
+            "allow_from": [TRUSTED, OWNER],
+            "dm_policy": "allowlist",
+            "bridge_port": ordinary_port,
+            "text_batch_delay_seconds": 0,
+            "text_batch_split_delay_seconds": 0,
+        },
+    ))
+    inbound_adapter._running = True
+    inbound_adapter._http_session = (
+        aiohttp.ClientSession()
+        if ordinary_ready["transport"] == "loopback"
+        else _InProcessBridgeSession(ordinary_process)
+    )
+    inbound_events = []
+    handler_responses = []
+    primary_handler = runner._primary_message_handler()
+
+    async def observed_primary_handler(event):
+        inbound_events.append(event)
+        response = await primary_handler(event)
+        handler_responses.append(response)
+        return response
+
+    inbound_adapter.set_message_handler(observed_primary_handler)
+    ordinary_poll_task = asyncio.create_task(inbound_adapter._poll_messages())
+    sabotaged_process = None
+    sabotaged_adapter = None
+    sabotaged_poll_task = None
     try:
-        bridge_data = _node_forwarded_event(
-            sender=TRUSTED, text="read newest inbox message",
+        callback = await asyncio.to_thread(
+            _emit_ordinary_bridge_message,
+            ordinary_process,
+            sender=TRUSTED,
+            text="read newest inbox message",
             message_id="VERTICAL-TRUSTED-PROVIDER-MESSAGE",
         )
-        inbound_adapter = WhatsAppAdapter(PlatformConfig(
-            enabled=True, extra={"allow_from": [TRUSTED, OWNER], "dm_policy": "allowlist"},
-        ))
-        inbound = await inbound_adapter._build_message_event(bridge_data)
+        assert callback["callbackCount"] == 1
+        assert callback["outcome"]["action"] == "queued"
+        for _ in range(500):
+            if tool_results and inbound_events:
+                break
+            await asyncio.sleep(0.01)
+        assert tool_results, "production /messages response did not reach GatewayRunner"
+        inbound = inbound_events[0]
         assert inbound is not None
         assert inbound.message_id == "VERTICAL-TRUSTED-PROVIDER-MESSAGE"
         assert inbound.metadata["whatsapp_account_id"] == ORDINARY_ACCOUNT
@@ -1964,10 +2321,7 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             == ORDINARY_INBOUND_PROVENANCE
         assert inbound.source.profile is None
 
-        dispatch = await runner._run_agent(
-            inbound.text, "", [], inbound.source, "vertical-session",
-            session_key="vertical-session-key", logical_event=inbound,
-        )
+        dispatch = handler_responses[-1] if handler_responses else None
         result = tool_results[-1]
         request_id = dict(result.terminal.metadata)["request_id"]
         durable = host.repository.get(request_id)
@@ -1989,24 +2343,53 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             await asyncio.sleep(0.01)
         assert len(ordinary_adapter.sent) == 1
 
-        approval_data = _node_forwarded_event(
-            sender=OWNER, text=f"/approve {request_id}",
+        approval_callback = await asyncio.to_thread(
+            _emit_ordinary_bridge_message,
+            ordinary_process,
+            sender=OWNER,
+            text=f"/approve {request_id}",
             message_id="VERTICAL-OWNER-PROVIDER-DECISION",
         )
-        approval = await inbound_adapter._build_message_event(approval_data)
+        assert approval_callback["outcome"]["action"] == "queued"
+        for _ in range(500):
+            if len(inbound_events) >= 2 and (
+                "Private-read request approved." in handler_responses
+            ):
+                break
+            await asyncio.sleep(0.01)
+        approval = inbound_events[1]
         assert approval.source.profile is None
-        assert await runner._handle_message(approval) == "Private-read request approved."
+        assert "Private-read request approved." in handler_responses
         for _ in range(300):
             if host.repository.get(request_id).status in {"consumed", "failed_consumed"}:
                 break
             await asyncio.sleep(0.01)
         assert host.repository.get(request_id).status == "consumed"
-        replay_approval = await runner._handle_message(approval)
-        assert replay_approval != "Private-read request approved."
-        await runner._run_agent(
-            inbound.text, "", [], inbound.source, "vertical-replay-session",
-            session_key="vertical-replay-session-key", logical_event=inbound,
+        replay_callback = await asyncio.to_thread(
+            _emit_ordinary_bridge_message,
+            ordinary_process,
+            sender=OWNER,
+            text=f"/approve {request_id}",
+            message_id="VERTICAL-OWNER-PROVIDER-DECISION",
         )
+        assert replay_callback["outcome"]["action"] == "queued"
+        for _ in range(500):
+            if len(inbound_events) >= 3 and len(handler_responses) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        assert handler_responses[-1] != "Private-read request approved."
+        replay_request = await asyncio.to_thread(
+            _emit_ordinary_bridge_message,
+            ordinary_process,
+            sender=TRUSTED,
+            text="read newest inbox message",
+            message_id="VERTICAL-TRUSTED-PROVIDER-MESSAGE",
+        )
+        assert replay_request["outcome"]["action"] == "queued"
+        for _ in range(500):
+            if len(tool_results) >= 2:
+                break
+            await asyncio.sleep(0.01)
         assert tool_results[-1].terminal.status == "safe_failure"
 
         deliveries = [json.loads(line) for line in capture.read_text().splitlines()]
@@ -2015,6 +2398,67 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         assert deliveries[0]["messageId"] == "3EB0ABCDEF0123456789AB"
         assert deliveries[0]["text"].endswith(PRIVATE_SENTINEL)
         assert len(_VerticalProviderHandler.observed) == 4
+
+        # Causal negative control: this separately copied, lockfile-installed
+        # package changes the exact registration call inside startSocket().
+        # The same production callback and /messages -> adapter poll path must
+        # stop before the GatewayRunner handler can accept a request.
+        sabotaged_process, sabotaged_ready = _start_ordinary_bridge_harness(
+            bridge_module=sabotaged_bridge_module,
+            harness=ordinary_harness,
+            home=tmp_path / "sabotaged-ordinary-node-home",
+        )
+        assert sabotaged_ready["callbackRegistered"] is True
+        assert sabotaged_ready["transport"] in {"loopback", "in_process"}
+        sabotaged_adapter = WhatsAppAdapter(PlatformConfig(
+            enabled=True,
+            extra={
+                "allow_from": [TRUSTED, OWNER],
+                "dm_policy": "allowlist",
+                "bridge_port": sabotaged_ready["port"],
+                "text_batch_delay_seconds": 0,
+                "text_batch_split_delay_seconds": 0,
+            },
+        ))
+        sabotaged_adapter._running = True
+        sabotaged_adapter._http_session = (
+            aiohttp.ClientSession()
+            if sabotaged_ready["transport"] == "loopback"
+            else _InProcessBridgeSession(sabotaged_process)
+        )
+        sabotage_dispatches = []
+
+        async def observe_sabotaged_dispatch(event):
+            sabotage_dispatches.append(event)
+            return await primary_handler(event)
+
+        sabotaged_adapter.set_message_handler(observe_sabotaged_dispatch)
+        sabotaged_poll_task = asyncio.create_task(
+            sabotaged_adapter._poll_messages()
+        )
+        tool_count_before_sabotage = len(tool_results)
+        sabotage_callback = await asyncio.to_thread(
+            _emit_ordinary_bridge_message,
+            sabotaged_process,
+            sender=TRUSTED,
+            text="must not become a private request",
+            message_id="VERTICAL-SABOTAGED-LIVE-CALL",
+        )
+        assert sabotage_callback["callbackCount"] == 1
+        assert sabotage_callback["outcome"] == {
+            "action": "ignored", "reason": "stale_emitting_socket",
+        }
+        await asyncio.sleep(1.25)
+        assert sabotaged_poll_task.done() is False
+        assert sabotage_dispatches == []
+        assert len(tool_results) == tool_count_before_sabotage
+        sabotaged_adapter._running = False
+        sabotaged_poll_task.cancel()
+        await asyncio.gather(sabotaged_poll_task, return_exceptions=True)
+        await sabotaged_adapter._http_session.close()
+        sabotaged_adapter._http_session = None
+        _stop_ordinary_bridge_harness(sabotaged_process)
+        sabotaged_process = None
 
         session_path = tmp_path / "ordinary-session.db"
         session_db = SessionDB(db_path=session_path)
@@ -2051,54 +2495,31 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         assert PRIVATE_SENTINEL not in caplog.text
         assert CREDENTIAL_SENTINEL not in caplog.text
 
-        # The same installed private package is now mutated. The production
-        # launcher/verifier must reject before returning identity to code that
-        # would construct a provider or publish an HTTP identity response.
-        mutated_artifact = sensitive_package / "http_server.js"
-        mutated_artifact.write_bytes(mutated_artifact.read_bytes() + b"\n// mutation probe\n")
-        accepted_marker = tmp_path / "mutated-identity-accepted"
-        verifier_probe = r"""
-import { pathToFileURL } from 'node:url';
-import { writeFileSync } from 'node:fs';
-const launcher = await import(pathToFileURL(process.env.JUNO_LAUNCHER));
-let identityAccepted = false;
-let providerConstructed = 0;
-try {
-  await launcher.verifySensitiveTransport();
-  identityAccepted = true;
-  providerConstructed += 1;
-  writeFileSync(process.env.JUNO_ACCEPTED_MARKER, 'unexpected');
-} catch {}
-process.stdout.write(JSON.stringify({ identityAccepted, providerConstructed }));
-"""
-        before_mutation_probe = capture.read_bytes()
-        provider_accesses = list(_VerticalProviderHandler.observed)
-        mutation = subprocess.run(
-            ["node", "--input-type=module", "-e", verifier_probe],
-            check=True, capture_output=True, text=True, timeout=30,
-            env={
-                **os.environ,
-                "HOME": str(home),
-                "HERMES_HOME": str(profile_home),
-                "XDG_CACHE_HOME": str(tmp_path / "mutation-cache"),
-                "JUNO_LAUNCHER": str(sensitive_package / "launcher.js"),
-                "JUNO_ACCEPTED_MARKER": str(accepted_marker),
-            },
-        )
-        assert json.loads(mutation.stdout) == {
-            "identityAccepted": False, "providerConstructed": 0,
-        }
-        assert not accepted_marker.exists()
-        assert capture.read_bytes() == before_mutation_probe
-        assert _VerticalProviderHandler.observed == provider_accesses
     finally:
         if session_db is not None:
             session_db.close()
+        inbound_adapter._running = False
+        ordinary_poll_task.cancel()
+        await asyncio.gather(ordinary_poll_task, return_exceptions=True)
+        if inbound_adapter._http_session is not None:
+            await inbound_adapter._http_session.close()
+            inbound_adapter._http_session = None
+        if sabotaged_poll_task is not None and not sabotaged_poll_task.done():
+            sabotaged_poll_task.cancel()
+            await asyncio.gather(sabotaged_poll_task, return_exceptions=True)
+        if sabotaged_adapter is not None \
+                and sabotaged_adapter._http_session is not None:
+            await sabotaged_adapter._http_session.close()
+            sabotaged_adapter._http_session = None
+        if sabotaged_process is not None:
+            _stop_ordinary_bridge_harness(sabotaged_process)
         if host is not None and host.is_healthy():
             await host.stop()
         runner._trusted_private_read_host = None
-        sensitive_process.terminate()
-        sensitive_process.wait(timeout=5)
+        _stop_ordinary_bridge_harness(ordinary_process)
+        if sensitive_process.poll() is None:
+            sensitive_process.terminate()
+            sensitive_process.wait(timeout=5)
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=2)
@@ -2115,7 +2536,7 @@ async def test_no_socket_vertical_preserves_producer_adapter_and_replay_contract
         enabled=True, extra={"allow_from": [TRUSTED, OWNER], "dm_policy": "allowlist"},
     ))
     try:
-        inbound = await adapter._build_message_event(_node_forwarded_event(
+        inbound = await adapter._build_message_event(_synthetic_ordinary_bridge_payload(
             sender=TRUSTED, text="read newest inbox message",
             message_id="NO-SOCKET-TRUSTED-PROVIDER-MESSAGE",
         ))
@@ -2123,7 +2544,7 @@ async def test_no_socket_vertical_preserves_producer_adapter_and_replay_contract
         result = _tool(inbound, host)
         request_id = dict(result.terminal.metadata)["request_id"]
         assert await host.process_once()
-        approval = await adapter._build_message_event(_node_forwarded_event(
+        approval = await adapter._build_message_event(_synthetic_ordinary_bridge_payload(
             sender=OWNER, text=f"/approve {request_id}",
             message_id="NO-SOCKET-OWNER-PROVIDER-DECISION",
         ))

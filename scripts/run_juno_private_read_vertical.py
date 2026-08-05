@@ -107,6 +107,14 @@ def main() -> int:
             ROOT / "tests/fixtures/juno_sensitive_http_harness.mjs",
             fixtures / "juno_sensitive_http_harness.mjs",
         )
+        shutil.copy2(
+            ROOT / "tests/fixtures/juno_ordinary_bridge_harness.mjs",
+            fixtures / "juno_ordinary_bridge_harness.mjs",
+        )
+        shutil.copy2(
+            ROOT / "tests/fixtures/juno_sensitive_core_boundary_loader.mjs",
+            fixtures / "juno_sensitive_core_boundary_loader.mjs",
+        )
         shutil.copy2(ROOT / ".npmrc", private / ".npmrc")
         _assert_no_symlinks(private)
         cache = private / "npm-cache"
@@ -120,6 +128,25 @@ def main() -> int:
             )
         _install(ordinary, cache, private, offline=bool(seed_value))
         _install(sensitive, cache, private, offline=bool(seed_value))
+        sabotaged_ordinary = scripts / "whatsapp-bridge-registration-sabotage"
+        shutil.copytree(ordinary, sabotaged_ordinary, symlinks=True)
+        sabotaged_bridge = sabotaged_ordinary / "bridge.js"
+        live_call = (
+            "registerProductionInboundMessageHandler({ "
+            "connectionSocket, isActiveSocket });"
+        )
+        source = sabotaged_bridge.read_text(encoding="utf-8")
+        if source.count(live_call) != 1:
+            raise RuntimeError("actual startSocket registration call is not unique")
+        sabotaged_bridge.write_text(
+            source.replace(
+                live_call,
+                "registerProductionInboundMessageHandler({ connectionSocket, "
+                "isActiveSocket: () => false });",
+            ),
+            encoding="utf-8",
+        )
+        _assert_symlinks_stay_private(sabotaged_ordinary, private)
         isolated_home = private / "home"
         isolated_hermes = private / "hermes-home"
         isolated_home.mkdir(mode=0o700)
@@ -133,8 +160,17 @@ def main() -> int:
             "XDG_CACHE_HOME": str(private / "cache"),
             "PYTHONPYCACHEPREFIX": str(private / "pycache"),
             "JUNO_ISOLATED_BRIDGE_MODULE": str(ordinary / "bridge.js"),
+            "JUNO_ISOLATED_SABOTAGED_BRIDGE_MODULE": str(
+                sabotaged_ordinary / "bridge.js"
+            ),
+            "JUNO_ISOLATED_ORDINARY_HARNESS": str(
+                fixtures / "juno_ordinary_bridge_harness.mjs"
+            ),
             "JUNO_ISOLATED_SENSITIVE_HARNESS": str(
                 fixtures / "juno_sensitive_http_harness.mjs"
+            ),
+            "JUNO_ISOLATED_SENSITIVE_BOUNDARY_LOADER": str(
+                fixtures / "juno_sensitive_core_boundary_loader.mjs"
             ),
             "JUNO_ISOLATED_SENSITIVE_PACKAGE": str(sensitive),
         }
@@ -144,7 +180,9 @@ def main() -> int:
                 "-rs",
                 "tests/gateway/test_juno_private_read_mvp_remediation.py",
                 "-k", (
-                    "production_registration_sabotage or "
+                    "actual_start_socket_route_adapter_dispatch or "
+                    "actual_start_socket_registration_mutation_blocks_dispatch or "
+                    "sensitive_launcher_mutation_rejects_before_core_import or "
                     "offline_cross_runtime_producer_to_private_delivery_vertical or "
                     "no_socket_vertical_preserves_producer_adapter_and_replay_contract"
                 ),
