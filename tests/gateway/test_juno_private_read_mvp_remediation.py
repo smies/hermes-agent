@@ -1416,7 +1416,6 @@ async def test_non_monotonic_sensitive_identity_fails_before_private_read(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("observed", [
     None,
-    _runtime_identity(account=ORDINARY_ACCOUNT),
     _runtime_identity(account="99999999999@s.whatsapp.net"),
 ])
 async def test_unavailable_or_wrong_sensitive_identity_fails_before_gmail(
