@@ -48,7 +48,7 @@ from gateway.juno_private_read_mvp import (
 from gateway.juno_replay_journal import JOURNAL_NAME, MARKER_NAME, _KEY_MAGIC
 from tests.gateway.test_juno_private_read_mvp_e2e import (
     FakeJsonTransport, FakeOrdinary, FakeSensitive, ORDINARY_ACCOUNT,
-    OWNER, OWNER_CHAT, PRIVATE_SENTINEL, SENSITIVE_ACCOUNT,
+    OWNER, OWNER_CHAT, OWNER_DESTINATION, PRIVATE_SENTINEL, SENSITIVE_ACCOUNT,
     TRUSTED, TRUSTED_CHAT, _event, _host, _raw_config, _tool,
 )
 from tools.private_read_request_tool import check_private_read_request_runtime
@@ -2423,7 +2423,7 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
 
         deliveries = [json.loads(line) for line in capture.read_text().splitlines()]
         assert len(deliveries) == 1
-        assert deliveries[0]["chat"] == "77777777777@s.whatsapp.net"
+        assert deliveries[0]["chat"] == OWNER_DESTINATION
         assert deliveries[0]["messageId"] == "3EB0ABCDEF0123456789AB"
         assert deliveries[0]["text"].endswith(PRIVATE_SENTINEL)
         assert len(_VerticalProviderHandler.observed) == 4
