@@ -542,8 +542,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Replace inherited fence bootstrap with this adapter's authority."""
         bridge_env.pop("HERMES_INTERNAL_WHATSAPP_FENCE_PROFILE", None)
         bridge_env.pop("HERMES_INTERNAL_WHATSAPP_FENCE_KEY", None)
-        profile = self._private_read_fence_profile
-        key = self._private_read_fence_key
+        profile = getattr(self, "_private_read_fence_profile", None)
+        key = getattr(self, "_private_read_fence_key", None)
         if profile is None and key is None:
             return
         if profile != "juno" or not isinstance(key, str):
