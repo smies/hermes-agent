@@ -825,20 +825,31 @@ precommitted identities. Exactly one identity is required. Zero selections,
 both options, a duplicate, unknown or malformed bytes, or any text-derived
 option fails closed.
 
-A valid decision binds the exact provider-canonical owner voter JID whose
-candidate made authenticated AES-GCM poll-vote decryption succeed, private DM
-destination, ordinary account, bundle, socket, connection and authority epoch,
-poll/message keys, poll creation ID, task, attempt, request and challenge
-generations, complete question/payload digest, secret digest, raw option
-identities, destination-delivery evidence, authenticated provenance/version,
-and observation time. The proposed rc14 helper returns both raw decrypted
-`selectedOptions` and the exact successful canonical voter-JID candidate; it
-does not discard which candidate succeeded. Local bridge/runtime identity is
-distinct from the remote voter identity. Any other candidate or JID, copied or
-untracked poll, foreign poll, reconnect drift, old generation, missing
-pre-send authority state, missing delivery evidence, late event, duplicate,
-or post-CAS change fails closed. Rc14 exposes no separately trustworthy remote
-device identity, so no remote owner-device field or test is required.
+A successful AES-GCM decryption is necessary but is not authorization by
+itself. The proposed rc14 helper returns both raw decrypted `selectedOptions`
+and the exact successful provider-canonical voter-JID candidate; it does not
+discard which candidate succeeded. Before option evaluation or durable
+mutation, the authority constant-time compares the canonical bytes of that
+candidate with the separately provisioned and sealed
+`ordinary_approval.expected_owner_voter_jid`. Exactly one successful candidate
+must exist and it must equal that expected value. The requester
+`owner_sender`, owner-DM destination, local bridge/runtime identity, and
+expected remote poll voter are distinct bindings and cannot substitute for
+one another. A decryption under any other voter candidate fails closed even
+when its authentication tag is valid.
+
+A valid decision binds that equality proof, the exact expected and observed
+provider-canonical owner voter JID, private DM destination, ordinary account,
+bundle, socket, connection and authority epoch, poll/message keys, poll
+creation ID, task, attempt, request and challenge generations, complete
+question/payload digest, secret digest, raw option identities,
+destination-delivery evidence, authenticated provenance/version, and
+observation time. Any second successful candidate, other candidate or JID,
+copied or untracked poll, foreign poll, reconnect drift, old generation,
+missing pre-send authority state, missing delivery evidence, late event,
+duplicate, or post-CAS change fails closed. Rc14 exposes no separately
+trustworthy remote device identity, so no remote owner-device field or test is
+required.
 
 Vote and destination-delivery events may arrive out of order. Until both exact
 conditions exist before expiry, the authority record retains only bounded
@@ -1520,7 +1531,10 @@ The closed version-1 object contains only these groups:
   monotonic epoch, sorted standing-tuple hash/count, provisioner public-key ID,
   read-only runtime generation, and authenticated adapter identity;
 - `ordinary_approval` with exact ordinary account/session/bundle/channel/
-  authority identities and owner DM destination binding;
+  authority identities, owner DM destination binding, and one separately
+  provisioned canonical `expected_owner_voter_jid`; this value is required for
+  the constant-time post-decryption equality check and is distinct from both
+  requester `owner_sender` and the destination binding;
 - `sensitive_delivery` with exact sensitive account/session/bundle/channel/
   transport identity and destination/thread binding; and
 - `limits`, containing only integer milliseconds/byte/count values that can
@@ -1600,9 +1614,13 @@ exclusion, and all independent mutation failures. Approval tests cover the
 exact poll question, ordered raw option bytes/hashes, variant, selectable
 count, prepare/bind/send-start/signed-commit, deterministic resolution payload,
 atomic decision enqueue, custom rc14 message IDs/secrets, pre-send listeners,
-exact destination status mapping, successful canonical owner voter-JID return,
-authority-only queue suppression, out-of-order evidence, every reconciliation
-state, epoch purge, retry/ambiguity/expiry, and pinned Node behavior. Root-
+exact destination status mapping, successful canonical voter-JID return,
+constant-time equality with the separately sealed expected owner-voter JID,
+rejection of a successfully decrypted vote from every non-owner candidate,
+rejection of zero or multiple successful candidates, distinct requester/
+destination/voter bindings, authority-only queue suppression, out-of-order
+evidence, every reconciliation state, epoch purge, retry/ambiguity/expiry, and
+pinned Node behavior. Root-
 bundle tests cover all three executable/closure/clean-launch contracts,
 application separation, inherited socketpair capability bootstrap, test-owner
 seams, and real deployment probes. Sensitive tests cover channel
