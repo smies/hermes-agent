@@ -23,6 +23,7 @@ from gateway.juno_private_read_mvp import (
     JunoPrivateReadMvpConfig,
     JunoPrivateReadMvpHost,
     OpenFgaChecker,
+    SensitiveRuntimeIdentity,
     SensitiveSubmission,
     private_read_tool_surface_is_closed,
     render_gmail_message,
@@ -40,7 +41,8 @@ PRIVATE_SENTINEL = "JUNO-PRIVATE-SENTINEL-DO-NOT-PERSIST"
 OWNER = "11111111111@s.whatsapp.net"
 TRUSTED = "22222222222@s.whatsapp.net"
 ORDINARY_ACCOUNT = "33333333333@s.whatsapp.net"
-ORDINARY_CHAT = "44444444444@s.whatsapp.net"
+OWNER_CHAT = OWNER
+TRUSTED_CHAT = TRUSTED
 SENSITIVE_ACCOUNT = "55555555555@s.whatsapp.net"
 OWNER_DESTINATION = "66666666666@s.whatsapp.net"
 TRUSTED_DESTINATION = "77777777777@s.whatsapp.net"
@@ -77,12 +79,14 @@ def _raw_config(tmp_path: Path) -> dict:
         "profile": "juno",
         "ordinary": {
             "account": ORDINARY_ACCOUNT,
-            "chat": ORDINARY_CHAT,
             "owner_sender": OWNER,
+            "owner_chat": OWNER_CHAT,
         },
         "requesters": [
-            {"sender": OWNER, "label": "James", "sensitive_destination": OWNER_DESTINATION},
-            {"sender": TRUSTED, "label": "Trusted Person", "sensitive_destination": TRUSTED_DESTINATION},
+            {"sender": OWNER, "source_chat": OWNER_CHAT, "label": "James",
+             "sensitive_destination": OWNER_DESTINATION},
+            {"sender": TRUSTED, "source_chat": TRUSTED_CHAT, "label": "Trusted Person",
+             "sensitive_destination": TRUSTED_DESTINATION},
         ],
         "capability_id": CAPABILITY_ID,
         "gmail_contract_version": GMAIL_CONTRACT_VERSION,
@@ -95,15 +99,15 @@ def _raw_config(tmp_path: Path) -> dict:
             "account": "juno@example.test",
         },
         "sensitive": {
-            "registration": "sensitive-runtime-test", "account": SENSITIVE_ACCOUNT,
-            "session": "epoch-test", "capability_file": str(sensitive),
+            "account": SENSITIVE_ACCOUNT, "capability_file": str(sensitive),
         },
         "timeouts": {"request": 2, "approval": 60, "read": 2, "submission": 2},
     }
 
 
 def _event(sender: str, text: str, *, account: str = ORDINARY_ACCOUNT,
-           chat: str = ORDINARY_CHAT, profile: str = "juno", message: str = "inbound-1"):
+           chat: str | None = None, profile: str = "juno", message: str = "inbound-1"):
+    chat = sender if chat is None else chat
     return MessageEvent(
         text=text,
         message_id=message,
@@ -165,8 +169,10 @@ class FakeJsonTransport:
 class FakeOrdinary:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.destinations: list[str] = []
 
-    async def send(self, text: str) -> str:
+    async def send(self, destination: str, text: str) -> str:
+        self.destinations.append(destination)
         self.messages.append(text)
         return "ordinary-message-1"
 
@@ -175,8 +181,16 @@ class FakeSensitive:
     def __init__(self) -> None:
         self.calls: list[tuple[object, str]] = []
         self.mode = "submitted"
+        self.identity = SensitiveRuntimeIdentity(
+            "sensitive-runtime-test", SENSITIVE_ACCOUNT, "epoch-test"
+        )
 
-    async def submit(self, *, request, plaintext: str) -> SensitiveSubmission:
+    async def observe_identity(self, *, request):
+        if self.mode == "identity-unavailable":
+            return None
+        return self.identity
+
+    async def submit(self, *, request, plaintext: str, identity) -> SensitiveSubmission:
         self.calls.append((request, plaintext))
         if self.mode == "mismatch":
             return SensitiveSubmission(
@@ -288,6 +302,8 @@ async def test_james_full_private_read_is_submitted_with_content_free_model_stat
                 "destination_chat": OWNER_DESTINATION,
                 "source_profile": "juno",
                 "source_account": ORDINARY_ACCOUNT,
+                "source_chat": OWNER_CHAT,
+                "source_message": "inbound-1",
                 "expires_at_us": request.expires_at_us,
                 "descriptor_digest": request.descriptor_digest,
             },
@@ -386,7 +402,7 @@ async def test_wrong_account_profile_chat_destination_expiry_and_malformed_comma
         for event in (
             _event(OWNER, "x", account="wrong"),
             _event(OWNER, "x", profile="default"),
-            _event(OWNER, "x", chat="wrong"),
+            _event(OWNER, "x", chat="99999999999@s.whatsapp.net"),
             _event("99999999999@s.whatsapp.net", "x"),
         ):
             binding = host.bind_event(event)

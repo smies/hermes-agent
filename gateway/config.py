@@ -31,11 +31,15 @@ def _load_gateway_yaml(stream):
         pass
 
     def _mapping(loader, node, deep=False):
-        loader.flatten_mapping(node)
-        result = {}
-        for key, value in loader.construct_pairs(node, deep=deep):
+        # Check only explicitly authored keys. flatten_mapping() copies merge
+        # keys into this mapping and would reject valid local overrides.
+        explicit = {}
+        for key_node, _value_node in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = loader.construct_object(key_node, deep=False)
             try:
-                duplicate = key in result
+                duplicate = key in explicit
             except TypeError as exc:
                 raise yaml.constructor.ConstructorError(
                     "while constructing gateway configuration",
@@ -50,8 +54,8 @@ def _load_gateway_yaml(stream):
                     "found a duplicate mapping key",
                     node.start_mark,
                 )
-            result[key] = value
-        return result
+            explicit[key] = True
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
 
     _UniqueKeyLoader.add_constructor(
         yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
@@ -1308,6 +1312,8 @@ def load_gateway_config() -> GatewayConfig:
     """
     _home = get_hermes_home()
     gw_data: dict = {}
+    config_yaml_path = _home / "config.yaml"
+    primary_present = config_yaml_path.exists()
 
     # Legacy fallback: gateway.json provides the base layer.
     # config.yaml keys always win when both specify the same setting.
@@ -1323,10 +1329,15 @@ def load_gateway_config() -> GatewayConfig:
         except Exception as e:
             logger.warning("Failed to load %s: %s", gateway_json_path, e)
 
+    # Private-read backward compatibility is allowed only when config.yaml is
+    # genuinely absent.  Once a primary source exists, omission, parse
+    # failure, or validation failure must not inherit a stale legacy opt-in.
+    if primary_present:
+        gw_data.pop("trusted_private_read", None)
+
     # Primary source: config.yaml
     try:
-        config_yaml_path = _home / "config.yaml"
-        if config_yaml_path.exists():
+        if primary_present:
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = _load_gateway_yaml(f) or {}
 
@@ -1796,8 +1807,11 @@ def load_gateway_config() -> GatewayConfig:
             # #41112 / #3823.
 
     except Exception as e:
+        if primary_present:
+            gw_data.pop("trusted_private_read", None)
         logger.warning(
-            "Failed to process config.yaml — falling back to .env / gateway.json values. "
+            "Failed to process config.yaml — private read remains fail-closed; "
+            "using other legacy values only. "
             "Check %s for syntax errors. Error: %s",
             _home / "config.yaml",
             e,

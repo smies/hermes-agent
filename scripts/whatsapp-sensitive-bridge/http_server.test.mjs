@@ -7,6 +7,7 @@ import {
   createSensitiveHttpHandler,
   listenLoopback,
 } from './http_server.js';
+import { SensitiveDeliveryTransport } from './delivery_core.js';
 
 const CAPABILITY = 'capability-8f0e9d16c2ac4ab096e9d30db0371fcba4c2cde36b424db8';
 
@@ -142,6 +143,61 @@ test('MVP submit route dispatches only to the submission operation', async () =>
   assert.equal(submits, 1);
   assert.equal(sends, 0);
   assert.equal(result.body.includes('PRIVATE'), false);
+});
+
+test('real HTTP handler calls real MVP transport with live identity and fake socket', async () => {
+  const ev = new EventEmitter();
+  const sends = [];
+  const account = '15551234567@s.whatsapp.net';
+  const ordinary = '15559876543@s.whatsapp.net';
+  const destination = '15557654321@s.whatsapp.net';
+  const runtime = 'runtime-live-synthetic';
+  const epoch = 'epoch-live-synthetic';
+  const messageId = '3EB0ABCDEF0123456789AB';
+  const sock = {
+    user: { id: '15551234567:4@s.whatsapp.net' }, ev,
+    async sendMessage(...args) {
+      sends.push(args);
+      return { key: { id: messageId, remoteJid: destination, fromMe: true } };
+    },
+  };
+  const transport = new SensitiveDeliveryTransport({
+    runtimeId: runtime, ordinaryAccountJid: ordinary,
+    transportIdentity: { manifest_sha256: 'a'.repeat(64) },
+    canonicalizeJid: (jid) => String(jid).replace(/:\d+@/, '@'),
+    generateMessageId: () => messageId,
+  });
+  transport.bindConnection({ sock, accountJid: account, epoch });
+  const handler = createSensitiveHttpHandler({ capability: CAPABILITY, transport });
+
+  const identity = await invoke(handler, {
+    method: 'GET', path: '/v1/identity',
+    headers: { host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY },
+  });
+  const evidence = JSON.parse(identity.body);
+  assert.equal(evidence.adapter_runtime_id, runtime);
+  assert.equal(evidence.connection_epoch, epoch);
+  assert.equal(evidence.provider_account_jid, account);
+
+  const request = JSON.stringify({
+    request_id: 'request-http-vertical', registration: runtime, session: epoch,
+    account, destination, private_value: 'PRIVATE-HTTP-VERTICAL',
+  });
+  const result = await invoke(handler, {
+    path: '/v1/submit',
+    headers: {
+      host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY,
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(request)),
+    },
+    chunks: [request],
+  });
+  assert.deepEqual(JSON.parse(result.body), {
+    state: 'submitted', message_id: messageId, account, destination,
+  });
+  assert.deepEqual(sends, [[destination, {
+    text: 'PRIVATE-HTTP-VERTICAL', linkPreview: null,
+  }, { messageId }]]);
 });
 
 test('aborted partial bodies release the active-request slot without parsing', async () => {

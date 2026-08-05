@@ -362,6 +362,29 @@ class AuthorizationTaskStore(
                         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     # Additive MVP storage deliberately shares this database
                     # without changing the high-assurance schema version.
+                    # Upgrade checkpoint-era tables before installing the
+                    # exact authenticated-event uniqueness index.
+                    existing_mvp = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='private_read_mvp_requests'"
+                    ).fetchone()
+                    if existing_mvp is not None:
+                        mvp_columns = {
+                            row[1]
+                            for row in conn.execute(
+                                "PRAGMA table_info(private_read_mvp_requests)"
+                            )
+                        }
+                        if "source_message" not in mvp_columns:
+                            conn.execute(
+                                "ALTER TABLE private_read_mvp_requests "
+                                "ADD COLUMN source_message TEXT NOT NULL DEFAULT ''"
+                            )
+                        if "approval_chat" not in mvp_columns:
+                            conn.execute(
+                                "ALTER TABLE private_read_mvp_requests "
+                                "ADD COLUMN approval_chat TEXT NOT NULL DEFAULT ''"
+                            )
                     for statement in _PRIVATE_READ_MVP.split(";"):
                         if statement.strip():
                             conn.execute(statement)
