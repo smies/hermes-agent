@@ -2,6 +2,10 @@
 
 - **Status:** proposed; implementation and deployment are not authorized
 - **Decision revision:** 2026-08-05
+- **Revision source commit:** `75f3d7a24654b270994a431bcf617de1b3669db2`
+- **Revision source tree:** `4253ee744ecde6c449ca81b10c55581b2de2ce9a`
+- **Revision source ADR SHA-256:**
+  `70f30c4154704d74bf397f01ba5925886a5806f2f3ca04ab14c2d45865417974`
 - **Reviewed WIP source commit:** `49d78bdc915e9e2c3ff78d7d4a3a7074ddb6ac85`
 - **Reviewed WIP source tree:** `c88ba9d705453561678b4e8ba2b501b4ff55a8bd`
 - **First reviewed ADR SHA-256:** `d9a413c3a44297ce02ed6e83f01a6f5de61b7be78f9a907677a223210367a700`
@@ -47,16 +51,21 @@ depth and is not treated as a substitute for the Inbox query.
 
 One approved operation may output only these canonical fields, in this order:
 
-1. `sender`, from the single `From` MIME header;
-2. `to`, from the single `To` MIME header;
-3. `cc`, from the single `Cc` MIME header;
-4. `subject`, from the single `Subject` MIME header;
-5. `date`, from the single `Date` MIME header; and
+1. `sender`, from the root Gmail message payload's single `From` MIME header;
+2. `to`, from the root Gmail message payload's single `To` MIME header;
+3. `cc`, from the root Gmail message payload's single `Cc` MIME header;
+4. `subject`, from the root Gmail message payload's single `Subject` MIME
+   header;
+5. `date`, from the root Gmail message payload's single `Date` MIME header;
+   and
 6. `text_body`, from exactly one eligible non-attachment `text/plain` leaf.
 
-Header values are message claims, not authenticated identities. Missing
-allowlisted headers render as a fixed `(not present)` marker. Message and
-thread IDs are ephemeral correlation inputs and are never output.
+Header values are message claims, not authenticated identities. Child-part
+headers are classification inputs only: they can never populate, replace, or
+override an output field. A root header missing from the root payload renders
+as the fixed `(not present)` marker even when a child part contains a header of
+the same name. Message and thread IDs are ephemeral correlation inputs and are
+never output.
 
 ### Owner-facing approval poll
 
@@ -101,15 +110,17 @@ bytes. Labels, punctuation, spaces, field order, and LF delimiters are fixed.
 The notification envelope separately contains the exact ordinary destination
 binding without displaying a private Gmail identity.
 
-For every attempt, the host computes a domain-separated HMAC over the complete
+For every attempt, the private service computes a domain-separated HMAC over
+the complete
 rendered question, the exact ordered option bytes, `selectableCount=1`, the
 `pollCreationMessageV3` variant, the fresh message-secret digest, pre-reserved
 provider poll ID, exact destination, and canonical dynamic envelope: task ID,
 task display ID, request and challenge generations, exact expiry, destination
 binding digest, attempt ID, capability descriptor and stable-label digests,
 ordinary bridge/launcher/package identity, adapter instance, account binding,
-socket and connection epoch, authenticated provenance version, and template
-version. The stable label retains its exact descriptor and HMAC semantics even
+socket, connection and authority epoch, private service/coordinator/signing
+generation, authenticated provenance version, and template version. The stable
+label retains its exact descriptor and HMAC semantics even
 though the rendered poll question is the single message shown to the owner.
 The challenge-payload digest is bound before send and must appear in correlated
 destination-delivery and owner-decision evidence. A digest of only the stable
@@ -184,7 +195,8 @@ Evidence captured read-only on 2026-08-05 is separated by kind:
 - **Absent or unverified active state:** no evidence established an active
   Gmail private-read composition, dedicated OAuth client/token, exact granted
   scope, Gmail account binding, OpenFGA service/model/policy, root-owned
-  sensitive bundle, paired sensitive session, or published Juno-only tool.
+  isolated-service bundles/UIDs, paired sensitive session, or published
+  Juno-only tool.
 - **Externally asserted facts:** any claim about provider-console state,
   account ownership, launchd environment, connector deployment, or live
   transport pairing that is not in the source/process proof above remains an
@@ -193,24 +205,75 @@ Evidence captured read-only on 2026-08-05 is separated by kind:
 The reviewed WIP foundation is not an implementation PASS. In particular,
 [`compose_trusted_private_read_services()`](../../gateway/trusted_private_read_host.py)
 returns `None` in the reviewed source, so enabled configuration cannot produce
-a host. The proposed changes below replace that dormant boundary only after
-implementation review.
+a private-service client composition. The proposed changes below replace that
+dormant boundary only after implementation review.
 
 ## 3. Privacy and threat contract
 
 ### Principals and fixed boundaries
 
-The trusted principals are the exact authenticated requester scope, one
-gateway process and coordinator generation, one dedicated Gmail Desktop OAuth
-client/grant and expected account, one pinned local OpenFGA 1.18.2 deployment,
-one separately approved root-owned sensitive bundle, and distinct ordinary
-and sensitive WhatsApp accounts/processes/sessions.
+The final architecture has three distinct non-login macOS service identities,
+each with one independently supervised process. Their names are conceptual
+until a separately reviewed deployment chooses concrete UIDs and launch
+labels:
 
-Display names, aliases, ambient profiles, global Google credentials, service
-self-reports, relay envelope claims, model text, and environment-selected
-accounts are never authority. Root or kernel compromise, Google compromise,
-and a same-process memory-forensic attacker are outside the v1 guarantees
-stated below.
+1. the **ordinary Juno WhatsApp bridge UID/process**, which owns only the
+   ordinary Juno Baileys session and ordinary chat/approval transport state;
+2. the **private-read service UID/process**, which owns the immutable
+   capability registry, authorization task store, HMAC and signing private
+   keys, Gmail OAuth/token files, Gmail HTTP/MIME provider, OpenFGA check
+   client, task worker, and approval/sensitive-delivery orchestration; and
+3. the **sensitive WhatsApp bridge UID/process**, which owns only the sensitive
+   Baileys session and sensitive-delivery state.
+
+The gateway/model UID owns none of those files and cannot traverse or read
+their directories. The three service UIDs cannot traverse or read one
+another's credential, session, or store directories. Each process has a
+separate fixed working directory, HOME/state root, socket namespace,
+dependency closure, launch record, content-free log sink, resource limits,
+and lifecycle supervision. Root-owned executable/runtime bundles are
+immutable to every service UID and to the gateway UID.
+
+The existing complete ordinary authorization directory at
+`/Users/james/.hermes/profiles/juno/whatsapp/session` is reused in place. It is
+never copied, split, or reduced to `creds.json`. A separately authorized
+deployment transaction may verify the complete multi-file directory, transfer
+its ownership/access to the ordinary bridge identity while preserving that
+canonical path, and prove rollback. Engineering and this ADR perform and
+authorize no ownership, mode, or ACL mutation.
+
+The private-read service and its reviewed code are the TCB for Gmail OAuth,
+Gmail plaintext, authorization state, policy attestation, and one-shot
+orchestration. The ordinary bridge is the TCB only for authenticated owner-turn
+and approval evidence. The sensitive bridge is the TCB only for final private
+delivery. The model, gateway tool implementations, plugins, skills, browser,
+terminal, file tools, other profiles, and every other gateway-UID component
+are outside the private TCB and have no OS file or socket access to private
+state. Same-UID model/tool attacks are excluded by OS identity separation,
+not by declaring the gateway UID trusted.
+
+The exact authenticated requester binding, dedicated Gmail Desktop OAuth
+client/grant and expected account, signed OpenFGA policy state, and exact
+bundle/service generations remain authority inputs. Display names, aliases,
+ambient profiles, global Google credentials, self-reports, relay claims,
+model text, and environment-selected accounts never are. Root/kernel or Google
+compromise remains outside v1.
+
+The private-read service sends private plaintext only over a dedicated
+sensitive-delivery Unix connection. The listener authenticates kernel peer
+credentials using `getpeereid` or an equivalently reviewed macOS primitive and
+accepts only the exact private-read UID; the private service requires the exact
+sensitive-bridge UID at the peer. The gateway and ordinary bridge cannot
+connect. The sensitive process never returns plaintext, rendered content, or
+provider error text: it returns only fixed authenticated terminal delivery
+evidence.
+
+The private-read service uses a different approval-authority Unix connection
+to the ordinary bridge. That listener accepts approval commands only from the
+exact private-read UID after kernel peer authentication; approval events return
+only on the same authenticated channel. Ordinary gateway chat IPC is a
+distinct endpoint that accepts only the gateway UID and has no approval
+prepare, commit, or authority-event operations.
 
 ### Four data classes
 
@@ -263,9 +326,9 @@ Version 1 must never:
 
 ### Exact resource bounds
 
-The following are code maxima; the closed configuration may only reduce them.
-The effective values are descriptor-bound. Crossing a cap fails rather than
-truncating silently.
+The following are code maxima; the dedicated decision record may only reduce
+them using its integer units. The effective values are descriptor-bound.
+Crossing a cap fails rather than truncating silently.
 
 - Query: exactly the UTF-8 bytes `in:inbox`; maximum schema allowance 512
   bytes, one non-empty line, no NUL/control/DEL or surrounding whitespace.
@@ -299,22 +362,25 @@ Google uses reviewed CA validation. OpenFGA alone uses the code-fixed loopback
 HTTP endpoint. All clients disable redirects, proxy/environment trust,
 `.netrc`, ambient credentials, and provider-controlled authorities.
 
-### Honest in-process memory guarantee
+### Honest isolated-process memory guarantee
 
-V1 guarantees bounded logical reachability, not physical zeroization. Private
-content and tokens have the shortest practical lifetimes; references are
-released explicitly in `finally` paths; controlled mutable buffers are wiped
-where the application truly owns them. No application persistence, logs,
-traces, model/tool/session/history/audit/policy/task content, or retained task
-results are permitted.
+V1 guarantees process and UID isolation plus bounded logical reachability, not
+physical zeroization. Gmail content and tokens exist only inside the
+private-read service until the fixed rendered bytes cross the authenticated
+sensitive-delivery socket. They have the shortest practical lifetimes;
+references are released explicitly in `finally` paths; controlled mutable
+buffers are wiped where the application truly owns them. The sensitive bridge
+holds only the bytes required for the one send. No application persistence,
+logs, traces, model/tool/session/history/audit/policy/task content, or retained
+task results are permitted.
 
 V1 does not claim that immutable Python `bytes`/`str`, HTTPX request/response
-objects, TLS buffers, exception allocator storage, or CPython allocator copies
-are physically erased. A same-process memory-forensic attacker is outside this
-plaintext-erasure guarantee. If physical erasure becomes a requirement,
-OAuth/fetch/parse/render must move into a killable isolated process and the
-current `Awaitable[str]` host boundary must be redesigned so plaintext never
-crosses back as a Python string.
+objects, TLS buffers, exception allocator storage, CPython allocator copies,
+or immutable Node buffers are physically erased. A memory-forensic attacker
+inside the private service is within the private TCB; one inside the sensitive
+bridge can observe only its bounded delivery plaintext. The gateway/model
+process never receives plaintext. A physical-erasure requirement needs a
+separate stronger memory-isolation ADR.
 
 `GmailMessageReadDto` is a slots-based class with `repr=False`, a fixed
 redacted `__repr__` and `__str__`, and no dataclass `asdict`, pickle, or copy
@@ -323,13 +389,13 @@ reprs, attempted pickle/copy, and all exception/task surfaces.
 
 ### Exception and cancellation hygiene
 
-The sensitive adapter never calls `raise_for_status()` and never rethrows an
-HTTPX, OAuth, provider, JSON, MIME, renderer, or sensitive-send exception. A
-private inner async frame owns request, response, token, body, parser, DTO, and
-render references. It catches every failure, manually maps the HTTP status and
-failure class to a closed non-private code, closes streams, releases all
-request/response/token/body references, wipes controllable buffers, and
-completes bounded mandatory cleanup.
+The private service never calls `raise_for_status()` and never transmits an
+HTTPX, OAuth, provider, JSON, MIME, renderer, approval, or sensitive-send
+exception across IPC. A private inner async frame owns request, response,
+token, body, parser, DTO, and render references. It catches every failure,
+manually maps the HTTP status and failure class to a closed non-private code,
+closes streams, releases all request/response/token/body references, wipes
+controllable buffers, and completes bounded mandatory cleanup.
 
 Only after the private exception frame has exited does an outer wrapper raise
 a fresh fixed `PrivateReadProviderFailure(code)` from `None`. Public error text
@@ -340,7 +406,7 @@ non-private control-flow kind, completes mandatory shielded bounded cleanup,
 exits the exception frame, and then recreates cancellation/control flow from
 outside it without retaining or re-raising the original exception graph. A
 fresh `asyncio.CancelledError()` or fixed control exception is raised from
-`None`. Cleanup failure permanently revokes host health and returns only a
+`None`. Cleanup failure permanently revokes service health and returns only a
 fixed content-free diagnostic.
 
 Tests recursively traverse exception cause, context and tracebacks and inspect
@@ -352,19 +418,12 @@ be absent after success, every mapped failure, cancellation, and shutdown.
 
 ### Closed requester scope
 
-The closed configuration contains exactly:
-
-```yaml
-requester:
-  gateway_profile: juno
-  agent_identity: <exact reviewed Juno agent identity>
-  platform: whatsapp
-  ordinary_account_binding: <exact ordinary account binding>
-  owner_sender: <exact authenticated owner sender>
-  source_chat: <exact ordinary source chat>
-  source_thread_sentinel: <exact no-thread or thread sentinel>
-  authenticated_provenance_version: <exact code-owned provenance/version>
-```
+The dedicated decision record contains one closed `requester` object with
+exactly `gateway_profile`, `agent_identity`, `platform`,
+`ordinary_account_binding`, `owner_sender`, `source_chat`,
+`source_thread_sentinel`, and `authenticated_provenance_version`.
+`gateway_profile` is exactly `juno` and `platform` is exactly `whatsapp`; the
+other strings are separately reviewed opaque deployment identities.
 
 Unknown or missing requester keys fail parsing. Every value is sealed into the
 composition and requester-scope digest. The gateway checks all seven values at
@@ -387,13 +446,46 @@ The materialized schema and Juno profile instruction bytes remain unchanged
 for the lifetime of that conversation. Enabling, disabling, replacing a
 descriptor, or publishing a new runtime never mutates an existing
 conversation's tool list or system prompt. Activation requires a fresh Juno
-conversation/session generation after successful host publication. Existing
+conversation/session generation after successful service publication. Existing
 conversations remain unavailable, preserving prompt-cache identity.
 
-Tests prove: absent host means absent schema; a healthy published Juno
+The gateway publishes this one content-free tool only after authenticating the
+private service over a code-fixed Unix socket and verifying the exact
+root-bundle, service, schema, requester, and publication generation. A proposal
+RPC contains only the capability ID, an opaque bridge-minted one-use inbound-
+turn grant, exact session/conversation generation, and fixed content-free
+correlation. The ordinary bridge minted that grant from the authenticated
+owner inbound turn; the private service verifies and atomically consumes it.
+The private listener kernel-authenticates and accepts this closed proposal RPC
+only from the exact gateway UID. The gateway/model cannot mint, inspect,
+extend, or replay a grant. The private service returns only fixed content-free
+task and terminal outcome states. Gmail output never crosses the gateway
+socket.
+
+At creation of a genuinely new gateway session/conversation generation, the
+gateway atomically captures an immutable, content-free
+`PrivateReadConversationCapability` together with the schema bytes. It
+contains the exact gateway session generation, profile/requester binding,
+private service/publication generation, root bundle/service identity, schema
+digest and bytes, terminal RPC capability identity, and explicit
+presence/absence state. The binding is persisted with session-generation
+metadata. Agent eviction, process reconstruction, or gateway restart reloads
+that binding; it never recaptures live availability for an existing session.
+
+A session born absent remains absent. A session born with publication
+generation G may execute only while the current publication is exactly G with
+identical service, bundle, schema, requester, and terminal capability identity.
+Removal or replacement fails closed and never falls forward. A new publication
+can become available only to a genuinely new session generation. Direct tool
+execution and deferred Tool Search definition/scope planning use only the
+session-bound capability and the exact-current equality/revocation check; they
+never resolve a current or newer runtime at call time.
+
+Tests prove: absent service means absent schema; a healthy published Juno
 generation gets the exact one-value enum and exact non-private purpose; other
-profiles get no schema; old generations do not gain it; replacement requires a
-fresh generation; and schema/instruction bytes are stable across turns.
+profiles get no schema; absent and old generations do not gain it after
+restart, eviction, or service replacement; revoked generations fail closed;
+and capability/schema/instruction bytes are stable across turns.
 
 ### Canonical descriptor and fingerprints
 
@@ -504,32 +596,78 @@ reused across a generation or notification kind.
 
 ### Challenge state machine
 
-The challenge is the exact single-select poll in section 1. The store
-atomically makes the task generation and notification attempt durable before
-the bridge is called. It reserves the attempt ID, generation, exact expiry,
-destination digest, canonical dynamic envelope, and descriptor/HMAC roots.
-The dedicated ordinary Node approval operation then performs exactly:
+The challenge is the exact single-select poll in section 1. The private store
+first durably creates and claims the notification attempt, reserving its
+attempt ID, task and generations, exact expiry, destination digest, canonical
+dynamic envelope, claim/coordinator fences, descriptor root, and HMAC root.
+No send-start fence has yet been crossed.
 
-1. receive that already durable host/store attempt and challenge generation;
-2. create a fresh cryptographic 32-byte poll `messageSecret` and a fresh
-   provider message ID;
-3. compute the two raw option identities as SHA-256 of the exact UTF-8
-   option-name bytes `Approve` and `Deny`;
-4. install a bounded authority-only ephemeral correlation record and all
-   listeners for that provider ID before sending;
-5. call rc14 `sendMessage()` with that exact custom `messageId` and the exact
-   poll payload;
-6. constant-time compare the returned message ID with the pre-reserved ID;
-7. await and store exact destination `DELIVERY_ACK`, `READ`, or `PLAYED`
-   evidence; and
-8. route decrypted votes only through the authority path.
+The peer-authenticated ordinary approval connection then uses two distinct,
+closed-schema operations.
 
-Pinned rc14's `MiscMessageGenerationOptions` inherits the caller-supplied
-`messageId`; the operation relies on and contract-tests that behavior. The
-fresh secret remains only in the authority record. Only its digest is included
-in the durable attempt HMAC. The complete question, ordered option bytes,
-selectable count, poll variant, secret digest, provider poll ID, destination,
-and dynamic envelope are HMAC-bound before submission.
+#### Prepare
+
+The private service calls `prepare_approval_poll` with the exact fixed
+question, ordered options, destination, attempt/task/generations, expiry, and a
+fresh private-service nonce. The ordinary bridge:
+
+1. verifies the exact private-service peer UID and the closed operation schema;
+2. verifies destination, account, socket, connection/authority epoch, expiry,
+   dynamic-field grammar, exact question bytes, ordered option bytes,
+   `selectableCount=1`, and `pollCreationMessageV3`;
+3. creates a fresh rc14-compatible custom provider message ID and fresh
+   cryptographic 32-byte `messageSecret`;
+4. builds the byte-exact `pollCreationMessageV3` with that caller-supplied
+   secret, computes raw option identities and the complete payload digest;
+5. installs all delivery/vote listeners and a bounded, one-shot ephemeral
+   preparation record before any send; and
+6. returns authenticated preparation evidence on the same peer-authenticated
+   connection.
+
+The evidence contains the preparation ID and generation, attempt/task/request/
+challenge generations, provider ID, secret digest but never the secret,
+complete payload digest, exact destination, ordinary bundle/account/socket/
+connection/authority epoch, expiry, service nonce, and option identities. The
+held record contains the byte-identical payload, secret, and custom provider
+ID. It is unavailable to ordinary chat IPC.
+
+The private service independently reconstructs the expected canonical payload
+and evidence under the pinned rc14 compatibility contract, checks every fixed
+and dynamic field and digest, and rejects any mismatch. A private-store CAS,
+bound to the live claim, coordinator fence, and whole descriptor, writes every
+preparation identity/digest into the attempt HMAC and audit state. A separate
+durable CAS then crosses send-start and records a fresh send-start generation.
+Only after that commit does the private service mint an opaque one-use signed
+commit grant. Its Ed25519 signing private key is readable only by the
+private-read UID; the ordinary root bundle contains only the pinned public
+verification key. The grant binds every prepared field, store attempt/version,
+send-start generation, exact expiry, ordinary authority epoch, and an exact
+single-use nonce.
+
+#### Commit-send
+
+The private service passes the signed grant to
+`commit_prepared_approval_poll`. The ordinary bridge verifies the signature,
+exact private-service peer UID, exact preparation match, expiry, authority
+epoch, and unused state. It atomically consumes the preparation and commit
+before calling rc14, then invokes `sendMessage()` exactly once with the held
+byte-identical payload, held `poll.messageSecret`, and held custom
+`messageId`. It constant-time compares the returned ID with the held ID.
+Duplicate, expired, foreign, stale, mismatched, or already consumed grants fail
+closed. Pinned rc14's `MiscMessageGenerationOptions` custom-ID inheritance and
+caller-supplied `poll.messageSecret` behavior are contract-tested.
+
+A process/socket failure after durable send-start is ambiguous even if Node
+has not confirmed submission. That attempt/message is never retried. Durable
+reconciliation distinguishes exactly: unprepared; prepared but store-unbound;
+store-bound prepared but not send-started; send-started with commit outcome
+unknown; exact destination accepted; and terminal decision/resolution states.
+Unprepared or definitely pre-send prepared state may be superseded only under
+the exact bounded policy. Loss of any bridge preparation before send-start
+supersedes the attempt and advances challenge generation; the attempt,
+provider ID, and secret are never reused. A send-started uncertainty is
+consumed ambiguous. Bridge preparation records are bounded, non-persistent,
+and never restored.
 
 Approval poll IDs, option identities, option text, secrets, and decrypted
 votes never enter the ordinary agent/model message queue. The existing generic
@@ -557,23 +695,26 @@ precommitted identities. Exactly one identity is required. Zero selections,
 both options, a duplicate, unknown or malformed bytes, or any text-derived
 option fails closed.
 
-A valid decision additionally binds the exact authenticated owner voter JID,
-owner device identity, private DM destination, ordinary account, bridge,
-launcher and package identities, socket and connection epoch, poll creation
-ID, task, attempt, request and challenge generations, complete question/payload
-digest, fresh message-secret/nonce verifier, destination-delivery evidence,
-authenticated provenance/version, and observation time. Another voter or
-device identity, copied or untracked poll, foreign poll, reconnect drift, old
-generation, missing pre-send authority state, missing delivery evidence, late
-event, duplicate, or change after the decision compare-and-swap fails closed.
+A valid decision binds the exact provider-canonical owner voter JID whose
+candidate made authenticated AES-GCM poll-vote decryption succeed, private DM
+destination, ordinary account, bundle, socket, connection and authority epoch,
+poll/message keys, poll creation ID, task, attempt, request and challenge
+generations, complete question/payload digest, secret digest, raw option
+identities, destination-delivery evidence, authenticated provenance/version,
+and observation time. The proposed rc14 helper returns both raw decrypted
+`selectedOptions` and the exact successful canonical voter-JID candidate; it
+does not discard which candidate succeeded. Local bridge/runtime identity is
+distinct from the remote voter identity. Any other candidate or JID, copied or
+untracked poll, foreign poll, reconnect drift, old generation, missing
+pre-send authority state, missing delivery evidence, late event, duplicate,
+or post-CAS change fails closed. Rc14 exposes no separately trustworthy remote
+device identity, so no remote owner-device field or test is required.
 
 Vote and destination-delivery events may arrive out of order. Until both exact
 conditions exist before expiry, the authority record retains only bounded
 non-private authentication/correlation evidence and cannot call the store
-decision CAS. A bridge or gateway restart destroys the ephemeral secret and
-authority state, consumes or supersedes the old attempt according to its send
-fence, and requires a new challenge generation. The secret is never persisted,
-and no vote from the old poll is accepted after restart.
+decision CAS. The secret is never persisted, and no prior-epoch poll event can
+be accepted after authority reattachment.
 
 ### Resolution state machine
 
@@ -608,11 +749,16 @@ binding, ordinary adapter/account/socket/epoch, decision-evidence digest,
 descriptor digest, and template version. Resolution expiry is deterministically
 the decision-recorded instant plus the code-fixed 60-second notification
 window. A resolution is exactly one deterministic content-free text message
-with a fresh pre-reserved custom message ID. It has no poll, options, button,
-reaction, or other control. Its dedicated Node operation installs the exact
-one-to-one destination listener before send, supplies the custom ID to rc14,
-constant-time checks the returned ID, and accepts only the same exact
-destination `DELIVERY_ACK`, `READ`, or `PLAYED` evidence.
+with no poll, options, button, reaction, or other control. It uses the same
+pre-reserved-ID → authenticated prepare evidence → durable store bind →
+distinct send-start CAS → one-use signed commit protocol as a challenge,
+through closed `prepare_approval_resolution` and
+`commit_prepared_approval_resolution` RPCs, without a poll secret or options.
+The ordinary bridge holds the exact rendered bytes and fresh custom provider
+ID, installs the one-to-one destination listener before prepare returns,
+atomically consumes the matching commit before one rc14 call, constant-time
+checks the returned ID, and accepts only the same exact destination
+`DELIVERY_ACK`, `READ`, or `PLAYED` evidence.
 
 Definite pre-submit failure may create a fresh resolution attempt before that
 expiry. Expiry terminalizes an unstarted or definite pre-submit attempt; an
@@ -623,13 +769,44 @@ audit-complete regardless of notification outcome. A late, unknown, or
 
 Pinned Node contract tests exercise the actual reviewed ordinary bridge and
 rc14 event adapter, including custom ID inheritance and returned-ID comparison,
-listener-before-send ordering, exact one-to-one `messages.update` status
-mapping, rejection of `SERVER_ACK` and every other non-accepting signal,
-group/status failure, raw option SHA-256 identities, single-selection
-validation, authenticated owner voter/device, authority-only queue suppression,
-all correlation dimensions, event-order inversion, restart ambiguity, late
-events, reconnect, disconnect, timeout, duplicates, and post-CAS changes.
-Python mocks alone are insufficient.
+caller-supplied poll secret, prepare/bind/send-start/commit ordering,
+single-use grant consumption, listener-before-send ordering, exact one-to-one
+`messages.update` status mapping, rejection of `SERVER_ACK` and every other
+non-accepting signal, group/status failure, raw option SHA-256 identities,
+single-selection validation, exact successful owner voter-JID candidate,
+authority-only queue suppression, all correlation dimensions, event-order
+inversion, restart ambiguity, late events, reconnect, disconnect, timeout,
+duplicates, and post-CAS changes. Python mocks alone are insufficient.
+
+### Restart and authority epochs
+
+All three services are independently supervised. A gateway restart neither
+stops nor authorizes either bridge or the private service. Existing gateway
+conversation capabilities remain bound to their old gateway publication and
+cannot fall forward: restart advances the gateway availability/publication
+generation before any client reattachment, and persisted old capabilities do
+not compare equal to it. The private service may nevertheless continue a valid
+already-created durable approval task independently.
+
+An ordinary bridge restart changes its kernel process/socket, connection, and
+authority epoch and destroys every preparation/listener. On peer-authenticated
+reattach it atomically purges all old preparations, authority events, and
+bounded queues before admitting a command. The private service rejects every
+prior-epoch event and reconciles each attempt using the send-fence states above.
+
+A private service restart changes its service, coordinator, signing, and
+publication epoch. Planned shutdown first requests synchronous gateway
+unpublication; unexpected socket loss makes the gateway synchronously
+unpublish before further dispatch. The restarted service reconnects to the
+ordinary bridge under a fresh authenticated lease, commands atomic purge of
+all prior private-service-epoch authority state, reconciles the durable store,
+and rejects every prior-epoch event or grant before republishing.
+
+A sensitive bridge restart changes its exact process/socket/connection/
+transport epoch and invalidates pending delivery registration under the
+existing pre-submit versus post-submit ambiguity rules. Approval events never
+use generic ordinary `messageQueue`; their bounded queues are keyed to and
+purged by the exact private-service/ordinary-bridge lease epoch.
 
 ## 6. Gmail OAuth, HTTP, and MIME adapter
 
@@ -726,17 +903,46 @@ allowed ASCII-compatible declaration, contain no forbidden controls, and fit
 after CRLF-to-LF normalization. Multiple candidates, missing candidate,
 attachment-backed plain text, malformed headers, or ambiguous charset fails.
 
-Only the six canonical fields enter the slots/redacted DTO. The renderer uses
-fixed ASCII field labels, field order, LF separators, no Markdown, HTML,
-linkification, locale, model, or adaptive behavior, and asserts the final
-4,096-byte cap.
+Only root Gmail message payload headers can populate the five header fields.
+Every child-part header is retained only long enough for bounded MIME
+classification and can never populate or override a DTO output field. Missing
+root headers produce `(not present)` regardless of conflicting child headers.
+Tests cover each conflicting child header, all missing-root combinations, and
+child-only values. Only the six canonical fields enter the slots/redacted DTO.
+The renderer uses fixed ASCII field labels, field order, LF separators, no
+Markdown, HTML, linkification, locale, model, or adaptive behavior, and asserts
+the final 4,096-byte cap.
 
 ## 7. Exact task-bound OpenFGA contract
 
-`LocalOpenFgaPrivateReadPdp` targets exactly OpenFGA 1.18.2 at the code-fixed
-loopback store and exact configured authorization model. Startup verifies the
-service version, store, model bytes/digest, policy version/digest, and
-owner-policy epoch without creating or changing any of them.
+The authenticated deployment uses exactly OpenFGA 1.18.2 under a separate
+non-login OpenFGA runtime UID and root-owned content-addressed runtime bundle.
+It binds only a code-fixed loopback address and requires one exact
+high-entropy runtime API credential. That credential is readable only by a
+separate non-login check-only proxy UID/process: neither the gateway nor the
+private-read service possesses it.
+
+The private-read service reaches a code-owned Unix-socket proxy. Kernel peer
+authentication accepts only the exact private-read UID. The proxy has a
+closed, bounded protocol exposing only `Check`, exact model/store metadata
+read, exact authorization-model bytes read, and exact standing
+`approved_reader` tuple reads required here. All tuple/model/store write or
+mutation endpoints are absent and rejected. The OpenFGA runtime datastore role
+is read-only while the runtime, proxy, or private capability is running, so
+even possession of the runtime API credential cannot mutate tuples, models,
+or stores.
+
+Provisioning has a separate writer datastore role and credential unavailable
+to all runtime UIDs. It occurs only while the OpenFGA runtime, check proxy, and
+private capability are stopped and unpublished. A root/offline provisioning
+authority owns an Ed25519 private signing key unavailable at runtime. Every
+policy transaction atomically updates the exact authorization model and the
+complete canonical standing `approved_reader` tuple set, increments a
+monotonic policy epoch, and emits a signed canonical policy manifest. That
+manifest binds store ID, model ID, exact model bytes/hash, exact sorted standing
+tuple-set hash/count, policy version/digest, epoch, provisioner key ID, and
+deployment generation. Runtime bundles contain only the pinned verification
+public key.
 
 The generic model has these semantics for each field object:
 
@@ -763,6 +969,17 @@ Task approval, contextual tuples, reconciliation, expiry, cleanup, or rollback
 may not create, restore, modify, or delete it. A contextual
 `approved_reader` self-grant is forbidden.
 
+At startup and immediately before each `pre_claim` and `pre_private_read`
+six-check group, the private service asks the check-only proxy for the exact
+model bytes/identity and a complete, strictly bounded standing tuple set. It
+rejects pagination, duplicates, extras, unknown relations/users/objects,
+incomplete reads, count drift, noncanonical ordering, and any set beyond the
+small code-fixed maximum. It independently recomputes canonical hashes,
+verifies the offline signature and monotonic epoch, and requires byte-for-byte
+equality with the signed policy manifest. The read-only runtime/datastore
+generation attestation must also prove that no writer can coexist while the
+capability is published. Startup configuration alone is never policy proof.
+
 For each stage, the adapter issues exactly N=6 independent checks, one for each
 field in canonical order. It issues N=6 at `pre_claim` and N=6 again at
 `pre_private_read`, for 12 requests per successful operation. Every request
@@ -778,117 +995,146 @@ request/binding/requester roots, worker and generation, model/policy/owner
 epoch, whole descriptor, stage, and expiry after each complete six-check group.
 Drift consumes or denies according to the existing side-effect fence.
 
+`HIGHER_CONSISTENCY` is an OpenFGA preference, not a linearizability claim.
+The actual standing-policy boundary comes from the read-only runtime, exact
+live model/tuple attestation against the signed manifest before both stages,
+the absence of runtime mutation authority, and post-group store revalidation.
+
 Tests mutate every contextual binding independently and require deny/failure,
 prove the exact two tuples and condition on every call, prove no contextual
-standing grant, and prove no field/batch shortcut exists.
+standing grant, prove no field/batch shortcut exists, and exercise the full
+proxy protocol, tuple/model bounds, manifest signature/epoch, writer exclusion,
+pagination/extra/incomplete failures, and both pre-stage attestations. During
+engineering the test harness uses only a fake check proxy and signed synthetic
+manifests. OpenFGA installation, provisioning, and policy epoch advancement are
+separate deployment approvals.
 
-## 8. Sensitive delivery executable identity on macOS
+## 8. Root-owned executable and clean-launch contract on macOS
 
 Live macOS 26.5.2 Python exposes neither `os.fexecve` nor `os.execveat`.
-MacOS v1 therefore uses an explicit OS immutability boundary, not a path
-recheck or gateway-user-writable staging claim.
+MacOS v1 therefore uses root-owned immutable content-addressed bundles plus
+double verification, never path recheck alone or user-writable staging.
 
-At a separately approved deployment step, the sensitive Node executable,
-launcher, manifest, verifier, source, package/lock metadata, and complete
-`node_modules` closure are installed into a versioned content-addressed bundle
-under a code-owned root such as:
+The private Python service, ordinary Node bridge, and sensitive Node bridge
+each have a different root-owned bundle under a code-fixed root such as:
 
 ```text
-/Library/Application Support/Hermes/private-read-bundles/sha256-<bundle-digest>/
+/Library/Application Support/Hermes/private-read-bundles/<service>/sha256-<digest>/
 ```
 
-All ancestors and bundle directories are root-owned and not group/world
-writable. Every entry is non-symlinked, has the reviewed type, mode and link
-count, is root-owned, is not writable by the gateway OS user, and is covered by
-an independently reviewed manifest/hash closure. Regular files are one-link;
-unknown files and mount/path substitution fail. Code/config can select only an
-allowlisted bundle digest/version, never an arbitrary command, executable,
-module, or path.
+Each bundle has its own closed, separately hashed manifest and complete
+dependency closure. The private bundle contains a pinned absolute CPython
+interpreter and venv/package closure. Each Node bundle contains a pinned
+absolute Node executable and its own package/lock/`node_modules` closure.
+Ordinary and sensitive Node graphs are installed and verified independently
+and may never import, resolve, or traverse one another.
 
-The host independently opens and hashes the exact root-owned bundle, verifies
-the manifest, verifier, source, pinned Node binary, Baileys rc14 identity, and
-full dependency closure, and constructs the registration command solely from
-that verified bundle. It rechecks ownership, path ancestry, types, modes,
-links, manifest, and hashes immediately before spawn. Root-owned immutability
-then prevents the gateway user from replacing verified bytes between check and
-execution under the v1 threat model. Root and kernel compromise are outside
-this boundary.
+All ancestors and bundle entries are root-owned, non-symlinked, not group/world
+writable, and immutable to the gateway and service UIDs. Every entry has the
+reviewed type, mode, link count, mount identity, and content hash; regular
+files are one-link; unknown or missing entries and path/mount substitution fail
+closed. Decision records may name only an allowlisted manifest identity
+relative to the code-fixed bundle root, never an arbitrary path, command,
+executable, module, or import.
 
-The root-owned launcher again verifies the manifest, verifier, source, pinned
-runtime, package/lock identity, and complete dependency closure before any
-dynamic import. Copying or staging into a gateway-user-writable directory does
-not provide verified-to-executed identity and is not part of this design.
+For each of the three launchers, the root manifest determines the absolute
+verified executable and complete argv, fixed root-owned bundle cwd, service
+UID/GID, and exact descriptor list. The launcher constructs an allowlisted
+environment from empty. It admits only code-fixed locale, timezone, HOME/state,
+and socket values. It explicitly rejects/removes `NODE_OPTIONS`, `NODE_PATH`,
+`PYTHONPATH`, `PYTHONHOME`, every `DYLD_*` and `LD_*` variable, npm lifecycle/
+hook/config injection, inspector/debug/preload/require switches, proxy
+variables, ambient credential variables, and every unreviewed value.
 
-No bundle installation occurs during engineering, normal startup, or this ADR
-revision. Installation, verification, rollback, and removal require later
-explicit root-authorized deployment and real proof. Unit tests use a
-production-owner predicate plus an explicit test-only expected-owner seam;
-deployment acceptance additionally requires a real root-owned bundle probe.
+No launcher inherits a shell, `PATH` resolution, caller cwd, `.env`, default
+keychain lookup, `.netrc`, plugin path, user-writable module path, or ambient
+configuration. Stdin is `/dev/null`; stdout/stderr go to a dedicated
+content-free sink. Every descriptor is close-on-exec and closed before exec
+except the exact manifest-allowlisted IPC, listener, and already-open validated
+configuration descriptors. Native loaders and package resolvers cannot search
+user-writable locations.
 
-Production startup fails before OAuth/OpenFGA/session provisioning on native
-Windows for v1 with an accurate “root-owned macOS sensitive bundle required;
-native Windows unsupported” status, unless a separate ADR approves an
-ACL-aware verified-to-executed equivalent.
+The supervising verifier performs identity, ancestry, ownership, mode, link,
+mount, manifest, executable, argv, and full closure validation immediately
+before spawn. The in-bundle launcher repeats the same validation before any
+dynamic import. Root-owned immutability prevents the unprivileged UIDs from
+replacing verified bytes between verification and execution within the stated
+threat model. Copying into a service- or gateway-writable staging directory is
+forbidden.
 
-Ordinary and sensitive account/profile/session/process/socket/dependency/
-queue/logger identities remain distinct. Pairing is absent from production
-startup and uses alphanumeric code only. Sensitive post-submit ambiguity burns
-the authorization; no result retry occurs.
+Deployment evidence binds each launchd record and bootstrap domain to the
+exact label, service UID/GID, bundle/manifest digest, executable/argv/cwd,
+environment digest, descriptor policy, socket paths and owners, sandbox
+profile, memory/CPU/process/file/network limits, log sink, supervision policy,
+and rollback identity. Root and kernel compromise remain outside v1.
 
-## 9. Async composition, publication, and cleanup
+No bundle, UID, socket directory, launch record, ownership rule, ACL, or
+service is installed or mutated during engineering, normal gateway startup, or
+this ADR revision. Installation and removal need separate root-authorized
+deployment review and rollback proof. Unit tests use an explicit test-only
+expected-owner seam; deployment acceptance additionally needs real root-owned
+bundle and clean-launch probes.
+
+Native Windows startup fails before credential, session, store, or service
+access with an accurate “root-owned macOS isolated-service bundles required;
+native Windows unsupported” status unless another ADR supplies an equivalent
+ACL-aware boundary. Pairing is never part of service startup and uses
+alphanumeric code only. Sensitive post-submit ambiguity consumes the
+authorization; no result retry occurs.
+
+## 9. Isolated initialization, publication, and cleanup
 
 ### Real initialization seam
 
-Synchronous `compose_trusted_private_read_services()` performs only inert,
-exact, code-owned construction. It returns a
-`TrustedPrivateReadHostServices` whose required `initialize`/`start_checks`
-callable is async and whose `close` callable owns every constructed cleanup
-slot. Constructors do no network, SQLite, session, subprocess, socket, path
-creation, OAuth, Gmail, or OpenFGA work.
+All constructors remain inert: they perform no network, SQLite, session,
+subprocess, socket, path creation, OAuth, Gmail, or OpenFGA work. The root
+launcher, not the gateway, starts each independently supervised service from
+its anchored manifest. For the private service it first verifies the exact
+bundle and clean-launch context, descriptor-opens the one code-fixed decision
+record, verifies its file seal, and passes only that allowlisted descriptor
+across exec.
 
-The exact call site is the existing async
-`GatewayRunner._start_trusted_private_read_host()` in
-[`gateway/run.py`](../../gateway/run.py). The runner owns the returned services
-until it explicitly transfers ownership into `TrustedPrivateReadGatewayHost`.
-It calls and awaits `services.initialize()` first. If service initialization,
-host construction, host preparation, or publication fails before transfer,
-the runner directly awaits `services.close()`; it never relies on a host that
-was not constructed to clean them up.
+Private-service initialization then runs in this exact order:
 
-Async initialization runs in this order:
-
-1. Purely parse the duplicate-aware closed schema in memory. Reject unknown,
-   missing or wrongly typed values and extract only the allowlisted sensitive
-   bundle version/digest. Do not open a configured path, credential, session,
-   store, or service.
-2. Derive the bundle path solely from the code-fixed root and that approved
-   version/digest. Descriptor-open it and verify platform support, root
-   ownership, ancestry ACLs/modes, entry types and modes, link count, mount
-   identity, manifest, Node, launcher, verifier, source, package/lock, exact
-   Baileys rc14, and the complete dependency closure before any credential,
-   store, session, or service access.
-3. Verify the complete configuration/composition seal, keys, configured file
-   identities, requester/session/path separation, exact descriptor, and fixed
-   authorities without creating anything.
-4. In the already defined privacy-safe order, verify pinned local OpenFGA
-   version/store/model/policy/epoch; perform the initial OAuth exchange or
-   refresh with exact scope and Gmail profile/account verification without
-   reading a message; verify ordinary adapter/account/socket/provenance; and
-   verify offline sensitive session/account readiness without opening a
-   sensitive socket.
-5. Open the authorization store; acquire the fork-safe singleton OS lock; then
-   atomically reconstruct/acquire the coordinator fence and run descriptor
-   reconciliation in the same database transaction. Publish the coordinator
-   fence only after that transaction commits, then create the worker.
-   Reconciliation never runs before the singleton lock and fence-acquisition
-   transaction.
-6. Recheck every seal, descriptor, publication/requester/profile generation,
-   identity, and health predicate; mark the still-unpublished composition
-   prepared; then publish through the synchronous registry below.
+1. Parse the raw UTF-8 decision-record bytes with the closed duplicate-
+   rejecting JSON parser. Verify version, canonical encoding, manifest/seal,
+   service UID/socket identities, disjoint state roots, requester descriptor,
+   and all code-fixed file identities without creating or mutating them.
+2. Revalidate the private, ordinary, and sensitive root-bundle/service
+   manifests, launch contexts, exact UID/GID and peer socket identities, and
+   confirm that the ordinary session remains the complete canonical directory.
+3. Through the authenticated check-only proxy, verify exact OpenFGA runtime,
+   store/model bytes, signed policy manifest, complete standing tuple set,
+   policy epoch, and read-only/no-writer generation.
+4. Perform the initial OAuth exchange or refresh, exact scope validation, and
+   Gmail profile/account verification without reading a message; then verify
+   ordinary account/authority readiness and offline sensitive account/session
+   readiness without sending.
+5. Open the private authorization store; acquire the fork-safe singleton OS
+   lock; then atomically reconstruct/acquire the coordinator fence and run
+   descriptor reconciliation in the same database transaction. Publish the
+   coordinator fence only after commit, then create the worker and fresh
+   ordinary/sensitive authenticated leases. Reconciliation never precedes the
+   singleton lock and fence-acquisition transaction.
+6. Recheck every seal, descriptor, policy attestation, peer epoch, requester
+   binding, service generation, and health predicate. Only then expose a
+   content-free attestation to the gateway's code-fixed socket and permit the
+   gateway publication transaction below.
 
 Partial failure closes every acquired slot in strict reverse order. No failed
-step can leave a store, singleton lock, coordinator fence, worker, listener,
-session, client, or publication live.
+step can leave a store, lock, coordinator, worker, approval lease, sensitive
+registration, client, or publication live. The private provider, store,
+worker, and credentials never enter the gateway process.
+
+In the gateway, synchronous `compose_trusted_private_read_services()` performs
+only inert code-owned construction of the built-in private-service client. At
+the existing async `GatewayRunner._start_trusted_private_read_host()` seam in
+[`gateway/run.py`](../../gateway/run.py), it authenticates the exact service,
+root-bundle, requester, protocol, schema, and publication generation over the
+code-fixed Unix socket. It returns a concrete built-in client composition only
+after exact attestation; it cannot accept a callback, factory, import, URL,
+command, arbitrary socket, or provider/store implementation. Pre-publication
+failure closes that client directly.
 
 ### Atomic publication
 
@@ -897,9 +1143,10 @@ A reviewed publication-registry module owns one process-global synchronous
 `PrivateReadPublicationSnapshot`. The snapshot contains at least:
 
 - publication state (`empty`, `published`, or permanently `failed`),
-  host/runtime authority, and health identity;
-- event authority and monotonic publication generation;
-- the runtime-bound terminal handler and immutable operation registry;
+  private-service client authority and health identity;
+- event authority, service/bundle identity, and monotonic publication
+  generation;
+- the RPC-bound terminal handler and immutable public operation registry;
 - exact schema generation, canonical tool schema bytes, and tool metadata;
 - requester/profile generation and authenticated provenance; and
 - the empty/failed reason code without private data.
@@ -909,79 +1156,137 @@ non-awaiting snapshot swap under that lock. No network, filesystem access,
 health check, logging callback, cleanup, event dispatch, tool-registry
 mutation, or `await` occurs while it is held. Rollback and shutdown first swap
 to an empty or failed snapshot at a higher generation under the same lock and
-only then perform awaited cleanup. No partial host/event/tool interval exists.
+only then perform awaited cleanup. No partial client/event/tool interval exists.
 
 Every synchronous authority reader obtains one immutable snapshot through the
-same registry and lock: authenticated event binding, private-read terminal
-capability capture, service-gated availability/schema discovery, and runner
-dispatch. `GatewayRunner._trusted_private_read_host` and any other separate
-runner fields are non-authoritative diagnostics only; if retained, they are
-set during the same short commit and authority code never reads them directly.
+same registry and lock: authenticated event binding, busy-principal checks,
+new-session capability/schema capture, service-gated discovery, terminal RPC
+dispatch, shutdown, and runner diagnostics. A publication swap advances the
+availability generation before any new conversation can be constructed.
+`GatewayRunner._trusted_private_read_host` and any other runner fields are
+non-authoritative diagnostics only; if retained, they are set during the same
+short commit and authority code never reads them directly.
 
 The private-read tool may remain statically registered in `tools/registry.py`.
-Its synchronous `check_fn` and schema materializer read the publication
-snapshot only when a new conversation tool snapshot is built. The tool registry
-is not mutated on private-read publication. A new conversation captures the
-runtime-bound terminal handler, publication generation, exact operation
-registry, and exact canonical schema bytes as one capability. Those bytes and
-objects remain immutable for that conversation. Execution compares the
-captured generation and authority identity with the current publication
-snapshot and fails closed if publication was removed or replaced; it never
-falls forward to a newer runtime.
+Its availability bypasses generic TTL and last-good caches. Every genuinely
+new session capture reads exactly one publication snapshot. The tool registry
+is not mutated on publication. `model_tools.py` includes publication identity,
+generation/state, requester identity, and schema digest in the definition
+cache key, so stale present or absent results cannot cross an availability
+generation.
+
+`agent/agent_init.py` atomically captures the immutable
+`PrivateReadConversationCapability` with definitions, schema bytes, registry
+generation, and the new gateway session/conversation generation. The gateway
+persists that content-free capability in session-generation metadata before
+model construction. Rebuilding an evicted agent or restarting the gateway for
+an existing session reloads it; it cannot recapture current availability.
+
+`agent/tool_executor.py` direct terminal planning/execution and deferred Tool
+Search definition/scope planning accept only that session-bound capability.
+They compare it with the one current publication solely for exact equality or
+revocation and never acquire a newer terminal handler. Existing conversation
+tool and prompt bytes remain unchanged even when execution is revoked.
 
 Lock order is fixed: `tools/registry.py` takes its own registry snapshot first,
 releases that lock, and then performs a short publication-snapshot read. A
 publication swap never acquires the tool-registry lock. This prevents lock
 inversion while keeping schema discovery and terminal dispatch coherent.
 
+Mandatory seam migration covers the `model_tools.py` definition cache;
+`agent/agent_init.py` schema/registry capture; `agent/tool_executor.py` direct
+planning and execution; deferred Tool Search definition and scope planning;
+gateway new-session generation creation and persisted metadata; agent
+eviction/rebuild for an existing session; the busy-principal check near
+`gateway/run.py:6680`; authenticated event binding near
+`gateway/run.py:24053`; shutdown/unpublication near `gateway/run.py:12828`;
+and every runner diagnostic. No separate live pointer is authority at any seam.
+
 ### Non-discardable cleanup
 
-Cleanup is a bounded, shielded, reverse-order close plan owned by the services.
-It records cleanup slots as resources are acquired and attempts every slot even
-after an earlier slot fails: publication unpublish, worker, coordinator,
-store, sensitive process group/socket/pipe, ordinary listener, sessions,
-HTTP streams/clients, token/DTO/body references, descriptors, and controlled
-buffers. Cleanup errors are aggregated only as content-free codes.
+Cleanup is bounded, shielded, reverse-order, and owned within each process.
+Gateway cleanup first synchronously unpublishes at a higher generation, then
+closes only its private-service client and content-free capability bindings.
+Private-service cleanup records slots as acquired and attempts all of them even
+after an earlier failure: worker, coordinator, store, sensitive registration/
+socket, ordinary authority lease/socket, OpenFGA proxy client, Gmail/OAuth
+streams/clients, token/DTO/body references, decision-record/bundle descriptors,
+and controlled buffers. Each bridge independently purges epoch-scoped
+registrations/listeners/queues and closes its sockets without exposing session
+state. Cleanup errors are aggregated only as content-free codes.
 
-Cancellation cannot discard cleanup. The runner/host starts one owned cleanup
-task, shields and awaits it within a fixed bound, and proves each absence or
-closure. Failure or timeout leaves the authoritative publication snapshot
-empty or failed at a higher generation and marks health permanently failed.
-The original private exception graph is not retained when cancellation/control
-flow is recreated.
+Cancellation cannot discard cleanup. Each supervisor/service starts one owned
+cleanup task, shields and awaits it within a fixed bound, and proves each
+absence or closure visible to that identity. Failure or timeout leaves gateway
+publication empty or failed at a higher generation and service health
+permanently failed. The original private exception graph is not retained when
+cancellation/control flow is recreated.
 
 ### Exact proposed file changes
 
+- `services/private_read/server.py`, `protocol.py`, and `schemas.py`: own the
+  separately launched private-service server, exact closed RPC framing, peer
+  authentication, proposal/grant consumption, content-free outcomes, worker,
+  and sensitive/approval orchestration.
+- `services/private_read/config.py` and `seals.py`: parse raw canonical
+  `config-v1.json` with duplicate rejection and verify its exact root/bundle/
+  file identities before object construction.
+- `services/private_read/gmail_provider.py`, `authorization_store.py`, and
+  `coordinator.py`: move all Gmail HTTP/MIME/OAuth, HMAC task state, descriptor
+  reconciliation, claim/send fences, and coordinator ordering behind the
+  private-service UID. No provider or store object exists in the gateway.
+- `services/private_read/openfga_proxy_client.py` and
+  `policy_manifest.py`: implement the peer-authenticated check-only protocol,
+  live model/standing-tuple reads, and signed canonical policy verification.
+- `services/openfga_check_proxy/`: provide the separately launched, closed
+  check/model/standing-tuple read proxy with no mutation surface.
+- `scripts/whatsapp-bridge/approval_authority.mjs` plus its bridge wiring: add
+  the peer-authenticated private-service endpoint, prepare/commit/event lease,
+  exact successful voter-JID return, one-shot records, queue suppression, and
+  epoch purge. Ordinary gateway chat IPC stays separate.
+- `services/private_read/ordinary_approval_client.py`: implement the private
+  service's exact peer-credential, preparation-evidence, signed-commit, and
+  epoch-scoped event client for that Node authority.
+- `scripts/whatsapp-sensitive-bridge/delivery_authority.mjs` plus its bridge
+  wiring: add the peer-authenticated private-plaintext delivery endpoint and
+  fixed terminal evidence response without any plaintext return.
+- `services/private_read/sensitive_delivery_client.py`: own the private
+  service's fixed plaintext-send request, exact sensitive peer/epoch checks,
+  and content-free terminal evidence validation.
+- `services/private_read_service_client.py`: provide the gateway's code-fixed
+  attesting client and closed content-free proposal/status RPC only.
 - `gateway/private_read_publication.py`: own the process-global synchronous
   `threading.RLock`, immutable `PrivateReadPublicationSnapshot`, monotonic
-  swap/unpublish operations, and the sole read API used by all authority paths.
+  availability generation, swap/unpublish, and sole authority read API.
+- `gateway/private_read_conversation_capability.py`: define and persist the
+  immutable content-free session-generation capability and exact-current
+  equality/revocation rule.
 - [`gateway/trusted_private_read_host.py`](../../gateway/trusted_private_read_host.py):
-  add the required async service initialization seam; implement inert exact
-  composition, explicit ownership transfer, prepared-host start, the
-  singleton-lock/coordinator/reconciliation transaction, runtime-bound
-  terminal capability, generation-aware event authority, and reverse-close
-  ownership.
-- [`gateway/run.py`](../../gateway/run.py): make
-  `_start_trusted_private_read_host()` own services until transfer, await async
-  initialization in the safe order, close services directly on pre-transfer
-  failure, and publish/unpublish only through the synchronous registry. Replace
-  the currently separate authenticated-event read of
-  `_trusted_private_read_host` in event dispatch and the shutdown/read paths
-  with one publication-snapshot read; any runner pointer is diagnostic only.
+  reduce production composition to the concrete built-in attested service
+  client; remove provider/store internals and arbitrary factories.
+- [`gateway/run.py`](../../gateway/run.py): publish/unpublish only through the
+  synchronous registry; migrate new-session persistence, rebuild, busy-
+  principal, event-binding, shutdown, and diagnostics to one snapshot.
 - [`tools/private_read_request_tool.py`](../../tools/private_read_request_tool.py):
-  keep one static service-gated registration; make availability, exact enum
-  schema materialization, terminal-handler capture, and execution generation
-  checks consume the publication snapshot rather than a separately registered
-  mutable runtime.
-- [`tools/registry.py`](../../tools/registry.py): in schema discovery and the
-  runtime-bound terminal capability/runner-dispatch paths, take the ordinary
-  registry snapshot first and then capture the private-read publication once;
-  carry its handler, schema bytes, and generation in the immutable terminal
-  capability without mutating the registry at publication time.
-- [`model_tools.py`](../../model_tools.py): ensure new-conversation tool
-  discovery and `handle_function_call()` dispatch use the captured terminal
-  capability and never re-resolve a newer private-read runtime from separate
-  global fields.
+  keep one static service-gated, content-free registration and execute only the
+  session-bound RPC capability.
+- [`tools/registry.py`](../../tools/registry.py),
+  [`model_tools.py`](../../model_tools.py), `agent/agent_init.py`, and
+  `agent/tool_executor.py`: add publication identity/state/schema digest to
+  definition caching and carry the session-bound capability through direct and
+  deferred Tool Search planning without runtime re-resolution.
+- `services/launch/` and three closed root-bundle manifests: verify exact
+  executable/argv/cwd/environment/descriptors/UID/GID/hash closures and clean
+  launch for private, ordinary, and sensitive services.
+- `scripts/release/verify_juno_private_read.py`,
+  `scripts/release/juno-private-read-release-v1.json`, and
+  `scripts/release/validate_node_runtime_docs.py`: implement the closed release
+  matrix, artifact/evidence manifests, status-aware type gate, Node installs/
+  tests/audits, docs validation, and full-suite orchestration.
+- Focused Python and Node contract tests cover every protocol, privacy,
+  policy, launch, publication/session, restart, release-manifest, and lifecycle
+  boundary above; documentation records the default-off engineering state and
+  separately authorized deployment procedure.
 
 ## 10. Relay release boundary
 
@@ -1007,87 +1312,79 @@ Discord relay components are deferred to a separate ADR and coordinated
 connector rollout with a proved producer/version/protocol. No such work may be
 smuggled into the Gmail activation gate.
 
-## 11. Closed configuration shape
+## 11. Dedicated closed decision record
 
-The future schema rejects unknown, missing, duplicate, or wrongly typed keys.
-Placeholders are deployment values; no real account, token, session, store, or
-chat identifier appears here.
+There is exactly one deployment source for this feature: the versioned JSON
+decision record at the launcher-compiled absolute path
+`/Library/Application Support/Hermes/private-read/config-v1.json`. Main
+`config.yaml`, profile overlays, managed configuration, environment, CLI,
+plugins, and legacy `gateway.trusted_private_read` cannot redirect, populate,
+or override it.
 
-```yaml
-trusted_private_read:
-  version: 3
-  enabled: false
-  state_dir: <canonical absolute owner-only directory>
-  key_file: <canonical absolute owner-only 0600 regular file>
-  composition_seal_file: <canonical absolute owner-only 0600 regular file>
+The file must be a bounded regular one-link non-symlink, owned by the exact
+private-service UID, mode `0600`, inside root-owned non-writable ancestry. Its
+device/inode, owner, mode, link count, byte length, SHA-256, and relative sealed
+file identities are bound by the private root manifest and deployment seal.
+The root launcher descriptor-opens and validates it before exec; the private
+service revalidates the passed descriptor and bytes before parsing.
 
-  requester:
-    gateway_profile: juno
-    agent_identity: <exact reviewed Juno agent identity>
-    platform: whatsapp
-    ordinary_account_binding: <exact ordinary account binding>
-    owner_sender: <exact authenticated owner sender>
-    source_chat: <exact ordinary source chat>
-    source_thread_sentinel: <exact no-thread or thread sentinel>
-    authenticated_provenance_version: <exact code-owned provenance/version>
+Raw bytes are strict UTF-8 JSON. Parsing rejects a BOM, invalid UTF-8,
+duplicate keys at any depth, unknown/missing/wrongly typed keys, booleans used
+as integers, floats where integers are required, integers outside their closed
+ranges, invalid enum/string grammar, non-NFC or alternate Unicode
+normalization, noncanonical escapes/numbers/key ordering/whitespace, trailing
+data, and any byte sequence different from the code-owned canonical encoder's
+output. Duplicate detection happens in the token parser before object
+construction. There is no interpolation, YAML tag/anchor/alias/merge, env
+expansion, overlay, profile inheritance, or legacy precedence.
 
-  gmail:
-    kind: gmail_v1
-    oauth_client_file: <canonical absolute owner-only 0600 regular file>
-    oauth_token_file: <canonical absolute owner-only 0600 regular file>
-    expected_profile_email: <exact provider-canonical Gmail identity>
-    required_scopes:
-      - https://www.googleapis.com/auth/gmail.readonly
+The closed version-1 object contains only these groups:
 
-  capability:
-    capability_id: gmail.newest_inbox_message.read
-    operation_version: 1
-    approval_label: Newest Inbox message — selected headers and plain-text body only
-    query: in:inbox
-    fields: [sender, to, cc, subject, date, text_body]
+- `version` exactly `1` and required boolean `enabled`; engineering artifacts
+  contain `false`, and only a separately approved deployment transaction may
+  replace and reseal this same canonical record with `true`;
+- exact `service_identities` for gateway, ordinary bridge, private service,
+  sensitive bridge, OpenFGA runtime, and check-only proxy UIDs/GIDs, plus their
+  code-fixed socket identities and required peer matrix;
+- exact `service_bundles` manifest version/digest/deployment generation for
+  private, ordinary, sensitive, OpenFGA runtime, and check proxy;
+- the closed eight-field `requester` descriptor from section 4;
+- exact `state_files` root-relative sealed identities for the private store,
+  HMAC key, commit-signing key, policy manifest, Gmail OAuth client/token, and
+  sensitive session directory, plus only a seal/digest identity for the
+  code-fixed complete ordinary session directory at its canonical path; the
+  record contains no absolute or parent-relative arbitrary path;
+- `capability` fixed to operation version 1, capability ID
+  `gmail.newest_inbox_message.read`, exact query `in:inbox`, exact ordered six
+  fields, label, poll template/version/options, and descriptor digest;
+- `gmail` fixed to kind `gmail_v1`, the one exact scope, sealed expected-account
+  binding, client/grant identity, and Gmail provider contract digest;
+- `openfga` fixed to version 1.18.2 with exact store/model identities, model
+  hash, signed policy-manifest identity/digest, policy version/digest,
+  monotonic epoch, sorted standing-tuple hash/count, provisioner public-key ID,
+  read-only runtime generation, and check-proxy identity;
+- `ordinary_approval` with exact ordinary account/session/bundle/socket/
+  authority identities and owner DM destination binding;
+- `sensitive_delivery` with exact sensitive account/session/bundle/socket/
+  transport identity and destination/thread binding; and
+- `limits`, containing only integer milliseconds/byte/count values that can
+  reduce, never enlarge, the code maxima in section 3. Decimal floating-point
+  seconds are not accepted.
 
-  openfga:
-    version: 1.18.2
-    store_id: <reviewed local store identity>
-    authorization_model_id: <reviewed model identity>
-    policy_version: <reviewed policy version>
-    policy_sha256: <reviewed lowercase SHA-256>
-    owner_policy_epoch: <reviewed monotonic epoch>
+The record cannot contain commands, executable names, import/module/callable
+names, URLs, provider factories, arbitrary socket or filesystem paths, Node or
+Python paths, alternate authorities, arbitrary queries/fields/copy, or any
+extension object. File identities are only code-fixed-root-relative sealed
+names from a closed enum. Code fixes Gmail/OAuth authorities and selectors,
+OpenFGA loopback authority, relations, templates, bundle roots, executables,
+and RPC schemas.
 
-  sensitive_delivery:
-    platform: whatsapp
-    profile: <exact sensitive profile>
-    account: <exact sensitive provider account>
-    destination_chat: <exact sensitive destination>
-    destination_thread: <exact thread sentinel>
-    session_dir: <canonical absolute sensitive session directory>
-    bundle_version: <reviewed root-owned bundle version>
-    bundle_sha256: <reviewed lowercase SHA-256>
-
-  limits:
-    approval_ttl_seconds: 300
-    connect_seconds: 2.0
-    write_seconds: 2.0
-    read_seconds: 5.0
-    pool_seconds: 1.0
-    request_total_seconds: 8.0
-    private_read_total_seconds: 20.0
-    oauth_response_bytes: 32768
-    gmail_profile_or_list_bytes: 65536
-    gmail_message_bytes: 262144
-    mime_depth: 8
-    mime_parts: 32
-    encoded_candidate_bytes: 65536
-    decoded_candidate_bytes: 16384
-    text_body_bytes: 3072
-    rendered_plaintext_bytes: 4096
-```
-
-Config cannot supply a URL, provider factory, import path, callable, command,
-executable, Node path, module, arbitrary query, alternate field, or approval
-copy. The parser requires the exact v1 capability values above rather than
-treating them as general extension points. Code fixes Gmail/OAuth authorities,
-OpenFGA loopback authority, selectors, templates, relation map, and bundle root.
+Presence of any legacy private-read YAML/config key or environment variable is
+an activation failure with one fixed content-free migration code; it is never
+merged. The gateway sees only the authenticated content-free publication
+attestation over its code-fixed socket. It cannot open this record and does not
+receive private account, destination, policy, credential, session, or UID
+identities.
 
 ## 12. Verification and implementation plan
 
@@ -1098,10 +1395,11 @@ accepted and proceeds in small reviewed slices.
 
 Tests first fix the exact capability/query/label/fields, requester binding,
 descriptor/HMAC domains, cache-stable schema discovery, generation replacement,
-whole-descriptor reconciliation matrix, and two unrelated synthetic provider
-adapters. They prove no Gmail branch enters generic authorization and no
-query/account plaintext enters model, schema, store, policy, audit, or ordinary
-notifications.
+conversation-capability persistence, eviction/restart behavior, direct and
+deferred execution, whole-descriptor reconciliation matrix, and two unrelated
+synthetic provider adapters. They prove no Gmail branch enters generic
+authorization and no query/account plaintext enters model, schema, store,
+policy, audit, gateway IPC, or ordinary notifications.
 
 ### Gmail and OAuth boundary
 
@@ -1110,6 +1408,7 @@ duplicate/extra/case variants, dedicated client/grant binding, account drift,
 fixed methods/authorities/paths/query/selectors/`prettyPrint=false`, redirects,
 stream caps, response allocation order, duplicate JSON, MIME budgets,
 incidental receipt, no ineligible decode or attachment fetch, DTO repr/str,
+root-only header provenance, conflicting child headers, missing root headers,
 deterministic rendering, exception graph hygiene, cancellation, and every
 content-free outcome.
 
@@ -1128,18 +1427,21 @@ ephemeral CA. Production authorities remain unchanged.
 
 Tests prove the exact shared/contextual tuple model, condition dimensions,
 12 independent higher-consistency checks, atomic post-group revalidation,
-standing-policy ownership, and all independent mutation failures. Approval
-tests cover the exact poll question, ordered raw option bytes/hashes, variant,
-selectable count, deterministic resolution payload, atomic decision enqueue,
-custom rc14 message IDs, pre-send authority/listeners, exact destination status
-mapping, owner voter/device binding, authority-only queue suppression,
-out-of-order evidence, retry/ambiguity/expiry, restart loss, and pinned Node
-behavior. Sensitive tests cover the root-owner predicate, manifest closure,
-pre-spawn recheck, test-owner seam, real deployment probe, account/session
-separation, and exact sensitive ACK meanings. Lifecycle tests inject
-`BaseException` and cancellation at every construction, initialization,
-transfer, publication, read, send, unpublish, and cleanup slot. Relay tests
-prove Discord components are inert and Juno is independent.
+standing-policy ownership, signed live model/tuple attestation, read-only writer
+exclusion, and all independent mutation failures. Approval tests cover the
+exact poll question, ordered raw option bytes/hashes, variant, selectable
+count, prepare/bind/send-start/signed-commit, deterministic resolution payload,
+atomic decision enqueue, custom rc14 message IDs/secrets, pre-send listeners,
+exact destination status mapping, successful canonical owner voter-JID return,
+authority-only queue suppression, out-of-order evidence, every reconciliation
+state, epoch purge, retry/ambiguity/expiry, and pinned Node behavior. Root-
+bundle tests cover all three executable/closure/clean-launch contracts,
+identity separation, test-owner seams, and real deployment probes. Sensitive
+tests cover peer credentials, no-plaintext response, account/session
+separation, and exact ACK meanings. Lifecycle tests inject `BaseException`,
+cancellation, and service restarts at every construction, initialization,
+lease, publication, read, send, unpublish, and cleanup slot. Relay tests prove
+Discord components are inert and Juno is independent.
 
 ### Reproducible Python type gate
 
@@ -1177,14 +1479,35 @@ Implementation adds a dedicated repository-owned tool environment:
 - a repository release script plus reviewed toolchain manifest pins the exact
   `uv` executable path, version, SHA-256, and supported platform identity.
 
-The script first verifies that exact `uv` identity. In a command-scoped
-owner-only environment with no ambient Python/tool configuration, it invokes
-that executable as `uv sync --locked --offline --project tools/type-gate`.
-It then verifies the resulting `ty` path, version `0.0.21`, executable
-SHA-256, installed distribution metadata, and artifact identity before
-invoking that exact executable. It archives the `uv` identity,
-toolchain-manifest and lock hashes, selected wheel/artifact hashes, and
-resulting checker identity. No ambient `ty`, `uvx`, network resolution,
+The manifest separately pins a hash-verified CPython 3.13 macOS-arm64 artifact
+and absolute interpreter for this release lane. Evidence archives its path,
+version, SHA-256, upstream artifact identity, build/configuration identity, and
+platform. Other platform lanes require separately reviewed explicit artifacts
+and `--python-platform` values.
+
+The script first verifies that exact `uv` and CPython identity. In a
+command-scoped owner-only environment with no ambient Python/tool
+configuration, it creates the exact ty environment from its own lock with the
+equivalent of
+`[verified_uv, "sync", "--locked", "--offline", "--python", verified_cpython,
+"--project", "tools/type-gate"]`. It also
+creates a different owner-only project environment for each parent/candidate
+revision, synchronized offline from that revision's root `pyproject.toml` and
+root `uv.lock` with every exact dev/test extra required for source imports,
+including pytest. The project command is equivalent to:
+
+```text
+[verified_uv, "sync", "--locked", "--offline", "--all-extras",
+ "--python", verified_cpython, "--project", revision_root]
+```
+
+Each environment uses a fresh hash-verified complete artifact mirror and
+revision-private cache; no venv, package cache, interpreter environment, or
+site-packages is shared between revisions or with the ty environment. After
+sync, the orchestrator verifies and archives the complete installed
+distribution inventory and artifact digests. It separately verifies the
+resulting `ty` path, version `0.0.21`, executable SHA-256, distribution
+metadata, and artifact identity. No ambient `ty`, `uvx`, network resolution,
 floating index, mutable shared cache, or unspecified lock is accepted.
 
 Release verification creates isolated owner-only source trees for the exact
@@ -1192,7 +1515,7 @@ parent and candidate, plus separate owner-only tool/cache/home/temp state. Its
 status-aware algorithm is:
 
 1. Run and archive the byte-exact output of
-   `git diff --raw -z --find-renames=100% --find-copies=100% <parent> <candidate> -- '*.py'`.
+   `git diff --raw -z --abbrev=40 --find-renames=100% --find-copies=100% <parent> <candidate> -- '*.py'`.
    Parse NUL-delimited records without a shell, retaining status, modes, blob
    IDs, similarity, and old/new paths. Accept only `M`, `A`, `D`, `R100`, and
    `C100`; reject any other, malformed, or unmerged status and any non-UTF-8
@@ -1207,14 +1530,37 @@ status-aware algorithm is:
 3. Abort separately if a revision that should have applicable paths has an
    empty manifest. An intentionally inapplicable revision is recorded as such,
    not passed as an empty checker invocation.
-4. Invoke the verified checker directly with an argv array, never shell word
-   splitting: `ty check --output-format gitlab --no-progress --color never`
-   followed by that revision's exact NUL-derived paths. Archive its exit
-   status and structured JSON exactly. Invalid JSON, unexpected schema,
-   undocumented exit status, missing/unreadable path, checker crash, or other
-   checker infrastructure/I/O failure is not a type diagnostic and fails the
-   gate.
-5. Strictly parse and canonicalize every diagnostic to this full comparison
+4. Invoke the verified checker directly with this exact argv array from the
+   exact revision root, never through a shell:
+
+   ```text
+   [verified_ty, "check",
+    "--project", revision_root,
+    "--python", revision_project_python,
+    "--python-version", "3.13",
+    "--python-platform", "darwin",
+    "--output-format", "gitlab",
+    "--no-progress", "--color", "never",
+    "--", *revision_paths]
+   ```
+
+   Archive cwd, argv, environment digest, exit status, stdout and stderr
+   exactly. Exit 0 is accepted only with an empty diagnostic array; exit 1 only
+   with a valid non-empty array. Exit 2 or any other status is infrastructure
+   failure. Missing/unreadable paths, checker crashes, or non-JSON output fail.
+5. Accept ty 0.0.21 GitLab output only as a top-level JSON array of closed
+   diagnostic objects. Each object has exactly required string
+   `description`, `check_name`, `fingerprint`, and `severity`, plus a closed
+   `location` whose required `path` is a string and whose closed
+   `positions.begin` and `positions.end` each have positive integer `line` and
+   `column`. Booleans are not integers. Unknown/missing fields or types,
+   invalid coordinates, invalid UTF-8, and severity outside the pinned observed
+   set `{major}` fail as infrastructure/schema errors. The complete
+   `description` is the comparison message after only UTF-8/LF and exact-root
+   normalization already defined below: no trimming, stripping, truncation,
+   or diagnostic-text rewrite. Archive `fingerprint` but never use it to waive
+   a mismatched full key.
+6. Strictly parse and canonicalize every diagnostic to this full comparison
    key: canonical candidate-relative POSIX path after the explicit rename/copy
    mapping; mapped start line and column; mapped end line and column; exact
    check/rule name; severity; and exact normalized message. Coordinates are
@@ -1223,7 +1569,7 @@ status-aware algorithm is:
    only the exact checkout root with `<repo>`, and performs no other lossy
    rewrite. Ordering does not affect set membership, but duplicate counts are
    archived.
-6. Generate and archive zero-context Git diff hunk maps for every common,
+7. Generate and archive zero-context Git diff hunk maps for every common,
    rename, and copy pair. Apply cumulative line offsets. A parent range maps to
    candidate coordinates only if every line spanned by its start/end range is
    unchanged; its columns then remain exact. Parent diagnostics touching a
@@ -1231,11 +1577,11 @@ status-aware algorithm is:
    touching an added or replaced range are candidate-only. A candidate
    diagnostic on an unchanged mapped range is subtracted only by an exact match
    of the complete key above.
-7. Treat every added-file diagnostic as candidate-only. Archive deleted-file
+8. Treat every added-file diagnostic as candidate-only. Archive deleted-file
    diagnostics as parent-only; they cannot subtract. Compare copies from old
    parent path to new candidate path and renames through their canonical path
    mapping.
-8. Archive raw checker totals and exit statuses, revision-specific manifests,
+9. Archive raw checker totals and exit statuses, revision-specific manifests,
    the status map, zero-context hunk maps, raw and normalized reports, mapped
    and unmatched parent diagnostics, the exact matched baseline multiset, and
    the exact candidate-only multiset.
@@ -1249,34 +1595,139 @@ temp paths are owner-only and destroyed after evidence capture.
 
 ### Reproducible Node, package, docs, and test gates
 
-All ordinary and sensitive bridge release tests run through the exact reviewed
-deployment Node executable from the candidate bundle, never ambient `node`.
-The harness asserts `process.execPath`, exact version, and executable SHA-256
-before tests. The exact reviewed package manager entry point is also invoked
-through that Node executable.
+Implementation adds one repository-owned orchestrator and two closed
+validators/manifests:
 
-Each ordinary and sensitive package starts from a clean owner-only directory,
-runs frozen/offline `npm ci` against the reviewed package and lock files,
-rejects lock mutation or network fallback, and records package/lock hashes plus
-the installed-tree/manifest identity. A separate `npm audit` is required for
-both packages with the exact reviewed executable/package-manager identity and
-an archived result; the release record distinguishes the intentionally online
-audit from offline installation. No ambient Node/npm evidence is accepted.
+- `scripts/release/verify_juno_private_read.py`;
+- `scripts/release/juno-private-read-release-v1.json`; and
+- `scripts/release/validate_node_runtime_docs.py`.
 
-Canonical and localized documentation that describes the root Hermes runtime
-must agree with the root engine requirement `Node >=22.22.0`, including
-English, Spanish, Chinese, and any other translated copies found by
-repository-wide search.
-Independent product/skill/package engine requirements are preserved and not
-mechanically overwritten. Documentation validation records every changed
-runtime claim and its owning package.
+The release manifest is versioned, canonical, duplicate-rejecting, and closed.
+For every lane it names the exact argv array, cwd, allowlisted environment,
+source OIDs, input/artifact hashes, expected output/test manifest, evidence
+path, and acceptance predicate. The orchestrator and manifest are themselves
+tested: a missing lane/path/artifact/output, nonzero exit, skipped or zero-test
+run, network use in an offline lane, environment drift, extra/missing package,
+or unarchived required evidence fails the release.
 
-Focused tests and then the supported full repository suite run with synthetic
-identities only. No real Gmail, OpenFGA, WhatsApp, account, token, credential,
-session, or live service is used during engineering. Privacy sentinels are
-scanned across logs, exceptions and traceback locals, tasks/coroutines,
-request/response objects, SQLite/WAL/journal, audit/policy bodies, files,
-model/session/memory surfaces, argv/environment, caches, and result objects.
+#### Node and npm lanes
+
+The two exact package roots are `scripts/whatsapp-bridge` and
+`scripts/whatsapp-sensitive-bridge`. For each, the manifest pins the absolute
+root-bundle Node executable path, version, SHA-256 and artifact/build identity,
+plus the absolute npm CLI JavaScript entry path, npm version/SHA-256, and its
+complete dependency closure. Npm is invoked only as
+`[verified_node, verified_npm_cli, ...]`, never through `PATH` or a package
+script.
+
+For each exact lock, release preparation creates a content-addressed offline
+tarball cache containing every and only the required package artifact. A
+separate hash manifest binds package name/version/integrity, tarball SHA-256,
+relative cache path, lock/package hashes, and complete cache tree; independent
+verification rejects extra, missing, mutable, or mismatched bytes before use.
+Each lane copies only reviewed package/lock/source bytes to a fresh owner-only
+work root and invokes exactly:
+
+```text
+[verified_node, verified_npm_cli, "ci", "--offline", "--ignore-scripts",
+ "--cache", verified_package_cache, "--no-audit", "--no-fund"]
+```
+
+The orchestrator denies network, verifies package/lock/source/tree hashes
+before and after, and archives the installed dependency inventory/digests.
+Direct Node test argv is exactly
+`[verified_node, "--test", "--test-concurrency=1", *test_files]`; package test
+scripts are bypassed.
+
+The ordinary sorted test manifest contains the existing eight files
+`allowlist.test.mjs`, `bridge.native.test.mjs`,
+`bridge.reconnect.test.mjs`, `bridge.sendqueue.test.mjs`,
+`outbound_ids.test.mjs`, `owner_message_gate.test.mjs`,
+`preimport_identity.test.mjs`, and `transport_identity.test.mjs`, plus the new
+`approval_authority.test.mjs` and `clean_launch.test.mjs`. The sensitive sorted
+manifest contains the existing eleven files `delivery_core.test.mjs`,
+`entrypoint.test.mjs`, `http_server.test.mjs`, `lifecycle.test.mjs`,
+`offline_provision.test.mjs`, `pin_and_identity.test.mjs`,
+`preimport_identity.test.mjs`, `provisioning_core.test.mjs`,
+`rc9_compatibility.test.mjs`, `real_auth_state.test.mjs`, and
+`session_paths.test.mjs`, plus `delivery_authority.test.mjs` and
+`clean_launch.test.mjs`. The manifest stores their full relative paths and
+hashes and rejects discovery-based additions or omissions.
+
+After all offline gates, each package has a distinct intentionally online,
+mutable-current audit lane with exact argv
+`[verified_node, verified_npm_cli, "audit", "--json", "--package-lock-only"]`.
+Acceptance requires valid closed audit JSON and zero vulnerabilities at every
+severity. Evidence archives registry authority, request time, response
+identity/body hash, npm/Node identities, package/lock hashes, and exit status;
+it is never represented as reproducible offline evidence.
+
+#### Documentation lane
+
+`validate_node_runtime_docs.py` obtains a NUL-safe tracked-file manifest from
+the exact candidate OID, classifies every file to its owning package/product,
+and extracts every root-Hermes Node runtime claim from canonical and translated
+READMEs, documentation, installers, and package manifests. It emits canonical
+JSON entries with exact `path`, `line`, `owner`, and `claim`. Every root claim
+must mean `>=22.22.0`; unrelated package requirements are preserved;
+unclassified or ambiguous claims fail. Evidence archives validator source/
+executable hash, source OID/manifest hash, classified input hashes, and output
+hash.
+
+#### Python and full-suite lanes
+
+The same verified CPython/artifact mirror creates one exact checkout-local root
+`.venv` from the candidate root `uv.lock` and all required extras using the
+offline locked `uv sync` contract above. `scripts/run_tests.sh` is invoked only
+after that `.venv` exists and its interpreter/distribution inventory/digests
+match the manifest; the orchestrator records and verifies the interpreter
+selected by the runner.
+
+The release manifest defines these exact focused groups as closed arrays:
+
+- `provider_privacy`: `tests/services/private_read/test_gmail_provider.py`,
+  `tests/services/private_read/test_gmail_mime_privacy.py`, and
+  `tests/services/private_read/test_oauth_boundary.py`;
+- `authorization_store_notifications`:
+  `tests/gateway/test_private_read_authorization.py`,
+  `tests/gateway/test_authorization_task_store.py`, and
+  `tests/services/private_read/test_notification_protocol.py`;
+- `publication_session_tool_search`:
+  `tests/gateway/test_trusted_private_read_host.py`,
+  `tests/gateway/test_trusted_private_read_event_scoping.py`,
+  `tests/gateway/test_active_principal_lifecycle.py`, and
+  `tests/tools/test_private_read_conversation_capability.py`;
+- `relay`: `tests/gateway/relay/test_relay_interactive.py`,
+  `tests/gateway/relay/test_relay_passthrough.py`,
+  `tests/gateway/relay/test_relay_per_platform_caps.py`, and
+  `tests/gateway/relay/test_ws_callback_dispatch.py`;
+- `config_installers`: `tests/services/private_read/test_config_v1.py`,
+  `tests/services/test_root_bundle_launch.py`, and
+  `tests/test_install_ps1_whatsapp_home_and_node_contract.py`;
+- `ordinary_bridge` and `sensitive_bridge`: the exact Node manifests above;
+  and
+- `lifecycle`: `tests/gateway/test_lifecycle_ledger.py` and
+  `tests/services/private_read/test_isolated_service_lifecycle.py`.
+
+Each Python group runs as a separate exact
+`[revision_project_python, "-m", "pytest", "-q", *group_paths]` process;
+terminal/private groups remain separate where SQLite process interference is
+possible. The orchestrator then runs the canonical full Python suite as exact
+argv `["scripts/run_tests.sh", "-j", "4"]` from the repository root, with the
+verified checkout-local `.venv`. Ruff runs as
+`[revision_project_python, "-m", "ruff", "check", "."]`. The syntax lane builds
+a NUL-safe sorted manifest of every tracked Python file and invokes deterministic
+batches of `[revision_project_python, "-m", "py_compile", *batch_paths]`.
+Thereafter it runs the status-aware ty gate, both direct Node suites, docs
+validator, both frozen installs, both online audits, and release-orchestrator
+self-tests.
+
+All `HOME`, `HERMES_HOME`, `TMPDIR`, bytecode, npm, uv, XDG, and tool-cache
+roots are command-scoped owner-only directories and are destroyed after
+evidence is sealed. Engineering uses synthetic identities and fake local
+services only. Privacy sentinels are scanned across logs, exception graphs and
+locals, tasks/coroutines, HTTP objects, SQLite/WAL/journal, audit/policy bodies,
+files, model/session/memory, argv/environment, caches, and result objects.
 
 ## 13. Deployment activation boundaries
 
@@ -1288,36 +1739,71 @@ does not imply any later action:
    outcome copy.
 2. Land the separately reviewed implementation commit.
 3. Install the candidate default-off.
-4. Separately install and review the versioned root-owned sensitive bundle,
-   including real ownership/immutability/hash/rollback proof.
-5. Create the dedicated Gmail Desktop OAuth client/token, satisfy the current
-   restricted-scope policy, and prove the exact `gmail.readonly` grant only.
-6. Start/provision OpenFGA 1.18.2 and its separately owned standing policy.
-7. Provision/pair sensitive WhatsApp by alphanumeric code only; QR is absent.
-8. Connect and verify ordinary and sensitive transports independently.
-9. Generate and review the final closed configuration/composition seal.
-10. Authorize `enabled: true`, the exact Juno profile launch configuration,
-    and the planned gateway restart.
-11. After restart, verify content-free health and Juno-only tool publication in
-    a fresh conversation/session generation; old generations remain unchanged.
-12. Send the exact approved non-private canary through sensitive delivery.
-13. Use the first live request as the ordinary approval-protocol canary: require
-    and archive content-free evidence for the exact custom poll ID, owner-DM
-    destination status, authority-only suppression, authenticated raw
-    `Approve` option identity, and decision CAS before the private read. There
-    is no synthetic or text fallback approval canary.
-14. Perform the first private Gmail read and archive the content-free terminal
-    state and resolution-attempt evidence. Activation acceptance requires
-    `ordinary_destination_delivered` for the exact resolution message;
-    ambiguity records a consumed failed canary and is never retried with the
-    same message.
+4. Separately authorize creation of the conceptual ordinary, private-read,
+   sensitive, OpenFGA runtime, and check-only proxy non-login UIDs/GIDs and
+   their disjoint state roots. Review exact concrete names before creation.
+5. Separately install each root-owned private/ordinary/sensitive/OpenFGA/proxy
+   bundle and launch record, proving manifest closure, clean-launch context,
+   sandbox/resource limits, immutable ownership, rollback, and removal.
+6. Separately create the root-owned socket directories/endpoints and prove the
+   exact peer-credential matrix; no service starts yet.
+7. In one separately authorized, reversible transaction, verify and transfer
+   ownership/access of the complete ordinary session directory in place at
+   `/Users/james/.hermes/profiles/juno/whatsapp/session`; do not copy, trim, or
+   move it, and prove rollback before proceeding.
+8. Generate, review, install, and seal the default-off dedicated
+   `config-v1.json` and private HMAC/commit-signing material without publishing
+   the feature.
+9. Separately provision the offline-signed OpenFGA model and complete standing
+   tuple set with the writer authority while all runtime components are stopped,
+   then remove writer availability and seal the resulting manifest/epoch.
+10. Separately start and attest the read-only OpenFGA 1.18.2 runtime and
+    check-only proxy, proving the exact no-concurrent-writer generation.
+11. Create the dedicated Gmail Desktop OAuth client/token, satisfy current
+    restricted-scope policy, and prove the exact `gmail.readonly` grant only.
+12. Provision/pair sensitive WhatsApp by alphanumeric code only; QR is absent.
+13. Separately start and attest the ordinary bridge, proving its exact
+    UID/bundle/session/chat-versus-approval-socket/authority epoch.
+14. Separately start and attest the sensitive bridge, proving its exact
+    UID/bundle/session/delivery socket/transport epoch and separation from the
+    ordinary bridge.
+15. Separately replace and reseal the same canonical decision record with
+    `enabled=true`; this changes no gateway publication and starts no service.
+16. Separately start and attest the private service, proving its exact
+    UID/bundle/config/store/policy/credential and both peer leases with
+    content-free health before gateway access.
+17. Separately authorize the exact gateway client/publication launch change
+    and start or restart the gateway. This stage alone permits a new gateway
+    publication generation.
+18. Verify content-free private-service attestation and Juno-only tool
+    publication in a genuinely fresh conversation/session generation; old,
+    absent, evicted, and reconstructed generations remain unchanged.
+19. Separately authorize and send the exact non-private sensitive-delivery
+    canary, requiring fixed terminal destination evidence only.
+20. Use the first separately authorized live request as the ordinary approval
+    protocol canary. Archive content-free evidence for prepare, durable bind,
+    send-start, signed commit, exact custom poll ID, owner-DM destination
+    status, authority-only suppression, successful canonical owner voter-JID,
+    raw `Approve` identity, and decision CAS. There is no synthetic/text
+    fallback approval canary.
+21. Separately authorize the first private Gmail read and archive only its
+    content-free terminal and resolution-attempt evidence. Acceptance requires
+    `ordinary_destination_delivered` for the exact resolution; ambiguity is a
+    consumed failed canary and never retries the same message.
 
 Rollback or failure leaves later stages unauthorized. Product approval does
-not land code. Code landing does not install. Installation does not install a
-root bundle. Bundle installation does not authorize OAuth. OAuth does not
-authorize OpenFGA or a read. Pairing does not connect or send. Enabling does not
-authorize a canary. A canary does not authorize Gmail. Only the final exact
-task-bound owner approval and policy checks authorize one read.
+not land code; landing does not install; installation does not create UIDs,
+root bundles, sockets, or launch records; bundle installation does not mutate
+session ownership; ownership transfer does not authorize configuration,
+OpenFGA, OAuth, pairing, service start, gateway publication, a canary, or a
+read. Pairing does not connect or send. Enabling does not authorize a canary.
+A canary does not authorize Gmail. Only the final exact task-bound owner
+approval and policy checks authorize one read.
+
+Choosing this isolated architecture is engineering architecture only. This ADR
+and its engineering work authorize no root change, service identity, ownership
+or ACL mutation, session transfer, launchd change, service start, publication,
+credential creation, account access, or production operation.
 
 ## 14. Alternatives, non-goals, and acceptance
 
@@ -1326,22 +1812,27 @@ skill, browser, Google SDK discovery client, or CLI subprocess; IMAP/App
 Passwords; broader/modify/send scopes; model summarization/redaction; ordinary
 WhatsApp result delivery; HTML/attachments; multi-account selection; model-
 proposed query/message IDs; provider factories/import paths/commands/URLs; a
-gateway-user-writable sensitive staging directory; `fexecve`/`execveat` on the
-stated macOS host; or making relay negotiation a Gmail dependency.
+gateway-owned private provider/store/credential path; shared service UID or
+Node dependency graph; main-YAML/legacy configuration; gateway-user-writable
+staging; `fexecve`/`execveat` on the stated macOS host; or making relay
+negotiation a Gmail dependency.
 
 Non-goals are mailbox browsing or summaries, thread search, pagination,
 history, settings, labels, contacts, background polling, watch/webhooks,
 indexing, replay, provider writes, Discord component rollout, physical
-in-process byte erasure, native Windows support, and multi-account use.
+byte erasure, native Windows support, and multi-account use.
 
-Implementation acceptance requires all specified product, privacy, OAuth,
-Gmail, policy, approval, sensitive bundle, lifecycle, cache-stability, relay,
-type, Node, package, documentation, and regression evidence. It also requires
-separate security, product, gateway, policy, runtime, and release approval.
-This ADR claims none of those gates have passed.
+Implementation acceptance requires all specified product, privacy, UID/socket,
+OAuth, Gmail, signed-policy/proxy, approval, three-service bundle/launch,
+lifecycle/epoch, conversation-cache, relay, type, Node, package,
+documentation, and regression evidence. It also requires separate security,
+product, gateway, policy, runtime, and release approval. This ADR claims none
+of those gates have passed.
 
-Unresolved deployment values include every real OAuth/account/chat/session/
-store/model/policy identity, owner-policy epoch, root bundle digest, adapter
-connection identity, final seal, and exact launch profile evidence. They must
-be created and reviewed only at their explicit activation boundary and may
-never fall back to ambient state.
+Unresolved deployment values include all concrete service UID/GID/launch
+labels, socket identities, OAuth/account/chat/session/store/model/policy
+identities, policy epoch, bundle and artifact digests, adapter/connection/
+authority generations, signing and provisioner key IDs, final seal, and exact
+launch profile evidence. Conceptual names in this ADR are not deployment
+values. Those values must be created and reviewed only at their explicit
+activation boundary and may never fall back to ambient state.
