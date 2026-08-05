@@ -4,10 +4,10 @@ This package is a canonical, loopback-only Baileys process for low-level
 sensitive-delivery evidence. It does not import the ordinary WhatsApp bridge
 or its adapter, session, socket, queue, indexes, logger, hooks, formatting, or
 retry paths. It does not mint authorization or user-facing receipts. The
-default-off gateway owner verifies the transport identity, validates returned
-evidence, and binds it into its own immutable receipt. Production private-read
-composition remains deliberately unavailable; configuration cannot select an
-arbitrary services module or activate provider reads.
+default-off gateway owner verifies the transport identity and validates
+returned evidence. The version-2 Juno MVP has a code-owned loopback submission
+composition; configuration still cannot select arbitrary executable services.
+Provisioning and deployment remain explicit operator gates.
 
 Every process entrypoint is a minimal launcher that imports only Node built-ins
 until qualification completes. The launcher contains an exact digest of the
@@ -90,6 +90,12 @@ only sender-companion/provider-fanout evidence and cannot succeed an attempt.
 Only an exact destination `DELIVERY_ACK`, `READ`, or `PLAYED` update can produce
 the internal `provider_accepted` outcome. Send and acknowledgement timeouts are
 never retried and remain post-submission ambiguous.
+
+The Juno MVP also exposes `/v1/submit`. It returns `submitted` only after the
+single exact `sendMessage` promise resolves with matching message/account/
+destination correlation. It does not wait for an acknowledgement and never
+labels that result delivered or read. A timeout, mismatch, or unknown result
+is terminal for that request and is not automatically retried.
 
 The audited dependency is exactly
 `@whiskeysockets/baileys@7.0.0-rc14`, resolved from its npm tarball with the

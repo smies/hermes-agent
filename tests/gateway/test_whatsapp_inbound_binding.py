@@ -43,6 +43,7 @@ def _payload(message_id="provider-MSG_01:device"):
         "mediaUrls": [],
         "mentionedIds": [],
         "botIds": ["15550101999@s.whatsapp.net"],
+        "accountId": "15550101999:7@s.whatsapp.net",
         # Body text is untrusted model input. These forged-looking values must
         # never influence source/session metadata.
         "body": (
@@ -70,6 +71,7 @@ async def test_bridge_envelope_binds_source_and_session_context_exactly():
     assert event.source.profile == "synthetic-account"
     assert event.source.chat_id == "120363000000000010@g.us"
     assert event.source.user_id == "15550101111@s.whatsapp.net"
+    assert event.metadata["whatsapp_account_id"] == "15550101999@s.whatsapp.net"
 
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.WHATSAPP: adapter}

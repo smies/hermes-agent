@@ -278,6 +278,63 @@ export class SensitiveDeliveryTransport {
     });
   }
 
+  async submit(request, { signal } = {}) {
+    const fields = ['request_id', 'registration', 'session', 'account', 'destination', 'private_value'];
+    if (!this.enabled || !this.connection) {
+      return Object.freeze({ state: 'failed', message_id: null, account: '', destination: '' });
+    }
+    if (!plainObject(request) || !exactKeys(request, fields)
+        || !boundedString(request.request_id)
+        || !boundedString(request.registration)
+        || !boundedString(request.session)
+        || !boundedString(request.account)
+        || !boundedString(request.destination)
+        || typeof request.private_value !== 'string'
+        || byteLength(request.private_value) === 0
+        || byteLength(request.private_value) > MAX_PRIVATE_BYTES
+        || signal?.aborted) {
+      return Object.freeze({ state: 'failed', message_id: null, account: '', destination: '' });
+    }
+    const connection = this.connection;
+    const account = canonicalAccountJid(request.account, this.canonicalizeJid);
+    const destination = canonicalDirectJid(request.destination, this.canonicalizeJid);
+    if (account.error || destination.error || account.value !== connection.accountJid
+        || request.registration !== this.runtimeId || request.session !== connection.epoch
+        || this.#connectionDriftCode(connection, account.value)) {
+      return Object.freeze({ state: 'failed', message_id: null,
+        account: request.account, destination: request.destination });
+    }
+    let messageId;
+    try {
+      messageId = this.generateMessageId(connection.sock.user?.id);
+    } catch {
+      return Object.freeze({ state: 'failed', message_id: null,
+        account: account.value, destination: destination.value });
+    }
+    if (!PROVIDER_MESSAGE_ID_PATTERN.test(messageId)) {
+      return Object.freeze({ state: 'failed', message_id: null,
+        account: account.value, destination: destination.value });
+    }
+    try {
+      const sent = await connection.sock.sendMessage(
+        destination.value,
+        { text: request.private_value, linkPreview: null },
+        { messageId },
+      );
+      if (signal?.aborted || sent?.key?.id !== messageId
+          || sent?.key?.remoteJid !== destination.value || sent?.key?.fromMe !== true
+          || this.#connectionDriftCode(connection, account.value)) {
+        return Object.freeze({ state: 'unknown', message_id: null,
+          account: account.value, destination: destination.value });
+      }
+      return Object.freeze({ state: 'submitted', message_id: messageId,
+        account: account.value, destination: destination.value });
+    } catch {
+      return Object.freeze({ state: 'unknown', message_id: null,
+        account: account.value, destination: destination.value });
+    }
+  }
+
   async send(request, { signal } = {}) {
     if (!this.enabled) return baseOutcome('unavailable', false, 'service_disabled');
     const connection = this.connection;

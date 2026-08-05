@@ -206,7 +206,10 @@ function trackSentMessageId(sent) {
 
 function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(':', '@');
+  const raw = String(value).trim();
+  const colon = raw.indexOf(':');
+  const domain = raw.indexOf('@');
+  return colon >= 0 && domain > colon ? `${raw.slice(0, colon)}${raw.slice(domain)}` : raw;
 }
 
 function redactWhatsAppId(value) {
@@ -711,6 +714,10 @@ async function startSocket() {
         },
       });
       event.fromOwner = fromOwner;
+      // Loopback host provenance: bind each accepted inbound to the exact
+      // authenticated bridge account. The Python adapter keeps this out of
+      // message text and exposes it only as host metadata.
+      event.accountId = normalizeWhatsAppId(sock.user?.id);
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {

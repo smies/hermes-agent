@@ -6181,6 +6181,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         host = None
         try:
+            if raw.get("version") == 2:
+                from gateway.juno_private_read_mvp import (
+                    JunoPrivateReadDependencies,
+                    JunoPrivateReadMvpConfig,
+                    JunoPrivateReadMvpHost,
+                    private_read_tool_surface_is_closed,
+                )
+                from gateway.trusted_private_read_host import (
+                    compose_trusted_private_read_services,
+                )
+
+                parsed_mvp = JunoPrivateReadMvpConfig.parse(raw)
+                if parsed_mvp is None:
+                    return False
+                services = compose_trusted_private_read_services(self, parsed_mvp)
+                if type(services) is not JunoPrivateReadDependencies:
+                    return False
+                host = JunoPrivateReadMvpHost(
+                    parsed_mvp,
+                    services,
+                )
+                if not await host.start():
+                    await host.stop()
+                    return False
+                if not private_read_tool_surface_is_closed():
+                    await host.stop()
+                    return False
+                self._trusted_private_read_host = host
+                logger.info("Juno private-read MVP host is ready")
+                return True
             from gateway.trusted_private_read_host import (
                 TrustedPrivateReadGatewayHost,
                 TrustedPrivateReadHostConfig,
@@ -14543,6 +14573,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Juno private-read decisions are authenticated control messages, not
+        # prompts. Consume them before update/clarify/busy/queue/model paths.
+        _private_host = getattr(self, "_trusted_private_read_host", None)
+        _private_intercept = getattr(_private_host, "intercept_approval", None)
+        if not is_internal and callable(_private_intercept):
+            try:
+                _decision = _private_intercept(event)
+            except BaseException:
+                logger.error("Private-read decision failed closed")
+                return "Private-read decision rejected."
+            if getattr(_decision, "matched", False):
+                return getattr(_decision, "response", None) or ""
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -19435,6 +19478,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            _private_host = getattr(self, "_trusted_private_read_host", None)
+            _private_config = getattr(_private_host, "config", None)
+            from gateway.juno_private_read_mvp import JunoPrivateReadMvpConfig
+            if (
+                type(_private_config) is JunoPrivateReadMvpConfig
+                and source.platform is Platform.WHATSAPP
+                and (source.profile or "default") == _private_config.profile
+            ):
+                # The pilot profile has one model capability. Background
+                # execution still receives no authenticated event context, so
+                # the tool fails closed there.
+                enabled_toolsets = ["private-read-request"]
+                disabled_toolsets = None
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
@@ -24302,6 +24358,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        _private_host = getattr(self, "_trusted_private_read_host", None)
+        _private_config = getattr(_private_host, "config", None)
+        from gateway.juno_private_read_mvp import JunoPrivateReadMvpConfig
+        if (
+            type(_private_config) is JunoPrivateReadMvpConfig
+            and source.platform is Platform.WHATSAPP
+            and (source.profile or "default") == _private_config.profile
+        ):
+            enabled_toolsets = ["private-read-request"]
+            disabled_toolsets = None
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

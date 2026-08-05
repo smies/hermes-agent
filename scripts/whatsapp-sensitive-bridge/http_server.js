@@ -118,7 +118,7 @@ export function createSensitiveHttpHandler({
       }
       return;
     }
-    if (req.method !== 'POST' || req.url !== '/v1/send') {
+    if (req.method !== 'POST' || !new Set(['/v1/send', '/v1/submit']).has(req.url)) {
       boundedError(res, 404, 'route_not_found');
       return;
     }
@@ -196,7 +196,13 @@ export function createSensitiveHttpHandler({
         return;
       }
       try {
-        const evidence = await transport.send(body, { signal: abort.signal });
+        const operation = req.url === '/v1/submit' ? transport.submit : transport.send;
+        if (typeof operation !== 'function') {
+          finishActive();
+          boundedError(res, 503, 'transport_unavailable');
+          return;
+        }
+        const evidence = await operation.call(transport, body, { signal: abort.signal });
         finishActive();
         writeJson(res, responseStatus(evidence), evidence);
       } catch {

@@ -95,6 +95,48 @@ test('production ACK deadline exceeds the exact-pin 30 second event buffer', () 
   assert.ok(DEFAULT_ACK_DEADLINE_MS >= 31_000);
 });
 
+test('MVP submission returns exact submitted correlation without waiting for delivery proof', async () => {
+  const id = '3EB0ABCDEFABCDEFABCDEF';
+  const h = harness({ ids: [id] });
+  const result = await h.transport.submit({
+    request_id: 'request-01HZX7M6Y2PE5F8K9W3R4T6V7X',
+    registration: RUNTIME,
+    session: EPOCH,
+    account: ACCOUNT,
+    destination: CHAT,
+    private_value: PRIVATE,
+  });
+
+  assert.deepEqual(result, {
+    state: 'submitted',
+    message_id: id,
+    account: ACCOUNT,
+    destination: CHAT,
+  });
+  assert.deepEqual(h.calls, [[CHAT, { text: PRIVATE, linkPreview: null }, { messageId: id }]]);
+  assert.equal(JSON.stringify(result).includes(PRIVATE), false);
+});
+
+test('MVP submission mismatch or uncertain send never reports submitted and is not retried', async () => {
+  const h = harness({
+    ids: ['3EB0ABCDEFABCDEFABCDE1'],
+    sendMessage: async () => { throw new Error(PRIVATE); },
+  });
+  const base = {
+    request_id: 'request-01HZX7M6Y2PE5F8K9W3R4T6V7X',
+    registration: RUNTIME,
+    session: EPOCH,
+    account: ACCOUNT,
+    destination: CHAT,
+    private_value: PRIVATE,
+  };
+  assert.equal((await h.transport.submit({ ...base, destination: '15550000000@s.whatsapp.net' })).state, 'unknown');
+  const wrong = await h.transport.submit({ ...base, registration: 'wrong-runtime' });
+  assert.equal(wrong.state, 'failed');
+  assert.equal(JSON.stringify(wrong).includes(PRIVATE), false);
+  assert.equal(h.calls.length, 1);
+});
+
 test('pre-reserved exact ID is registered before one exact plaintext send and synchronous ACK resolves', async () => {
   const id = '3EB0ABCDEF0123456789AB';
   const h = harness({

@@ -247,6 +247,38 @@ CREATE TABLE IF NOT EXISTS authorization_coordinator_lease (
 )
 """
 
+# The fast Juno MVP deliberately shares the authorization database and its
+# coordinator with the existing authorization engine.  This additive table is
+# payload-free: it contains only sealed routing metadata and lifecycle state.
+_PRIVATE_READ_MVP = """
+CREATE TABLE IF NOT EXISTS private_read_mvp_requests (
+    request_id TEXT PRIMARY KEY,
+    requester TEXT NOT NULL,
+    source_profile TEXT NOT NULL,
+    source_account TEXT NOT NULL,
+    source_chat TEXT NOT NULL,
+    capability_id TEXT NOT NULL,
+    destination_account TEXT NOT NULL,
+    destination_chat TEXT NOT NULL,
+    owner_sender TEXT NOT NULL,
+    descriptor_digest TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL,
+    expires_at_us INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'pending','approved','denied','expired','claimed','consumed',
+        'failed_consumed'
+    )),
+    notice_claimed INTEGER NOT NULL DEFAULT 0 CHECK (notice_claimed IN (0,1)),
+    claim_token_digest TEXT,
+    provider_message_id TEXT,
+    terminal_code TEXT,
+    updated_at_us INTEGER NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_private_read_mvp_state
+    ON private_read_mvp_requests(status, expires_at_us, created_at_us)
+"""
+
 _INDEXES_V2 = """
 CREATE INDEX IF NOT EXISTS idx_authorization_tasks_state_due
     ON authorization_tasks(status, expires_at_us, created_at_us);
@@ -327,6 +359,7 @@ _SCHEMA = ";".join(
         _NOTIFICATIONS_V7.format(table="authorization_notification_attempts"),
         _PDP_V3.format(table="authorization_pdp_evidence"),
         _LEASE,
+        _PRIVATE_READ_MVP,
         _INDEXES_V4,
     ]
 )

@@ -29,6 +29,10 @@ _GENERIC_DEFERRED_CONTENT = json.dumps(
 _GENERIC_DEFERRED_FINAL = (
     "The private read request requires approval and was deferred safely."
 )
+_GENERIC_ACCEPTED_CONTENT = json.dumps(
+    {"status": "accepted"}, sort_keys=True, separators=(",", ":")
+)
+_GENERIC_ACCEPTED_FINAL = "The private read request was accepted safely."
 
 
 def configure_private_read_request_runtime(
@@ -42,6 +46,27 @@ def configure_private_read_request_runtime(
     if health_check is not None and not callable(health_check):
         raise TypeError("private read request health check must be callable")
     _register_runtime(runtime, health_check=health_check)
+
+
+def configure_private_read_mvp_handler(handler, *, health_check=None) -> None:
+    """Install the code-owned MVP handler without exposing config callbacks."""
+    if handler is not None and not callable(handler):
+        raise TypeError("private read MVP handler must be callable")
+    if health_check is not None and not callable(health_check):
+        raise TypeError("private read MVP health check must be callable")
+    if handler is None:
+        _register_runtime(None)
+        return
+    bound = _RuntimeBoundMvpHandler(handler, health_check)
+    registry._register_host_terminal_tool(
+        name=PRIVATE_READ_REQUEST_TOOL_NAME,
+        toolset="private-read-request",
+        schema=PRIVATE_READ_REQUEST_SCHEMA,
+        handler=bound,
+        check_fn=bound.available,
+        description="Create a payload-free private-read request",
+        emoji="🔐",
+    )
 
 
 def check_private_read_request_runtime() -> bool:
@@ -135,6 +160,54 @@ class _RuntimeBoundPrivateReadHandler:
         )
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _RuntimeBoundMvpHandler:
+    handler: object = field(repr=False)
+    health_check: object = field(default=None, repr=False)
+
+    def available(self) -> bool:
+        try:
+            return self.health_check is None or self.health_check() is True
+        except BaseException:
+            return False
+
+    def __call__(self, args: object, *, tool_call_id: str | None = None,
+                 **_host_kwargs: object) -> ToolExecutionResult:
+        del tool_call_id
+        try:
+            proposal = PrivateReadProposal.from_model_args(args)
+            if not self.available():
+                return terminal_safe_failure("terminal_handler_error")
+            outcome = self.handler(proposal.capability_id)
+            if type(outcome) is not tuple or len(outcome) != 2:
+                return terminal_safe_failure("terminal_handler_error")
+            status, request_id = outcome
+            if type(status) is not str or type(request_id) is not str or not request_id:
+                return terminal_safe_failure("terminal_handler_error")
+            if status == "approved":
+                return ToolExecutionResult(
+                    content=_GENERIC_ACCEPTED_CONTENT,
+                    terminal=TerminalToolDirective(
+                        final_response=_GENERIC_ACCEPTED_FINAL,
+                        status="accepted",
+                        reason="queued",
+                        metadata={"request_id": request_id},
+                    ),
+                )
+            if status == "pending":
+                return ToolExecutionResult(
+                    content=_GENERIC_DEFERRED_CONTENT,
+                    terminal=TerminalToolDirective(
+                        final_response=_GENERIC_DEFERRED_FINAL,
+                        status="deferred",
+                        reason="approval_required",
+                        metadata={"request_id": request_id},
+                    ),
+                )
+            return terminal_safe_failure("terminal_handler_error")
+        except BaseException:
+            return terminal_safe_failure("terminal_handler_error")
+
 PRIVATE_READ_REQUEST_SCHEMA = {
     "name": PRIVATE_READ_REQUEST_TOOL_NAME,
     "description": (
@@ -186,5 +259,6 @@ __all__ = [
     "PRIVATE_READ_REQUEST_SCHEMA",
     "PRIVATE_READ_REQUEST_TOOL_NAME",
     "check_private_read_request_runtime",
+    "configure_private_read_mvp_handler",
     "configure_private_read_request_runtime",
 ]

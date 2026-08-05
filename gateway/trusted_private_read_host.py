@@ -50,7 +50,7 @@ from tools.private_read_request_tool import configure_private_read_request_runti
 
 
 SENSITIVE_VERIFIED_LAUNCHER_SHA256 = (
-    "04a5a598423042a2ab7dfe347a149a00dd5ad8e41eeddbbb2afc78d63eed8964"
+    "6c0f3d594123fe268b943227e1182c79805ec96093bb0c32d97b76453f8dc356"
 )
 SENSITIVE_RUNTIME_LAUNCHER_PATH = (
     Path(__file__).absolute().parent.parent
@@ -902,18 +902,23 @@ class TrustedPrivateReadGatewayHost:
 
 def compose_trusted_private_read_services(
     _runner: object,
-    _config: TrustedPrivateReadHostConfig,
-) -> None:
+    _config: object,
+) -> object:
     """Gateway-owned production composition boundary.
 
     The WIP accepted an arbitrary import path whose factory could self-assert
     requester identity, policy evidence, account separation, and delivery
-    authority.  That is not a trustworthy composition mechanism.  Until the
-    gateway has concrete built-in typed adapters for those authorities, the
-    only safe production composition is unavailable.  Tests may instantiate
-    ``TrustedPrivateReadGatewayHost`` directly with closed synthetic services;
-    the gateway runner never accepts such an injection from configuration.
+    authority. That is not a trustworthy composition mechanism. Version 2
+    resolves only to the built-in Juno MVP adapters below; the version-1
+    high-assurance design remains dormant for future hardening. Configuration
+    never selects executable code.
     """
+    from gateway.juno_private_read_mvp import (
+        JunoPrivateReadMvpConfig,
+        compose_juno_private_read_mvp_services,
+    )
+    if type(_config) is JunoPrivateReadMvpConfig:
+        return compose_juno_private_read_mvp_services(_runner, _config)
     return None
 
 

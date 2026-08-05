@@ -1653,6 +1653,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
             metadata: Dict[str, Any] = {}
+            account_id = to_whatsapp_jid(data.get("accountId"))
+            if account_id:
+                metadata["whatsapp_account_id"] = account_id
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:

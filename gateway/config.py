@@ -23,6 +23,43 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _load_gateway_yaml(stream):
+    """Safe-load gateway YAML while rejecting duplicate mapping keys."""
+    import yaml
+
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def _mapping(loader, node, deep=False):
+        loader.flatten_mapping(node)
+        result = {}
+        for key, value in loader.construct_pairs(node, deep=deep):
+            try:
+                duplicate = key in result
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing gateway configuration",
+                    node.start_mark,
+                    "found an unhashable mapping key",
+                    node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing gateway configuration",
+                    node.start_mark,
+                    "found a duplicate mapping key",
+                    node.start_mark,
+                )
+            result[key] = value
+        return result
+
+    _UniqueKeyLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        _mapping,
+    )
+    return yaml.load(stream, Loader=_UniqueKeyLoader)
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -1288,11 +1325,10 @@ def load_gateway_config() -> GatewayConfig:
 
     # Primary source: config.yaml
     try:
-        import yaml
         config_yaml_path = _home / "config.yaml"
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
-                yaml_cfg = yaml.safe_load(f) or {}
+                yaml_cfg = _load_gateway_yaml(f) or {}
 
             # Match the canonical runtime loader: expand user-authored
             # ${VAR}/${env:VAR} references before applying the managed leaf

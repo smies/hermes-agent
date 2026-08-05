@@ -15,7 +15,10 @@ export const MIME_MAP = {
 
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(':', '@');
+  const raw = String(value).trim();
+  const colon = raw.indexOf(':');
+  const domain = raw.indexOf('@');
+  return colon >= 0 && domain > colon ? `${raw.slice(0, colon)}${raw.slice(domain)}` : raw;
 }
 
 export function getMessageContent(msg) {

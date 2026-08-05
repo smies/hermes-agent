@@ -115,6 +115,35 @@ test('listener binds only 127.0.0.1 even when callers request another host', asy
   assert.deepEqual(server.bound, { port: 0, host: '127.0.0.1' });
 });
 
+test('MVP submit route dispatches only to the submission operation', async () => {
+  let submits = 0;
+  let sends = 0;
+  const body = JSON.stringify({ request_id: 'opaque', private_value: 'PRIVATE' });
+  const result = await invoke(createSensitiveHttpHandler({
+    capability: CAPABILITY,
+    transport: {
+      async submit() {
+        submits += 1;
+        return { state: 'submitted', message_id: 'message-1', account: 'a', destination: 'd' };
+      },
+      async send() { sends += 1; return { outcome: 'denied', submitted: false }; },
+    },
+  }), {
+    path: '/v1/submit',
+    headers: {
+      host: '127.0.0.1',
+      [CAPABILITY_HEADER]: CAPABILITY,
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(body)),
+    },
+    chunks: [body],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(submits, 1);
+  assert.equal(sends, 0);
+  assert.equal(result.body.includes('PRIVATE'), false);
+});
+
 test('aborted partial bodies release the active-request slot without parsing', async () => {
   let sends = 0;
   const handler = createSensitiveHttpHandler({

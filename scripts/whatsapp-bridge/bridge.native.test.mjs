@@ -20,9 +20,15 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
+  normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+assert.equal(
+  normalizeWhatsAppId('15550101999:7@s.whatsapp.net'),
+  '15550101999@s.whatsapp.net',
+);
 
 // -- inbound read receipts ------------------------------------------------
 {

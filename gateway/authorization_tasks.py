@@ -81,6 +81,7 @@ from gateway.authorization_schema import (
     _NOTIFICATIONS_V4,
     _PDP_V2,
     _PDP_V3,
+    _PRIVATE_READ_MVP,
     _SCHEMA,
     _TASKS_V2,
     _TASKS_V4,
@@ -359,6 +360,11 @@ class AuthorizationTaskStore(
                                 "authorization legacy audit failed integrity migration"
                             ) from exc
                         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    # Additive MVP storage deliberately shares this database
+                    # without changing the high-assurance schema version.
+                    for statement in _PRIVATE_READ_MVP.split(";"):
+                        if statement.strip():
+                            conn.execute(statement)
                     conn.execute("COMMIT")
                     break
                 except sqlite3.OperationalError as exc:

@@ -63,7 +63,7 @@ def _get_wsecret(name, default=None):
 
 logger = logging.getLogger(__name__)
 
-ORDINARY_VERIFIED_LAUNCHER_SHA256 = "182ce6713a28f5d09655e9778f8ac83c4833a24e02eb1ec364b5806db4952a47"
+ORDINARY_VERIFIED_LAUNCHER_SHA256 = "6bfb088a883205f197300b224118e4d7906e0315f97b2066c1d9496cc271395b"
 
 
 def verify_ordinary_launcher(path: Path) -> bool:
