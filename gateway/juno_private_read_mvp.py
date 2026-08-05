@@ -38,6 +38,11 @@ GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_AUTHORITY = "https://gmail.googleapis.com"
 OPENFGA_AUTHORITY = "http://127.0.0.1:8080"
 OPENFGA_CLIENT_CONTRACT_VERSION = "1.18.2"
+SENSITIVE_AUTHORITY = "http://127.0.0.1:3011"
+SENSITIVE_SUBMIT_CONTRACT_VERSION = "juno-sensitive-submit-v2"
+MAX_SENSITIVE_DEADLINE_AHEAD_US = 300_000_000
+MIN_TRUSTED_EPOCH_US = 1_000_000_000_000_000
+MAX_TRUSTED_EPOCH_US = 9_007_199_254_740_991
 MAX_PRIVATE_RENDER_BYTES = 16 * 1024
 MAX_GMAIL_RESPONSE_BYTES = 128 * 1024
 MAX_GMAIL_PARTS = 64
@@ -47,15 +52,16 @@ SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
 SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
 ORDINARY_INBOUND_PROVENANCE = "messages.upsert:registered-emitting-socket:v1"
 _SENSITIVE_TRANSPORT_IDENTITY = {
-    "manifest_sha256": "c10ec43325576c3bccd5027c3e46c85cb02050ea22334e36a3de6bb4909dffb2",
-    "launcher_sha256": "6c0f3d594123fe268b943227e1182c79805ec96093bb0c32d97b76453f8dc356",
-    "source_sha256": "816c7918c71441c4222eab15bb274c510c3aaff7a4f7e715fa82bb91f71a9a7b",
+    "manifest_sha256": "cb49995c1fb9697ff917b99feb73b4646386f886346bde260c45aa6d9c3428e1",
+    "launcher_sha256": "f1a062b75768e4cd2423a329e8284ea4f1451796e11cfdf45ac4b639f9c536d5",
+    "source_sha256": "8e63bcf560da154a698a6a40c6f56bc1ad0dba8fa72e133255a9330f5e796cc9",
     "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
     "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
-    "verifier_sha256": "64d9c5318503eb752dfe4232cbee5eb6ede107778007004e4814ba7f234c8eb1",
+    "verifier_sha256": "b2f77c04853eead92cfbc2614bb2ed474db714d04a73dd16b0f7013cfca431a5",
     "node_modules_tree_sha256": "48121207ef2e275e835b08cf58b264b8f0d4ef56eddb07298e833a2720dc62ef",
     "package_name": "hermes-whatsapp-sensitive-bridge",
     "package_version": "1.0.0",
+    "submit_contract_version": SENSITIVE_SUBMIT_CONTRACT_VERSION,
     "baileys_spec": "7.0.0-rc14",
     "baileys_lock_version": "7.0.0-rc14",
     "baileys_lock_resolved": "https://registry.npmjs.org/@whiskeysockets/baileys/-/baileys-7.0.0-rc14.tgz",
@@ -84,7 +90,9 @@ def _provider_authority_digest(config: "JunoPrivateReadMvpConfig") -> str:
         "openfga_client_contract": OPENFGA_CLIENT_CONTRACT_VERSION,
         "openfga_model_id": config.openfga_model_id,
         "openfga_store_id": config.openfga_store_id,
-        "sensitive_authority": "http://127.0.0.1:3011",
+        "sensitive_authority": SENSITIVE_AUTHORITY,
+        "sensitive_submit_contract": SENSITIVE_SUBMIT_CONTRACT_VERSION,
+        "sensitive_transport_identity": _SENSITIVE_TRANSPORT_IDENTITY,
     }
     return hashlib.sha256(json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
@@ -134,6 +142,18 @@ def _jid(value: object, label: str, *, direct: bool = True) -> str:
     if pattern.fullmatch(result) is None:
         raise JunoPrivateReadError(f"{label} configuration is invalid")
     return result
+
+
+def _direct_identity_aliases(value: str) -> frozenset[str]:
+    """Return the reviewed direct-JID alias identity, failing closed."""
+    if _WHATSAPP_DIRECT_RE.fullmatch(value) is None:
+        raise JunoPrivateReadError("WhatsApp identity configuration is invalid")
+    from gateway.whatsapp_identity import expand_whatsapp_aliases
+
+    aliases = expand_whatsapp_aliases(value)
+    if not aliases or any(re.fullmatch(r"\d{1,32}", item) is None for item in aliases):
+        raise JunoPrivateReadError("WhatsApp identity configuration is invalid")
+    return frozenset(aliases)
 
 
 def _event_id(value: object) -> str | None:
@@ -216,6 +236,8 @@ class JunoPrivateReadMvpConfig:
         timeouts = _exact_dict(
             raw["timeouts"], {"request", "approval", "read", "submission"}, "timeouts"
         )
+        ordinary_account = _jid(ordinary["account"], "ordinary account")
+        ordinary_aliases = _direct_identity_aliases(ordinary_account)
         requester_rows = raw["requesters"]
         if type(requester_rows) is not list or not 1 <= len(requester_rows) <= 16:
             raise JunoPrivateReadError("requester configuration is invalid")
@@ -227,13 +249,18 @@ class JunoPrivateReadMvpConfig:
                 {"sender", "source_chat", "label", "sensitive_destination"},
                 "requester",
             )
+            sensitive_destination = _jid(
+                row["sensitive_destination"], "sensitive destination"
+            )
+            if ordinary_aliases & _direct_identity_aliases(sensitive_destination):
+                raise JunoPrivateReadError(
+                    "sensitive destination must differ from ordinary account"
+                )
             requester = JunoRequester(
                 sender=_jid(row["sender"], "requester sender"),
                 source_chat=_jid(row["source_chat"], "requester source chat", direct=False),
                 label=_text(row["label"], "requester label", 80),
-                sensitive_destination=_jid(
-                    row["sensitive_destination"], "sensitive destination"
-                ),
+                sensitive_destination=sensitive_destination,
             )
             if requester.sender in seen:
                 raise JunoPrivateReadError("requester configuration is invalid")
@@ -242,9 +269,8 @@ class JunoPrivateReadMvpConfig:
         owner = _jid(ordinary["owner_sender"], "owner sender")
         if owner not in seen:
             raise JunoPrivateReadError("owner must be an allowlisted requester")
-        ordinary_account = _jid(ordinary["account"], "ordinary account")
         sensitive_account = _jid(sensitive["account"], "sensitive account")
-        if hmac.compare_digest(ordinary_account, sensitive_account):
+        if ordinary_aliases & _direct_identity_aliases(sensitive_account):
             raise JunoPrivateReadError("ordinary and sensitive accounts must differ")
         state_dir = _owner_directory(Path(_text(raw["state_dir"], "state directory", 2048)))
         credential = _owner_file(
@@ -435,6 +461,9 @@ class MvpAuthorizationRepository:
                 "openfga_store_id": values["openfga_store_id"],
                 "openfga_model_id": values["openfga_model_id"],
                 "provider_authority_digest": values["provider_authority_digest"],
+                "sensitive_authority": SENSITIVE_AUTHORITY,
+                "sensitive_submit_contract": SENSITIVE_SUBMIT_CONTRACT_VERSION,
+                "sensitive_transport_identity": _SENSITIVE_TRANSPORT_IDENTITY,
             }, sort_keys=True, separators=(",", ":"),
         )
 
@@ -857,8 +886,14 @@ class MvpAuthorizationRepository:
         return self.store._write(mutate, at_us=now_us)
 
     def finish(self, request_id: str, claim_token: str, *, submitted: bool,
-               provider_message_id: str | None, code: str, now_us: int) -> bool:
-        final = "consumed" if submitted else "failed_consumed"
+               provider_message_id: str | None, code: str, now_us: int,
+               expired: bool = False) -> bool:
+        if submitted:
+            final = "consumed"
+        elif expired:
+            final = "expired"
+        else:
+            final = "failed_consumed"
         def mutate(conn):
             row = conn.execute(
                 "SELECT rowid,* FROM private_read_mvp_requests WHERE request_id=?",
@@ -989,7 +1024,7 @@ class FixedHttpJsonTransport:
         self._authorities = {
             GMAIL_AUTHORITY: GMAIL_AUTHORITY,
             OPENFGA_AUTHORITY: OPENFGA_AUTHORITY,
-            "http://127.0.0.1:3011": "http://127.0.0.1:3011",
+            SENSITIVE_AUTHORITY: SENSITIVE_AUTHORITY,
         }
         if _test_authorities is not None:
             if type(_test_authorities) is not dict or not set(_test_authorities) <= set(self._authorities):
@@ -1332,7 +1367,7 @@ class SensitiveSubmission:
     destination: str
 
     def __post_init__(self) -> None:
-        if self.state not in {"submitted", "failed", "unknown"}:
+        if self.state not in {"submitted", "failed", "unknown", "expired"}:
             raise ValueError("invalid sensitive submission state")
 
     def __repr__(self) -> str:
@@ -1643,6 +1678,7 @@ class JunoPrivateReadMvpHost:
             return False
         request, token = claimed
         submitted = False
+        deadline_expired = False
         provider_message_id = None
         code = "failed"
         plaintext = None
@@ -1722,6 +1758,9 @@ class JunoPrivateReadMvpHost:
                 submitted = True
                 provider_message_id = result.message_id
                 code = "submitted"
+            elif type(result) is SensitiveSubmission and result.state == "expired":
+                deadline_expired = True
+                code = "expired_at_submission_boundary"
             else:
                 code = "submission_mismatch"
         except BaseException:
@@ -1732,6 +1771,7 @@ class JunoPrivateReadMvpHost:
                 request.request_id, token, submitted=submitted,
                 provider_message_id=provider_message_id, code=code,
                 now_us=self._clock_us(),
+                expired=deadline_expired,
             )
         return True
 
@@ -1791,9 +1831,11 @@ class _GatewayOrdinaryNotifier:
 
 
 class _SensitiveHttpSubmitter:
-    def __init__(self, config: JunoPrivateReadMvpConfig, transport: JsonTransport):
+    def __init__(self, config: JunoPrivateReadMvpConfig, transport: JsonTransport,
+                 *, _clock_us: Callable[[], int] | None = None):
         self._config = config
         self._transport = transport
+        self._clock_us = _clock_us or (lambda: time.time_ns() // 1000)
 
     async def observe_identity(
         self, *, request: MvpRequest
@@ -1803,8 +1845,23 @@ class _SensitiveHttpSubmitter:
     async def submit(
         self, *, request: MvpRequest, plaintext: str, identity: SensitiveRuntimeIdentity
     ) -> SensitiveSubmission:
+        try:
+            entry_now_us = self._clock_us()
+        except BaseException:
+            return SensitiveSubmission(
+                "failed", None, request.destination_account, request.destination_chat
+            )
+        entry_deadline = _sensitive_deadline_status(
+            request.expires_at_us, entry_now_us
+        )
+        if entry_deadline != "live":
+            return SensitiveSubmission(
+                "expired" if entry_deadline == "expired" else "failed",
+                None, request.destination_account, request.destination_chat,
+            )
         return await _sealed_sensitive_submit(
-            self._config, self._transport, request, plaintext, identity
+            self._config, self._transport, request, plaintext, identity,
+            _clock_us=self._clock_us, _entry_now_us=entry_now_us,
         )
 
 
@@ -1827,7 +1884,7 @@ async def _sealed_sensitive_identity(
         if capability is None:
             return None
         response = await transport.request(
-            method="GET", authority="http://127.0.0.1:3011", path="/v1/identity",
+            method="GET", authority=SENSITIVE_AUTHORITY, path="/v1/identity",
             query=(), headers={"x-hermes-sensitive-capability": capability,
                                "accept": "application/json"}, body=None,
             timeout=config.request_timeout, max_bytes=4096,
@@ -1865,20 +1922,40 @@ async def _sealed_sensitive_identity(
 async def _sealed_sensitive_submit(
     config: JunoPrivateReadMvpConfig, transport: JsonTransport, request: MvpRequest,
     plaintext: str, identity: SensitiveRuntimeIdentity,
+    *, _clock_us: Callable[[], int] | None = None,
+    _entry_now_us: int | None = None,
 ) -> SensitiveSubmission:
+    clock_us = _clock_us or (lambda: time.time_ns() // 1000)
     try:
+        entry_now_us = clock_us() if _entry_now_us is None else _entry_now_us
+        entry_deadline = _sensitive_deadline_status(request.expires_at_us, entry_now_us)
+        if entry_deadline != "live":
+            return SensitiveSubmission(
+                "expired" if entry_deadline == "expired" else "failed",
+                None, request.destination_account, request.destination_chat,
+            )
         capability = _read_sensitive_capability(config)
         if capability is None:
             return SensitiveSubmission("failed", None, "", "")
+        issue_deadline = _sensitive_deadline_status(
+            request.expires_at_us, clock_us(), previous_now_us=entry_now_us
+        )
+        if issue_deadline != "live":
+            return SensitiveSubmission(
+                "expired" if issue_deadline == "expired" else "failed",
+                None, request.destination_account, request.destination_chat,
+            )
         response = await transport.request(
-            method="POST", authority="http://127.0.0.1:3011", path="/v1/submit",
+            method="POST", authority=SENSITIVE_AUTHORITY, path="/v1/submit",
             query=(), headers={"x-hermes-sensitive-capability": capability,
                                "content-type": "application/json", "accept": "application/json"},
-            body={"request_id": request.request_id,
+            body={"contract_version": SENSITIVE_SUBMIT_CONTRACT_VERSION,
+                  "request_id": request.request_id,
                   "registration": identity.registration,
                   "session": identity.session,
                   "account": request.destination_account,
                   "destination": request.destination_chat,
+                  "expires_at_us": request.expires_at_us,
                   "private_value": plaintext},
             timeout=config.submission_timeout, max_bytes=4096,
         )
@@ -1890,6 +1967,22 @@ async def _sealed_sensitive_submit(
         )
     except BaseException:
         return SensitiveSubmission("unknown", None, "mismatch", "mismatch")
+
+
+def _sensitive_deadline_status(
+    expires_at_us: object, now_us: object, *, previous_now_us: int | None = None
+) -> str:
+    if (
+        type(expires_at_us) is not int
+        or type(now_us) is not int
+        or (previous_now_us is not None and type(previous_now_us) is not int)
+        or not MIN_TRUSTED_EPOCH_US <= now_us <= MAX_TRUSTED_EPOCH_US
+        or not MIN_TRUSTED_EPOCH_US <= expires_at_us <= MAX_TRUSTED_EPOCH_US
+        or (previous_now_us is not None and now_us < previous_now_us)
+        or expires_at_us - now_us > MAX_SENSITIVE_DEADLINE_AHEAD_US
+    ):
+        return "invalid"
+    return "live" if now_us < expires_at_us else "expired"
 
 
 def compose_juno_private_read_mvp_services(
@@ -1964,6 +2057,7 @@ __all__ = [
     "MvpEventContext", "MvpRequest", "OPENFGA_CLIENT_CONTRACT_VERSION",
     "ORDINARY_INBOUND_PROVENANCE",
     "OpenFgaChecker", "PrivateReadAuthorizer", "PrivateReadProvider",
+    "SENSITIVE_AUTHORITY", "SENSITIVE_SUBMIT_CONTRACT_VERSION",
     "SensitiveRuntimeIdentity", "SensitiveSubmission",
     "compose_juno_private_read_mvp_services", "private_read_tool_surface_is_closed",
     "render_gmail_message",

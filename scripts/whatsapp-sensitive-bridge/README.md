@@ -46,9 +46,10 @@ Before enablement, process spawn, any send, and acceptance of any evidence, the
 trusted host must compare the complete returned transport identity to immutable,
 reviewed allowlisted expected values. That comparison includes
 `launcher_sha256`, `manifest_sha256`, `source_sha256`, `package_sha256`,
-`lock_sha256`, the exact
+`lock_sha256`, `verifier_sha256`, `node_modules_tree_sha256`, the exact
 npm spec, lock version/resolved/integrity, installed name/version/package bytes,
-and `baileys_tree_sha256`. The published Git head is recorded only as reviewed
+`baileys_tree_sha256`, and the exact `juno-sensitive-submit-v2` contract. The
+published Git head is recorded only as reviewed
 release metadata because the npm package does not claim a `gitHead`; it is not
 artifact ancestry proof. Self-reported hashes only describe the running tree;
 they are not their own trust anchor, and neither is npm's git-dependency
@@ -95,7 +96,14 @@ The Juno MVP also exposes `/v1/submit`. It returns `submitted` only after the
 single exact `sendMessage` promise resolves with matching message/account/
 destination correlation. It does not wait for an acknowledgement and never
 labels that result delivered or read. A timeout, mismatch, or unknown result
-is terminal for that request and is not automatically retried.
+is terminal for that request and is not automatically retried. Its authenticated
+JSON body carries the exact integer `expires_at_us` deadline and
+`contract_version: juno-sensitive-submit-v2`. The Python coroutine checks the
+deadline at entry and immediately before HTTP issue; the authenticated Node
+handler checks immediately before delivery dispatch; and the delivery core
+checks again with no event-loop yield before `sendMessage`. Exact expiry is
+stale. Missing, malformed, incoherent, or more-than-five-minute deadlines fail
+closed without invoking the provider send primitive.
 
 The audited dependency is exactly
 `@whiskeysockets/baileys@7.0.0-rc14`, resolved from its npm tarball with the

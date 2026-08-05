@@ -5,6 +5,11 @@ export const DEFAULT_MAX_BODY_BYTES = 24 * 1024;
 export const DEFAULT_ACTIVE_REQUEST_LIMIT = 8;
 export const DEFAULT_RATE_LIMIT = 30;
 export const DEFAULT_RATE_WINDOW_MS = 60_000;
+export const SENSITIVE_SUBMIT_CONTRACT_VERSION = 'juno-sensitive-submit-v2';
+
+const MAX_DEADLINE_AHEAD_US = 300_000_000;
+const MIN_TRUSTED_EPOCH_US = 1_000_000_000_000_000;
+const MAX_TRUSTED_EPOCH_US = Number.MAX_SAFE_INTEGER;
 
 const LOOPBACK_PEERS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -53,6 +58,32 @@ function responseStatus(evidence) {
   return 200;
 }
 
+function submitDeadlineState(body, nowUs) {
+  let now;
+  try { now = nowUs(); } catch { return 'invalid'; }
+  const expires = body?.expires_at_us;
+  if (body?.contract_version !== SENSITIVE_SUBMIT_CONTRACT_VERSION
+      || !Number.isSafeInteger(expires)
+      || !Number.isSafeInteger(now)
+      || now < MIN_TRUSTED_EPOCH_US
+      || now > MAX_TRUSTED_EPOCH_US
+      || expires < MIN_TRUSTED_EPOCH_US
+      || expires > MAX_TRUSTED_EPOCH_US
+      || expires - now > MAX_DEADLINE_AHEAD_US) {
+    return 'invalid';
+  }
+  return now < expires ? 'live' : 'expired';
+}
+
+function deadlineFailure(res, state) {
+  writeJson(res, state === 'expired' ? 200 : 400, {
+    state: state === 'expired' ? 'expired' : 'failed',
+    message_id: null,
+    account: '',
+    destination: '',
+  });
+}
+
 export function createSensitiveHttpHandler({
   capability,
   transport,
@@ -61,6 +92,7 @@ export function createSensitiveHttpHandler({
   rateLimit = DEFAULT_RATE_LIMIT,
   rateWindowMs = DEFAULT_RATE_WINDOW_MS,
   nowMs = () => Date.now(),
+  nowUs = () => Date.now() * 1000,
   parseJson = (bytes) => JSON.parse(bytes.toString('utf8')),
 }) {
   const maxBytes = Math.max(1, Math.floor(maxBodyBytes));
@@ -202,6 +234,16 @@ export function createSensitiveHttpHandler({
           boundedError(res, 503, 'transport_unavailable');
           return;
         }
+        if (req.url === '/v1/submit') {
+          const deadline = submitDeadlineState(body, nowUs);
+          if (deadline !== 'live') {
+            finishActive();
+            deadlineFailure(res, deadline);
+            return;
+          }
+        }
+        // No await or event-loop yield may separate the authenticated final
+        // deadline sample above from entry into the delivery core.
         const evidence = await operation.call(transport, body, { signal: abort.signal });
         finishActive();
         writeJson(res, responseStatus(evidence), evidence);

@@ -4,12 +4,14 @@ import { EventEmitter } from 'node:events';
 
 import {
   CAPABILITY_HEADER,
+  SENSITIVE_SUBMIT_CONTRACT_VERSION,
   createSensitiveHttpHandler,
   listenLoopback,
 } from './http_server.js';
 import { SensitiveDeliveryTransport } from './delivery_core.js';
 
 const CAPABILITY = 'capability-8f0e9d16c2ac4ab096e9d30db0371fcba4c2cde36b424db8';
+const MVP_SUBMIT_CONTRACT = SENSITIVE_SUBMIT_CONTRACT_VERSION;
 
 function invoke(handler, { method = 'POST', path = '/v1/send', headers = {}, chunks = [] } = {}) {
   return new Promise((resolve) => {
@@ -119,9 +121,14 @@ test('listener binds only 127.0.0.1 even when callers request another host', asy
 test('MVP submit route dispatches only to the submission operation', async () => {
   let submits = 0;
   let sends = 0;
-  const body = JSON.stringify({ request_id: 'opaque', private_value: 'PRIVATE' });
+  const body = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    request_id: 'opaque', expires_at_us: 1_785_846_900_000_000,
+    private_value: 'PRIVATE',
+  });
   const result = await invoke(createSensitiveHttpHandler({
     capability: CAPABILITY,
+    nowUs: () => 1_785_846_896_000_000,
     transport: {
       async submit() {
         submits += 1;
@@ -143,6 +150,40 @@ test('MVP submit route dispatches only to the submission operation', async () =>
   assert.equal(submits, 1);
   assert.equal(sends, 0);
   assert.equal(result.body.includes('PRIVATE'), false);
+});
+
+test('MVP handler rejects exact expiry immediately before delivery dispatch', async () => {
+  const now = 1_785_846_896_000_000;
+  let submits = 0;
+  const body = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    request_id: 'expired-handler-request',
+    registration: 'runtime', session: 'epoch',
+    account: '15551234567@s.whatsapp.net',
+    destination: '15557654321@s.whatsapp.net',
+    expires_at_us: now,
+    private_value: 'PRIVATE-HANDLER-DEADLINE',
+  });
+  const result = await invoke(createSensitiveHttpHandler({
+    capability: CAPABILITY,
+    nowUs: () => now,
+    transport: {
+      async submit() { submits += 1; return { state: 'submitted' }; },
+    },
+  }), {
+    path: '/v1/submit',
+    headers: {
+      host: '127.0.0.1', [CAPABILITY_HEADER]: CAPABILITY,
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(body)),
+    },
+    chunks: [body],
+  });
+  assert.deepEqual(JSON.parse(result.body), {
+    state: 'expired', message_id: null, account: '', destination: '',
+  });
+  assert.equal(submits, 0);
+  assert.equal(result.body.includes('PRIVATE-HANDLER-DEADLINE'), false);
 });
 
 test('real HTTP handler calls real MVP transport with live identity and fake socket', async () => {
@@ -180,8 +221,10 @@ test('real HTTP handler calls real MVP transport with live identity and fake soc
   assert.equal(evidence.provider_account_jid, account);
 
   const request = JSON.stringify({
+    contract_version: MVP_SUBMIT_CONTRACT,
     request_id: 'request-http-vertical', registration: runtime, session: epoch,
-    account, destination, private_value: 'PRIVATE-HTTP-VERTICAL',
+    account, destination, expires_at_us: Date.now() * 1000 + 60_000_000,
+    private_value: 'PRIVATE-HTTP-VERTICAL',
   });
   const result = await invoke(handler, {
     path: '/v1/submit',

@@ -14,6 +14,15 @@ the separate sensitive WhatsApp process. Model and ordinary surfaces receive
 only fixed status text. A successful transport result is called `submitted`;
 it is not a delivery or read claim.
 
+Each durable request binds the complete reviewed sensitive artifact identity,
+loopback authority, and exact `juno-sensitive-submit-v2` contract through its
+provider-authority and descriptor digests. Submission carries the request's
+microsecond deadline through the authenticated loopback body and rechecks it at
+the Python coroutine, HTTP issue, Node handler, delivery-core, and provider-send
+boundaries. Sensitive destinations are rejected when they resolve to the
+ordinary account, and version-2 hosting is unavailable in multiplexed gateway
+processes; it requires a dedicated non-multiplexed Juno runner.
+
 The implementation is deliberately smaller than the accepted high-assurance
 ADR. The ADR is unchanged and remains the hardening roadmap. In particular,
 this MVP does not implement native polls, signed prepare/commit evidence,

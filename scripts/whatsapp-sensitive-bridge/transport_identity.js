@@ -10,6 +10,7 @@ export const BAILEYS_INTEGRITY = 'sha512-WK+X8ju8TPGxvWIsP8hrY6JB6FltYuFe+vsqKfj
 // Reviewed release metadata only. The npm artifact does not claim gitHead, so
 // this value must never be used as proof of tarball ancestry.
 export const BAILEYS_REVIEWED_RELEASE_GIT_HEAD = '7e7b0757e3f9f3c7789fb1cfd2f241d5002a199a';
+export const SENSITIVE_SUBMIT_CONTRACT_VERSION = 'juno-sensitive-submit-v2';
 export const CANONICAL_SOURCE_FILES = Object.freeze([
   'delivery_core.js',
   'http_server.js',
@@ -109,7 +110,7 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   const lock = JSON.parse(lockBytes.toString('utf8'));
   const manifest = exactObject(
     JSON.parse(manifestBytes.toString('utf8')),
-    ['version', 'package_name', 'package_version', 'package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256', 'node_modules_tree_sha256', 'baileys'],
+    ['version', 'package_name', 'package_version', 'submit_contract_version', 'package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256', 'node_modules_tree_sha256', 'baileys'],
     'transport manifest',
   );
   const expected = exactObject(
@@ -120,6 +121,7 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   if (manifest.version !== 3
       || manifest.package_name !== pkg.name
       || manifest.package_version !== pkg.version
+      || manifest.submit_contract_version !== SENSITIVE_SUBMIT_CONTRACT_VERSION
       || pkg.dependencies?.['@whiskeysockets/baileys'] !== BAILEYS_SPEC
       || expected.spec !== BAILEYS_SPEC
       || expected.lock_version !== BAILEYS_SPEC
@@ -175,6 +177,7 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
     node_modules_tree_sha256: nodeModulesTreeSha256,
     package_name: pkg.name,
     package_version: pkg.version,
+    submit_contract_version: SENSITIVE_SUBMIT_CONTRACT_VERSION,
     baileys_spec: BAILEYS_SPEC,
     baileys_lock_version: lockEntry.version,
     baileys_lock_resolved: lockEntry.resolved,

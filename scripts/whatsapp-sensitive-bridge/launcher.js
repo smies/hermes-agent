@@ -5,7 +5,7 @@ import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const EXPECTED_MANIFEST_SHA256 = 'c10ec43325576c3bccd5027c3e46c85cb02050ea22334e36a3de6bb4909dffb2';
+export const EXPECTED_MANIFEST_SHA256 = 'cb49995c1fb9697ff917b99feb73b4646386f886346bde260c45aa6d9c3428e1';
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -15,7 +15,7 @@ function parseAnchoredManifest(manifestBytes) {
   const manifest = JSON.parse(manifestBytes.toString('utf8'));
   const keys = [
     'version', 'package_name', 'package_version', 'package_sha256',
-    'lock_sha256', 'verifier_sha256', 'source_sha256',
+    'submit_contract_version', 'lock_sha256', 'verifier_sha256', 'source_sha256',
     'node_modules_tree_sha256', 'baileys',
   ];
   const baileysKeys = [
@@ -30,6 +30,7 @@ function parseAnchoredManifest(manifestBytes) {
   if (!exact(manifest, keys) || manifest.version !== 3
       || typeof manifest.package_name !== 'string' || !manifest.package_name
       || typeof manifest.package_version !== 'string' || !manifest.package_version
+      || manifest.submit_contract_version !== 'juno-sensitive-submit-v2'
       || !['package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256',
         'node_modules_tree_sha256'].every((name) => digest(manifest[name]))
       || !exact(manifest.baileys, baileysKeys)

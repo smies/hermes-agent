@@ -16,6 +16,7 @@ import {
   BAILEYS_REVIEWED_RELEASE_GIT_HEAD,
   BAILEYS_SPEC,
   BAILEYS_TARBALL,
+  SENSITIVE_SUBMIT_CONTRACT_VERSION,
   computeTransportIdentity,
 } from './transport_identity.js';
 import { EXPECTED_MANIFEST_SHA256 } from './launcher.js';
@@ -46,6 +47,7 @@ test('package, lock, installed metadata, and deterministic tree bind the exact n
   assert.equal(lockEntry.resolved, BAILEYS_TARBALL);
   assert.equal(lockEntry.integrity, BAILEYS_INTEGRITY);
   assert.equal(identity.baileys_spec, BAILEYS_SPEC);
+  assert.equal(identity.submit_contract_version, SENSITIVE_SUBMIT_CONTRACT_VERSION);
   assert.equal(identity.baileys_lock_version, BAILEYS_SPEC);
   assert.equal(identity.baileys_lock_resolved, BAILEYS_TARBALL);
   assert.equal(identity.baileys_lock_integrity, BAILEYS_INTEGRITY);

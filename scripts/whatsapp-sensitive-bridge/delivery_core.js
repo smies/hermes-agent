@@ -5,6 +5,7 @@ export const DEFAULT_SEND_DEADLINE_MS = 15_000;
 // Keep the post-send acknowledgement window strictly beyond that bound.
 export const DEFAULT_ACK_DEADLINE_MS = 31_000;
 export const PROVIDER_MESSAGE_ID_PATTERN = /^3EB0[0-9A-F]{18}$/;
+export const SENSITIVE_SUBMIT_CONTRACT_VERSION = 'juno-sensitive-submit-v2';
 
 const ACCEPTED_STATUSES = new Set([
   WAMessageStatus.DELIVERY_ACK,
@@ -19,6 +20,9 @@ const REJECTED_STATUSES = new Set([
 const MAX_PRIVATE_BYTES = 16 * 1024;
 const MAX_OPAQUE_BYTES = 256;
 const MAX_BINDING_BYTES = 512;
+const MAX_DEADLINE_AHEAD_US = 300_000_000;
+const MIN_TRUSTED_EPOCH_US = 1_000_000_000_000_000;
+const MAX_TRUSTED_EPOCH_US = Number.MAX_SAFE_INTEGER;
 
 export const REQUEST_FIELDS = Object.freeze([
   'authorization_task_id',
@@ -100,6 +104,25 @@ function safeNow(nowUs) {
   } catch {
     return null;
   }
+}
+
+function deadlineState(expiresAtUs, nowUs, previousNowUs = null) {
+  const now = safeNow(nowUs);
+  if (!Number.isSafeInteger(expiresAtUs)
+      || expiresAtUs < MIN_TRUSTED_EPOCH_US
+      || expiresAtUs > MAX_TRUSTED_EPOCH_US
+      || now === null
+      || now < MIN_TRUSTED_EPOCH_US
+      || now > MAX_TRUSTED_EPOCH_US
+      || (previousNowUs !== null && now < previousNowUs)
+      || expiresAtUs - now > MAX_DEADLINE_AHEAD_US) {
+    return { state: 'invalid', now };
+  }
+  return { state: now < expiresAtUs ? 'live' : 'expired', now };
+}
+
+function submitResult(state, account = '', destination = '') {
+  return Object.freeze({ state, message_id: null, account, destination });
 }
 
 function addBounded(map, key, value, limit) {
@@ -279,11 +302,15 @@ export class SensitiveDeliveryTransport {
   }
 
   async submit(request, { signal } = {}) {
-    const fields = ['request_id', 'registration', 'session', 'account', 'destination', 'private_value'];
+    const fields = [
+      'contract_version', 'request_id', 'registration', 'session', 'account',
+      'destination', 'expires_at_us', 'private_value',
+    ];
     if (!this.enabled || !this.connection) {
-      return Object.freeze({ state: 'failed', message_id: null, account: '', destination: '' });
+      return submitResult('failed');
     }
     if (!plainObject(request) || !exactKeys(request, fields)
+        || request.contract_version !== SENSITIVE_SUBMIT_CONTRACT_VERSION
         || !boundedString(request.request_id)
         || !boundedString(request.registration)
         || !boundedString(request.session)
@@ -293,7 +320,7 @@ export class SensitiveDeliveryTransport {
         || byteLength(request.private_value) === 0
         || byteLength(request.private_value) > MAX_PRIVATE_BYTES
         || signal?.aborted) {
-      return Object.freeze({ state: 'failed', message_id: null, account: '', destination: '' });
+      return submitResult('failed');
     }
     const connection = this.connection;
     const account = canonicalAccountJid(request.account, this.canonicalizeJid);
@@ -303,6 +330,13 @@ export class SensitiveDeliveryTransport {
         || this.#connectionDriftCode(connection, account.value)) {
       return Object.freeze({ state: 'failed', message_id: null,
         account: request.account, destination: request.destination });
+    }
+    const entryDeadline = deadlineState(request.expires_at_us, this.nowUs);
+    if (entryDeadline.state === 'invalid') {
+      return submitResult('failed', account.value, destination.value);
+    }
+    if (entryDeadline.state === 'expired') {
+      return submitResult('expired', account.value, destination.value);
     }
     let messageId;
     try {
@@ -314,6 +348,17 @@ export class SensitiveDeliveryTransport {
     if (!PROVIDER_MESSAGE_ID_PATTERN.test(messageId)) {
       return Object.freeze({ state: 'failed', message_id: null,
         account: account.value, destination: destination.value });
+    }
+    // This is the final deadline fence. No await, microtask, timer, or other
+    // event-loop yield may occur between this sample and the provider call.
+    const sendDeadline = deadlineState(
+      request.expires_at_us, this.nowUs, entryDeadline.now,
+    );
+    if (sendDeadline.state === 'invalid') {
+      return submitResult('failed', account.value, destination.value);
+    }
+    if (sendDeadline.state === 'expired') {
+      return submitResult('expired', account.value, destination.value);
     }
     try {
       const sent = await connection.sock.sendMessage(

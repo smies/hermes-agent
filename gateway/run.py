@@ -6182,6 +6182,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         host = None
         try:
             if raw.get("version") == 2:
+                if bool(getattr(self.config, "multiplex_profiles", False)):
+                    logger.error(
+                        "Juno private-read MVP requires a dedicated non-multiplexed gateway"
+                    )
+                    return False
                 from gateway.juno_private_read_mvp import (
                     JunoPrivateReadDependencies,
                     JunoPrivateReadMvpConfig,

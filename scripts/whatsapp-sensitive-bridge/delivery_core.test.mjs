@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   DEFAULT_ACK_DEADLINE_MS,
+  SENSITIVE_SUBMIT_CONTRACT_VERSION,
   SensitiveDeliveryTransport,
 } from './delivery_core.js';
 
@@ -13,6 +14,7 @@ const ORDINARY_ACCOUNT = '15559876543@s.whatsapp.net';
 const RUNTIME = 'runtime-01HZX7M6Y2PE5F8K9W3R4T6V7X';
 const EPOCH = 'epoch-01HZX7M6Y2PE5F8K9W3R4T6V7X';
 const PRIVATE = 'PRIVATE-CANARY-é-7b5031';
+const MVP_SUBMIT_CONTRACT = SENSITIVE_SUBMIT_CONTRACT_VERSION;
 const TRANSPORT_IDENTITY = Object.freeze({
   manifest_sha256: 'a'.repeat(64),
   baileys_spec: '7.0.0-rc14',
@@ -99,11 +101,13 @@ test('MVP submission returns exact submitted correlation without waiting for del
   const id = '3EB0ABCDEFABCDEFABCDEF';
   const h = harness({ ids: [id] });
   const result = await h.transport.submit({
+    contract_version: MVP_SUBMIT_CONTRACT,
     request_id: 'request-01HZX7M6Y2PE5F8K9W3R4T6V7X',
     registration: RUNTIME,
     session: EPOCH,
     account: ACCOUNT,
     destination: CHAT,
+    expires_at_us: 1_785_846_900_000_000,
     private_value: PRIVATE,
   });
 
@@ -123,11 +127,13 @@ test('MVP submission mismatch or uncertain send never reports submitted and is n
     sendMessage: async () => { throw new Error(PRIVATE); },
   });
   const base = {
+    contract_version: MVP_SUBMIT_CONTRACT,
     request_id: 'request-01HZX7M6Y2PE5F8K9W3R4T6V7X',
     registration: RUNTIME,
     session: EPOCH,
     account: ACCOUNT,
     destination: CHAT,
+    expires_at_us: 1_785_846_900_000_000,
     private_value: PRIVATE,
   };
   assert.equal((await h.transport.submit({ ...base, destination: '15550000000@s.whatsapp.net' })).state, 'unknown');
@@ -135,6 +141,69 @@ test('MVP submission mismatch or uncertain send never reports submitted and is n
   assert.equal(wrong.state, 'failed');
   assert.equal(JSON.stringify(wrong).includes(PRIVATE), false);
   assert.equal(h.calls.length, 1);
+});
+
+test('MVP submission rejects exact expiry at delivery entry without consuming a send', async () => {
+  const now = 1_785_846_896_000_000;
+  const h = harness({ nowUs: () => now });
+  const result = await h.transport.submit({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    request_id: 'request-expired-at-delivery-entry',
+    registration: RUNTIME,
+    session: EPOCH,
+    account: ACCOUNT,
+    destination: CHAT,
+    expires_at_us: now,
+    private_value: PRIVATE,
+  });
+  assert.deepEqual(result, {
+    state: 'expired', message_id: null, account: ACCOUNT, destination: CHAT,
+  });
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.transport.stats().active, 0);
+});
+
+test('MVP submission rechecks exact expiry at provider send invocation with no yield', async () => {
+  const expiry = 1_785_846_896_000_000;
+  const samples = [expiry - 1, expiry];
+  const h = harness({ nowUs: () => samples.shift() });
+  const result = await h.transport.submit({
+    contract_version: MVP_SUBMIT_CONTRACT,
+    request_id: 'request-expires-at-provider-boundary',
+    registration: RUNTIME,
+    session: EPOCH,
+    account: ACCOUNT,
+    destination: CHAT,
+    expires_at_us: expiry,
+    private_value: PRIVATE,
+  });
+  assert.deepEqual(result, {
+    state: 'expired', message_id: null, account: ACCOUNT, destination: CHAT,
+  });
+  assert.equal(h.calls.length, 0);
+  assert.equal(samples.length, 0);
+});
+
+test('MVP submission fails closed on missing malformed or incoherent deadlines', async () => {
+  const now = 1_785_846_896_000_000;
+  const h = harness({ nowUs: () => now });
+  const base = {
+    contract_version: MVP_SUBMIT_CONTRACT,
+    request_id: 'request-malformed-deadline',
+    registration: RUNTIME,
+    session: EPOCH,
+    account: ACCOUNT,
+    destination: CHAT,
+    expires_at_us: now + 1,
+    private_value: PRIVATE,
+  };
+  for (const deadline of [undefined, '1785846896000001', Number.MAX_SAFE_INTEGER]) {
+    const candidate = { ...base };
+    if (deadline === undefined) delete candidate.expires_at_us;
+    else candidate.expires_at_us = deadline;
+    assert.equal((await h.transport.submit(candidate)).state, 'failed');
+  }
+  assert.equal(h.calls.length, 0);
 });
 
 test('pre-reserved exact ID is registered before one exact plaintext send and synchronous ACK resolves', async () => {

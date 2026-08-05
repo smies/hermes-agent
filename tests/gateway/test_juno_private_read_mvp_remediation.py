@@ -1449,9 +1449,12 @@ async def test_python_submitter_real_http_route_uses_fresh_identity(tmp_path: Pa
         path, body = _SensitiveHandler.observed[1]
         assert path == "/v1/submit"
         assert set(body) == {
-            "request_id", "registration", "session", "account", "destination", "private_value",
+            "contract_version", "request_id", "registration", "session", "account",
+            "destination", "expires_at_us", "private_value",
         }
         assert (body["registration"], body["session"]) == ("runtime-fresh", "epoch-fresh")
+        assert body["contract_version"] == "juno-sensitive-submit-v2"
+        assert body["expires_at_us"] == request.expires_at_us
     finally:
         await host.stop()
         server.shutdown()

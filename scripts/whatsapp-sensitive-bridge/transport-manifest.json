@@ -2,10 +2,11 @@
   "version": 3,
   "package_name": "hermes-whatsapp-sensitive-bridge",
   "package_version": "1.0.0",
+  "submit_contract_version": "juno-sensitive-submit-v2",
   "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
   "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
-  "verifier_sha256": "64d9c5318503eb752dfe4232cbee5eb6ede107778007004e4814ba7f234c8eb1",
-  "source_sha256": "816c7918c71441c4222eab15bb274c510c3aaff7a4f7e715fa82bb91f71a9a7b",
+  "verifier_sha256": "b2f77c04853eead92cfbc2614bb2ed474db714d04a73dd16b0f7013cfca431a5",
+  "source_sha256": "8e63bcf560da154a698a6a40c6f56bc1ad0dba8fa72e133255a9330f5e796cc9",
   "node_modules_tree_sha256": "48121207ef2e275e835b08cf58b264b8f0d4ef56eddb07298e833a2720dc62ef",
   "baileys": {
     "spec": "7.0.0-rc14",
