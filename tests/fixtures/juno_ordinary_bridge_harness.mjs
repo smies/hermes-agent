@@ -2,6 +2,10 @@ import { EventEmitter } from 'node:events';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
+const sessionArgument = process.argv.indexOf('--session');
+if (sessionArgument >= 0 && process.argv[sessionArgument + 1]) {
+  process.env.WHATSAPP_SESSION_PATH = process.argv[sessionArgument + 1];
+}
 const bridge = await import(pathToFileURL(process.env.JUNO_BRIDGE_MODULE));
 const ev = new EventEmitter();
 const sentMessages = [];
