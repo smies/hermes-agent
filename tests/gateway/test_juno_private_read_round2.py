@@ -4,7 +4,15 @@ import asyncio
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -13,9 +21,11 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.juno_private_read_mvp import (
     JunoOrdinaryRuntimeTopology,
+    JunoPrivateReadError,
     JunoPrivateReadMvpConfig,
     _SENSITIVE_TRANSPORT_IDENTITY,
     _SensitiveBridgeSupervisor,
+    _prepare_sensitive_receiver_replay_authority,
     resolve_juno_ordinary_runtime_topology,
 )
 from tests.gateway.test_juno_private_read_mvp_e2e import _raw_config
@@ -103,6 +113,136 @@ def _write_sensitive_credentials(session: Path, *, registration_id: int = 47) ->
     target = session / "creds.json"
     target.write_text(json.dumps(creds), encoding="utf-8")
     target.chmod(0o600)
+
+
+def _parent_death_supervisor(child: Path, port: int) -> subprocess.Popen:
+    source = """
+import json, subprocess, sys, time
+child, port = sys.argv[1], sys.argv[2]
+process = subprocess.Popen(
+    ['node', child, port], stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+line = process.stdout.readline()
+if not line:
+    raise SystemExit(process.wait())
+ready = json.loads(line)
+print(json.dumps({'parent_pid': __import__('os').getpid(), 'child_pid': process.pid,
+                  'child_ready': ready}), flush=True)
+while True:
+    time.sleep(60)
+"""
+    return subprocess.Popen(
+        [sys.executable, "-c", source, str(child), str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _readline_bounded(process: subprocess.Popen, timeout: float = 5.0) -> str:
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    if not ready:
+        raise AssertionError(f"parent process {process.pid} produced no readiness evidence")
+    return process.stdout.readline()
+
+
+def _wait_port_released(port: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            time.sleep(0.05)
+        finally:
+            probe.close()
+    return False
+
+
+def test_receiver_replay_authority_cannot_be_recreated_after_state_exists(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    identity = _prepare_sensitive_receiver_replay_authority(state_dir)
+    (state_dir / "authorization.db").write_bytes(b"rolled-back-valid-snapshot")
+
+    shutil.rmtree(identity["root"])
+    Path(identity["anchor_path"]).unlink()
+
+    with pytest.raises(JunoPrivateReadError):
+        _prepare_sensitive_receiver_replay_authority(state_dir)
+
+
+def test_parent_death_pipe_reaps_exact_signal_ignoring_child_and_releases_3011() -> None:
+    child = Path(__file__).parents[1] / "fixtures" / "juno_parent_death_child.mjs"
+    port = 3011
+    preflight = socket.socket()
+    try:
+        preflight.bind(("127.0.0.1", port))
+    except PermissionError:
+        pytest.skip("execution sandbox denied parent-death loopback gate")
+    except OSError as exc:
+        pytest.fail(f"stale unknown listener owns sensitive port 3011: {exc}")
+    finally:
+        preflight.close()
+
+    parent = _parent_death_supervisor(child, port)
+    replacement = None
+    child_pid = None
+    replacement_child_pid = None
+    try:
+        line = _readline_bounded(parent)
+        if not line:
+            stderr = parent.stderr.read()
+            if "operation not permitted" in stderr.lower():
+                pytest.skip("execution sandbox denied parent-death child listen")
+            pytest.fail(f"parent-death child failed to start: {stderr[:512]}")
+        ready = json.loads(line)
+        child_pid = ready["child_pid"]
+        assert ready["child_ready"] == {"pid": child_pid, "live": True}
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=3)
+        assert _wait_port_released(port)
+        deadline = time.monotonic() + 5
+        while _pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _pid_exists(child_pid), "exact orphaned sensitive child survived parent death"
+
+        replacement = _parent_death_supervisor(child, port)
+        replacement_line = _readline_bounded(replacement)
+        assert replacement_line
+        replacement_ready = json.loads(replacement_line)
+        replacement_child_pid = replacement_ready["child_pid"]
+        assert replacement_child_pid != child_pid
+        assert replacement_ready["child_ready"]["live"] is True
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=3)
+        if replacement is not None and replacement.poll() is None:
+            replacement.kill()
+            replacement.wait(timeout=3)
+        if replacement_child_pid is not None:
+            deadline = time.monotonic() + 5
+            while _pid_exists(replacement_child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if _pid_exists(replacement_child_pid):
+                os.kill(replacement_child_pid, signal.SIGKILL)
+                pytest.fail("replacement parent left a descendant after control EOF")
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_topology_resolver_binds_exact_sensitive_credential_generation(
@@ -296,6 +436,43 @@ async def test_reconciler_shutdown_cleans_host_and_child_once(
 
 
 @pytest.mark.asyncio
+async def test_reconciler_cancellation_joins_bounded_then_caller_depublishes(
+    tmp_path, monkeypatch,
+) -> None:
+    runner = _runner(tmp_path)
+    adapter = _Adapter()
+    adapter.topology = _Topology(adapter, "ordinary-a")
+    runner._current_juno_private_read_topology = lambda: adapter.topology
+    runner._shutdown_event = asyncio.Event()
+    runner._background_tasks = set()
+    runner._trusted_private_read_reconciler_task = None
+    host = _Host("ordinary-a")
+    supervisor = _Supervisor()
+
+    async def activate(_topology):
+        return host, supervisor
+
+    monkeypatch.setattr(runner, "_activate_juno_private_read_generation", activate)
+    runner._ensure_juno_private_read_reconciler()
+    task = runner._trusted_private_read_reconciler_task
+    for _ in range(50):
+        if runner._trusted_private_read_host is host:
+            break
+        await asyncio.sleep(0)
+    assert runner._trusted_private_read_host is host
+    assert await asyncio.wait_for(
+        runner._stop_juno_private_read_reconciler(), timeout=2.5
+    )
+    assert task.done()
+    assert all(item.get_name() != "juno-private-read-reconciler"
+               for item in asyncio.all_tasks() if not item.done())
+    await runner._depublish_juno_private_read_generation()
+    assert host.stopped == 1
+    assert supervisor.stopped == 1
+    assert runner._trusted_private_read_host is None
+
+
+@pytest.mark.asyncio
 async def test_supervisor_never_adopts_stale_port_owner_generation(
     tmp_path, monkeypatch,
 ) -> None:
@@ -327,6 +504,14 @@ async def test_supervisor_never_adopts_stale_port_owner_generation(
     class Process:
         stopped = False
 
+        class Control:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        stdin = Control()
+
         def poll(self):
             return 0 if self.stopped else None
 
@@ -340,7 +525,13 @@ async def test_supervisor_never_adopts_stale_port_owner_generation(
             return 0
 
     process = Process()
-    monkeypatch.setattr("gateway.juno_private_read_mvp.subprocess.Popen", lambda *_a, **_k: process)
+    popen_calls = []
+
+    def popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return process
+
+    monkeypatch.setattr("gateway.juno_private_read_mvp.subprocess.Popen", popen)
 
     class StalePortTransport:
         async def request(self, **_call):
@@ -386,6 +577,86 @@ async def test_supervisor_never_adopts_stale_port_owner_generation(
     supervisor = _SensitiveBridgeSupervisor(
         config, topology, transport=StalePortTransport(),
     )
+    replay_identity = _prepare_sensitive_receiver_replay_authority(config.state_dir)
+    assert replay_identity["root"].endswith("sensitive-receiver-replay")
     assert not await supervisor.start()
+    assert len(popen_calls) == 1
+    assert popen_calls[0][1]["stdin"] == subprocess.PIPE
+    assert process.stopped
+    assert supervisor.process is None
+
+
+@pytest.mark.asyncio
+async def test_supervisor_start_cancellation_propagates_after_bounded_child_reap(
+    tmp_path, monkeypatch,
+) -> None:
+    config = replace(
+        JunoPrivateReadMvpConfig.parse(_raw_config(tmp_path)), request_timeout=2,
+    )
+    ordinary = tmp_path / "cancel-ordinary-session"
+    sensitive = tmp_path / "cancel-sensitive-session"
+    ordinary.mkdir(mode=0o700)
+    sensitive.mkdir(mode=0o700)
+    topology = JunoOrdinaryRuntimeTopology(
+        adapter=object(), adapter_generation="b" * 64,
+        ordinary_runtime_id="ordinary-runtime", ordinary_socket_generation=1,
+        ordinary_account_phone=config.ordinary_account,
+        ordinary_account_lid="44444444444@lid",
+        ordinary_session_path=str(ordinary),
+        ordinary_session_identity=(
+            f"{ordinary.stat().st_dev}:{ordinary.stat().st_ino}"
+        ),
+        ordinary_manifest_sha256="c" * 64,
+        ordinary_source_sha256="d" * 64,
+        ordinary_launcher_sha256="e" * 64,
+        sensitive_session_path=str(sensitive),
+        sensitive_session_identity=(
+            f"{sensitive.stat().st_dev}:{sensitive.stat().st_ino}"
+        ),
+    )
+
+    class Process:
+        stopped = False
+
+        class Control:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        stdin = Control()
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def terminate(self):
+            self.stopped = True
+
+        def kill(self):
+            self.stopped = True
+
+        def wait(self):
+            return 0
+
+    process = Process()
+    monkeypatch.setattr(
+        "gateway.juno_private_read_mvp.subprocess.Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    supervisor = _SensitiveBridgeSupervisor(config, topology)
+    probing = asyncio.Event()
+
+    async def blocked_probe():
+        probing.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(supervisor, "_probe_identity", blocked_probe)
+    task = asyncio.create_task(supervisor.start())
+    await asyncio.wait_for(probing.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2)
+    assert task.done()
+    assert process.stdin.closed
     assert process.stopped
     assert supervisor.process is None

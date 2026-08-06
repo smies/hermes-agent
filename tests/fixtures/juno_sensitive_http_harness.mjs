@@ -4,6 +4,7 @@ import { appendFileSync } from 'node:fs';
 import http from 'node:http';
 
 import { SensitiveDeliveryTransport } from '../../scripts/whatsapp-sensitive-bridge/delivery_core.js';
+import { DurableReceiverReplayAuthority } from '../../scripts/whatsapp-sensitive-bridge/replay_authority.js';
 import {
   createSensitiveHttpHandler,
   listenLoopback,
@@ -33,8 +34,10 @@ function sealedLaunch() {
   let launch;
   try { launch = JSON.parse(process.env[LAUNCH_ENV]); } catch { throw new Error('sealed launch required'); }
   if (!exactObject(launch, [
-    'version', 'process_generation', 'configured_account_jid', 'ordinary', 'sensitive',
-  ]) || launch.version !== 1
+    'version', 'process_generation', 'configured_account_jid', 'profile', 'mode',
+    'replay', 'ordinary', 'sensitive',
+  ]) || launch.version !== 2 || launch.profile !== 'juno'
+      || launch.mode !== 'sensitive-outbound-only'
       || typeof launch.process_generation !== 'string'
       || !/^[a-f0-9]{64}$/.test(launch.process_generation)
       || !exactObject(launch.ordinary, [
@@ -135,6 +138,7 @@ const transport = new SensitiveDeliveryTransport({
   transportIdentity: identity,
   canonicalizeJid,
   generateMessageId: () => '3EB0ABCDEF0123456789AB',
+  replayAuthority: new DurableReceiverReplayAuthority(launch.replay),
 });
 transport.bindConnection({
   socket, sock: socket,
@@ -159,7 +163,12 @@ try {
 
 const stop = () => {
   transport.setEnabled(false);
+  try { server.closeAllConnections?.(); } catch {}
   server.close(() => process.exit(0));
 };
 process.once('SIGTERM', stop);
 process.once('SIGINT', stop);
+process.stdin.once('end', stop);
+process.stdin.once('error', stop);
+process.stdin.once('close', stop);
+process.stdin.resume();

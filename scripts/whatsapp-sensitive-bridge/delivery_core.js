@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 
+import { DurableReceiverReplayAuthority } from './replay_authority.js';
+
 export const PROVIDER_MESSAGE_ID_PATTERN = /^3EB0[0-9A-F]{18}$/;
 export const SENSITIVE_SUBMIT_CONTRACT_VERSION = 'juno-sensitive-submit-v2';
 
@@ -8,7 +10,6 @@ const MAX_OPAQUE_BYTES = 256;
 const MAX_DEADLINE_AHEAD_US = 300_000_000;
 const MIN_TRUSTED_EPOCH_US = 1_000_000_000_000_000;
 const MAX_TRUSTED_EPOCH_US = Number.MAX_SAFE_INTEGER;
-const DEFAULT_MAX_REPLAY_TOMBSTONES = 4096;
 
 function plainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -111,7 +112,7 @@ export class SensitiveDeliveryTransport {
     canonicalizeJid,
     generateMessageId,
     nowUs = () => Date.now() * 1000,
-    maxReplayTombstones = DEFAULT_MAX_REPLAY_TOMBSTONES,
+    replayAuthority,
   }) {
     if (!boundedString(runtimeId) || !/^[a-f0-9]{64}$/.test(processGeneration)
         || !plainObject(topologyIdentity) || !plainObject(transportIdentity)) {
@@ -120,9 +121,8 @@ export class SensitiveDeliveryTransport {
     if (typeof canonicalizeJid !== 'function' || typeof generateMessageId !== 'function') {
       throw new TypeError('missing pinned provider helpers');
     }
-    if (!Number.isSafeInteger(maxReplayTombstones) || maxReplayTombstones < 1
-        || maxReplayTombstones > DEFAULT_MAX_REPLAY_TOMBSTONES) {
-      throw new TypeError('invalid replay tombstone bound');
+    if (!(replayAuthority instanceof DurableReceiverReplayAuthority)) {
+      throw new TypeError('durable receiver replay authority is required');
     }
     this.runtimeId = runtimeId;
     this.processGeneration = processGeneration;
@@ -134,8 +134,7 @@ export class SensitiveDeliveryTransport {
     this.ordinaryAccountJid = ordinaryAccount.value;
     this.generateMessageId = generateMessageId;
     this.nowUs = nowUs;
-    this.maxReplayTombstones = maxReplayTombstones;
-    this.replayTombstones = new Map();
+    this.replayAuthority = replayAuthority;
     this.connection = null;
     this.enabled = true;
   }
@@ -250,11 +249,6 @@ export class SensitiveDeliveryTransport {
     if (entryDeadline.state === 'expired') {
       return submitResult('expired', account.value, destination.value);
     }
-    if (!this.#reserveSubmission(
-      request, connection, account.value, destination.value, entryDeadline.now,
-    )) {
-      return submitResult('failed', account.value, destination.value);
-    }
     let messageId;
     try {
       messageId = this.generateMessageId(connection.sock.user?.id);
@@ -285,6 +279,17 @@ export class SensitiveDeliveryTransport {
     }
     if (sendDeadline.state === 'expired') {
       return submitResult('expired', account.value, destination.value);
+    }
+    try {
+      if (!this.#burnSubmission(request, connection, account.value, destination.value)) {
+        return submitResult('failed', account.value, destination.value);
+      }
+    } catch {
+      // Replay authority failure withdraws all receiver/provider authority for
+      // this process generation.  A missing or unsafe durable root must never
+      // degrade into a process-local replay map.
+      this.setEnabled(false);
+      return submitResult('failed', account.value, destination.value);
     }
     try {
       const sent = await connection.sock.sendMessage(
@@ -356,35 +361,23 @@ export class SensitiveDeliveryTransport {
     return null;
   }
 
-  #reserveSubmission(request, connection, account, destination, now) {
-    for (const [nonce, record] of this.replayTombstones) {
-      if (record.expiresAtUs <= now) this.replayTombstones.delete(nonce);
-    }
+  #burnSubmission(request, connection, account, destination) {
     const plaintextDigest = createHash('sha256')
       .update(request.private_value, 'utf8')
       .digest('hex');
-    const descriptorDigest = createHash('sha256').update(JSON.stringify({
+    return this.replayAuthority.burn(request.request_id, {
+      profile: 'juno',
+      mode: 'sensitive-outbound-only',
       runtime: this.runtimeId,
+      process_generation: this.processGeneration,
       session: connection.epoch,
       account,
       destination,
       expires_at_us: request.expires_at_us,
-      plaintext_sha256: plaintextDigest,
-    })).digest('hex');
-    const existing = this.replayTombstones.get(request.request_id);
-    if (existing) {
-      // Exact duplicates and mismatched reuse are both terminal. Comparing the
-      // content-free digest keeps the distinction available for diagnostics
-      // without retaining or logging the private payload.
-      void (existing.descriptorDigest === descriptorDigest);
-      return false;
-    }
-    if (this.replayTombstones.size >= this.maxReplayTombstones) return false;
-    this.replayTombstones.set(request.request_id, Object.freeze({
-      descriptorDigest,
-      expiresAtUs: request.expires_at_us,
-    }));
-    return true;
+      payload_sha256: plaintextDigest,
+      topology_sha256: this.topologyIdentity.topology_sha256,
+      transport_manifest_sha256: this.transportIdentity.manifest_sha256,
+    });
   }
 
   #closeConnection(reason) {

@@ -27,6 +27,19 @@ destination; groups and alternate users are rejected. Version-2 hosting is
 unavailable in multiplexed gateway processes; it requires a dedicated
 non-multiplexed Juno runner.
 
+The plaintext-bearing receiver performs a final synchronous durable burn before
+Baileys invocation. Its replay root and sibling anchor are independent of
+authorization SQLite, survive receiver replacement, and store only bounded
+request/descriptor digests. They are initialized only while the Juno state
+directory is pristine; once any Juno state exists, missing, corrupt, aliased,
+hardlinked, incorrectly owned/mode-set, or unwritable replay authority prevents
+sensitive publication.
+Tombstones are never expired or pruned, so logical request IDs never become
+reusable; operational growth is permanent and must be monitored. The sensitive
+child also holds authority only while the exact supervisor-owned stdin pipe is
+live. Parent EOF/error closes the listener/provider socket and exits, while an
+unknown listener on port 3011 remains a fail-closed startup error.
+
 The enforceable guarantee is application containment: private Gmail plaintext
 must not reach the low-trust model, prompt/tool/session history, ordinary
 inbound queue, extractor, quote/sent index, mirrors, hooks, logs, standard

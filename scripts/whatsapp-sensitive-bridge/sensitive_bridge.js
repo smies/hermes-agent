@@ -13,6 +13,8 @@ import makeWASocket, {
 import { SensitiveDeliveryTransport } from './delivery_core.js';
 import { createSensitiveHttpHandler, listenLoopback } from './http_server.js';
 import { SensitiveSocketLifecycle } from './lifecycle.js';
+import { DurableReceiverReplayAuthority } from './replay_authority.js';
+import { bindOwnedParentControl } from './parent_control.js';
 import { prepareSessionPaths, SessionPathError } from './session_paths.js';
 import { verifyLidBootstrap } from './provisioning_core.js';
 
@@ -53,10 +55,15 @@ export function parseCanonicalArgs(argv, env = process.env) {
   try { launch = JSON.parse(env[LAUNCH_ENV]); } catch { throw new Error('sealed launch required'); }
   if (!exactObject(launch, [
     'version', 'process_generation', 'configured_account_jid',
-    'ordinary', 'sensitive',
-  ]) || launch.version !== 1
+    'profile', 'mode', 'replay', 'ordinary', 'sensitive',
+  ]) || launch.version !== 2
       || typeof launch.process_generation !== 'string'
       || !/^[a-f0-9]{64}$/.test(launch.process_generation)
+      || launch.profile !== 'juno'
+      || launch.mode !== 'sensitive-outbound-only'
+      || !exactObject(launch.replay, [
+        'root', 'root_identity', 'anchor_path', 'authority_sha256',
+      ])
       || !exactObject(launch.ordinary, [
         'adapter_generation', 'runtime_id', 'socket_generation',
         'account_phone_jid', 'account_lid_jid', 'session_path',
@@ -117,6 +124,7 @@ export function parseCanonicalArgs(argv, env = process.env) {
     sensitiveAccountJid,
     ordinaryAccountJid,
     launch,
+    replayIdentity: Object.freeze({ ...launch.replay }),
   });
 }
 
@@ -124,6 +132,7 @@ export async function runSensitiveBridge({
   argv = process.argv.slice(2),
   env = process.env,
   transportIdentity,
+  testProviderSeam = null,
 } = {}) {
   // This is a dedicated process. Keep every subsequently created auth/session
   // artifact owner-only even if the service manager inherited a looser mask.
@@ -140,7 +149,11 @@ export async function runSensitiveBridge({
     sensitiveAccountJid,
     ordinaryAccountJid,
     launch,
+    replayIdentity,
   } = parseCanonicalArgs(argv, env);
+  // Replay authority is opened and validated before auth state, socket, HTTP
+  // publication, or any provider object is constructed.
+  const replayAuthority = new DurableReceiverReplayAuthority(replayIdentity);
   // Activation requires two independently generated linked-device auth
   // artifacts, not merely two different path strings.
   const sessionPathGuard = prepareSessionPaths(sessionDir, ordinarySessionDir, {
@@ -186,10 +199,30 @@ export async function runSensitiveBridge({
     transportIdentity,
     canonicalizeJid: jidNormalizedUser,
     generateMessageId: (userId) => generateMessageIDV2(userId),
+    replayAuthority,
   });
   const server = http.createServer();
   let fatalCode = null;
-  const lifecycle = new SensitiveSocketLifecycle({
+  let stopped = false;
+  let lifecycle = null;
+  let parentAlive = true;
+  const closeAuthority = () => {
+    if (stopped) return;
+    stopped = true;
+    transport.setEnabled(false);
+    lifecycle?.stop();
+    try { server.closeAllConnections?.(); } catch {}
+    try { server.close(); } catch {}
+  };
+  const parentLost = () => {
+    if (!parentAlive) return;
+    parentAlive = false;
+    closeAuthority();
+    process.exitCode = 1;
+    setImmediate(() => process.exit(1));
+  };
+  const parentControl = bindOwnedParentControl(parentLost);
+  lifecycle = new SensitiveSocketLifecycle({
     sessionPathGuard,
     expectedSensitiveAccountJid: sensitiveAccountJid,
     ordinaryAccountJid,
@@ -212,7 +245,7 @@ export async function runSensitiveBridge({
       }
       return auth;
     },
-    makeSocket: makeWASocket,
+    makeSocket: testProviderSeam?.makeSocket || makeWASocket,
     canonicalizeJid: jidNormalizedUser,
     onBound: (connection) => transport.bindConnection(connection),
     onUnbound: (reason) => transport.unbindConnection(reason),
@@ -230,16 +263,18 @@ export async function runSensitiveBridge({
   server.keepAliveTimeout = 1_000;
   server.maxRequestsPerSocket = 32;
   await lifecycle.start();
-  if (fatalCode || lifecycle.fatalCode) throw new Error('sensitive bridge startup rejected');
+  if (!parentAlive || !parentControl.live() || fatalCode || lifecycle.fatalCode) {
+    closeAuthority();
+    throw new Error('sensitive bridge startup rejected');
+  }
   await listenLoopback(server, { port });
+  if (!parentAlive || !parentControl.live()) {
+    closeAuthority();
+    throw new Error('sensitive bridge parent unavailable');
+  }
 
-  let stopped = false;
   const stop = () => {
-    if (stopped) return;
-    stopped = true;
-    transport.setEnabled(false);
-    lifecycle.stop();
-    server.close();
+    closeAuthority();
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);

@@ -13,9 +13,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +85,19 @@ def _run_node_suite(package: Path, private: Path) -> None:
         check=True, cwd=package, env={**os.environ, "HOME": str(private / "home")},
         timeout=300,
     )
+
+
+def _port_release_status(port: int) -> bool | None:
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", port))
+        return True
+    except PermissionError:
+        return None
+    except OSError:
+        return False
+    finally:
+        probe.close()
 
 
 def main() -> int:
@@ -174,24 +189,67 @@ def main() -> int:
             ),
             "JUNO_ISOLATED_SENSITIVE_PACKAGE": str(sensitive),
         }
-        completed = subprocess.run(
-            [
-                sys.executable, "-m", "pytest", "-q",
-                "-rs",
-                "tests/gateway/test_juno_private_read_mvp_remediation.py",
-                "-k", (
-                    "actual_start_socket_route_adapter_dispatch or "
-                    "actual_start_socket_registration_mutation_blocks_dispatch or "
-                    "sensitive_launcher_mutation_rejects_before_core_import or "
-                    "offline_cross_runtime_producer_to_private_delivery_vertical or "
-                    "no_socket_vertical_preserves_producer_adapter_and_replay_contract"
-                ),
-            ],
-            cwd=ROOT,
-            env=env,
-            timeout=180,
+        vertical_tests = (
+            "test_actual_start_socket_route_adapter_dispatch",
+            "test_actual_start_socket_registration_mutation_blocks_dispatch",
+            "test_sensitive_launcher_mutation_rejects_before_core_import",
+            "test_offline_cross_runtime_producer_to_private_delivery_vertical",
+            "test_no_socket_vertical_preserves_producer_adapter_and_replay_contract",
         )
-        return completed.returncode
+        repetitions = int(os.environ.get("JUNO_VERTICAL_REPETITIONS", "1"))
+        if not 1 <= repetitions <= 10:
+            raise RuntimeError("JUNO_VERTICAL_REPETITIONS must be between 1 and 10")
+        host_blocked = False
+        for attempt in range(1, repetitions + 1):
+            for test_name in vertical_tests:
+                report = private / f"vertical-{attempt}-{test_name}.xml"
+                completed = subprocess.run(
+                    [
+                        sys.executable, "-m", "pytest", "-vv", "-rs",
+                        "--timeout=75", "--timeout-method=thread",
+                        "-o", "faulthandler_timeout=70",
+                        f"--junitxml={report}",
+                        (
+                            "tests/gateway/test_juno_private_read_mvp_remediation.py::"
+                            f"{test_name}"
+                        ),
+                    ],
+                    cwd=ROOT,
+                    env={**env, "PYTHONFAULTHANDLER": "1"},
+                    # Collection/import receives a small allowance outside the
+                    # exact test's independent 75-second watchdog.
+                    timeout=105,
+                )
+                if completed.returncode != 0:
+                    return completed.returncode
+                suite = ET.parse(report).getroot()
+                skipped = sum(
+                    int(item.get("skipped", "0"))
+                    for item in suite.iter("testsuite")
+                )
+                if skipped:
+                    print(
+                        f"vertical attempt {attempt} {test_name} was host-blocked "
+                        f"({skipped} skips)",
+                        file=sys.stderr,
+                    )
+                    host_blocked = True
+                port_status = _port_release_status(3011)
+                if port_status is None:
+                    print(
+                        f"vertical attempt {attempt} {test_name} could not inspect "
+                        "sensitive port 3011 (sandbox denied bind)",
+                        file=sys.stderr,
+                    )
+                    host_blocked = True
+                elif not port_status:
+                    print(
+                        f"vertical attempt {attempt} {test_name} left sensitive "
+                        "port 3011 owned",
+                        file=sys.stderr,
+                    )
+                    return 3
+        return 2 if host_blocked else 0
 
 
 if __name__ == "__main__":

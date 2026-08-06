@@ -14,9 +14,12 @@ export const SENSITIVE_SUBMIT_CONTRACT_VERSION = 'juno-sensitive-submit-v2';
 export const CANONICAL_SOURCE_FILES = Object.freeze([
   'delivery_core.js',
   'http_server.js',
+  'inherited_test_provider.js',
   'lifecycle.js',
   'offline_provision.js',
+  'parent_control.js',
   'provisioning_core.js',
+  'replay_authority.js',
   'session_paths.js',
   'sensitive_bridge.js',
 ]);

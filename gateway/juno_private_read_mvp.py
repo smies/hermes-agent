@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -54,12 +55,12 @@ SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
 SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
 ORDINARY_INBOUND_PROVENANCE = "messages.upsert:registered-emitting-socket:v1"
 _SENSITIVE_TRANSPORT_IDENTITY = {
-    "manifest_sha256": "f0fec17a6fa4e913e315f2dff35e536152f15d80a8d88398f42a92c60eb969fe",
-    "launcher_sha256": "7b8e88fe70c9e89c5b9fa348fd45ee4b771867c95569a50ae146c494a420570d",
-    "source_sha256": "d730028ba37ef7cd2a645200a7e19a60e250b7b2fab4d8f19f53c4cdabc82a4f",
+    "manifest_sha256": "795fc764fb28bb3d53e6abed1dc2de4bc02c6b41f330cc6120b81312ef540232",
+    "launcher_sha256": "722bbfe84f597433f0e57c398410abbac88f690a589673b80fa5915b9a91c396",
+    "source_sha256": "b1edb61d9cb4e5d072832997d499aa901ef3065b6377afac0f98f6339d6ebed3",
     "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
     "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
-    "verifier_sha256": "b2f77c04853eead92cfbc2614bb2ed474db714d04a73dd16b0f7013cfca431a5",
+    "verifier_sha256": "b486e4afee374d864bf3f1d219dc301aac45578822f96e3b494f93ca91a20770",
     "node_modules_tree_sha256": "48121207ef2e275e835b08cf58b264b8f0d4ef56eddb07298e833a2720dc62ef",
     "package_name": "hermes-whatsapp-sensitive-bridge",
     "package_version": "1.0.0",
@@ -1478,6 +1479,10 @@ class JunoPrivateReadMvpHost:
         if not self._ordinary_fence_healthy():
             return False
         try:
+            # Establish the receiver-owned replay domain before creating any
+            # authorization state.  Thereafter its absence is damage and may
+            # never be interpreted as a fresh install.
+            _prepare_sensitive_receiver_replay_authority(self.config.state_dir)
             master = _load_or_create_state_key(self.config.state_dir)
         except JunoPrivateReadError:
             return False
@@ -2079,6 +2084,112 @@ def resolve_juno_ordinary_runtime_topology(
         return None
 
 
+_SENSITIVE_RECEIVER_REPLAY_DIRECTORY = "sensitive-receiver-replay"
+_SENSITIVE_RECEIVER_REPLAY_ANCHOR = "sensitive-receiver-replay.anchor"
+_SENSITIVE_RECEIVER_REPLAY_AUTHORITY = ".authority"
+
+
+def _prepare_sensitive_receiver_replay_authority(state_dir: Path) -> dict[str, str]:
+    """Create once, then strictly validate, the receiver-owned replay domain.
+
+    The sibling anchor makes disappearance of the replay directory fail closed
+    instead of looking like a fresh install.  This domain is deliberately not
+    part of authorization SQLite and is never rebuilt from authorization rows.
+    """
+    root = state_dir / _SENSITIVE_RECEIVER_REPLAY_DIRECTORY
+    anchor = state_dir / _SENSITIVE_RECEIVER_REPLAY_ANCHOR
+    authority = root / _SENSITIVE_RECEIVER_REPLAY_AUTHORITY
+
+    def owner_regular(path: Path) -> os.stat_result:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+            or path.resolve(strict=True) != path
+        ):
+            raise JunoPrivateReadError("sensitive replay authority unavailable")
+        return info
+
+    def sync_directory(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def write_all(descriptor: int, value: bytes) -> None:
+        offset = 0
+        while offset < len(value):
+            written = os.write(descriptor, value[offset:])
+            if written <= 0:
+                raise JunoPrivateReadError("sensitive replay authority unavailable")
+            offset += written
+
+    try:
+        root_exists, anchor_exists = root.exists(), anchor.exists()
+        if root_exists != anchor_exists:
+            raise JunoPrivateReadError("sensitive replay authority unavailable")
+        if not root_exists:
+            # Creation is a one-time pristine-state transition. Once any Juno
+            # state exists, disappearance of both replay artifacts is damage,
+            # not a new install, and must not make old request IDs reusable.
+            if any(state_dir.iterdir()):
+                raise JunoPrivateReadError("sensitive replay authority unavailable")
+            root.mkdir(mode=0o700, parents=False)
+            marker = secrets.token_hex(32).encode("ascii") + b"\n"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL \
+                | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(authority, flags, 0o600)
+            try:
+                write_all(descriptor, marker)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            authority_sha256 = hashlib.sha256(marker).hexdigest()
+            descriptor = os.open(anchor, flags, 0o600)
+            try:
+                write_all(descriptor, authority_sha256.encode("ascii") + b"\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            sync_directory(root)
+            sync_directory(state_dir)
+        if root.resolve(strict=True) != root:
+            raise JunoPrivateReadError("sensitive replay authority unavailable")
+        root_info = root.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode)
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+            or (hasattr(os, "getuid") and root_info.st_uid != os.getuid())
+        ):
+            raise JunoPrivateReadError("sensitive replay authority unavailable")
+        owner_regular(anchor)
+        owner_regular(authority)
+        marker = authority.read_bytes()
+        authority_sha256 = hashlib.sha256(marker).hexdigest()
+        if (
+            len(marker) != 65
+            or re.fullmatch(rb"[a-f0-9]{64}\n", marker) is None
+            or anchor.read_bytes() != authority_sha256.encode("ascii") + b"\n"
+        ):
+            raise JunoPrivateReadError("sensitive replay authority unavailable")
+        return {
+            "root": str(root),
+            "root_identity": f"{root_info.st_dev}:{root_info.st_ino}",
+            "anchor_path": str(anchor),
+            "authority_sha256": authority_sha256,
+        }
+    except JunoPrivateReadError:
+        raise
+    except BaseException:
+        raise JunoPrivateReadError("sensitive replay authority unavailable") from None
+
+
 class _SensitiveBridgeSupervisor:
     """Own one reviewed sensitive child and its fresh submission capability."""
 
@@ -2096,13 +2207,17 @@ class _SensitiveBridgeSupervisor:
         self.capability = secrets.token_urlsafe(48)
         self.topology_identity: tuple[tuple[str, str], ...] = ()
         self._last_verified_monotonic = 0.0
+        self._replay_identity: dict[str, str] | None = None
 
     def _launch_descriptor(self) -> dict[str, object]:
         topology = self.topology
         return {
-            "version": 1,
+            "version": 2,
             "process_generation": self.process_generation,
             "configured_account_jid": self.config.sensitive_account,
+            "profile": self.config.profile,
+            "mode": "sensitive-outbound-only",
+            "replay": dict(self._replay_identity or {}),
             "ordinary": {
                 "adapter_generation": topology.adapter_generation,
                 "runtime_id": topology.ordinary_runtime_id,
@@ -2140,16 +2255,22 @@ class _SensitiveBridgeSupervisor:
             if node is None or hashlib.sha256(launcher.read_bytes()).hexdigest() \
                     != SENSITIVE_VERIFIED_LAUNCHER_SHA256:
                 return False
+            self._replay_identity = _prepare_sensitive_receiver_replay_authority(
+                self.config.state_dir
+            )
             env = with_hermes_node_path()
             env.pop("HERMES_WHATSAPP_SENSITIVE_CAPABILITY", None)
             env.pop("HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH", None)
+            env.pop("HERMES_INTERNAL_JUNO_TEST_PROVIDER_AUTHORITY_FD", None)
+            env.pop("HERMES_INTERNAL_JUNO_TEST_PROVIDER_CAPTURE_FD", None)
+            env.pop("HERMES_INTERNAL_JUNO_TEST_PROVIDER_AUTHORITY_SHA256", None)
             env["HERMES_WHATSAPP_SENSITIVE_CAPABILITY"] = self.capability
             env["HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH"] = json.dumps(
                 self._launch_descriptor(), sort_keys=True, separators=(",", ":"),
             )
             self.process = subprocess.Popen(
                 [node, str(launcher), "--port", str(self.port)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, env=env,
                 **windows_detach_popen_kwargs(),
             )
@@ -2163,6 +2284,9 @@ class _SensitiveBridgeSupervisor:
                     self._last_verified_monotonic = time.monotonic()
                     return True
                 await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            await self.stop()
+            raise
         except BaseException:
             pass
         await self.stop()
@@ -2235,7 +2359,20 @@ class _SensitiveBridgeSupervisor:
         self.capability = ""
         self.topology_identity = ()
         self._last_verified_monotonic = 0.0
-        if process is None or process.poll() is not None:
+        self._replay_identity = None
+        if process is None:
+            return
+        control = process.stdin
+        if control is not None:
+            try:
+                control.close()
+            except BaseException:
+                pass
+        if process.poll() is not None:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(process.wait), timeout=1)
+            except BaseException:
+                pass
             return
         try:
             process.terminate()
@@ -2243,6 +2380,10 @@ class _SensitiveBridgeSupervisor:
         except BaseException:
             try:
                 process.kill()
+            except BaseException:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.to_thread(process.wait), timeout=3)
             except BaseException:
                 pass
 

@@ -5,7 +5,7 @@ import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const EXPECTED_MANIFEST_SHA256 = 'f0fec17a6fa4e913e315f2dff35e536152f15d80a8d88398f42a92c60eb969fe';
+export const EXPECTED_MANIFEST_SHA256 = '795fc764fb28bb3d53e6abed1dc2de4bc02c6b41f330cc6120b81312ef540232';
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -73,7 +73,22 @@ export async function verifySensitiveTransport(
 export async function launchSensitiveBridge(argv = process.argv.slice(2), env = process.env) {
   const identity = await verifySensitiveTransport();
   const core = await import('./sensitive_bridge.js');
-  return core.runSensitiveBridge({ argv, env, transportIdentity: identity });
+  let testProviderSeam = null;
+  if ([
+    'HERMES_INTERNAL_JUNO_TEST_PROVIDER_AUTHORITY_FD',
+    'HERMES_INTERNAL_JUNO_TEST_PROVIDER_CAPTURE_FD',
+    'HERMES_INTERNAL_JUNO_TEST_PROVIDER_AUTHORITY_SHA256',
+  ].some(name => env[name] !== undefined)) {
+    const seam = await import('./inherited_test_provider.js');
+    let launch;
+    try { launch = JSON.parse(env.HERMES_INTERNAL_WHATSAPP_SENSITIVE_LAUNCH); } catch {
+      throw new Error('inherited test provider authority rejected');
+    }
+    testProviderSeam = seam.loadInheritedTestProvider(env, launch);
+  }
+  return core.runSensitiveBridge({
+    argv, env, transportIdentity: identity, testProviderSeam,
+  });
 }
 
 if (process.argv[1]

@@ -13,6 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseCanonicalArgs, runSensitiveBridge } from './sensitive_bridge.js';
+import { initializeReceiverReplayAuthority } from './replay_authority.js';
 import { SessionPathGuard } from './session_paths.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,7 @@ const SENSITIVE_SESSION = path.join(SESSION_ROOT, 'sensitive');
 const ORDINARY_SESSION = path.join(SESSION_ROOT, 'ordinary');
 mkdirSync(ORDINARY_SESSION, { mode: 0o700 });
 mkdirSync(SENSITIVE_SESSION, { mode: 0o700 });
+const REPLAY = initializeReceiverReplayAuthority(path.join(SESSION_ROOT, 'receiver-replay'));
 
 function args(overrides = {}) {
   const values = {
@@ -37,9 +39,12 @@ function launchEnv(overrides = {}) {
   const ordinaryStat = lstatSync(ORDINARY_SESSION, { bigint: true });
   const sensitiveStat = lstatSync(SENSITIVE_SESSION, { bigint: true });
   const launch = {
-    version: 1,
+    version: 2,
     process_generation: 'a'.repeat(64),
     configured_account_jid: SENSITIVE,
+    profile: 'juno',
+    mode: 'sensitive-outbound-only',
+    replay: REPLAY,
     ordinary: {
       adapter_generation: 'b'.repeat(64), runtime_id: 'ordinary-runtime',
       socket_generation: 1, account_phone_jid: SENSITIVE,
@@ -71,6 +76,7 @@ test('canonical launcher requires the same exact account identity and refuses in
     sensitiveAccountJid: SENSITIVE,
     ordinaryAccountJid: ORDINARY,
     launch: parsed.launch,
+    replayIdentity: parsed.replayIdentity,
   });
   assert.throws(
     () => parseCanonicalArgs(args(), launchEnv({ configured_account_jid: DIFFERENT })),

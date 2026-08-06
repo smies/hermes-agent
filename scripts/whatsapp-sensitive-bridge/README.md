@@ -112,6 +112,29 @@ checks again with no event-loop yield before `sendMessage`. Exact expiry is
 stale. Missing, malformed, incoherent, or more-than-five-minute deadlines fail
 closed without invoking the provider send primitive.
 
+Immediately before the final provider call, the receiver creates and fsyncs an
+owner-only `O_CREAT|O_EXCL` tombstone under the dedicated
+`sensitive-receiver-replay` authority. The filename is a SHA-256 of the logical
+request ID; the bounded record contains only the request-ID digest and a digest
+of the complete profile/mode/runtime/session/account/destination/expiry/payload/
+topology descriptor. Tombstones are permanent: expiry does not make a logical
+request ID reusable. The authority is initialized only before any other Juno
+state exists; missing replay artifacts in a non-pristine state directory fail
+closed. This intentionally trades unbounded long-term inode/disk growth for
+durable one-shot semantics. Operators must monitor the directory and expand or
+migrate the whole sealed authority; deleting or pruning individual tombstones
+makes the receiver fail closed and is not supported.
+
+The Python supervisor is the sole writer of the child's inherited stdin control
+pipe. EOF/error disables HTTP and provider authority, tears down the socket, and
+exits the child, including after supervisor `SIGKILL` or `os._exit`. Graceful
+shutdown closes that pipe before TERM/KILL escalation and waits for the exact
+child. The exact-launcher test provider seam requires two inherited owner-only
+file descriptors plus a parent-PID/process-generation/expiry-bound authority;
+it is absent from launch descriptors, scrubbed by the production supervisor,
+and exists only to intercept the final synthetic test send below the reviewed
+launcher/core boundary without WhatsApp network access.
+
 The audited dependency is exactly
 `@whiskeysockets/baileys@7.0.0-rc14`, resolved from its npm tarball with the
 integrity recorded in `transport-manifest.json`.

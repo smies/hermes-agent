@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { chmodSync, mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import {
   CAPABILITY_HEADER,
@@ -9,9 +12,21 @@ import {
   listenLoopback,
 } from './http_server.js';
 import { SensitiveDeliveryTransport } from './delivery_core.js';
+import {
+  DurableReceiverReplayAuthority,
+  initializeReceiverReplayAuthority,
+} from './replay_authority.js';
 
 const CAPABILITY = 'capability-8f0e9d16c2ac4ab096e9d30db0371fcba4c2cde36b424db8';
 const MVP_SUBMIT_CONTRACT = SENSITIVE_SUBMIT_CONTRACT_VERSION;
+
+function freshReplayAuthority() {
+  const state = mkdtempSync(path.join(realpathSync.native(tmpdir()), 'juno-http-replay-'));
+  chmodSync(state, 0o700);
+  return new DurableReceiverReplayAuthority(
+    initializeReceiverReplayAuthority(path.join(state, 'receiver-replay')),
+  );
+}
 
 function invoke(handler, { method = 'POST', path = '/v1/submit', headers = {}, chunks = [] } = {}) {
   return new Promise((resolve) => {
@@ -300,6 +315,7 @@ test('real HTTP handler calls real MVP transport with live identity and fake soc
     transportIdentity: { manifest_sha256: 'a'.repeat(64) },
     canonicalizeJid: (jid) => String(jid).replace(/:\d+@/, '@'),
     generateMessageId: () => messageId,
+    replayAuthority: freshReplayAuthority(),
   });
   transport.bindConnection({ sock, accountJid: account, epoch });
   const handler = createSensitiveHttpHandler({ capability: CAPABILITY, transport });

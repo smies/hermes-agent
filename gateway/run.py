@@ -6259,21 +6259,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task.add_done_callback(background.discard)
 
     async def _juno_private_read_reconciler(self) -> None:
+        while not self._shutdown_event.is_set():
+            await self._reconcile_juno_private_read_host_once()
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+        # Natural shutdown owns depublish.  Forced task cancellation does not:
+        # the cancelling caller joins this poller first, then owns teardown.
+        await self._depublish_juno_private_read_generation()
+
+    async def _stop_juno_private_read_reconciler(self) -> bool:
+        """Cancel and join the poller without making it own slow teardown.
+
+        Generation resources are depublished by the caller after this join.
+        Keeping cleanup out of the task's cancellation ``finally`` prevents a
+        cancelled timed wait from becoming an unbounded hidden cleanup owner.
+        """
+        task = getattr(self, "_trusted_private_read_reconciler_task", None)
+        self._trusted_private_read_reconciler_task = None
+        if task is None or task is asyncio.current_task():
+            return task is None
+        task.cancel()
+        done, pending = await asyncio.wait({task}, timeout=2.0)
+        if pending:
+            logger.error("Trusted private-read reconciler did not terminate")
+            task.cancel()
+            return False
         try:
-            while not self._shutdown_event.is_set():
-                await self._reconcile_juno_private_read_host_once()
-                try:
-                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    pass
+            task.result()
         except asyncio.CancelledError:
-            raise
-        finally:
-            if (
-                getattr(self, "_trusted_private_read_config", None) is not None
-                or getattr(self, "_trusted_private_read_supervisor", None) is not None
-            ):
-                await self._depublish_juno_private_read_generation()
+            pass
+        except BaseException:
+            logger.error("Trusted private-read reconciler failed during shutdown")
+        return bool(done)
 
     def _current_juno_private_read_topology(self):
         config = getattr(self, "_trusted_private_read_config", None)
@@ -6341,28 +6360,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         config = self._trusted_private_read_config
         supervisor = _SensitiveBridgeSupervisor(config, topology)
-        if not await supervisor.start():
-            await supervisor.stop()
-            return None
-        services = compose_juno_private_read_mvp_services(
-            self, config, sensitive_supervisor=supervisor,
-        )
-        if type(services) is not JunoPrivateReadDependencies:
-            await supervisor.stop()
-            return None
-        ordinary = services.ordinary
-        if type(ordinary) is not _GatewayOrdinaryNotifier \
-                or ordinary._adapter is not topology.adapter:
-            await supervisor.stop()
-            return None
-        host = JunoPrivateReadMvpHost(
-            config, services, active_profile=self._active_profile_name(),
-        )
-        if not await host.start() or not private_read_tool_surface_is_closed():
-            await host.stop()
-            await supervisor.stop()
-            return None
-        return host, supervisor
+        host = None
+        published = False
+        try:
+            if not await supervisor.start():
+                return None
+            services = compose_juno_private_read_mvp_services(
+                self, config, sensitive_supervisor=supervisor,
+            )
+            if type(services) is not JunoPrivateReadDependencies:
+                return None
+            ordinary = services.ordinary
+            if type(ordinary) is not _GatewayOrdinaryNotifier \
+                    or ordinary._adapter is not topology.adapter:
+                return None
+            host = JunoPrivateReadMvpHost(
+                config, services, active_profile=self._active_profile_name(),
+            )
+            if not await host.start() or not private_read_tool_surface_is_closed():
+                return None
+            published = True
+            return host, supervisor
+        finally:
+            if not published:
+                if host is not None:
+                    try:
+                        await host.stop()
+                    except BaseException:
+                        logger.error("Sensitive private-read host activation cleanup failed")
+                try:
+                    await supervisor.stop()
+                except BaseException:
+                    logger.error("Sensitive private-read child activation cleanup failed")
 
     async def _depublish_juno_private_read_generation(self) -> None:
         host = getattr(self, "_trusted_private_read_host", None)
@@ -12994,20 +13023,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
-            reconcile_task = getattr(
-                self, "_trusted_private_read_reconciler_task", None,
-            )
-            self._trusted_private_read_reconciler_task = None
-            if reconcile_task is not None and reconcile_task is not asyncio.current_task():
-                reconcile_task.cancel()
-                try:
-                    await reconcile_task
-                except asyncio.CancelledError:
-                    pass
-                except BaseException:
-                    logger.error(
-                        "Trusted private-read reconciliation cleanup could not be proven",
-                    )
+            await GatewayRunner._stop_juno_private_read_reconciler(self)
             if (
                 getattr(self, "_trusted_private_read_config", None) is not None
                 or getattr(self, "_trusted_private_read_supervisor", None) is not None

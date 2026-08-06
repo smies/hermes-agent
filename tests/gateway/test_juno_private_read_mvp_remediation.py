@@ -14,6 +14,7 @@ import os
 import re
 import selectors
 import shutil
+import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sqlite3
@@ -50,6 +51,7 @@ from gateway.juno_private_read_mvp import (
     SensitiveRuntimeIdentity,
     SensitiveSubmission,
     _SENSITIVE_TRANSPORT_IDENTITY,
+    _prepare_sensitive_receiver_replay_authority,
     compose_juno_private_read_mvp_services,
     render_gmail_message,
 )
@@ -261,9 +263,42 @@ def _ordinary_bridge_sent(process: subprocess.Popen) -> list[dict]:
 
 def _stop_ordinary_bridge_harness(process: subprocess.Popen) -> None:
     if process.poll() is not None:
+        process.wait(timeout=1)
         return
-    process.stdin.close()
-    process.wait(timeout=5)
+    try:
+        process.stdin.close()
+    except BaseException:
+        pass
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        process.terminate()
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+async def _cancel_task_bounded(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    done, pending = await asyncio.wait({task}, timeout=2)
+    assert not pending, f"task did not terminate: {task.get_name()}"
+    assert task in done
+
+
+def _assert_sensitive_port_released() -> None:
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", 3011))
+    except PermissionError:
+        pytest.skip("execution sandbox denied sensitive-port release assertion")
+    finally:
+        probe.close()
 
 
 class _InProcessBridgeResponse:
@@ -584,8 +619,7 @@ async def test_actual_start_socket_route_adapter_dispatch(
     finally:
         adapter._running = False
         if poll_task is not None:
-            poll_task.cancel()
-            await asyncio.gather(poll_task, return_exceptions=True)
+            await _cancel_task_bounded(poll_task)
         await adapter._http_session.close()
         adapter._http_session = None
         _stop_ordinary_bridge_harness(process)
@@ -650,8 +684,7 @@ async def test_actual_start_socket_registration_mutation_blocks_dispatch(
         assert dispatched == []
     finally:
         adapter._running = False
-        poll_task.cancel()
-        await asyncio.gather(poll_task, return_exceptions=True)
+        await _cancel_task_bounded(poll_task)
         await adapter._http_session.close()
         adapter._http_session = None
         _stop_ordinary_bridge_harness(process)
@@ -1109,6 +1142,9 @@ async def test_replay_genesis_startup_faults_remain_unpublished_and_offline(
     # Supply the exact historical raw-key migration input. Production creates
     # and fsyncs genesis journal+marker before it seals this key, so each
     # injected failure necessarily reaches the named genesis boundary.
+    # Receiver replay authority is a separate prerequisite and must already be
+    # durable before any historical authorization state can exist.
+    _prepare_sensitive_receiver_replay_authority(config.state_dir)
     key_path = config.state_dir / "mvp-store.key"
     config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     config.state_dir.chmod(0o700)
@@ -2573,9 +2609,8 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             assert _VerticalProviderHandler.observed == []
             reconcile_task = runner._trusted_private_read_reconciler_task
             assert reconcile_task is not None
-            reconcile_task.cancel()
-            await asyncio.gather(reconcile_task, return_exceptions=True)
-            runner._trusted_private_read_reconciler_task = None
+            assert await runner._stop_juno_private_read_reconciler()
+            assert reconcile_task.done()
             monkeypatch.delenv(stale_environment)
 
         assert await runner._start_trusted_private_read_host()
@@ -2764,8 +2799,7 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         assert sabotage_dispatches == []
         assert len(tool_results) == tool_count_before_sabotage
         sabotaged_adapter._running = False
-        sabotaged_poll_task.cancel()
-        await asyncio.gather(sabotaged_poll_task, return_exceptions=True)
+        await _cancel_task_bounded(sabotaged_poll_task)
         await sabotaged_adapter._http_session.close()
         sabotaged_adapter._http_session = None
         _stop_ordinary_bridge_harness(sabotaged_process)
@@ -2789,10 +2823,15 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         gateway_log.write_text(caplog.text, encoding="utf-8")
 
         reconcile_task = runner._trusted_private_read_reconciler_task
-        reconcile_task.cancel()
-        await asyncio.gather(reconcile_task, return_exceptions=True)
-        runner._trusted_private_read_reconciler_task = None
+        assert await runner._stop_juno_private_read_reconciler()
+        assert reconcile_task.done()
         await runner._depublish_juno_private_read_generation()
+        assert supervisor.process is None
+        assert all(
+            task.get_name() != "juno-private-read-reconciler"
+            for task in asyncio.all_tasks() if not task.done()
+        )
+        _assert_sensitive_port_released()
         ordinary_surfaces = [
             session_path, trajectory, gateway_log,
         ]
@@ -2817,14 +2856,12 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             session_db.close()
         inbound_adapter._running = False
         if ordinary_poll_task is not None:
-            ordinary_poll_task.cancel()
-            await asyncio.gather(ordinary_poll_task, return_exceptions=True)
+            await _cancel_task_bounded(ordinary_poll_task)
         if inbound_adapter._http_session is not None:
             await inbound_adapter._http_session.close()
             inbound_adapter._http_session = None
         if sabotaged_poll_task is not None and not sabotaged_poll_task.done():
-            sabotaged_poll_task.cancel()
-            await asyncio.gather(sabotaged_poll_task, return_exceptions=True)
+            await _cancel_task_bounded(sabotaged_poll_task)
         if sabotaged_adapter is not None \
                 and sabotaged_adapter._http_session is not None:
             await sabotaged_adapter._http_session.close()
@@ -2835,14 +2872,14 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
             runner, "_trusted_private_read_reconciler_task", None,
         )
         if reconcile_task is not None:
-            reconcile_task.cancel()
-            await asyncio.gather(reconcile_task, return_exceptions=True)
-            runner._trusted_private_read_reconciler_task = None
+            assert await runner._stop_juno_private_read_reconciler()
+            assert reconcile_task.done()
         await runner._depublish_juno_private_read_generation()
         _stop_ordinary_bridge_harness(ordinary_process)
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=2)
+        assert not provider_thread.is_alive()
 
 
 @pytest.mark.asyncio
@@ -3104,6 +3141,10 @@ async def test_immutable_checkpoint_schema_migrates_legacy_rows_fail_closed(
         OpenFgaChecker(config, transport), GmailNewestInboxProvider(config, transport),
         ordinary, sensitive, lambda: True,
     )
+    # This test isolates authorization-schema migration. A receiver replay
+    # authority is now a prerequisite to any persisted Juno state and is not
+    # reconstructed from the legacy authorization checkpoint under test.
+    _prepare_sensitive_receiver_replay_authority(config.state_dir)
     db_path = config.state_dir / "authorization.db"
     key_path = config.state_dir / "mvp-store.key"
     key_path.write_bytes(b"k" * 32)

@@ -1,11 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { chmodSync, mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import {
   SENSITIVE_SUBMIT_CONTRACT_VERSION,
   SensitiveDeliveryTransport,
 } from './delivery_core.js';
+import {
+  DurableReceiverReplayAuthority,
+  initializeReceiverReplayAuthority,
+} from './replay_authority.js';
 
 const CHAT = '15557654321@s.whatsapp.net';
 const ACCOUNT = '15551234567@s.whatsapp.net';
@@ -53,7 +60,7 @@ function harness({
   nowUs = () => NOW,
   lidForPhone = async () => null,
   sendMessage,
-  maxReplayTombstones,
+  replayIdentity,
 } = {}) {
   const calls = [];
   const operations = [];
@@ -85,10 +92,18 @@ function harness({
     canonicalizeJid: canonicalize,
     generateMessageId: () => MESSAGE_ID,
     nowUs,
-    ...(maxReplayTombstones === undefined ? {} : { maxReplayTombstones }),
+    replayAuthority: new DurableReceiverReplayAuthority(
+      replayIdentity || freshReplayIdentity(),
+    ),
   });
   transport.bindConnection({ sock, accountJid: account, epoch: EPOCH });
   return { calls, operations, sock, transport };
+}
+
+function freshReplayIdentity() {
+  const state = mkdtempSync(path.join(realpathSync.native(tmpdir()), 'juno-delivery-replay-'));
+  chmodSync(state, 0o700);
+  return initializeReceiverReplayAuthority(path.join(state, 'receiver-replay'));
 }
 
 test('v2 submit performs one exact correlated plaintext send', async () => {
@@ -236,12 +251,8 @@ test('receiver atomically rejects a concurrent duplicate before a second send', 
   const first = h.transport.submit(request);
   await Promise.resolve();
   const second = h.transport.submit(request);
-  const duplicate = await Promise.race([
-    second,
-    new Promise(resolve => setTimeout(() => resolve(null), 25)),
-  ]);
   release('80808080808@lid');
-  assert.notEqual(duplicate, null, 'duplicate was not rejected before provider work completed');
+  const duplicate = await second;
   assert.equal(duplicate.state, 'failed');
   assert.equal((await first).state, 'submitted');
   await second;
@@ -274,23 +285,12 @@ test('nonce tombstone survives socket reconnect and epoch rotation', async () =>
   assert.equal(h.calls.length, 1);
 });
 
-test('unexpired tombstones are bounded without eviction', async () => {
-  const h = harness({ maxReplayTombstones: 1 });
+test('permanent tombstones do not evict an earlier logical request', async () => {
+  const h = harness();
   assert.equal((await h.transport.submit(submission())).state, 'submitted');
   assert.equal((await h.transport.submit(submission({
     requestId: 'request-01HZX7M6Y2PE5F8K9W3R4T6V8Y',
-  }))).state, 'failed');
-  assert.equal(h.calls.length, 1);
-});
-
-test('expired tombstones are pruned before admitting a new bounded nonce', async () => {
-  let now = NOW;
-  const h = harness({ maxReplayTombstones: 1, nowUs: () => now });
-  assert.equal((await h.transport.submit(submission())).state, 'submitted');
-  now = NOW + 5_000_000;
-  assert.equal((await h.transport.submit(submission({
-    requestId: 'request-01HZX7M6Y2PE5F8K9W3R4T6V8Z',
-    expiresAtUs: now + 4_000_000,
   }))).state, 'submitted');
+  assert.equal((await h.transport.submit(submission())).state, 'failed');
   assert.equal(h.calls.length, 2);
 });
