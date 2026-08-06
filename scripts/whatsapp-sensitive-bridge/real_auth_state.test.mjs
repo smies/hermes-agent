@@ -44,7 +44,7 @@ test('real pinned multi-file auth uses bare numeric LID keys and staged owner-on
           end() {},
         };
         queueMicrotask(async () => {
-          listeners.get('connection.update')?.({ connection: 'connecting' });
+          listeners.get('connection.update')?.({ qr: 'provider-private-readiness' });
           await auth.keys.set({ 'lid-mapping': { [phone]: lidUser } });
           auth.creds.registered = true;
           auth.creds.me = { id: `${phone}@s.whatsapp.net`, lid: `${lidUser}@lid` };

@@ -55,9 +55,9 @@ SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
 SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
 ORDINARY_INBOUND_PROVENANCE = "messages.upsert:registered-emitting-socket:v1"
 _SENSITIVE_TRANSPORT_IDENTITY = {
-    "manifest_sha256": "795fc764fb28bb3d53e6abed1dc2de4bc02c6b41f330cc6120b81312ef540232",
-    "launcher_sha256": "722bbfe84f597433f0e57c398410abbac88f690a589673b80fa5915b9a91c396",
-    "source_sha256": "b1edb61d9cb4e5d072832997d499aa901ef3065b6377afac0f98f6339d6ebed3",
+    "manifest_sha256": "59311b71c2910f176f0acc508b0533d5235b330b3dbd80629571a49a8b64448e",
+    "launcher_sha256": "e2ee6973e7502aff1ae2c17b30b44e592ed18d202232d2b4322a5558aadeef9a",
+    "source_sha256": "014399f7c277d6d8637f83c27185313f394e680dd44f5f78449248b545ecf468",
     "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
     "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
     "verifier_sha256": "b486e4afee374d864bf3f1d219dc301aac45578822f96e3b494f93ca91a20770",

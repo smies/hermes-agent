@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from unittest.mock import patch
@@ -131,14 +132,76 @@ def test_pairing_code_is_only_written_to_explicit_operator_channel(tmp_path: Pat
         ):
         run_whatsapp_provisioning(
             "sensitive",
-            phone="+" + "0" * 11,
+            phone="+15551234567",
             operator=operator,
             machine_output=machine,
         )
     assert code in operator.getvalue()
     assert code not in machine.getvalue()
     assert code not in repr(process.request)
+    assert json.loads(process.request)["phone"] == "+15551234567"
     assert process.kwargs is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Node operator-channel contract")
+def test_real_node_boundary_surfaces_allowlisted_pre_code_failure_without_mutation(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    fixture = tmp_path / "provisioner-fixture.mjs"
+    fixture.write_text(
+        """
+let request = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { request += chunk; });
+process.stdin.on('end', () => {
+  JSON.parse(request);
+  process.stderr.write(JSON.stringify({
+    event: 'pairing_failure', reason: 'pairing_request_failed',
+  }) + '\\n');
+  process.stdout.write(JSON.stringify({
+    event: 'complete', state: 'needs_provisioning',
+  }) + '\\n');
+  process.exitCode = 1;
+});
+""",
+        encoding="utf-8",
+    )
+    ordinary = tmp_path / "ordinary"
+    sensitive = tmp_path / "sensitive"
+    operator = _TTY()
+    machine = io.StringIO()
+    with (
+        patch(
+            "hermes_cli.whatsapp_provisioning.find_node_executable",
+            return_value=node,
+        ),
+        patch(
+            "hermes_cli.whatsapp_provisioning.resolve_provisioning_roots",
+            return_value=(ordinary, sensitive),
+        ),
+        patch(
+            "hermes_cli.whatsapp_provisioning._provisioner_script",
+            return_value=fixture,
+        ),
+        patch("hermes_cli.whatsapp_provisioning._ensure_provisioner_dependencies"),
+        pytest.raises(
+            WhatsAppProvisioningError,
+            match="pairing-code request failed before a code was issued",
+        ),
+    ):
+        run_whatsapp_provisioning(
+            "sensitive",
+            phone="+15551234567",
+            operator=operator,
+            machine_output=machine,
+        )
+    assert operator.getvalue() == ""
+    assert machine.getvalue() == ""
+    assert not ordinary.exists()
+    assert not sensitive.exists()
 
 
 def test_noninteractive_operator_is_rejected_before_spawn() -> None:

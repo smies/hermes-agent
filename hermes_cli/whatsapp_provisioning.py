@@ -27,7 +27,25 @@ _MAX_EVENT_BYTES = 4096
 _ROLES = frozenset({"ordinary", "sensitive"})
 _PAIRING_CODE_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTVWXYZ"
 _PAIRING_CODE_RE = re.compile(rf"^[{_PAIRING_CODE_ALPHABET}]{{8}}$")
-_SENSITIVE_PROVISION_LAUNCHER_SHA256 = "b812665a229f8947c9b4da2fda1ec3fa5a2ace2002dea49b31662f01500a5b31"
+_PRE_CODE_FAILURE_MESSAGES = {
+    "connection_closed": (
+        "WhatsApp connection closed before a pairing code was issued"
+    ),
+    "ordinary_session_not_ready": (
+        "ordinary WhatsApp session is not ready for sensitive provisioning"
+    ),
+    "pairing_code_invalid": "WhatsApp returned an invalid pairing code",
+    "pairing_request_failed": (
+        "WhatsApp pairing-code request failed before a code was issued"
+    ),
+    "provisioning_failed": (
+        "WhatsApp provisioning failed before a pairing code was issued"
+    ),
+    "provisioning_timeout": (
+        "WhatsApp provisioning timed out before a pairing code was issued"
+    ),
+}
+_SENSITIVE_PROVISION_LAUNCHER_SHA256 = "6f2b08d8e7eafb1dd713dadef8466ae6e11ff94914ab53dbc3c32efff823b7a0"
 
 
 class WhatsAppProvisioningError(RuntimeError):
@@ -389,9 +407,25 @@ def run_whatsapp_provisioning(
             if not code_frame or len(code_frame.encode("utf-8")) > 256 or not code_frame.endswith("\n"):
                 raise WhatsAppProvisioningError("provisioner returned an invalid code")
             code_event = json.loads(code_frame)
-            code = code_event.get("code") if type(code_event) is dict else None
+            if type(code_event) is not dict:
+                raise WhatsAppProvisioningError("provisioner returned an invalid code")
+            if code_event.get("event") == "pairing_failure":
+                reason = code_event.get("reason")
+                if (
+                    set(code_event) != {"event", "reason"}
+                    or type(reason) is not str
+                    or reason not in _PRE_CODE_FAILURE_MESSAGES
+                ):
+                    raise WhatsAppProvisioningError(
+                        "provisioner returned an invalid failure reason"
+                    )
+                raise WhatsAppProvisioningError(
+                    _PRE_CODE_FAILURE_MESSAGES[reason]
+                )
+            code = code_event.get("code")
             if (
-                code_event.get("event") != "pairing_code"
+                set(code_event) != {"event", "code"}
+                or code_event.get("event") != "pairing_code"
                 or type(code) is not str
                 or _PAIRING_CODE_RE.fullmatch(code) is None
             ):
@@ -423,6 +457,9 @@ def run_whatsapp_provisioning(
             if operator_thread.is_alive():
                 raise subprocess.TimeoutExpired(child_args, timeout_seconds)
             if operator_failure:
+                failure = operator_failure[0]
+                if isinstance(failure, WhatsAppProvisioningError):
+                    raise failure from None
                 raise WhatsAppProvisioningError(
                     "provisioner returned an invalid code"
                 ) from None

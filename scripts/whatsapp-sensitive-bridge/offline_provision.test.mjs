@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import {
   chmod, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile,
 } from 'node:fs/promises';
@@ -9,8 +10,10 @@ import path from 'node:path';
 
 import {
   commitStagedSession,
+  PRE_CODE_FAILURE_REASONS,
   ProvisioningCommitError,
   provisionOffline,
+  runProvisioner,
   validateExistingOffline,
 } from './offline_provision.js';
 import { parseProvisioningRequest } from './provisioning_core.js';
@@ -123,6 +126,60 @@ function fakeSocket({ phoneJid, lidJid, update, onPairingCode }) {
   queueMicrotask(() => ev.emit('connection.update', update(socket)));
   return socket;
 }
+
+function wireRequest(phone = '+15551234567') {
+  return Readable.from([`${JSON.stringify({
+    version: 1,
+    action: 'provision',
+    role: 'ordinary',
+    phone,
+    ordinary_session: '/tmp/hermes-wire-ordinary',
+    sensitive_session: '/tmp/hermes-wire-sensitive',
+  })}\n`]);
+}
+
+test('operator wire accepts leading plus and emits exactly one pairing-code frame', async () => {
+  const output = [];
+  const operator = [];
+  const exitCode = await runProvisioner({
+    input: wireRequest(),
+    output: { write: frame => output.push(frame) },
+    operatorOutput: { write: frame => operator.push(frame) },
+    provision: async ({ request, emitCode }) => {
+      assert.equal(request.phone, '15551234567');
+      emitCode('ABCD3FGH');
+      return { account_namespace: 's.whatsapp.net', lid_ready: true };
+    },
+  });
+  assert.equal(exitCode, 0);
+  assert.deepEqual(operator.map(JSON.parse), [{ event: 'pairing_code', code: 'ABCD3FGH' }]);
+  assert.deepEqual(output.map(JSON.parse), [{
+    event: 'complete', state: 'ready_for_production',
+    account_namespace: 's.whatsapp.net', lid_ready: true,
+  }]);
+});
+
+test('pre-code wire failures expose only a finite content-free allowlisted reason', async () => {
+  const raw = 'provider rejected 15551234567@s.whatsapp.net from /private/session';
+  const output = [];
+  const operator = [];
+  const exitCode = await runProvisioner({
+    input: wireRequest(),
+    output: { write: frame => output.push(frame) },
+    operatorOutput: { write: frame => operator.push(frame) },
+    provision: async () => {
+      throw new Error('pairing_request_failed', { cause: new Error(raw) });
+    },
+  });
+  assert.equal(exitCode, 1);
+  assert.deepEqual(operator.map(JSON.parse), [
+    { event: 'pairing_failure', reason: 'pairing_request_failed' },
+  ]);
+  assert.ok(PRE_CODE_FAILURE_REASONS.includes(JSON.parse(operator[0]).reason));
+  assert.equal(`${output.join('')}\n${operator.join('')}`.includes(raw), false);
+  assert.equal(`${output.join('')}\n${operator.join('')}`.includes('15551234567'), false);
+  assert.equal(`${output.join('')}\n${operator.join('')}`.includes('/private/session'), false);
+});
 
 async function syncDirectoryForTest(directory) {
   const handle = await open(directory, 'r');
@@ -305,7 +362,7 @@ test('offline provisioning uses only requestPairingCode and persists canonical L
           phoneJid,
           lidJid,
           onPairingCode: () => { pairingCalls += 1; },
-          update: () => ({ connection: 'connecting' }),
+          update: () => ({ qr: 'provider-private-readiness' }),
         });
         socket.sendMessage = () => { sendCalls += 1; };
         queueMicrotask(() => socket.ev.emit('connection.update', { connection: 'open' }));
@@ -323,38 +380,51 @@ test('offline provisioning uses only requestPairingCode and persists canonical L
   }
 });
 
-test('offline provisioning closes the socket on a forbidden alternate payload', async () => {
+test('pairing request failure discards provider details and leaves the target absent', async () => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-provision-')));
   const ordinary = path.join(root, 'ordinary');
   const sensitive = path.join(root, 'sensitive');
   const { phone, phoneJid, lidJid } = identities();
+  const ordinaryCreds = authIdentity(phoneJid, lidJid, 17);
   let socket;
   try {
+    await chmod(root, 0o700);
+    await mkdir(ordinary, { mode: 0o700 });
+    const ordinaryBytes = JSON.stringify(ordinaryCreds);
+    await writeFile(path.join(ordinary, 'creds.json'), ordinaryBytes, { mode: 0o600 });
     const request = parseProvisioningRequest({
       version: 1,
       action: 'provision',
-      role: 'ordinary',
+      role: 'sensitive',
       phone,
       ordinary_session: ordinary,
       sensitive_session: sensitive,
     });
     await assert.rejects(provisionOffline({
       request,
-      canonicalizeJid: (value) => String(value),
-      useAuthState: async () => ({ state: { creds: {}, keys: {} }, saveCreds: async () => {} }),
+      canonicalizeJid: (value) => String(value).replace(/:\d+@/, '@'),
+      useAuthState: async (session) => ({
+        state: session === ordinary ? {
+          creds: ordinaryCreds,
+          keys: { get: async () => ({ [phone]: lidJid.split('@')[0] }) },
+        } : { creds: {}, keys: {} },
+        saveCreds: async () => {},
+      }),
       makeSocket: () => {
         socket = fakeSocket({
           phoneJid,
           lidJid,
-          onPairingCode: () => {},
-          update: () => ({ qr: 'forbidden' }),
+          onPairingCode: () => { throw new Error('raw provider response with identifiers'); },
+          update: () => ({ qr: 'provider-private-readiness' }),
         });
         return socket;
       },
       emitCode: () => assert.fail('pairing code must not be emitted'),
       timeoutMs: 2_000,
-    }), /qr_payload_forbidden/);
+    }), /pairing_request_failed/);
     assert.equal(socket.endCalled, true);
+    assert.equal(await readFile(path.join(ordinary, 'creds.json'), 'utf8'), ordinaryBytes);
+    await assert.rejects(stat(sensitive), { code: 'ENOENT' });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -407,7 +477,7 @@ test('reprovision stages fresh auth, requests a fresh code, and preserves existi
           requestPairingCode: async () => { pairingCalls += 1; return 'R3PR9V1S'; },
           end() {},
         };
-        queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
+        queueMicrotask(() => ev.emit('connection.update', { qr: 'provider-private-readiness' }));
         queueMicrotask(() => ev.emit('connection.update', { connection: 'close' }));
         return socket;
       },
@@ -480,7 +550,7 @@ test('explicit reprovision replaces unsafe legacy auth with fresh owner-only sta
           requestPairingCode: async () => { pairingCalls += 1; return 'M3GYC9DE'; },
           end() {},
         };
-        queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
+        queueMicrotask(() => ev.emit('connection.update', { qr: 'provider-private-readiness' }));
         queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
@@ -550,7 +620,7 @@ test('post-install staged failure restores the exact unsafe legacy tree', async 
           requestPairingCode: async () => 'R9MMB4CK',
           end() {},
         };
-        queueMicrotask(() => ev.emit('connection.update', { connection: 'connecting' }));
+        queueMicrotask(() => ev.emit('connection.update', { qr: 'provider-private-readiness' }));
         queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
@@ -662,7 +732,7 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
           end() {},
         };
         queueMicrotask(async () => {
-          ev.emit('connection.update', { connection: 'connecting' });
+          ev.emit('connection.update', { qr: 'provider-private-readiness' });
           await firstMayContinue;
           ev.emit('connection.update', { connection: 'open' });
         });

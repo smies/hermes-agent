@@ -25,6 +25,14 @@ const MAX_INPUT_BYTES = 4096;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const AUTH_DIRECTORY_MODE = 0o700;
 const AUTH_FILE_MODE = 0o600;
+export const PRE_CODE_FAILURE_REASONS = Object.freeze([
+  'connection_closed',
+  'ordinary_session_not_ready',
+  'pairing_code_invalid',
+  'pairing_request_failed',
+  'provisioning_failed',
+  'provisioning_timeout',
+]);
 
 // Set before any call to useMultiFileAuthState.  Baileys otherwise creates
 // auth JSON as 0644 under the usual 0022 umask.
@@ -503,12 +511,28 @@ export async function provisionOffline({
       sock.ev.on('creds.update', onCredsUpdate);
       sock.ev.on('connection.update', async (update) => {
         try {
-          if (update?.qr) return fail('qr_payload_forbidden');
           validateOwnerDirectory(stage, { required: true });
-          if (!pairedCode
-              && (update?.connection === 'connecting' || update?.connection === undefined)) {
+          // rc14 emits `connecting` before its WebSocket/Noise handshake is
+          // usable, and requestPairingCode() fails immediately if called then.
+          // Its private QR-reference update is the first post-handshake signal
+          // for an unregistered socket.  Treat only the presence of that field
+          // as readiness; never inspect, retain, emit, or display its payload.
+          if (!pairedCode && update?.qr) {
             pairedCode = true;
-            const code = normalizePairingCode(await sock.requestPairingCode(request.phone));
+            let providerCode;
+            try {
+              providerCode = await sock.requestPairingCode(request.phone);
+            } catch {
+              return fail('pairing_request_failed');
+            }
+            let code;
+            try {
+              code = normalizePairingCode(providerCode);
+            } catch {
+              return fail('pairing_code_invalid');
+            } finally {
+              providerCode = null;
+            }
             emitCode(code);
           }
           if (update?.connection === 'close') return fail('connection_closed');
@@ -607,8 +631,10 @@ export async function runProvisioner({
   input = process.stdin,
   output = process.stdout,
   operatorOutput = null,
+  provision = provisionOffline,
 } = {}) {
   let request;
+  let codeWritten = false;
   try {
     request = await readRequest(input);
     if (request.action === 'validate') {
@@ -620,11 +646,10 @@ export async function runProvisioner({
       })}\n`);
       return validated ? 0 : 1;
     }
-    let codeWritten = false;
     if (!operatorOutput || typeof operatorOutput.write !== 'function') {
       throw new Error('operator_channel_required');
     }
-    const result = await provisionOffline({
+    const result = await provision({
       request,
       emitCode: (code) => {
         if (codeWritten) throw new Error('pairing_code_reuse');
@@ -648,6 +673,10 @@ export async function runProvisioner({
         : {}),
       ...(unsafeExisting ? { error: 'unsafe_existing_session_requires_reprovision' } : {}),
     })}\n`);
+    if (!codeWritten && operatorOutput && typeof operatorOutput.write === 'function') {
+      const reason = PRE_CODE_FAILURE_REASONS.includes(code) ? code : 'provisioning_failed';
+      operatorOutput.write(`${JSON.stringify({ event: 'pairing_failure', reason })}\n`);
+    }
     return 1;
   } finally {
     request = null;
