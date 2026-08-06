@@ -5048,6 +5048,58 @@ class TurnRunner:
             cmd = approval_data.get("command", "")
             desc = approval_data.get("description", "dangerous command")
 
+            trusted = approval_data.get("trusted_approval")
+            if isinstance(trusted, dict):
+                destination = trusted.get("destination") or {}
+                platform_name = str(destination.get("platform") or "")
+                if not platform_name or platform_name == "twilio_voice":
+                    raise RuntimeError("trusted approval destination is invalid")
+                target_adapter = next(
+                    (
+                        adapter
+                        for key, adapter in self._runner.adapters.items()
+                        if str(getattr(key, "value", key)) == platform_name
+                    ),
+                    None,
+                )
+                if target_adapter is None:
+                    raise RuntimeError("trusted approval adapter is unavailable")
+                if str(getattr(target_adapter, "approval_account_id", "")) != str(
+                    destination.get("account_id") or ""
+                ):
+                    raise RuntimeError("trusted approval account identity does not match")
+                if not bool(
+                    getattr(target_adapter, "approval_thread_routing_enabled", False)
+                ):
+                    raise RuntimeError("trusted approval exact thread routing is disabled")
+                approval_id = str(trusted.get("approval_id") or "")
+                tool_name = str(trusted.get("tool_name") or "tool")
+                expires_seconds = int(trusted.get("expires_seconds") or 0)
+                message = (
+                    "⚠️ **Voice-originated tool requires one-use approval**\n\n"
+                    f"Tool: `{tool_name}`\n"
+                    f"Expires in at most {expires_seconds} seconds.\n\n"
+                    f"Reply `/approve {approval_id}` to allow this exact call once, "
+                    f"or `/deny {approval_id}` to deny it. Session and permanent grants are unavailable."
+                )
+                metadata = {"thread_id": str(destination.get("thread_id") or "")}
+                send_future = safe_schedule_threadsafe(
+                    target_adapter.send(
+                        str(destination.get("chat_id") or ""),
+                        message,
+                        metadata=metadata,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="Trusted voice approval send scheduling error",
+                )
+                if send_future is None:
+                    raise RuntimeError("trusted approval event loop is unavailable")
+                send_result = send_future.result(timeout=15)
+                if not send_result.success:
+                    raise RuntimeError("trusted approval delivery failed")
+                return
+
             # Redact credentials from the command before displaying it in
             # the approval prompt — Tirith's findings are already redacted,
             # but the raw command string still leaks secrets to the chat

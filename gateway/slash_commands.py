@@ -5250,8 +5250,27 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, resolve_trusted_gateway_approval,
+            has_blocking_approval,
         )
+
+        raw_tokens = event.get_command_args().strip().split()
+        if raw_tokens and raw_tokens[0].startswith("va_"):
+            if len(raw_tokens) != 1:
+                return t("gateway.approve.no_pending")
+            identity = {
+                "platform": str(getattr(source.platform, "value", source.platform)),
+                "account_id": str(getattr(source, "scope_id", None) or ""),
+                "chat_id": str(source.chat_id or ""),
+                "user_id": str(source.user_id or ""),
+                "thread_id": str(getattr(source, "thread_id", None) or ""),
+            }
+            count = resolve_trusted_gateway_approval(
+                raw_tokens[0], identity, "once"
+            )
+            if not count:
+                return t("gateway.approve.no_pending")
+            return t("gateway.approve.once_singular", count=1)
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
@@ -5299,8 +5318,25 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, resolve_trusted_gateway_approval,
+            has_blocking_approval,
         )
+
+        trusted_tokens = event.get_command_args().strip().split()
+        if trusted_tokens and trusted_tokens[0].startswith("va_"):
+            identity = {
+                "platform": str(getattr(source.platform, "value", source.platform)),
+                "account_id": str(getattr(source, "scope_id", None) or ""),
+                "chat_id": str(source.chat_id or ""),
+                "user_id": str(source.user_id or ""),
+                "thread_id": str(getattr(source, "thread_id", None) or ""),
+            }
+            count = resolve_trusted_gateway_approval(
+                trusted_tokens[0], identity, "deny"
+            )
+            if not count:
+                return t("gateway.deny.no_pending")
+            return t("gateway.deny.denied_singular")
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:

@@ -1,0 +1,11 @@
+quick_tunnel:
+  cloudflared_binary: /opt/homebrew/bin/cloudflared
+  local_url: http://127.0.0.1:8091
+  expected_voice_number_count: 2
+  # REQUIRED for --apply. Copy the exact reviewed IncomingPhoneNumber SIDs;
+  # count-only discovery is deliberately limited to planning.
+  managed_number_sids:
+    - PN_REPLACE_WITH_FIRST_EXACT_SID
+    - PN_REPLACE_WITH_SECOND_EXACT_SID
+  runtime_public_url_file: ~/.hermes/state/twilio-voice-public-url.json
+  rollback_state_file: ~/.hermes/state/twilio-voice-rollback.json

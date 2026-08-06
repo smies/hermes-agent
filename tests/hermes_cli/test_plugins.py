@@ -399,6 +399,433 @@ class TestResolvePreToolBlock:
     directive (incl. the approve→gate escalation) to a block message."""
 
 
+    def test_observability_context_import_failure_fails_closed(self, monkeypatch):
+        import builtins
+
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        real_import = builtins.__import__
+
+        def _import_failure(name, *args, **kwargs):
+            if name == "tools.approval":
+                raise ImportError("context helpers unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _import_failure)
+
+        message = resolve_pre_tool_block("terminal", {})
+
+        assert message is not None
+        assert message.startswith("BLOCKED:")
+        assert "context binding failed" in message.lower()
+
+
+    def test_observability_context_bind_failure_fails_closed(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        def _bind_failure(**kwargs):
+            raise RuntimeError("context bind failed")
+
+        monkeypatch.setattr(
+            "tools.approval.set_current_observability_context",
+            _bind_failure,
+        )
+
+        message = resolve_pre_tool_block("terminal", {})
+
+        assert message is not None
+        assert message.startswith("BLOCKED:")
+        assert "context binding failed" in message.lower()
+
+
+    def test_hook_resolution_exception_fails_closed_and_restores_once(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        from tools import approval
+
+        outer_tokens = approval.set_current_observability_context(
+            turn_id="outer-turn",
+            tool_call_id="outer-tool-call",
+        )
+        real_reset = approval.reset_current_observability_context
+        reset_calls = []
+
+        def _hook_failure(*args, **kwargs):
+            raise RuntimeError("hook aggregation failed")
+
+        def _tracking_reset(tokens):
+            reset_calls.append(tokens)
+            real_reset(tokens)
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook_failure)
+        monkeypatch.setattr(
+            approval,
+            "reset_current_observability_context",
+            _tracking_reset,
+        )
+        try:
+            message = resolve_pre_tool_block(
+                "terminal",
+                {},
+                tool_call_id="inner-tool-call",
+                turn_id="inner-turn",
+            )
+
+            assert message is not None
+            assert message.startswith("BLOCKED:")
+            assert "resolution failed" in message.lower()
+            assert len(reset_calls) == 1
+            assert approval._approval_turn_id.get() == "outer-turn"
+            assert approval._approval_tool_call_id.get() == "outer-tool-call"
+        finally:
+            real_reset(outer_tokens)
+
+
+    @pytest.mark.parametrize("approval_result", [None, [], "not a mapping"])
+    def test_non_mapping_approval_result_fails_closed_and_restores_once(
+        self, monkeypatch, approval_result
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        from tools import approval
+
+        real_reset = approval.reset_current_observability_context
+        reset_calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "why"}
+            ],
+        )
+        monkeypatch.setattr(
+            approval,
+            "request_tool_approval",
+            lambda *args, **kwargs: approval_result,
+        )
+
+        def _tracking_reset(tokens):
+            reset_calls.append(tokens)
+            real_reset(tokens)
+
+        monkeypatch.setattr(
+            approval,
+            "reset_current_observability_context",
+            _tracking_reset,
+        )
+
+        message = resolve_pre_tool_block("terminal", {})
+
+        assert message is not None
+        assert message.startswith("BLOCKED:")
+        assert "resolution failed" in message.lower()
+        assert len(reset_calls) == 1
+
+
+    def test_restoration_failure_overrides_hook_resolution_failure(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        token = object()
+        reset_calls = []
+
+        monkeypatch.setattr(
+            "tools.approval.set_current_observability_context",
+            lambda **kwargs: token,
+        )
+
+        def _hook_failure(*args, **kwargs):
+            raise RuntimeError("hook aggregation failed")
+
+        def _reset_failure(received_token):
+            reset_calls.append(received_token)
+            raise RuntimeError("context reset failed")
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook_failure)
+        monkeypatch.setattr(
+            "tools.approval.reset_current_observability_context",
+            _reset_failure,
+        )
+
+        message = resolve_pre_tool_block("terminal", {})
+
+        assert message is not None
+        assert message.startswith("BLOCKED:")
+        assert "context restoration failed" in message.lower()
+        assert reset_calls == [token]
+
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "allow",
+            "approve",
+            "block",
+            "deny",
+            "timeout",
+            "malformed",
+            "gate_exception",
+        ],
+    )
+    def test_observability_context_reset_failure_overrides_resolution(
+        self, monkeypatch, mode
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        token = object()
+        monkeypatch.setattr(
+            "tools.approval.set_current_observability_context",
+            lambda **kwargs: token,
+        )
+
+        def _reset_failure(received_token):
+            assert received_token is token
+            raise RuntimeError("context reset failed")
+
+        monkeypatch.setattr(
+            "tools.approval.reset_current_observability_context",
+            _reset_failure,
+        )
+
+        if mode == "allow":
+            directive = []
+        elif mode == "block":
+            directive = [{"action": "block", "message": "blocked by plugin"}]
+        else:
+            directive = [{"action": "approve", "message": "why"}]
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: directive,
+        )
+
+        def _gate(*args, **kwargs):
+            if mode == "approve":
+                return {"approved": True, "message": None}
+            if mode == "deny":
+                return {"approved": False, "message": "approval denied"}
+            if mode == "timeout":
+                return {"approved": False, "message": "approval timed out"}
+            if mode == "malformed":
+                return {}
+            if mode == "gate_exception":
+                raise RuntimeError("gate crashed")
+            raise AssertionError(f"unexpected gate call for {mode}")
+
+        if mode not in {"allow", "block"}:
+            monkeypatch.setattr(
+                "tools.approval.request_tool_approval",
+                _gate,
+            )
+
+        message = resolve_pre_tool_block("terminal", {})
+
+        assert message is not None
+        assert message.startswith("BLOCKED:")
+        assert "context restoration failed" in message.lower()
+
+
+    def test_binds_exact_context_through_hook_and_real_trusted_gate(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        from tools import approval
+
+        session_id = "twilio_voice:synthetic-call"
+        tool_call_id = "synthetic-tool-call"
+        turn_id = "synthetic-turn"
+        args = {"command": "synthetic"}
+        notices = []
+        observed = []
+
+        def _hook(hook_name, **kwargs):
+            observed.append(
+                (
+                    "hook",
+                    approval._approval_turn_id.get(),
+                    approval._approval_tool_call_id.get(),
+                )
+            )
+            return [{"action": "approve", "message": "trusted voice gate"}]
+
+        def _approve_once(bound_session, notify_cb, approval_data, *, surface):
+            observed.append(
+                (
+                    "gate",
+                    approval._approval_turn_id.get(),
+                    approval._approval_tool_call_id.get(),
+                )
+            )
+            assert bound_session == session_id
+            assert surface == "trusted_non_voice"
+            notify_cb(approval_data)
+            return {"resolved": True, "choice": "once"}
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+        monkeypatch.setattr(approval, "_await_gateway_decision", _approve_once)
+        approval.register_gateway_notify(session_id, notices.append)
+        session_token = approval.set_current_session_key(session_id)
+        try:
+            approval.prepare_trusted_voice_approval(
+                voice_session_id=session_id,
+                tool_call_id=tool_call_id,
+                tool_name="terminal",
+                args=args,
+                destination={
+                    "platform": "mattermost",
+                    "account_id": "synthetic-account",
+                    "chat_id": "synthetic-chat",
+                    "user_id": "synthetic-owner",
+                    "thread_id": "synthetic-thread",
+                },
+                expires_seconds=60,
+            )
+
+            assert resolve_pre_tool_block(
+                "terminal",
+                args,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+            ) is None
+        finally:
+            approval.discard_trusted_voice_approval()
+            approval.reset_current_session_key(session_token)
+            approval.unregister_gateway_notify(session_id)
+
+        assert observed == [
+            ("hook", turn_id, tool_call_id),
+            ("gate", turn_id, tool_call_id),
+        ]
+        assert notices[0]["trusted_approval"]["tool_call_id"] == tool_call_id
+
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [
+            ("no_directive", None),
+            ("block", "blocked by plugin"),
+            ("approve", None),
+            ("deny", "approval denied"),
+            ("timeout", "approval timed out"),
+            ("gate_exception", "BLOCKED: plugin approval gate failed for terminal"),
+            ("malformed", "BLOCKED: plugin approval required for terminal"),
+        ],
+    )
+    def test_restores_nested_context_on_every_resolution_path(
+        self, monkeypatch, mode, expected
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        from tools import approval
+
+        outer_tokens = approval.set_current_observability_context(
+            turn_id="outer-turn",
+            tool_call_id="outer-tool-call",
+        )
+        seen = []
+
+        def _hook(hook_name, **kwargs):
+            seen.append(
+                (
+                    "hook",
+                    approval._approval_turn_id.get(),
+                    approval._approval_tool_call_id.get(),
+                )
+            )
+            if mode == "no_directive":
+                return []
+            if mode == "block":
+                return [{"action": "block", "message": "blocked by plugin"}]
+            return [{"action": "approve", "message": "why"}]
+
+        def _gate(*args, **kwargs):
+            seen.append(
+                (
+                    "gate",
+                    approval._approval_turn_id.get(),
+                    approval._approval_tool_call_id.get(),
+                )
+            )
+            if mode == "gate_exception":
+                raise RuntimeError("gate crashed")
+            if mode == "malformed":
+                return {}
+            if mode == "deny":
+                return {"approved": False, "message": "approval denied"}
+            if mode == "timeout":
+                return {"approved": False, "message": "approval timed out"}
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+        monkeypatch.setattr("tools.approval.request_tool_approval", _gate)
+        try:
+            assert resolve_pre_tool_block(
+                "terminal",
+                {},
+                tool_call_id="inner-tool-call",
+                turn_id="inner-turn",
+            ) == expected
+
+            assert seen[0] == ("hook", "inner-turn", "inner-tool-call")
+            if mode not in {"no_directive", "block"}:
+                assert seen[1] == ("gate", "inner-turn", "inner-tool-call")
+            assert approval._approval_turn_id.get() == "outer-turn"
+            assert approval._approval_tool_call_id.get() == "outer-tool-call"
+        finally:
+            approval.reset_current_observability_context(outer_tokens)
+
+
+    def test_empty_tool_call_id_fails_closed_and_restores_outer_context(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        from tools import approval
+
+        session_id = "twilio_voice:synthetic-call"
+        outer_tokens = approval.set_current_observability_context(
+            turn_id="outer-turn",
+            tool_call_id="prepared-tool-call",
+        )
+        session_token = approval.set_current_session_key(session_id)
+        notices = []
+        approval.register_gateway_notify(session_id, notices.append)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+        )
+        try:
+            approval.prepare_trusted_voice_approval(
+                voice_session_id=session_id,
+                tool_call_id="prepared-tool-call",
+                tool_name="terminal",
+                args={},
+                destination={
+                    "platform": "mattermost",
+                    "account_id": "synthetic-account",
+                    "chat_id": "synthetic-chat",
+                    "user_id": "synthetic-owner",
+                    "thread_id": "synthetic-thread",
+                },
+                expires_seconds=60,
+            )
+
+            message = resolve_pre_tool_block(
+                "terminal",
+                {},
+                session_id=session_id,
+                tool_call_id="",
+                turn_id="",
+            )
+
+            assert message is not None and "correlation" in message.lower()
+            assert notices == []
+            assert approval._approval_turn_id.get() == "outer-turn"
+            assert approval._approval_tool_call_id.get() == "prepared-tool-call"
+        finally:
+            approval.discard_trusted_voice_approval()
+            approval.unregister_gateway_notify(session_id)
+            approval.reset_current_session_key(session_token)
+            approval.reset_current_observability_context(outer_tokens)
+
+
     def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
 

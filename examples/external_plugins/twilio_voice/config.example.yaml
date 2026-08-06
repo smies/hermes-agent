@@ -1,0 +1,85 @@
+# Field reference only. Apply behavioral values with `hermes config set` as
+# documented in README.md; do not hand-edit the default profile config.
+plugins:
+  enabled:
+    - twilio-voice-platform
+
+display:
+  busy_input_mode: interrupt
+  busy_ack_enabled: false
+  platforms:
+    twilio_voice:
+      tool_progress: 'off'
+      show_reasoning: false
+      streaming: true
+      interim_assistant_messages: false
+      long_running_notifications: false
+      busy_ack_detail: false
+
+gateway:
+  # The bridge uses Hermes's normal durable gateway session store and cached
+  # default-profile AIAgent. Incoming prompts interrupt a busy voice turn.
+  streaming:
+    enabled: true
+    transport: draft
+  platforms:
+    twilio_voice:
+      enabled: true
+      gateway_restart_notification: false
+      typing_indicator: false
+      extra:
+        bind_host: 127.0.0.1
+        bind_port: 8091
+
+        # Stable named tunnel: set this and omit runtime_public_url_file.
+        public_base_url: https://voice.example.invalid
+
+        # Quick Tunnel: omit public_base_url and enable this instead. The
+        # supervisor creates the owner-only file after discovering each URL.
+        # runtime_public_url_file: ~/.hermes/state/twilio-voice-public-url.json
+
+        # Required behavioral access policy; use E.164 strings. This is not a
+        # credential, so it belongs in config.yaml rather than .env.
+        allowed_callers:
+          - "+REPLACE_WITH_E164_CALLER"
+
+        # Required exact trusted non-voice reviewer. Every value is matched on
+        # decision; voice input cannot change this immutable startup snapshot.
+        trusted_approval_destination:
+          platform: mattermost
+          account_id: REPLACE_WITH_REVIEWED_ACCOUNT_ID
+          chat_id: REPLACE_WITH_REVIEWED_CHANNEL_ID
+          user_id: REPLACE_WITH_REVIEWED_OWNER_USER_ID
+          thread_id: REPLACE_WITH_REVIEWED_THREAD_ID
+          expires_seconds: 120
+
+        greeting: Hello. You are securely connected to Hermes.
+        language: en-GB
+        voice: ""
+        tts_provider: Google
+        transcription_provider: Deepgram
+        speech_model: nova-3-general
+
+        max_duration_seconds: 900
+        idle_timeout_seconds: 90
+        setup_timeout_seconds: 8
+        max_frame_bytes: 16384
+        max_prompt_chars: 4096
+        max_concurrent_calls: 2
+        pin_max_attempts: 3
+        hangup_digit: "#"
+
+        # Recommended. Anything not listed below is escalated into the existing
+        # Hermes/Juno human-approval path, and voice cannot approve itself.
+        action_policy: approval_required
+        safe_tools:
+          - clarify
+          - web_search
+          - web_extract
+
+    mattermost:
+      extra:
+        # Required so the trusted approval notification is delivered to the
+        # exact reviewed thread rather than as a channel-level post.
+        reply_mode: thread
+        approval_account_id: REPLACE_WITH_REVIEWED_ACCOUNT_ID

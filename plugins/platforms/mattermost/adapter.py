@@ -126,6 +126,9 @@ class MattermostAdapter(BasePlatformAdapter):
 
         self._bot_user_id: str = ""
         self._bot_username: str = ""
+        self._approval_account_id = str(
+            config.extra.get("approval_account_id") or ""
+        ).strip()
 
         # aiohttp session + websocket handle
         self._session: Any = None  # aiohttp.ClientSession
@@ -145,6 +148,16 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
+
+    @property
+    def approval_account_id(self) -> str:
+        """Explicit immutable account identity for cross-surface approvals."""
+        return self._approval_account_id
+
+    @property
+    def approval_thread_routing_enabled(self) -> bool:
+        """Whether exact thread metadata is honored for approval delivery."""
+        return self._reply_mode == "thread"
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -980,6 +993,7 @@ class MattermostAdapter(BasePlatformAdapter):
             user_name=sender_name,
             thread_id=thread_id,
             message_id=post_id,
+            scope_id=self._approval_account_id or None,
         )
 
         # Per-channel ephemeral prompt

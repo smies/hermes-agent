@@ -1,0 +1,19 @@
+name: twilio-voice-platform
+label: Twilio Voice
+kind: platform
+version: 0.1.0
+description: Secure inbound-only Twilio ConversationRelay bridge for Hermes.
+author: External example; install under ~/.hermes/plugins/twilio_voice
+requires_env:
+  - name: TWILIO_ACCOUNT_SID
+    description: Existing Twilio account SID.
+    password: true
+    secret: true
+  - name: TWILIO_AUTH_TOKEN
+    description: Existing primary Twilio auth token used for request signatures.
+    password: true
+    secret: true
+  - name: TWILIO_VOICE_PIN
+    description: Required six-to-twelve-digit DTMF PIN collected before ConversationRelay starts.
+    password: true
+    secret: true

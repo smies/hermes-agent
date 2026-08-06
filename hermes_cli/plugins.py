@@ -2268,31 +2268,60 @@ def resolve_pre_tool_block(
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
     """
-    details = _get_pre_tool_call_directive_details(
-        tool_name, args, task_id=task_id, session_id=session_id,
-        tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
-    )
-    if details.action == "block":
-        return details.message
-    if details.action == "approve":
+    try:
+        from tools.approval import (
+            reset_current_observability_context,
+            set_current_observability_context,
+        )
+
+        observability_tokens = set_current_observability_context(
+            turn_id=turn_id,
+            tool_call_id=tool_call_id,
+        )
+    except Exception:
+        return (
+            "BLOCKED: approval observability context binding failed for "
+            f"{tool_name}"
+        )
+
+    reset_completed = False
+    try:
         try:
-            from tools.approval import request_tool_approval
-            result = request_tool_approval(
-                tool_name,
-                details.message or "",
-                rule_key=details.rule_key or tool_name,
+            details = _get_pre_tool_call_directive_details(
+                tool_name, args, task_id=task_id, session_id=session_id,
+                tool_call_id=tool_call_id, turn_id=turn_id,
+                api_request_id=api_request_id, middleware_trace=middleware_trace,
             )
-        except Exception:
-            # Fail-closed: if the gate itself errors, block rather than
-            # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
+            if details.action == "block":
+                return details.message
+            if details.action == "approve":
+                try:
+                    from tools.approval import request_tool_approval
+                    result = request_tool_approval(
+                        tool_name,
+                        details.message or "",
+                        rule_key=details.rule_key or tool_name,
+                    )
+                except Exception:
+                    # Fail-closed: if the gate itself errors, block rather than
+                    # silently execute an action a plugin flagged for approval.
+                    return f"BLOCKED: plugin approval gate failed for {tool_name}"
+                if not result.get("approved"):
+                    return str(
+                        result.get("message")
+                        or f"BLOCKED: plugin approval required for {tool_name}"
+                    )
+            return None
+        finally:
+            reset_current_observability_context(observability_tokens)
+            reset_completed = True
+    except Exception:
+        if not reset_completed:
+            return (
+                "BLOCKED: approval observability context restoration failed for "
+                f"{tool_name}"
             )
-    return None
+        return f"BLOCKED: plugin pre-tool resolution failed for {tool_name}"
 
 
 def get_pre_verify_continue_message(

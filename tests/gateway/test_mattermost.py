@@ -98,6 +98,24 @@ def _make_adapter():
     return adapter
 
 
+def test_mattermost_approval_account_identity_is_frozen():
+    from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+    config = PlatformConfig(
+        enabled=True,
+        token="test-token",
+        extra={
+            "url": "https://mm.example.com",
+            "approval_account_id": "reviewed-account",
+            "reply_mode": "thread",
+        },
+    )
+    adapter = MattermostAdapter(config)
+    config.extra["approval_account_id"] = "changed"
+    assert adapter.approval_account_id == "reviewed-account"
+    assert adapter.approval_thread_routing_enabled is True
+
+
 class TestMattermostFormatMessage:
     def setup_method(self):
         self.adapter = _make_adapter()
@@ -592,5 +610,3 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.source.thread_id == "top_post_123"
     assert msg_event.source.message_id == "top_post_123"
     assert msg_event.message_id == "top_post_123"
-
-

@@ -12,9 +12,11 @@ import contextvars
 import fnmatch
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -50,6 +52,67 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+_trusted_voice_approval: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "trusted_voice_approval",
+    default=None,
+)
+
+
+def _canonical_argument_digest(args) -> str:
+    encoded = json.dumps(
+        args,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def prepare_trusted_voice_approval(
+    *,
+    voice_session_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    args: dict,
+    destination: dict,
+    expires_seconds: int,
+) -> None:
+    """Bind one voice tool call to an immutable trusted non-voice decision."""
+    required = ("platform", "account_id", "chat_id", "user_id", "thread_id")
+    normalized = {key: str(destination.get(key) or "") for key in required}
+    if normalized["platform"] == "twilio_voice" or any(
+        not normalized[key] for key in required
+    ):
+        raise ValueError("trusted approval destination is incomplete or voice-originated")
+    if not voice_session_id or not tool_call_id or not tool_name:
+        raise ValueError("trusted voice approval correlation is incomplete")
+    expiry = int(expires_seconds)
+    if not 1 <= expiry <= 600:
+        raise ValueError("trusted voice approval expiry is out of bounds")
+    _trusted_voice_approval.set(
+        {
+            "voice_session_id": str(voice_session_id),
+            "tool_call_id": str(tool_call_id),
+            "tool_name": str(tool_name),
+            "argument_digest": _canonical_argument_digest(args),
+            "args_ref": args,
+            "destination": normalized,
+            "expires_seconds": expiry,
+        }
+    )
+
+
+def discard_trusted_voice_approval() -> None:
+    """Discard any prepared trusted voice approval in the current context."""
+    _trusted_voice_approval.set(None)
+
+
+def _consume_trusted_voice_approval() -> dict | None:
+    """Take the current trusted voice approval at most once."""
+    trusted = _trusted_voice_approval.get()
+    discard_trusted_voice_approval()
+    return trusted
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -2308,6 +2371,7 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_trusted_gateway_entries: dict[str, tuple[str, _ApprovalEntry]] = {}
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2331,6 +2395,9 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        for approval_id, (entry_session, _entry) in list(_trusted_gateway_entries.items()):
+            if entry_session == session_key:
+                _trusted_gateway_entries.pop(approval_id, None)
     for entry in entries:
         entry.event.set()
 
@@ -2355,11 +2422,15 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        ordinary = [entry for entry in queue if not entry.data.get("trusted_approval")]
+        if not ordinary:
+            return 0
         if resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = ordinary
+            queue[:] = [entry for entry in queue if entry not in targets]
         else:
-            targets = [queue.pop(0)]
+            targets = [ordinary[0]]
+            queue.remove(targets[0])
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -2369,6 +2440,50 @@ def resolve_gateway_approval(session_key: str, choice: str,
             entry.reason = reason
         entry.event.set()
     return len(targets)
+
+
+def resolve_trusted_gateway_approval(
+    approval_id: str,
+    decision_identity: dict,
+    choice: str,
+    *,
+    now: float | None = None,
+) -> int:
+    """Resolve one exact trusted voice approval; mismatches never consume it."""
+    if choice not in {"once", "deny"}:
+        return 0
+    identity = {
+        key: str(decision_identity.get(key) or "")
+        for key in ("platform", "account_id", "chat_id", "user_id", "thread_id")
+    }
+    with _lock:
+        found = _trusted_gateway_entries.get(str(approval_id or ""))
+        if found is None:
+            return 0
+        session_key, entry = found
+        trusted = entry.data.get("trusted_approval") or {}
+        if identity != trusted.get("destination"):
+            return 0
+        current = time.time() if now is None else float(now)
+        if current > float(trusted.get("expires_at") or 0):
+            _trusted_gateway_entries.pop(str(approval_id), None)
+            queue = _gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+            entry.result = "deny"
+            entry.event.set()
+            return 0
+        _trusted_gateway_entries.pop(str(approval_id), None)
+        queue = _gateway_queues.get(session_key, [])
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+        entry.result = choice
+        entry.event.set()
+        return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -2436,6 +2551,9 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        for approval_id, (entry_session, _entry) in list(_trusted_gateway_entries.items()):
+            if entry_session == session_key:
+                _trusted_gateway_entries.pop(approval_id, None)
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
@@ -3341,6 +3459,12 @@ def request_tool_approval(
     (a bare script with no ``HERMES_INTERACTIVE``) fails CLOSED — a plugin-
     flagged action never runs ungated without a human.
     """
+    trusted_voice = _consume_trusted_voice_approval()
+    if trusted_voice is not None:
+        active_session = get_current_session_key(default="")
+        if active_session and active_session == trusted_voice.get("voice_session_id"):
+            return _run_trusted_voice_approval(tool_name, reason, trusted_voice)
+
     description = reason or f"Plugin requires approval for {tool_name}"
     # Allowlist grain: an explicit plugin rule_key wins; otherwise derive from
     # tool + a short hash of the reason so distinct reasons on the same tool
@@ -3381,6 +3505,64 @@ def request_tool_approval(
             "A plugin flagged this action for human confirmation."
         ),
     )
+
+
+def _run_trusted_voice_approval(tool_name: str, reason: str, trusted: dict) -> dict:
+    """Use the existing gateway wait queue without minting reusable authority."""
+    session_key = get_current_session_key(default="")
+    if not session_key:
+        return {"approved": False, "message": "BLOCKED: voice session correlation is unavailable."}
+    if session_key != trusted.get("voice_session_id"):
+        return {"approved": False, "message": "BLOCKED: voice session correlation changed."}
+    current_tool_call_id = _approval_tool_call_id.get()
+    if not current_tool_call_id or current_tool_call_id != trusted.get("tool_call_id"):
+        return {"approved": False, "message": "BLOCKED: voice tool correlation changed."}
+    if tool_name != trusted.get("tool_name"):
+        return {"approved": False, "message": "BLOCKED: voice tool correlation changed."}
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    if notify_cb is None:
+        return {"approved": False, "message": "BLOCKED: trusted approval route is unavailable."}
+
+    approval_id = "va_" + secrets.token_urlsafe(18)
+    expires_at = time.time() + int(trusted["expires_seconds"])
+    approval_data = {
+        "command": f"<{tool_name}> (voice one-use approval)",
+        "pattern_key": f"trusted_voice:{trusted['tool_call_id']}",
+        "pattern_keys": [f"trusted_voice:{trusted['tool_call_id']}"],
+        "description": reason or f"Voice tool '{tool_name}' requires approval",
+        "allow_permanent": False,
+        "allow_session": False,
+        "trusted_approval": {
+            "approval_id": approval_id,
+            "voice_session_id": trusted["voice_session_id"],
+            "voice_session_key": session_key,
+            "tool_call_id": trusted["tool_call_id"],
+            "tool_name": tool_name,
+            "argument_digest": trusted["argument_digest"],
+            "destination": dict(trusted["destination"]),
+            "expires_at": expires_at,
+            "expires_seconds": int(trusted["expires_seconds"]),
+        },
+    }
+    decision = _await_gateway_decision(
+        session_key, notify_cb, approval_data, surface="trusted_non_voice"
+    )
+    if not decision.get("resolved") or decision.get("choice") != "once":
+        return {
+            "approved": False,
+            "message": "BLOCKED: trusted non-voice one-use approval was denied or expired.",
+        }
+    try:
+        current_digest = _canonical_argument_digest(trusted["args_ref"])
+    except Exception:
+        current_digest = ""
+    if current_digest != trusted["argument_digest"]:
+        return {
+            "approved": False,
+            "message": "BLOCKED: tool arguments changed after approval was requested.",
+        }
+    return {"approved": True, "message": None}
 
 
 # =========================================================================
@@ -3437,6 +3619,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
+        trusted = approval_data.get("trusted_approval") or {}
+        trusted_id = str(trusted.get("approval_id") or "")
+        if trusted_id:
+            _trusted_gateway_entries[trusted_id] = (session_key, entry)
 
     def _drop_entry() -> None:
         with _lock:
@@ -3445,6 +3631,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 queue.remove(entry)
             if not queue:
                 _gateway_queues.pop(session_key, None)
+            if trusted_id:
+                current = _trusted_gateway_entries.get(trusted_id)
+                if current is not None and current[1] is entry:
+                    _trusted_gateway_entries.pop(trusted_id, None)
 
     # Notify plugins that an approval is being requested. Fires before the
     # gateway notify callback so observers get the event in real time.
@@ -3472,6 +3662,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
     timeout = _get_approval_timeout()
+    if trusted_id:
+        timeout = min(
+            timeout,
+            max(0.0, float(trusted.get("expires_at") or 0) - time.time()),
+        )
 
     try:
         from tools.environments.base import touch_activity_if_due
