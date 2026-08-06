@@ -158,6 +158,7 @@ def _wait_port_released(port: int, timeout: float = 5.0) -> bool:
     while time.monotonic() < deadline:
         probe = socket.socket()
         try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
             return True
         except OSError:
@@ -187,6 +188,7 @@ def test_parent_death_pipe_reaps_exact_signal_ignoring_child_and_releases_3011()
     port = 3011
     preflight = socket.socket()
     try:
+        preflight.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         preflight.bind(("127.0.0.1", port))
     except PermissionError:
         pytest.skip("execution sandbox denied parent-death loopback gate")
