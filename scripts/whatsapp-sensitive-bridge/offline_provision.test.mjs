@@ -793,6 +793,7 @@ async function restartJourney(mode = 'success') {
   const creds = { registered: false };
   const sockets = [];
   let codeCount = 0;
+  let codeEmittedBeforeRestart = false;
   let saveCount = 0;
   await chmod(root, 0o700);
   const request = parseProvisioningRequest({
@@ -841,6 +842,7 @@ async function restartJourney(mode = 'success') {
           ev.emit('creds.update', { registered: true, me: creds.me });
           await tick();
         }
+        codeEmittedBeforeRestart = codeCount === 1;
         ev.emit('connection.update', {
           connection: 'close',
           lastDisconnect: { error: { output: { statusCode: 515 } } },
@@ -869,9 +871,13 @@ async function restartJourney(mode = 'success') {
       emitCode: () => { codeCount += 1; },
       timeoutMs: mode === 'reconnect_timeout' ? 75 : 2_000,
     });
-    return { outcome, root, ordinary, sockets, codeCount, saveCount };
+    return {
+      outcome, root, ordinary, sockets, codeCount, codeEmittedBeforeRestart, saveCount,
+    };
   } catch (error) {
-    return { error, root, ordinary, sockets, codeCount, saveCount };
+    return {
+      error, root, ordinary, sockets, codeCount, codeEmittedBeforeRestart, saveCount,
+    };
   }
 }
 
@@ -882,6 +888,7 @@ test('accepted pairing survives one 515 restart and commits only after reauthent
       account_namespace: 's.whatsapp.net', lid_ready: true,
     });
     assert.equal(fixture.codeCount, 1);
+    assert.equal(fixture.codeEmittedBeforeRestart, true);
     assert.equal(fixture.sockets.length, 2);
     assert.equal(fixture.sockets[0].ended, true);
     assert.equal(fixture.sockets[1].ended, true);
@@ -909,6 +916,69 @@ test('515 recovery rejects pre-registration, repeated restart, save failure, and
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
+  }
+});
+
+test('close ingress suppresses a blocked pairing code before non-515 failure', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-pair-close-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'2'.repeat(10)}`;
+  const pairingStarted = deferred();
+  const pairingResult = deferred();
+  let socket;
+  let codeCount = 0;
+  await chmod(root, 0o700);
+  const request = parseProvisioningRequest({
+    version: 1, action: 'provision', role: 'ordinary', phone,
+    ordinary_session: ordinary, sensitive_session: sensitive,
+  });
+  const provisioning = provisionOffline({
+    request,
+    useAuthState: async session => ({
+      state: {
+        creds: { registered: false },
+        keys: { get: async () => ({}), set: async () => {} },
+      },
+      saveCreds: async () => {
+        await writeFile(path.join(session, 'creds.json'), '{}', { mode: 0o600 });
+      },
+    }),
+    makeSocket: () => {
+      const ev = new EventEmitter();
+      socket = {
+        ev,
+        requestPairingCode: async () => {
+          pairingStarted.resolve();
+          return pairingResult.promise;
+        },
+        end() {},
+      };
+      return socket;
+    },
+    emitCode: () => { codeCount += 1; },
+    timeoutMs: 2_000,
+  });
+  try {
+    await waitFor(() => Boolean(socket), 'socket was not created');
+    socket.ev.emit('connection.update', { qr: 'provider-private-readiness' });
+    await pairingStarted.promise;
+    socket.ev.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 500 } } },
+    });
+    pairingResult.resolve('D3ADC0DE');
+    const result = await Promise.race([
+      provisioning.then(() => ({ outcome: 'success' }), error => ({ error })),
+      new Promise(resolve => setTimeout(() => resolve({ outcome: 'still_pending' }), 250)),
+    ]);
+    assert.match(String(result.error?.message || ''), /connection_closed/);
+    assert.equal(codeCount, 0);
+    assert.equal(existsSync(ordinary), false);
+  } finally {
+    pairingResult.resolve('D3ADC0DE');
+    await provisioning.catch(() => {});
+    await rm(root, { recursive: true, force: true });
   }
 });
 

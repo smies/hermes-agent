@@ -578,8 +578,7 @@ export async function provisionOffline({
           }
           return;
         }
-        const mayFinishPairing = () => !settled
-          && (isActive(generation) || pendingRestartGeneration === generation);
+        const mayFinishPairing = () => isActive(generation);
         if (!isActive(generation)
             && !(update?.qr && pendingRestartGeneration === generation)) return;
         try {
