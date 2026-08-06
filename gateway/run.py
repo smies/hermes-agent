@@ -6323,6 +6323,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if callable(refresh):
                     try:
                         refreshed = bool(await refresh())
+                    except asyncio.CancelledError:
+                        raise
                     except BaseException:
                         refreshed = False
             if (
@@ -6363,6 +6365,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         host = None
         published = False
         try:
+            # Warm model/plugin discovery before the short-lived sensitive
+            # runtime authority exists.  The result is expected to be closed
+            # while the handler is dormant; the post-start check below proves
+            # the published surface after registry generation changes.
+            await asyncio.to_thread(private_read_tool_surface_is_closed)
             if not await supervisor.start():
                 return None
             services = compose_juno_private_read_mvp_services(

@@ -421,8 +421,13 @@ async def test_three_stale_starts_reap_then_valid_start_survives_slow_surface_ch
 
     monkeypatch.setattr(mvp, "_SensitiveBridgeSupervisor", Supervisor)
 
+    surface_checks = 0
+
     def slow_private_tool_surface_check() -> bool:
-        time.sleep(0.75)
+        nonlocal surface_checks
+        surface_checks += 1
+        if surface_checks == 1:
+            time.sleep(0.75)
         return check_private_read_request_runtime()
 
     monkeypatch.setattr(
@@ -460,6 +465,7 @@ async def test_three_stale_starts_reap_then_valid_start_survives_slow_surface_ch
         assert await runner._start_trusted_private_read_host()
         assert runner._trusted_private_read_host is not None
         assert len(supervisors) == 4
+        assert surface_checks == 5
         assert all(item.stop_count == 1 for item in supervisors[:3])
         assert supervisors[3].healthy()
     finally:

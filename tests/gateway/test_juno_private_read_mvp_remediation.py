@@ -294,6 +294,9 @@ async def _cancel_task_bounded(task: asyncio.Task | None) -> None:
 def _assert_sensitive_port_released() -> None:
     probe = socket.socket()
     try:
+        # Permit rebinding across the listener's short-lived TCP TIME_WAIT
+        # state; an active listener still prevents this bind.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(("127.0.0.1", 3011))
     except PermissionError:
         pytest.skip("execution sandbox denied sensitive-port release assertion")
@@ -2839,7 +2842,7 @@ async def test_offline_cross_runtime_producer_to_private_delivery_vertical(
         for base in tuple(ordinary_surfaces):
             ordinary_surfaces.extend(base.parent.glob(base.name + "-*"))
         scanned = b"\n".join(
-            path.read_bytes() for path in ordinary_surfaces if path.exists()
+            path.read_bytes() for path in ordinary_surfaces if path.is_file()
         )
         assert PRIVATE_SENTINEL.encode() not in scanned
         assert CREDENTIAL_SENTINEL.encode() not in scanned
