@@ -459,6 +459,13 @@ def test_config_is_default_off_closed_and_rejects_unknown_duplicate_semantics(tm
         ))
 
 
+def test_builtin_openfga_authority_does_not_share_gateway_api_port() -> None:
+    gateway_api_authority = "http://127.0.0.1:8080"
+
+    assert OPENFGA_AUTHORITY == "http://127.0.0.1:8082"
+    assert OPENFGA_AUTHORITY != gateway_api_authority
+
+
 def test_renderer_is_exact_six_fields_and_content_free_failures() -> None:
     encoded = base64.urlsafe_b64encode(b"body").decode().rstrip("=")
     message = {"id": "id", "payload": {"mimeType": "text/plain", "headers": [
