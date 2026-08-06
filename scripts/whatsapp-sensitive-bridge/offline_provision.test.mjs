@@ -128,6 +128,24 @@ function fakeSocket({ phoneJid, lidJid, update, onPairingCode }) {
   return socket;
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate, message) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  assert.fail(message);
+}
+
 function wireRequest(phone = '+15551234567') {
   return Readable.from([`${JSON.stringify({
     version: 1,
@@ -891,5 +909,246 @@ test('515 recovery rejects pre-registration, repeated restart, save failure, and
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
+  }
+});
+
+test('515 fences an old open already blocked in credential save until replacement opens', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-old-open-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'4'.repeat(10)}`;
+  const phoneJid = `${phone}@s.whatsapp.net`;
+  const lidJid = '474747474@lid';
+  const creds = { registered: false };
+  const firstSaveStarted = deferred();
+  const releaseFirstSave = deferred();
+  const sockets = [];
+  let saveCalls = 0;
+  let codeCount = 0;
+  await chmod(root, 0o700);
+  const request = parseProvisioningRequest({
+    version: 1, action: 'provision', role: 'ordinary', phone,
+    ordinary_session: ordinary, sensitive_session: sensitive,
+  });
+  const provisioning = provisionOffline({
+    request,
+    canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+    useAuthState: async session => ({
+      state: {
+        creds,
+        keys: { get: async () => ({ [phone]: lidJid.split('@')[0] }), set: async () => {} },
+      },
+      saveCreds: async () => {
+        saveCalls += 1;
+        if (saveCalls === 1) {
+          firstSaveStarted.resolve();
+          await releaseFirstSave.promise;
+        }
+        await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+      },
+    }),
+    makeSocket: () => {
+      const ev = new EventEmitter();
+      const socket = {
+        ev,
+        user: { id: phoneJid },
+        signalRepository: { lidMapping: { getLIDForPN: async () => lidJid } },
+        requestPairingCode: async () => 'G3N3R4T1',
+        end() {},
+      };
+      sockets.push(socket);
+      return socket;
+    },
+    emitCode: () => { codeCount += 1; },
+    timeoutMs: 2_000,
+  });
+  try {
+    await waitFor(() => sockets.length === 1, 'first socket was not created');
+    sockets[0].ev.emit('connection.update', { qr: 'provider-private-readiness' });
+    await waitFor(() => codeCount === 1, 'pairing code was not emitted');
+    creds.registered = true;
+    creds.me = { id: phoneJid, lid: lidJid };
+    sockets[0].ev.emit('connection.update', { connection: 'open' });
+    await firstSaveStarted.promise;
+    sockets[0].ev.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 515 } } },
+    });
+    releaseFirstSave.resolve();
+    await waitFor(() => sockets.length === 2, 'replacement socket was not created');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(existsSync(ordinary), false, 'old generation committed before replacement open');
+    let settled = false;
+    provisioning.finally(() => { settled = true; }).catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+    sockets[1].ev.emit('connection.update', { connection: 'open' });
+    assert.deepEqual(await provisioning, {
+      account_namespace: 's.whatsapp.net', lid_ready: true,
+    });
+    assert.equal(codeCount, 1);
+  } finally {
+    releaseFirstSave.resolve();
+    if (sockets[1]) sockets[1].ev.emit('connection.update', { connection: 'open' });
+    await provisioning.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('deadline cannot settle or release the lock after canonical rename begins', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-commit-timeout-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'5'.repeat(10)}`;
+  const phoneJid = `${phone}@s.whatsapp.net`;
+  const lidJid = '575757575@lid';
+  const creds = { registered: true, me: { id: phoneJid, lid: lidJid } };
+  const confirmationEntered = deferred();
+  const releaseConfirmation = deferred();
+  const sockets = [];
+  let lockHeld = false;
+  let releaseCount = 0;
+  await chmod(root, 0o700);
+  const request = parseProvisioningRequest({
+    version: 1, action: 'provision', role: 'ordinary', phone,
+    ordinary_session: ordinary, sensitive_session: sensitive,
+  });
+  const provisioning = provisionOffline({
+    request,
+    canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+    useAuthState: async session => ({
+      state: {
+        creds,
+        keys: { get: async () => ({ [phone]: lidJid.split('@')[0] }), set: async () => {} },
+      },
+      saveCreds: async () => {
+        await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+      },
+    }),
+    makeSocket: () => {
+      const ev = new EventEmitter();
+      const socket = {
+        ev,
+        user: { id: phoneJid },
+        signalRepository: { lidMapping: { getLIDForPN: async () => lidJid } },
+        requestPairingCode: async () => assert.fail('registered fixture must not request a code'),
+        end() {},
+      };
+      sockets.push(socket);
+      return socket;
+    },
+    emitCode: () => assert.fail('registered fixture must not emit a code'),
+    timeoutMs: 40,
+    acquireLock: () => {
+      lockHeld = true;
+      return Object.freeze({ release() { lockHeld = false; releaseCount += 1; } });
+    },
+    beforeDurableConfirmation: async () => {
+      confirmationEntered.resolve();
+      await releaseConfirmation.promise;
+    },
+  });
+  try {
+    await waitFor(() => sockets.length === 1, 'socket was not created');
+    sockets[0].ev.emit('connection.update', { connection: 'open' });
+    await confirmationEntered.promise;
+    assert.equal(existsSync(path.join(ordinary, 'creds.json')), true, 'canonical rename did not occur');
+    const early = await Promise.race([
+      provisioning.then(() => 'success', () => 'failure'),
+      new Promise(resolve => setTimeout(() => resolve('pending'), 100)),
+    ]);
+    assert.equal(early, 'pending');
+    assert.equal(lockHeld, true);
+    assert.equal(releaseCount, 0);
+    releaseConfirmation.resolve();
+    assert.deepEqual(await provisioning, {
+      account_namespace: 's.whatsapp.net', lid_ready: true,
+    });
+    assert.equal(lockHeld, false);
+    assert.equal(releaseCount, 1);
+  } finally {
+    releaseConfirmation.resolve();
+    await provisioning.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('late credential writes in the final drain quiesce before timeout releases the lock', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-creds-drain-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'7'.repeat(10)}`;
+  const phoneJid = `${phone}@s.whatsapp.net`;
+  const lidJid = '676767676@lid';
+  const creds = { registered: true, me: { id: phoneJid, lid: lidJid } };
+  const firstSaveStarted = deferred();
+  const releaseFirstSave = deferred();
+  let socket;
+  let saveCalls = 0;
+  let lockHeld = false;
+  let releaseCount = 0;
+  await chmod(root, 0o700);
+  const request = parseProvisioningRequest({
+    version: 1, action: 'provision', role: 'ordinary', phone,
+    ordinary_session: ordinary, sensitive_session: sensitive,
+  });
+  const provisioning = provisionOffline({
+    request,
+    canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+    useAuthState: async session => ({
+      state: {
+        creds,
+        keys: { get: async () => ({ [phone]: lidJid.split('@')[0] }), set: async () => {} },
+      },
+      saveCreds: async () => {
+        saveCalls += 1;
+        if (saveCalls === 1) {
+          firstSaveStarted.resolve();
+          await releaseFirstSave.promise;
+        }
+        await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+      },
+    }),
+    makeSocket: () => {
+      const ev = new EventEmitter();
+      socket = {
+        ev,
+        user: { id: phoneJid },
+        signalRepository: { lidMapping: { getLIDForPN: async () => lidJid } },
+        requestPairingCode: async () => assert.fail('registered fixture must not request a code'),
+        end() {},
+      };
+      return socket;
+    },
+    emitCode: () => assert.fail('registered fixture must not emit a code'),
+    timeoutMs: 40,
+    acquireLock: () => {
+      lockHeld = true;
+      return Object.freeze({ release() { lockHeld = false; releaseCount += 1; } });
+    },
+  });
+  try {
+    await waitFor(() => Boolean(socket), 'socket was not created');
+    socket.ev.emit('creds.update', { late: true });
+    socket.ev.emit('connection.update', { connection: 'open' });
+    await firstSaveStarted.promise;
+    const early = await Promise.race([
+      provisioning.then(() => 'success', () => 'failure'),
+      new Promise(resolve => setTimeout(() => resolve('pending'), 100)),
+    ]);
+    assert.equal(early, 'pending');
+    assert.equal(lockHeld, true);
+    assert.equal(releaseCount, 0);
+    socket.ev.emit('creds.update', { fenced: true });
+    releaseFirstSave.resolve();
+    await assert.rejects(provisioning, /provisioning_timeout/);
+    assert.equal(saveCalls, 2, 'fenced late event escaped the final credential drain');
+    assert.equal(lockHeld, false);
+    assert.equal(releaseCount, 1);
+    assert.equal(existsSync(ordinary), false);
+  } finally {
+    releaseFirstSave.resolve();
+    await provisioning.catch(() => {});
+    await rm(root, { recursive: true, force: true });
   }
 });

@@ -453,19 +453,25 @@ export async function provisionOffline({
   const sockets = new Set();
   let timer;
   let pairedCode = false;
+  let codeEmitted = false;
   let done = false;
+  let transitionChain = Promise.resolve();
+  let authWriteChain = Promise.resolve();
   let account = null;
   let lid = null;
   let legacySeal = null;
   const phoneJid = `${request.phone}@s.whatsapp.net`;
-  const close = () => {
-    if (done) return;
-    done = true;
-    clearTimeout(timer);
+  const fenceSockets = () => {
     for (const candidate of sockets) {
       try { candidate.ev?.removeAllListeners?.(); } catch {}
       try { candidate.end?.(); } catch {}
     }
+  };
+  const close = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    fenceSockets();
   };
   try {
     if (request.role === 'sensitive') {
@@ -505,11 +511,13 @@ export async function provisionOffline({
     const auth = wrapStagedAuth(rawAuth, stage);
     await normalizeNewAuthTree(stage);
     let authWriteFailed = false;
-    let authWriteChain = Promise.resolve();
     let finishing = false;
     let generationCounter = 0;
     let activeGeneration = 0;
+    let pendingRestartGeneration = 0;
     let restartCount = 0;
+    let settled = false;
+    let commitStarted = false;
     const persistAuth = () => {
       authWriteChain = authWriteChain
         .then(() => auth.saveCreds())
@@ -517,15 +525,63 @@ export async function provisionOffline({
       return authWriteChain;
     };
     const outcome = await new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('provisioning_timeout')), timeoutMs);
-      const fail = (code) => reject(code instanceof Error ? code : new Error(code));
+      const isActive = generation => !settled && generation === activeGeneration;
+      const settle = (error, value = null) => {
+        if (settled) return false;
+        settled = true;
+        activeGeneration = 0;
+        pendingRestartGeneration = 0;
+        close();
+        if (error) reject(error instanceof Error ? error : new Error(error));
+        else resolve(value);
+        return true;
+      };
+      const fail = code => settle(code instanceof Error ? code : new Error(code));
+      const enqueueTransition = operation => {
+        const current = transitionChain.then(operation);
+        transitionChain = current.catch(() => {});
+        return current;
+      };
+      timer = setTimeout(() => {
+        if (!commitStarted) fail('provisioning_timeout');
+      }, timeoutMs);
       const statusCode = (update) => {
         const value = update?.lastDisconnect?.error?.output?.statusCode;
         return Number.isInteger(value) ? value : null;
       };
       let startSocket;
-      const onConnectionUpdate = async (candidate, generation, onCredsUpdate, update) => {
-        if (generation !== activeGeneration) return;
+      const onConnectionUpdate = async (
+        candidate, generation, onCredsUpdate, update, restartFenced = false,
+      ) => {
+        if (restartFenced) {
+          if (settled || pendingRestartGeneration !== generation) return;
+          try {
+            if (statusCode(update) !== 515 || restartCount !== 0) {
+              return fail('connection_closed');
+            }
+            await persistAuth();
+            if (settled || pendingRestartGeneration !== generation) return;
+            if (authWriteFailed) return fail('credential_persistence_failed');
+            if (!codeEmitted) return fail('connection_closed');
+            validateAuthFiles(stage);
+            if (await stagedRegisteredAccount(stage, canonicalizeJid) !== phoneJid) {
+              if (settled || pendingRestartGeneration !== generation) return;
+              return fail('connection_closed');
+            }
+            if (settled || pendingRestartGeneration !== generation) return;
+            restartCount = 1;
+            pendingRestartGeneration = 0;
+            finishing = false;
+            startSocket();
+          } catch {
+            fail('provisioning_failed');
+          }
+          return;
+        }
+        const mayFinishPairing = () => !settled
+          && (isActive(generation) || pendingRestartGeneration === generation);
+        if (!isActive(generation)
+            && !(update?.qr && pendingRestartGeneration === generation)) return;
         try {
           validateOwnerDirectory(stage, { required: true });
           // rc14 emits `connecting` before its WebSocket/Noise handshake is
@@ -541,7 +597,7 @@ export async function provisionOffline({
             } catch {
               return fail('pairing_request_failed');
             }
-            if (generation !== activeGeneration) return;
+            if (!mayFinishPairing()) return;
             let code;
             try {
               code = normalizePairingCode(providerCode);
@@ -551,29 +607,7 @@ export async function provisionOffline({
               providerCode = null;
             }
             emitCode(code);
-          }
-          if (update?.connection === 'close') {
-            const registeredAccount = auth.state.creds?.registered === true
-              ? canonicalAccount(auth.state.creds?.me?.id || '', canonicalizeJid)
-              : null;
-            if (statusCode(update) !== 515 || !pairedCode || restartCount !== 0
-                || registeredAccount !== phoneJid) return fail('connection_closed');
-            // A successful first pairing is expected to close with 515. Fence
-            // this generation before draining its queued credential writes and
-            // opening exactly one replacement socket against the same staged
-            // auth. The absolute provisioning timer is deliberately unchanged.
-            activeGeneration = 0;
-            candidate.ev.off?.('creds.update', onCredsUpdate);
-            await persistAuth();
-            if (authWriteFailed) return fail('credential_persistence_failed');
-            validateAuthFiles(stage);
-            if (await stagedRegisteredAccount(stage, canonicalizeJid) !== phoneJid) {
-              return fail('connection_closed');
-            }
-            restartCount = 1;
-            finishing = false;
-            startSocket();
-            return;
+            codeEmitted = true;
           }
           if (update?.connection !== 'open') return;
           if (finishing) return;
@@ -582,10 +616,12 @@ export async function provisionOffline({
           // write and one final credential snapshot before validation/commit.
           candidate.ev.off?.('creds.update', onCredsUpdate);
           await persistAuth();
+          if (!isActive(generation)) return;
           if (authWriteFailed) return fail('credential_persistence_failed');
           account = canonicalAccount(candidate.user?.id || '', canonicalizeJid);
           if (!account || account !== phoneJid) return fail('account_binding_failed');
           const otherAccountAfterPairing = await existingAccount(otherSession, canonicalizeJid);
+          if (!isActive(generation)) return;
           if ((otherAccountBeforePairing && otherAccountAfterPairing !== otherAccountBeforePairing)
               || (otherAccountAfterPairing && account !== otherAccountAfterPairing)) {
             return fail('session_process_isolation_required');
@@ -593,6 +629,7 @@ export async function provisionOffline({
           lid = await verifyLidBootstrap({
             auth, sock: candidate, phoneJid, canonicalizeJid,
           });
+          if (!isActive(generation)) return;
           if (!lid) return fail('lid_bootstrap_incomplete');
           const persistedLid = await verifyLidBootstrap({
             auth,
@@ -600,15 +637,19 @@ export async function provisionOffline({
             phoneJid,
             canonicalizeJid,
           });
+          if (!isActive(generation)) return;
           if (!persistedLid || persistedLid !== lid) return fail('lid_bootstrap_incomplete');
           if (otherAccountAfterPairing) {
             const otherAuth = await useAuthState(otherSession);
+            if (!isActive(generation)) return;
             const otherTopology = await sessionTopology(otherAuth, canonicalizeJid);
+            if (!isActive(generation)) return;
             if (!sameTopology({ phone: account, lid }, otherTopology)) {
               return fail('account_topology_mismatch');
             }
           }
           await normalizeNewAuthTree(stage);
+          if (!isActive(generation)) return;
           validateAuthFiles(stage);
           if (otherAccountAfterPairing) {
             const stagedGuard = request.role === 'sensitive'
@@ -620,11 +661,13 @@ export async function provisionOffline({
           // cross-role lock is still held.  A same-account race therefore has
           // exactly one possible winner.
           const otherAccountBeforeCommit = await existingAccount(otherSession, canonicalizeJid);
+          if (!isActive(generation)) return;
           if ((otherAccountAfterPairing && otherAccountBeforeCommit !== otherAccountAfterPairing)
               || (otherAccountBeforeCommit && account !== otherAccountBeforeCommit)) {
             return fail('session_process_isolation_required');
           }
           const confirmIsolation = async () => {
+            if (!isActive(generation)) throw new Error('stale_generation');
             if (otherAccountBeforeCommit) {
               const committedGuard = prepareSessionPaths(
                 request.sensitiveSession,
@@ -633,16 +676,30 @@ export async function provisionOffline({
               );
               committedGuard.revalidate();
               const committed = await useAuthState(request.session);
+              if (!isActive(generation)) throw new Error('stale_generation');
               const other = await useAuthState(otherSession);
-              if (!sameTopology(
-                await sessionTopology(committed, canonicalizeJid),
-                await sessionTopology(other, canonicalizeJid),
-              )) throw new Error('account_topology_mismatch');
+              if (!isActive(generation)) throw new Error('stale_generation');
+              const committedTopology = await sessionTopology(committed, canonicalizeJid);
+              if (!isActive(generation)) throw new Error('stale_generation');
+              const otherTopology = await sessionTopology(other, canonicalizeJid);
+              if (!isActive(generation)) throw new Error('stale_generation');
+              if (!sameTopology(committedTopology, otherTopology)) {
+                throw new Error('account_topology_mismatch');
+              }
             }
             if (typeof beforeDurableConfirmation === 'function') {
               await beforeDurableConfirmation();
+              if (!isActive(generation)) throw new Error('stale_generation');
             }
           };
+          if (!isActive(generation)) return;
+          // The ordinary deadline governs pairing and validation only. Once
+          // commit owns the generation, provider listeners are fenced and the
+          // timer is disarmed; commitStagedSession must converge through its
+          // existing durable success or bounded rollback/recovery contract.
+          commitStarted = true;
+          clearTimeout(timer);
+          fenceSockets();
           await commitStagedSession(
             stage,
             request.session,
@@ -651,8 +708,11 @@ export async function provisionOffline({
             confirmIsolation,
             commitOps,
           );
+          if (!isActive(generation)) return;
           stage = null;
-          resolve(Object.freeze({ account_namespace: account.split('@')[1], lid_ready: true }));
+          settle(null, Object.freeze({
+            account_namespace: account.split('@')[1], lid_ready: true,
+          }));
         } catch (error) {
           fail(error instanceof ProvisioningCommitError ? error : 'provisioning_failed');
         }
@@ -666,18 +726,36 @@ export async function provisionOffline({
         }));
         sockets.add(candidate);
         const onCredsUpdate = () => {
-          if (generation === activeGeneration) void persistAuth();
+          if (isActive(generation)) void persistAuth();
         };
         candidate.ev.on('creds.update', onCredsUpdate);
         candidate.ev.on('connection.update', (update) => {
-          void onConnectionUpdate(candidate, generation, onCredsUpdate, update);
+          if (!isActive(generation)) return;
+          if (update?.connection === 'close') {
+            // Fence synchronously at event ingress. An already-entered open
+            // handler will observe the lost generation after its next await;
+            // the serialized close transition validates restart eligibility
+            // after all earlier connection transitions have quiesced.
+            activeGeneration = 0;
+            pendingRestartGeneration = generation;
+            candidate.ev.off?.('creds.update', onCredsUpdate);
+            void enqueueTransition(() => onConnectionUpdate(
+              candidate, generation, onCredsUpdate, update, true,
+            ));
+            return;
+          }
+          void enqueueTransition(() => onConnectionUpdate(
+            candidate, generation, onCredsUpdate, update,
+          ));
         });
       };
-      startSocket();
+      try { startSocket(); } catch { fail('provisioning_failed'); }
     });
     return outcome;
   } finally {
     close();
+    try { await transitionChain; } catch {}
+    try { await authWriteChain; } catch {}
     if (stage) {
       try { await rm(stage, { recursive: true, force: true }); } catch {}
     }
