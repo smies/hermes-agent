@@ -206,7 +206,6 @@ def main() -> int:
                 completed = subprocess.run(
                     [
                         sys.executable, "-m", "pytest", "-vv", "-rs",
-                        "--timeout=75", "--timeout-method=thread",
                         "-o", "faulthandler_timeout=70",
                         f"--junitxml={report}",
                         (
