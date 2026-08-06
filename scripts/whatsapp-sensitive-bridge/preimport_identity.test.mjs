@@ -52,6 +52,19 @@ for (const launcher of ['launcher.js', 'provision_launcher.js']) {
     assert.equal(existsSync(marker), false);
   });
 
+  test(`${launcher} pre-hashes the rc14 patcher before its marker can execute`, () => {
+    const root = copyPackage();
+    const marker = path.join(root, `${launcher}-patcher-evaluated`);
+    const target = path.join(root, 'patch_rc14_pairing.js');
+    const source = readFileSync(target, 'utf8');
+    writeFileSync(target, source.replace(
+      '#!/usr/bin/env node\n',
+      `#!/usr/bin/env node\nprocess.getBuiltinModule('node:fs').writeFileSync(${JSON.stringify(marker)}, 'x');\n`,
+    ));
+    runRejected(root, launcher);
+    assert.equal(existsSync(marker), false);
+  });
+
   for (const packageName of ['libsignal', 'pino', 'protobufjs']) {
     test(`${launcher} rejects tampered ${packageName} before evaluation`, () => {
       const root = copyPackage();
@@ -124,7 +137,7 @@ test('sensitive cores are inert and graph has no ordinary local edge', () => {
   for (const name of [
     'launcher.js', 'provision_launcher.js', 'sensitive_bridge.js',
     'transport_identity.js', 'offline_provision.js', 'lifecycle.js',
-    'provisioning_core.js', 'delivery_core.js', 'http_server.js',
+    'patch_rc14_pairing.js', 'provisioning_core.js', 'delivery_core.js', 'http_server.js',
     'session_paths.js',
   ]) {
     assert.equal(

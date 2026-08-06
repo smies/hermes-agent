@@ -5,7 +5,8 @@ export function buildSensitiveSocketConfig({ auth, logger }) {
     auth,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Sensitive Delivery', 'Chrome', '120.0'],
+    // Exact @whiskeysockets/baileys@7.0.0-rc14 Browsers.macOS('Chrome').
+    browser: ['Mac OS', 'Chrome', '14.4.1'],
     syncFullHistory: false,
     fireInitQueries: false,
     // The production session must finish its LID bootstrap during offline

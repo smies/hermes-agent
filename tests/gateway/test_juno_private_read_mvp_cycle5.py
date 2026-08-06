@@ -71,12 +71,17 @@ async def test_provider_digest_and_descriptor_seal_every_sensitive_identity_elem
         expected_fields = {
             "manifest_sha256", "launcher_sha256", "source_sha256",
             "package_sha256", "lock_sha256", "verifier_sha256",
+            "patcher_sha256",
             "node_modules_tree_sha256", "package_name", "package_version",
             "submit_contract_version", "baileys_spec", "baileys_lock_version",
             "baileys_lock_resolved", "baileys_lock_integrity",
             "baileys_installed_name", "baileys_version",
-            "baileys_package_sha256", "baileys_tree_sha256",
-            "baileys_reviewed_release_git_head",
+            "baileys_package_sha256", "baileys_preimage_tree_sha256",
+            "baileys_tree_sha256",
+            "baileys_reviewed_release_git_head", "baileys_patch_contract",
+            "baileys_patch_upstream_commit", "baileys_patch_target",
+            "baileys_patch_preimage_sha256", "baileys_patch_postimage_sha256",
+            "baileys_patch_postimage_contract_sha256",
         }
         assert set(mvp._SENSITIVE_TRANSPORT_IDENTITY) == expected_fields
         baseline = mvp._provider_authority_digest(host.config)

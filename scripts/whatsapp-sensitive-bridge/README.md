@@ -54,9 +54,13 @@ Before enablement, process spawn, any send, and acceptance of any evidence, the
 trusted host must compare the complete returned transport identity to immutable,
 reviewed allowlisted expected values. That comparison includes
 `launcher_sha256`, `manifest_sha256`, `source_sha256`, `package_sha256`,
-`lock_sha256`, `verifier_sha256`, `node_modules_tree_sha256`, the exact
+`lock_sha256`, `verifier_sha256`, `patcher_sha256`,
+`node_modules_tree_sha256`, the exact
 npm spec, lock version/resolved/integrity, installed name/version/package bytes,
-`baileys_tree_sha256`, and the exact `juno-sensitive-submit-v2` contract. The
+the preimage and patched `baileys_tree_sha256` values, the rc14-only pairing
+patch contract/upstream commit/target, literal socket preimage/postimage hashes,
+postimage-contract digest, and the exact
+`juno-sensitive-submit-v2` contract. The
 published Git head is recorded only as reviewed
 release metadata because the npm package does not claim a `gitHead`; it is not
 artifact ancestry proof. Self-reported hashes only describe the running tree;
@@ -138,6 +142,16 @@ launcher/core boundary without WhatsApp network access.
 The audited dependency is exactly
 `@whiskeysockets/baileys@7.0.0-rc14`, resolved from its npm tarball with the
 integrity recorded in `transport-manifest.json`.
+The package's root `postinstall` applies a built-ins-only, fail-closed patch to
+the exact reviewed rc14 `lib/Socket/socket.js`. It keeps the pairing code local
+until the matching `companion_hello` IQ succeeds, uses only platform `1` and
+`Chrome (Mac OS)`, and rejects matched errors, missing responses, timeouts, or
+socket closure without persisting the transient code or account identity.
+After server-accepted pairing, the offline provisioner permits the expected
+registered-state `515 restartRequired` exactly once: it fences the first socket,
+drains staged credentials, reconnects with that same auth under the original
+deadline, and commits only after authenticated open and LID validation. It
+never requests or emits a second code.
 Reproduce the install from this directory with:
 
 ```sh

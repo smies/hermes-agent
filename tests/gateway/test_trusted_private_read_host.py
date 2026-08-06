@@ -49,6 +49,7 @@ def _config(root: Path) -> dict:
     identity = {
         "manifest_sha256": "a" * 64,
         "verifier_sha256": "f" * 64,
+        "patcher_sha256": "9" * 64,
         "launcher_sha256": SENSITIVE_VERIFIED_LAUNCHER_SHA256,
         "source_sha256": "b" * 64,
         "node_modules_tree_sha256": "1" * 64,
@@ -56,6 +57,7 @@ def _config(root: Path) -> dict:
         "lock_sha256": "d" * 64,
         "package_name": "fixture-package",
         "package_version": "fixture-version",
+        "submit_contract_version": "fixture-submit-contract",
         "baileys_spec": "fixture-spec",
         "baileys_lock_version": "fixture-lock-version",
         "baileys_lock_resolved": "fixture-lock-resolved",
@@ -63,8 +65,15 @@ def _config(root: Path) -> dict:
         "baileys_lock_integrity": "fixture-lock-integrity",
         "baileys_installed_name": "fixture-installed-name",
         "baileys_package_sha256": "f" * 64,
+        "baileys_preimage_tree_sha256": "7" * 64,
         "baileys_tree_sha256": "e" * 64,
         "baileys_reviewed_release_git_head": "fixture-reviewed-head",
+        "baileys_patch_contract": "fixture-patch-contract",
+        "baileys_patch_upstream_commit": "fixture-patch-head",
+        "baileys_patch_target": "fixture-patch-target",
+        "baileys_patch_preimage_sha256": "6" * 64,
+        "baileys_patch_postimage_sha256": "5" * 64,
+        "baileys_patch_postimage_contract_sha256": "8" * 64,
     }
     _write_owner_json(key_file, keys)
     _write_owner_json(

@@ -55,13 +55,14 @@ SENSITIVE_IDENTITY_MAX_AGE_US = 5_000_000
 SENSITIVE_IDENTITY_FUTURE_SKEW_US = 250_000
 ORDINARY_INBOUND_PROVENANCE = "messages.upsert:registered-emitting-socket:v1"
 _SENSITIVE_TRANSPORT_IDENTITY = {
-    "manifest_sha256": "59311b71c2910f176f0acc508b0533d5235b330b3dbd80629571a49a8b64448e",
-    "launcher_sha256": "e2ee6973e7502aff1ae2c17b30b44e592ed18d202232d2b4322a5558aadeef9a",
-    "source_sha256": "014399f7c277d6d8637f83c27185313f394e680dd44f5f78449248b545ecf468",
-    "package_sha256": "d3acebf298753b1009f6f5f65575fe7cdceceb05cd20bac024a0fbfaf1467d6f",
+    "manifest_sha256": "cd6afb1bd78b36b2cb8ac44ef340336c1f123eec3f49004d744d5675fd91569c",
+    "launcher_sha256": "e27eb4336115f7154352956104bf2d9ffe4f58dc901361206fa2a7f956981848",
+    "source_sha256": "32f129e2c7a8fe50215bbb0d83439fab3f611c3de6d5d26ab45fc36668a787c7",
+    "package_sha256": "725e3923282066d4c42f4017c1cf430059a6a95c124d8f32f61d9d077146c3da",
     "lock_sha256": "11763893096a6abe8b28a017dc652506bd47d39ef2ddeb0fe2ea110be58dc05a",
-    "verifier_sha256": "b486e4afee374d864bf3f1d219dc301aac45578822f96e3b494f93ca91a20770",
-    "node_modules_tree_sha256": "48121207ef2e275e835b08cf58b264b8f0d4ef56eddb07298e833a2720dc62ef",
+    "verifier_sha256": "404d291589e2aedb5bf8519f9af8453f653d970b36a811702e2623d23966380c",
+    "patcher_sha256": "106f815249330c68020dd0f189e32430585496e7cd52cf0639dae596e175607d",
+    "node_modules_tree_sha256": "11113c23c7c55c0c10dc0fe293d7ce5688dd0b000a7c3792046663509ee57ee2",
     "package_name": "hermes-whatsapp-sensitive-bridge",
     "package_version": "1.0.0",
     "submit_contract_version": SENSITIVE_SUBMIT_CONTRACT_VERSION,
@@ -72,8 +73,15 @@ _SENSITIVE_TRANSPORT_IDENTITY = {
     "baileys_installed_name": "@whiskeysockets/baileys",
     "baileys_version": "7.0.0-rc14",
     "baileys_package_sha256": "b5f4f2d1a8af27239e0e9869594345b5d99ecc102193b98117332cadffcebc0d",
-    "baileys_tree_sha256": "bdb0b02cb790daa88421bf29700b43b1e449378a77f51edcfd8d524e9b9f0112",
+    "baileys_preimage_tree_sha256": "bdb0b02cb790daa88421bf29700b43b1e449378a77f51edcfd8d524e9b9f0112",
+    "baileys_tree_sha256": "86ab52f7e1c341371f7a2b7237f495c5b1bbcfc7773fda934f1aeabbd02a02a6",
     "baileys_reviewed_release_git_head": "7e7b0757e3f9f3c7789fb1cfd2f241d5002a199a",
+    "baileys_patch_contract": "hermes-baileys-rc14-pairing-iq-v1",
+    "baileys_patch_upstream_commit": "834dc742e349958fd162f7a2239514e9b237fb5a",
+    "baileys_patch_target": "lib/Socket/socket.js",
+    "baileys_patch_preimage_sha256": "ff8b19ff02491fa080ee371f066d49c94acb903207dd0d9fdb5548e5a594fb4a",
+    "baileys_patch_postimage_sha256": "cd1b74943cc78d74a0abdc0b98d23b12badaf5d9bc3f98369d7fa043735c99bf",
+    "baileys_patch_postimage_contract_sha256": "5d7b075354235384a00d7cf6d674a91293fcb4e12d924d71371d79dad7712998",
 }
 _APPROVAL_RE = re.compile(r"^/(approve|deny) ([A-Za-z0-9_-]{16,80})$")
 _SENSITIVE_MESSAGE_ID_RE = re.compile(r"^3EB0[0-9A-F]{18}$")

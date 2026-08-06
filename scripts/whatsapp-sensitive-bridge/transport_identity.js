@@ -18,6 +18,7 @@ export const CANONICAL_SOURCE_FILES = Object.freeze([
   'lifecycle.js',
   'offline_provision.js',
   'parent_control.js',
+  'patch_rc14_pairing.js',
   'provisioning_core.js',
   'replay_authority.js',
   'session_paths.js',
@@ -45,7 +46,7 @@ function framedManifest(entries) {
   return hash.digest('hex');
 }
 
-function treeEntries(root, relative = '') {
+function treeEntries(root, relative = '', replacements = null) {
   const directory = path.join(root, relative);
   const entries = [];
   for (const name of readdirSync(directory).sort()) {
@@ -53,14 +54,18 @@ function treeEntries(root, relative = '') {
     const child = path.join(root, ...childRelative.split('/'));
     const stat = lstatSync(child);
     if (stat.isSymbolicLink()) throw new Error('transport identity refuses symlinks');
-    if (stat.isDirectory()) entries.push(...treeEntries(root, childRelative));
-    else if (stat.isFile()) entries.push([childRelative, fileHash(child)]);
+    if (stat.isDirectory()) entries.push(...treeEntries(root, childRelative, replacements));
+    else if (stat.isFile()) entries.push([
+      childRelative,
+      replacements?.has(childRelative)
+        ? sha256(replacements.get(childRelative)) : fileHash(child),
+    ]);
     else throw new Error('transport identity found unsupported tree entry');
   }
   return entries;
 }
 
-function dependencyTreeEntries(root, relative = '') {
+function dependencyTreeEntries(root, relative = '', replacements = null) {
   const directory = path.join(root, relative);
   const entries = [];
   for (const name of readdirSync(directory).sort()) {
@@ -70,7 +75,7 @@ function dependencyTreeEntries(root, relative = '') {
     const child = path.join(root, ...childRelative.split('/'));
     const stat = lstatSync(child);
     if (stat.isDirectory()) {
-      entries.push(...dependencyTreeEntries(root, childRelative));
+      entries.push(...dependencyTreeEntries(root, childRelative, replacements));
     } else if (stat.isSymbolicLink()) {
       entries.push([
         childRelative,
@@ -79,7 +84,11 @@ function dependencyTreeEntries(root, relative = '') {
     } else if (stat.isFile()) {
       entries.push([
         childRelative,
-        sha256(Buffer.concat([Buffer.from('file\0'), readFileSync(child)])),
+        sha256(Buffer.concat([
+          Buffer.from('file\0'),
+          replacements?.has(childRelative)
+            ? replacements.get(childRelative) : readFileSync(child),
+        ])),
       ]);
     } else {
       throw new Error('transport identity found unsupported dependency entry');
@@ -96,7 +105,7 @@ function exactObject(value, keys, label) {
   return value;
 }
 
-export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
+export async function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   const root = path.resolve(packageRoot);
   const packagePath = path.join(root, 'package.json');
   const lockPath = path.join(root, 'package-lock.json');
@@ -113,15 +122,15 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   const lock = JSON.parse(lockBytes.toString('utf8'));
   const manifest = exactObject(
     JSON.parse(manifestBytes.toString('utf8')),
-    ['version', 'package_name', 'package_version', 'submit_contract_version', 'package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256', 'node_modules_tree_sha256', 'baileys'],
+    ['version', 'package_name', 'package_version', 'submit_contract_version', 'package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256', 'node_modules_tree_sha256', 'patcher_sha256', 'baileys'],
     'transport manifest',
   );
   const expected = exactObject(
     manifest.baileys,
-    ['spec', 'lock_version', 'lock_resolved', 'lock_integrity', 'installed_name', 'installed_version', 'reviewed_release_git_head', 'package_sha256', 'tree_sha256'],
+    ['spec', 'lock_version', 'lock_resolved', 'lock_integrity', 'installed_name', 'installed_version', 'reviewed_release_git_head', 'package_sha256', 'preimage_tree_sha256', 'tree_sha256', 'patch_contract', 'patch_upstream_commit', 'patch_target', 'patch_preimage_sha256', 'patch_postimage_sha256', 'patch_postimage_contract_sha256'],
     'transport manifest Baileys identity',
   );
-  if (manifest.version !== 3
+  if (manifest.version !== 4
       || manifest.package_name !== pkg.name
       || manifest.package_version !== pkg.version
       || manifest.submit_contract_version !== SENSITIVE_SUBMIT_CONTRACT_VERSION
@@ -150,6 +159,32 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
   if (installed.name !== '@whiskeysockets/baileys' || installed.version !== BAILEYS_SPEC) {
     throw new Error('unexpected sensitive Baileys package');
   }
+  const patcherPath = path.join(root, 'patch_rc14_pairing.js');
+  const patcherBytes = readFileSync(patcherPath);
+  const patcherSha256 = sha256(patcherBytes);
+  if (manifest.patcher_sha256 !== patcherSha256) {
+    throw new Error('sensitive rc14 patcher identity mismatch');
+  }
+  const patcher = await import(
+    `data:text/javascript;base64,${patcherBytes.toString('base64')}`
+  );
+  const patchIdentity = patcher.verifyInstalledPatch(root);
+  const expectedPostimageContract = sha256(Buffer.from(
+    `${patchIdentity.contract}\0${patchIdentity.preimage_sha256}\0`
+      + `${patchIdentity.postimage_sha256}\0${patchIdentity.preimage_tree_sha256}\0`
+      + `${patchIdentity.postimage_tree_sha256}\0${patcherSha256}`,
+    'utf8',
+  ));
+  if (expected.patch_contract !== patchIdentity.contract
+      || expected.patch_upstream_commit !== patchIdentity.upstream_commit
+      || expected.patch_target !== patchIdentity.target
+      || expected.patch_preimage_sha256 !== patchIdentity.preimage_sha256
+      || expected.patch_postimage_sha256 !== patchIdentity.postimage_sha256
+      || expected.preimage_tree_sha256 !== patchIdentity.preimage_tree_sha256
+      || expected.tree_sha256 !== patchIdentity.postimage_tree_sha256
+      || expected.patch_postimage_contract_sha256 !== expectedPostimageContract) {
+    throw new Error('sensitive rc14 patch contract mismatch');
+  }
 
   const sourceSha256 = framedManifest(
     CANONICAL_SOURCE_FILES.map((name) => [name, fileHash(path.join(root, name))]),
@@ -161,7 +196,9 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
     dependencyTreeEntries(path.join(root, 'node_modules')),
   );
   const baileysPackageSha256 = sha256(installedPackageBytes);
-  const baileysTreeSha256 = framedManifest(treeEntries(baileysRoot));
+  const baileysTreeSha256 = framedManifest(
+    treeEntries(baileysRoot),
+  );
   if (manifest.package_sha256 !== packageSha256
       || manifest.lock_sha256 !== lockSha256
       || manifest.verifier_sha256 !== verifierSha256
@@ -177,6 +214,7 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
     package_sha256: packageSha256,
     lock_sha256: lockSha256,
     verifier_sha256: verifierSha256,
+    patcher_sha256: patcherSha256,
     node_modules_tree_sha256: nodeModulesTreeSha256,
     package_name: pkg.name,
     package_version: pkg.version,
@@ -190,6 +228,13 @@ export function computeTransportIdentity(packageRoot, expectedManifestSha256) {
     baileys_package_sha256: baileysPackageSha256,
     baileys_tree_sha256: baileysTreeSha256,
     baileys_reviewed_release_git_head: BAILEYS_REVIEWED_RELEASE_GIT_HEAD,
+    baileys_patch_contract: patchIdentity.contract,
+    baileys_patch_upstream_commit: patchIdentity.upstream_commit,
+    baileys_patch_target: patchIdentity.target,
+    baileys_patch_preimage_sha256: patchIdentity.preimage_sha256,
+    baileys_patch_postimage_sha256: patchIdentity.postimage_sha256,
+    baileys_preimage_tree_sha256: patchIdentity.preimage_tree_sha256,
+    baileys_patch_postimage_contract_sha256: expectedPostimageContract,
   };
   return Object.freeze(bounded);
 }

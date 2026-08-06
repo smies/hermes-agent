@@ -2763,6 +2763,7 @@ def _synthetic_host_config(root: Path) -> TrustedPrivateReadHostConfig:
     identity = {
         "manifest_sha256": "a" * 64,
         "verifier_sha256": "f" * 64,
+        "patcher_sha256": "9" * 64,
         "launcher_sha256": SENSITIVE_VERIFIED_LAUNCHER_SHA256,
         "source_sha256": "b" * 64,
         "node_modules_tree_sha256": "1" * 64,
@@ -2770,6 +2771,7 @@ def _synthetic_host_config(root: Path) -> TrustedPrivateReadHostConfig:
         "lock_sha256": "d" * 64,
         "package_name": "synthetic-package",
         "package_version": "synthetic-version",
+        "submit_contract_version": "synthetic-submit-contract",
         "baileys_spec": "synthetic-spec",
         "baileys_lock_version": "synthetic-lock-version",
         "baileys_lock_resolved": "synthetic-lock-resolved",
@@ -2777,8 +2779,15 @@ def _synthetic_host_config(root: Path) -> TrustedPrivateReadHostConfig:
         "baileys_lock_integrity": "synthetic-lock-integrity",
         "baileys_installed_name": "synthetic-installed-name",
         "baileys_package_sha256": "f" * 64,
+        "baileys_preimage_tree_sha256": "7" * 64,
         "baileys_tree_sha256": "e" * 64,
         "baileys_reviewed_release_git_head": "synthetic-reviewed-head",
+        "baileys_patch_contract": "synthetic-patch-contract",
+        "baileys_patch_upstream_commit": "synthetic-patch-head",
+        "baileys_patch_target": "synthetic-patch-target",
+        "baileys_patch_preimage_sha256": "6" * 64,
+        "baileys_patch_postimage_sha256": "5" * 64,
+        "baileys_patch_postimage_contract_sha256": "8" * 64,
     }
     allowlist.write_text(json.dumps({
         "version": 1,

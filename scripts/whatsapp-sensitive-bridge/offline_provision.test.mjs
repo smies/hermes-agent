@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { Readable } from 'node:stream';
 import {
   chmod, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile,
@@ -392,6 +393,8 @@ test('pairing request failure discards provider details and leaves the target ab
     await mkdir(ordinary, { mode: 0o700 });
     const ordinaryBytes = JSON.stringify(ordinaryCreds);
     await writeFile(path.join(ordinary, 'creds.json'), ordinaryBytes, { mode: 0o600 });
+    const ordinaryBefore = await stat(ordinary);
+    const credentialsBefore = await stat(path.join(ordinary, 'creds.json'));
     const request = parseProvisioningRequest({
       version: 1,
       action: 'provision',
@@ -424,6 +427,8 @@ test('pairing request failure discards provider details and leaves the target ab
     }), /pairing_request_failed/);
     assert.equal(socket.endCalled, true);
     assert.equal(await readFile(path.join(ordinary, 'creds.json'), 'utf8'), ordinaryBytes);
+    assert.equal((await stat(ordinary)).ino, ordinaryBefore.ino);
+    assert.equal((await stat(path.join(ordinary, 'creds.json'))).ino, credentialsBefore.ino);
     await assert.rejects(stat(sensitive), { code: 'ENOENT' });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -758,5 +763,133 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
   } finally {
     releaseFirst?.();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function restartJourney(mode = 'success') {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-restart-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'3'.repeat(10)}`;
+  const lidUser = '737373737';
+  const creds = { registered: false };
+  const sockets = [];
+  let codeCount = 0;
+  let saveCount = 0;
+  await chmod(root, 0o700);
+  const request = parseProvisioningRequest({
+    version: 1,
+    action: 'provision',
+    role: 'ordinary',
+    phone,
+    ordinary_session: ordinary,
+    sensitive_session: sensitive,
+  });
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+  const useAuthState = async session => ({
+    state: {
+      creds,
+      keys: {
+        get: async () => ({ [phone]: lidUser }),
+        set: async () => {},
+      },
+    },
+    saveCreds: async () => {
+      saveCount += 1;
+      if (mode === 'save_failure') throw new Error('injected_save_failure');
+      await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+    },
+  });
+  const makeSocket = () => {
+    const ev = new EventEmitter();
+    const generation = sockets.length + 1;
+    const socket = {
+      ev,
+      generation,
+      user: { id: `${phone}@s.whatsapp.net` },
+      signalRepository: { lidMapping: { getLIDForPN: async () => `${lidUser}@lid` } },
+      requestPairingCode: async () => 'R3START1',
+      ended: false,
+      end() { this.ended = true; },
+    };
+    sockets.push(socket);
+    queueMicrotask(async () => {
+      if (generation === 1) {
+        ev.emit('connection.update', { qr: 'provider-private-readiness' });
+        await tick();
+        if (mode !== 'restart_before_registration') {
+          creds.registered = true;
+          creds.me = { id: `${phone}@s.whatsapp.net`, lid: `${lidUser}@lid` };
+          ev.emit('creds.update', { registered: true, me: creds.me });
+          await tick();
+        }
+        ev.emit('connection.update', {
+          connection: 'close',
+          lastDisconnect: { error: { output: { statusCode: 515 } } },
+        });
+        await tick();
+        // Must be ignored after the first generation is fenced.
+        ev.emit('connection.update', { connection: 'open' });
+      } else if (mode === 'repeated_restart') {
+        ev.emit('connection.update', {
+          connection: 'close',
+          lastDisconnect: { error: { output: { statusCode: 515 } } },
+        });
+      } else if (mode !== 'reconnect_timeout') {
+        await tick();
+        ev.emit('connection.update', { connection: 'open' });
+      }
+    });
+    return socket;
+  };
+  try {
+    const outcome = await provisionOffline({
+      request,
+      useAuthState,
+      makeSocket,
+      canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+      emitCode: () => { codeCount += 1; },
+      timeoutMs: mode === 'reconnect_timeout' ? 75 : 2_000,
+    });
+    return { outcome, root, ordinary, sockets, codeCount, saveCount };
+  } catch (error) {
+    return { error, root, ordinary, sockets, codeCount, saveCount };
+  }
+}
+
+test('accepted pairing survives one 515 restart and commits only after reauthenticated open', async () => {
+  const fixture = await restartJourney();
+  try {
+    assert.deepEqual(fixture.outcome, {
+      account_namespace: 's.whatsapp.net', lid_ready: true,
+    });
+    assert.equal(fixture.codeCount, 1);
+    assert.equal(fixture.sockets.length, 2);
+    assert.equal(fixture.sockets[0].ended, true);
+    assert.equal(fixture.sockets[1].ended, true);
+    assert.ok(fixture.saveCount >= 2, 'restart and authenticated open must each drain creds');
+    assert.equal((await stat(fixture.ordinary)).mode & 0o777, 0o700);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('515 recovery rejects pre-registration, repeated restart, save failure, and reconnect timeout', async () => {
+  const cases = [
+    ['restart_before_registration', /connection_closed/],
+    ['repeated_restart', /connection_closed/],
+    ['save_failure', /credential_persistence_failed/],
+    ['reconnect_timeout', /provisioning_timeout/],
+  ];
+  for (const [mode, expected] of cases) {
+    const fixture = await restartJourney(mode);
+    try {
+      assert.match(String(fixture.error?.message || ''), expected, mode);
+      assert.equal(fixture.codeCount, 1, mode);
+      assert.equal(existsSync(fixture.ordinary), false, mode);
+      assert.ok(fixture.sockets.length <= 2, mode);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });

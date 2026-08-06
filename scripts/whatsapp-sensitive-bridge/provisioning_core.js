@@ -62,7 +62,8 @@ export function buildProvisioningSocketConfig({ auth, logger }) {
     auth,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Offline Provisioner', 'Chrome', '120.0'],
+    // Exact @whiskeysockets/baileys@7.0.0-rc14 Browsers.macOS('Chrome').
+    browser: ['Mac OS', 'Chrome', '14.4.1'],
     // Provisioning alone may perform the initial LID bootstrap. Production
     // sockets keep all three disabled.
     syncFullHistory: true,

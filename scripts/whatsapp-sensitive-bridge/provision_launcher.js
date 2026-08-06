@@ -5,7 +5,7 @@ import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const EXPECTED_MANIFEST_SHA256 = '59311b71c2910f176f0acc508b0533d5235b330b3dbd80629571a49a8b64448e';
+export const EXPECTED_MANIFEST_SHA256 = 'cd6afb1bd78b36b2cb8ac44ef340336c1f123eec3f49004d744d5675fd91569c';
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -16,26 +16,29 @@ function parseAnchoredManifest(manifestBytes) {
   const keys = [
     'version', 'package_name', 'package_version', 'package_sha256',
     'submit_contract_version', 'lock_sha256', 'verifier_sha256', 'source_sha256',
-    'node_modules_tree_sha256', 'baileys',
+    'node_modules_tree_sha256', 'patcher_sha256', 'baileys',
   ];
   const baileysKeys = [
     'spec', 'lock_version', 'lock_resolved', 'lock_integrity',
     'installed_name', 'installed_version', 'reviewed_release_git_head',
-    'package_sha256', 'tree_sha256',
+    'package_sha256', 'preimage_tree_sha256', 'tree_sha256', 'patch_contract',
+    'patch_upstream_commit', 'patch_target', 'patch_preimage_sha256',
+    'patch_postimage_sha256', 'patch_postimage_contract_sha256',
   ];
   const exact = (value, expected) => value
     && Object.getPrototypeOf(value) === Object.prototype
     && Object.keys(value).sort().join('\0') === [...expected].sort().join('\0');
   const digest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-  if (!exact(manifest, keys) || manifest.version !== 3
+  if (!exact(manifest, keys) || manifest.version !== 4
       || typeof manifest.package_name !== 'string' || !manifest.package_name
       || typeof manifest.package_version !== 'string' || !manifest.package_version
       || manifest.submit_contract_version !== 'juno-sensitive-submit-v2'
       || !['package_sha256', 'lock_sha256', 'verifier_sha256', 'source_sha256',
-        'node_modules_tree_sha256'].every((name) => digest(manifest[name]))
+        'node_modules_tree_sha256', 'patcher_sha256'].every((name) => digest(manifest[name]))
       || !exact(manifest.baileys, baileysKeys)
-      || !digest(manifest.baileys.package_sha256)
-      || !digest(manifest.baileys.tree_sha256)) {
+      || !['package_sha256', 'preimage_tree_sha256', 'tree_sha256',
+        'patch_preimage_sha256', 'patch_postimage_sha256',
+        'patch_postimage_contract_sha256'].every((name) => digest(manifest.baileys[name]))) {
     throw new Error('sensitive transport manifest schema mismatch');
   }
   return manifest;
@@ -58,7 +61,7 @@ export async function launchProvisioner(argv = process.argv.slice(2)) {
   const verifier = await import(
     `data:text/javascript;base64,${verifierBytes.toString('base64')}`
   );
-  verifier.computeTransportIdentity(root, EXPECTED_MANIFEST_SHA256);
+  await verifier.computeTransportIdentity(root, EXPECTED_MANIFEST_SHA256);
   if (argv.length === 1 && argv[0] === '--verify-only') return 0;
   const core = await import('./offline_provision.js');
   const operatorOutput = argv.length === 1 && argv[0] === '--operator-stdio'

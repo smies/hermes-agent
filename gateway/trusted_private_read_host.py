@@ -50,7 +50,7 @@ from tools.private_read_request_tool import configure_private_read_request_runti
 
 
 SENSITIVE_VERIFIED_LAUNCHER_SHA256 = (
-    "e2ee6973e7502aff1ae2c17b30b44e592ed18d202232d2b4322a5558aadeef9a"
+    "e27eb4336115f7154352956104bf2d9ffe4f58dc901361206fa2a7f956981848"
 )
 SENSITIVE_RUNTIME_LAUNCHER_PATH = (
     Path(__file__).absolute().parent.parent
@@ -343,12 +343,19 @@ class TrustedPrivateReadHostConfig:
         identity_fields = {
             "manifest_sha256", "verifier_sha256", "source_sha256",
             "node_modules_tree_sha256", "package_sha256", "lock_sha256",
+            "patcher_sha256",
             "launcher_sha256",
-            "package_name", "package_version", "baileys_spec",
+            "package_name", "package_version", "submit_contract_version",
+            "baileys_spec",
             "baileys_lock_version", "baileys_lock_resolved",
             "baileys_lock_integrity", "baileys_installed_name", "baileys_version",
-            "baileys_package_sha256", "baileys_tree_sha256",
+            "baileys_package_sha256", "baileys_preimage_tree_sha256",
+            "baileys_tree_sha256",
             "baileys_reviewed_release_git_head",
+            "baileys_patch_contract", "baileys_patch_upstream_commit",
+            "baileys_patch_target", "baileys_patch_preimage_sha256",
+            "baileys_patch_postimage_sha256",
+            "baileys_patch_postimage_contract_sha256",
         }
         if allowlist["version"] != 1 or type(identity) is not dict or set(identity) != identity_fields:
             raise TrustedPrivateReadConfigurationError("transport allowlist is invalid")

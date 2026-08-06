@@ -70,6 +70,7 @@ test('socket config explicitly disables own events, history/offline sync, retry/
   const auth = { creds: {}, keys: {} };
   const config = buildSensitiveSocketConfig({ auth, logger: { child() { return this; } } });
   assert.equal(config.auth, auth);
+  assert.deepEqual(config.browser, ['Mac OS', 'Chrome', '14.4.1']);
   assert.equal(config.emitOwnEvents, false);
   assert.equal(config.enableRecentMessageCache, false);
   assert.equal(config.maxMsgRetryCount, 0);

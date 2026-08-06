@@ -26,6 +26,7 @@ test('exact rc14 pairing-code alphabet normalization with no QR surface', () => 
   assert.throws(() => normalizePhone('not-a-phone'), /phone_input_invalid/);
   const config = buildProvisioningSocketConfig({ auth: {}, logger: {} });
   assert.equal(config.printQRInTerminal, false);
+  assert.deepEqual(config.browser, ['Mac OS', 'Chrome', '14.4.1']);
   assert.equal(config.syncFullHistory, true);
   assert.equal(config.fireInitQueries, true);
   assert.equal(config.shouldSyncHistoryMessage({}), true);

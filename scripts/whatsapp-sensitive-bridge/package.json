@@ -5,6 +5,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "postinstall": "node patch_rc14_pairing.js",
     "start": "node launcher.js",
     "provision": "node provision_launcher.js",
     "test": "node --test --test-concurrency=1 *.test.mjs"

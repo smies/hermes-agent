@@ -158,6 +158,10 @@ process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { request += chunk; });
 process.stdin.on('end', () => {
   JSON.parse(request);
+  const providerRejection = {
+    status: 400, response: 'bad-request', id: 'matching-iq-identifier',
+  };
+  void providerRejection;
   process.stderr.write(JSON.stringify({
     event: 'pairing_failure', reason: 'pairing_request_failed',
   }) + '\\n');
@@ -200,6 +204,9 @@ process.stdin.on('end', () => {
         )
     assert operator.getvalue() == ""
     assert machine.getvalue() == ""
+    for forbidden in ("400", "bad-request", "matching-iq-identifier"):
+        assert forbidden not in operator.getvalue()
+        assert forbidden not in machine.getvalue()
     assert not ordinary.exists()
     assert not sensitive.exists()
 

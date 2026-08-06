@@ -39,11 +39,19 @@ def _assert_symlinks_stay_private(root: Path, private: Path) -> None:
                 raise RuntimeError("isolated Node dependency symlink escapes private tree")
 
 
-def _install(package: Path, cache: Path, private: Path, *, offline: bool) -> None:
+def _install(
+    package: Path,
+    cache: Path,
+    private: Path,
+    *,
+    offline: bool,
+    ignore_scripts: bool,
+) -> None:
     offline_args = ["--offline"] if offline else []
+    script_args = ["--ignore-scripts"] if ignore_scripts else []
     subprocess.run(
         [
-            "npm", "ci", "--ignore-scripts",
+            "npm", "ci", *script_args,
             "--no-audit", "--no-fund", "--cache", str(cache),
             *offline_args,
         ],
@@ -158,8 +166,14 @@ def main() -> int:
                 seed, cache,
                 (ordinary / "package-lock.json", sensitive / "package-lock.json"),
             )
-        _install(ordinary, cache, private, offline=bool(seed_value))
-        _install(sensitive, cache, private, offline=bool(seed_value))
+        _install(
+            ordinary, cache, private,
+            offline=bool(seed_value), ignore_scripts=True,
+        )
+        _install(
+            sensitive, cache, private,
+            offline=bool(seed_value), ignore_scripts=False,
+        )
         sabotaged_ordinary = scripts / "whatsapp-bridge-registration-sabotage"
         shutil.copytree(ordinary, sabotaged_ordinary, symlinks=True)
         sabotaged_bridge = sabotaged_ordinary / "bridge.js"

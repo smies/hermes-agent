@@ -45,7 +45,7 @@ _PRE_CODE_FAILURE_MESSAGES = {
         "WhatsApp provisioning timed out before a pairing code was issued"
     ),
 }
-_SENSITIVE_PROVISION_LAUNCHER_SHA256 = "6f2b08d8e7eafb1dd713dadef8466ae6e11ff94914ab53dbc3c32efff823b7a0"
+_SENSITIVE_PROVISION_LAUNCHER_SHA256 = "f0ac143a99437d090e1432d24b57bc35cbfeda262ae43df31b149ee46a5a8cd4"
 
 
 class WhatsAppProvisioningError(RuntimeError):

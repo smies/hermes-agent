@@ -62,6 +62,14 @@ async function existingAccount(session, canonicalizeJid) {
   } catch { return null; }
 }
 
+async function stagedRegisteredAccount(session, canonicalizeJid) {
+  try {
+    const payload = JSON.parse(await readFile(path.join(session, 'creds.json'), 'utf8'));
+    if (payload?.registered !== true) return null;
+    return canonicalAccount(payload?.me?.id || '', canonicalizeJid);
+  } catch { return null; }
+}
+
 async function sessionTopology(auth, canonicalizeJid, sock = {}) {
   if (auth?.state?.creds?.registered !== true) return null;
   const phone = canonicalAccount(auth.state.creds?.me?.id || '', canonicalizeJid);
@@ -442,7 +450,7 @@ export async function provisionOffline({
   const lock = typeof acquireLock === 'function' ? acquireLock(request, ownerRoot) : null;
   let stage = null;
   const otherSession = request.role === 'ordinary' ? request.sensitiveSession : request.ordinarySession;
-  let sock;
+  const sockets = new Set();
   let timer;
   let pairedCode = false;
   let done = false;
@@ -454,8 +462,10 @@ export async function provisionOffline({
     if (done) return;
     done = true;
     clearTimeout(timer);
-    try { sock.ev?.removeAllListeners?.(); } catch {}
-    try { sock.end?.(); } catch {}
+    for (const candidate of sockets) {
+      try { candidate.ev?.removeAllListeners?.(); } catch {}
+      try { candidate.end?.(); } catch {}
+    }
   };
   try {
     if (request.role === 'sensitive') {
@@ -494,22 +504,28 @@ export async function provisionOffline({
     const rawAuth = await useAuthState(stage);
     const auth = wrapStagedAuth(rawAuth, stage);
     await normalizeNewAuthTree(stage);
-    sock = makeSocket(buildProvisioningSocketConfig({ auth: auth.state, logger: silentLogger() }));
     let authWriteFailed = false;
     let authWriteChain = Promise.resolve();
     let finishing = false;
+    let generationCounter = 0;
+    let activeGeneration = 0;
+    let restartCount = 0;
     const persistAuth = () => {
       authWriteChain = authWriteChain
         .then(() => auth.saveCreds())
         .catch(() => { authWriteFailed = true; });
       return authWriteChain;
     };
-    const onCredsUpdate = () => { void persistAuth(); };
     const outcome = await new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(new Error('provisioning_timeout')), timeoutMs);
       const fail = (code) => reject(code instanceof Error ? code : new Error(code));
-      sock.ev.on('creds.update', onCredsUpdate);
-      sock.ev.on('connection.update', async (update) => {
+      const statusCode = (update) => {
+        const value = update?.lastDisconnect?.error?.output?.statusCode;
+        return Number.isInteger(value) ? value : null;
+      };
+      let startSocket;
+      const onConnectionUpdate = async (candidate, generation, onCredsUpdate, update) => {
+        if (generation !== activeGeneration) return;
         try {
           validateOwnerDirectory(stage, { required: true });
           // rc14 emits `connecting` before its WebSocket/Noise handshake is
@@ -521,10 +537,11 @@ export async function provisionOffline({
             pairedCode = true;
             let providerCode;
             try {
-              providerCode = await sock.requestPairingCode(request.phone);
+              providerCode = await candidate.requestPairingCode(request.phone);
             } catch {
               return fail('pairing_request_failed');
             }
+            if (generation !== activeGeneration) return;
             let code;
             try {
               code = normalizePairingCode(providerCode);
@@ -535,23 +552,47 @@ export async function provisionOffline({
             }
             emitCode(code);
           }
-          if (update?.connection === 'close') return fail('connection_closed');
+          if (update?.connection === 'close') {
+            const registeredAccount = auth.state.creds?.registered === true
+              ? canonicalAccount(auth.state.creds?.me?.id || '', canonicalizeJid)
+              : null;
+            if (statusCode(update) !== 515 || !pairedCode || restartCount !== 0
+                || registeredAccount !== phoneJid) return fail('connection_closed');
+            // A successful first pairing is expected to close with 515. Fence
+            // this generation before draining its queued credential writes and
+            // opening exactly one replacement socket against the same staged
+            // auth. The absolute provisioning timer is deliberately unchanged.
+            activeGeneration = 0;
+            candidate.ev.off?.('creds.update', onCredsUpdate);
+            await persistAuth();
+            if (authWriteFailed) return fail('credential_persistence_failed');
+            validateAuthFiles(stage);
+            if (await stagedRegisteredAccount(stage, canonicalizeJid) !== phoneJid) {
+              return fail('connection_closed');
+            }
+            restartCount = 1;
+            finishing = false;
+            startSocket();
+            return;
+          }
           if (update?.connection !== 'open') return;
           if (finishing) return;
           finishing = true;
           // Fence later provider writes, then drain every already-scheduled
           // write and one final credential snapshot before validation/commit.
-          sock.ev.off?.('creds.update', onCredsUpdate);
+          candidate.ev.off?.('creds.update', onCredsUpdate);
           await persistAuth();
           if (authWriteFailed) return fail('credential_persistence_failed');
-          account = canonicalAccount(sock.user?.id || '', canonicalizeJid);
+          account = canonicalAccount(candidate.user?.id || '', canonicalizeJid);
           if (!account || account !== phoneJid) return fail('account_binding_failed');
           const otherAccountAfterPairing = await existingAccount(otherSession, canonicalizeJid);
           if ((otherAccountBeforePairing && otherAccountAfterPairing !== otherAccountBeforePairing)
               || (otherAccountAfterPairing && account !== otherAccountAfterPairing)) {
             return fail('session_process_isolation_required');
           }
-          lid = await verifyLidBootstrap({ auth, sock, phoneJid, canonicalizeJid });
+          lid = await verifyLidBootstrap({
+            auth, sock: candidate, phoneJid, canonicalizeJid,
+          });
           if (!lid) return fail('lid_bootstrap_incomplete');
           const persistedLid = await verifyLidBootstrap({
             auth,
@@ -615,7 +656,24 @@ export async function provisionOffline({
         } catch (error) {
           fail(error instanceof ProvisioningCommitError ? error : 'provisioning_failed');
         }
-      });
+      };
+      startSocket = () => {
+        const generation = ++generationCounter;
+        activeGeneration = generation;
+        const candidate = makeSocket(buildProvisioningSocketConfig({
+          auth: auth.state,
+          logger: silentLogger(),
+        }));
+        sockets.add(candidate);
+        const onCredsUpdate = () => {
+          if (generation === activeGeneration) void persistAuth();
+        };
+        candidate.ev.on('creds.update', onCredsUpdate);
+        candidate.ev.on('connection.update', (update) => {
+          void onConnectionUpdate(candidate, generation, onCredsUpdate, update);
+        });
+      };
+      startSocket();
     });
     return outcome;
   } finally {
