@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -68,7 +68,7 @@ test('package, lock, installed metadata, and deterministic tree bind the exact n
 });
 
 test('transport identity fails closed after source or installed package tampering', async () => {
-  const copy = mkdtempSync(path.join(tmpdir(), 'hermes-sensitive-identity-'));
+  const copy = realpathSync(mkdtempSync(path.join(tmpdir(), 'hermes-sensitive-identity-')));
   cpSync(HERE, copy, {
     recursive: true,
     verbatimSymlinks: true,
