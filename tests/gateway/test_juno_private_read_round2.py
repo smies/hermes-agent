@@ -345,6 +345,132 @@ async def test_reconciler_publishes_once_after_delayed_topology_and_recovery(
 
 
 @pytest.mark.asyncio
+async def test_three_stale_starts_reap_then_valid_start_survives_slow_surface_check(
+    tmp_path, monkeypatch,
+) -> None:
+    """Cold tool discovery must not starve the ordinary fence refresh task."""
+    import gateway.juno_private_read_mvp as mvp
+    from tools.private_read_request_tool import check_private_read_request_runtime
+
+    runner = _runner(tmp_path)
+    runner._shutdown_event = asyncio.Event()
+    runner._background_tasks = set()
+    runner._trusted_private_read_reconcile_lock = asyncio.Lock()
+
+    class RefreshingAdapter:
+        def __init__(self) -> None:
+            self.last_refresh = time.monotonic()
+
+        def private_read_sender_companion_fence_healthy(self, profile: str) -> bool:
+            return profile == "juno" and time.monotonic() - self.last_refresh < 0.5
+
+        async def send(self, _destination: str, _text: str):
+            return SimpleNamespace(success=True, message_id="ordinary-notice")
+
+    adapter = RefreshingAdapter()
+    topology = _Topology(adapter, "ordinary-live")
+    runner.adapters[Platform.WHATSAPP] = adapter
+    runner._current_juno_private_read_topology = lambda: (
+        topology
+        if adapter.private_read_sender_companion_fence_healthy("juno")
+        else None
+    )
+
+    supervisors = []
+
+    class Supervisor:
+        def __init__(self, _config, _topology) -> None:
+            self.process = SimpleNamespace(
+                pid=10_000 + len(supervisors), state="running", control_open=True,
+            )
+            self.reaped = None
+            self.stop_count = 0
+            supervisors.append(self)
+
+        async def start(self) -> bool:
+            return not any(
+                os.environ.get(name) == "1"
+                for name in (
+                    "JUNO_TEST_SENSITIVE_STALE_CAPABILITY",
+                    "JUNO_TEST_SENSITIVE_STALE_TOPOLOGY",
+                    "JUNO_TEST_SENSITIVE_STALE_PROCESS_GENERATION",
+                )
+            )
+
+        async def stop(self) -> None:
+            self.stop_count += 1
+            process, self.process = self.process, None
+            if process is not None:
+                process.control_open = False
+                process.state = "reaped"
+                self.reaped = process
+
+        def healthy(self) -> bool:
+            return self.process is not None and self.process.state == "running"
+
+        async def refresh(self) -> bool:
+            return self.healthy()
+
+        async def observe_identity(self, *, request):
+            del request
+            return None
+
+        async def submit(self, *, request, plaintext, identity):
+            del request, plaintext, identity
+            raise AssertionError("startup recovery must not submit")
+
+    monkeypatch.setattr(mvp, "_SensitiveBridgeSupervisor", Supervisor)
+
+    def slow_private_tool_surface_check() -> bool:
+        time.sleep(0.75)
+        return check_private_read_request_runtime()
+
+    monkeypatch.setattr(
+        mvp, "private_read_tool_surface_is_closed", slow_private_tool_surface_check,
+    )
+
+    async def refresh_fence() -> None:
+        while True:
+            adapter.last_refresh = time.monotonic()
+            await asyncio.sleep(0.005)
+
+    refresh_task = asyncio.create_task(refresh_fence())
+    try:
+        for stale_environment in (
+            "JUNO_TEST_SENSITIVE_STALE_CAPABILITY",
+            "JUNO_TEST_SENSITIVE_STALE_TOPOLOGY",
+            "JUNO_TEST_SENSITIVE_STALE_PROCESS_GENERATION",
+        ):
+            monkeypatch.setenv(stale_environment, "1")
+            await asyncio.sleep(0.01)
+            assert not await runner._start_trusted_private_read_host()
+            assert runner._trusted_private_read_host is None
+            rejected = supervisors[-1]
+            assert rejected.process is None
+            assert rejected.reaped is not None
+            assert rejected.reaped.state == "reaped"
+            assert rejected.reaped.control_open is False
+            reconcile_task = runner._trusted_private_read_reconciler_task
+            assert reconcile_task is not None
+            assert await runner._stop_juno_private_read_reconciler()
+            assert reconcile_task.done()
+            monkeypatch.delenv(stale_environment)
+
+        await asyncio.sleep(0.01)
+        assert await runner._start_trusted_private_read_host()
+        assert runner._trusted_private_read_host is not None
+        assert len(supervisors) == 4
+        assert all(item.stop_count == 1 for item in supervisors[:3])
+        assert supervisors[3].healthy()
+    finally:
+        await runner._stop_juno_private_read_reconciler()
+        await runner._depublish_juno_private_read_generation()
+        refresh_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await refresh_task
+
+
+@pytest.mark.asyncio
 async def test_reconciler_burns_old_handler_on_adapter_or_runtime_replacement(
     tmp_path, monkeypatch,
 ) -> None:

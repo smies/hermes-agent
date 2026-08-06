@@ -6377,7 +6377,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             host = JunoPrivateReadMvpHost(
                 config, services, active_profile=self._active_profile_name(),
             )
-            if not await host.start() or not private_read_tool_surface_is_closed():
+            if not await host.start():
+                logger.error("Juno private-read activation failed at host readiness")
+                return None
+            # The first model_tools import performs synchronous built-in and
+            # plugin discovery.  Keep that cold-start work off the event loop
+            # so the ordinary adapter can continue refreshing its short-lived
+            # authenticated topology evidence while the reviewed tool surface
+            # is verified.
+            if not await asyncio.to_thread(private_read_tool_surface_is_closed):
+                logger.error("Juno private-read activation failed at tool surface readiness")
                 return None
             published = True
             return host, supervisor
