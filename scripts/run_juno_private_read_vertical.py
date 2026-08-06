@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 
@@ -98,6 +99,18 @@ def _port_release_status(port: int) -> bool | None:
         return False
     finally:
         probe.close()
+
+
+def _wait_for_port_release(port: int, *, timeout: float = 5.0) -> bool | None:
+    """Allow bounded parent-death cleanup, but never hide a persistent owner."""
+    deadline = time.monotonic() + timeout
+    while True:
+        status = _port_release_status(port)
+        if status is not False:
+            return status
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def main() -> int:
@@ -233,7 +246,7 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     host_blocked = True
-                port_status = _port_release_status(3011)
+                port_status = _wait_for_port_release(3011)
                 if port_status is None:
                     print(
                         f"vertical attempt {attempt} {test_name} could not inspect "
