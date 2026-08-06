@@ -91,6 +91,10 @@ def _run_node_suite(package: Path, private: Path) -> None:
 def _port_release_status(port: int) -> bool | None:
     probe = socket.socket()
     try:
+        # Listener teardown can leave short-lived TIME_WAIT state. Reuse-address
+        # distinguishes that harmless state from a process still owning the
+        # listening authority while preserving fail-closed bind behavior.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(("127.0.0.1", port))
         return True
     except PermissionError:
