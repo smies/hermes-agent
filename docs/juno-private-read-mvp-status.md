@@ -1,5 +1,10 @@
 # Juno private-read MVP status (Option 2)
 
+> **Superseded and inactive.** The current direction is
+> [Juno learns locally and consults Kite for private authority](architecture/adr-juno-kite-trusted-principal-architecture.md).
+> This document is retained as history. The MVP remains disabled and is not
+> commissioned; this notice activates or deletes nothing.
+
 Status as of 2026-08-05: **offline implementation candidate; not authorized
 or ready for deployment**.
 

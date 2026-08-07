@@ -1,5 +1,10 @@
 # Trusted private-read gateway host
 
+> **Superseded and inactive.** The current direction is
+> [Juno learns locally and consults Kite for private authority](architecture/adr-juno-kite-trusted-principal-architecture.md).
+> This document is retained as history. The host design remains disabled and
+> is not commissioned; this notice activates or deletes nothing.
+
 The trusted private-read host is absent by default. The gateway considers it
 only when `gateway.trusted_private_read` is an explicit version-1 mapping with
 `enabled: true`. Disabled or invalid configuration leaves the service-gated

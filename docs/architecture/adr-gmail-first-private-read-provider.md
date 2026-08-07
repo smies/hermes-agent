@@ -1,5 +1,10 @@
 # ADR: Gmail as Juno's first concrete private-read provider
 
+> **Superseded and inactive.** The current direction is
+> [Juno learns locally and consults Kite for private authority](adr-juno-kite-trusted-principal-architecture.md).
+> This document is retained as history. Its private-read design remains
+> disabled and is not commissioned; this notice activates or deletes nothing.
+
 - **Status:** proposed; implementation and deployment are not authorized
 - **Decision revision:** 2026-08-05
 - **Revision source commit:** `be72114b7c32501d8c24cddae4d1dac9b8f47825`
