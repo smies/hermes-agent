@@ -118,8 +118,18 @@ def _adapter(tmp_path: Path) -> WhatsAppAdapter:
     return adapter
 
 
-def test_exact_trusted_principal_v2_configures_fence_without_legacy_service(
+def test_legacy_juno_self_chat_can_configure_sender_companion_fence(
     tmp_path: Path,
+) -> None:
+    adapter = _unconfigured_adapter(tmp_path, mode="self-chat")
+
+    adapter.configure_private_read_sender_companion_fence("juno")
+
+    assert adapter._private_read_fence_profile == "juno"
+
+
+def test_exact_trusted_principal_v2_configures_fence_without_legacy_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw = _trusted_principal_activation()
     raw["principal_bindings"].append(
@@ -127,9 +137,25 @@ def test_exact_trusted_principal_v2_configures_fence_without_legacy_service(
     )
     runner = _activation_runner(raw)
     adapter = _unconfigured_adapter(tmp_path)
+    configured_before_connect = False
+    configure = adapter.configure_trusted_principal_v2_sender_companion_fence
+
+    def observe_preconnect(profile: str) -> None:
+        nonlocal configured_before_connect
+        configured_before_connect = (
+            adapter._bridge_process is None and not adapter._running
+        )
+        configure(profile)
+
+    monkeypatch.setattr(
+        adapter,
+        "configure_trusted_principal_v2_sender_companion_fence",
+        observe_preconnect,
+    )
 
     runner._configure_juno_private_read_sender_fence(Platform.WHATSAPP, adapter)
 
+    assert configured_before_connect is True
     assert adapter._private_read_fence_profile == "juno"
     assert runner.config.trusted_private_read == {"version": 2, "enabled": False}
     assert not hasattr(runner, "_trusted_private_read_host")
@@ -149,6 +175,7 @@ def test_exact_trusted_principal_v2_configures_fence_without_legacy_service(
         "no_groups",
         "bad_policy",
         "plugin_disabled",
+        "adapter_capability_missing",
     ),
 )
 def test_trusted_principal_fence_activation_requires_exact_scope(
@@ -181,8 +208,12 @@ def test_trusted_principal_fence_activation_requires_exact_scope(
         runner.config.juno_kite_trusted_principal = None
     elif case == "plugin_disabled":
         runner.config.enabled_plugins = ()
-    adapter = _unconfigured_adapter(
-        tmp_path, mode="self-chat" if case == "self_chat" else "bot"
+    adapter = (
+        SimpleNamespace(_private_read_fence_profile=None)
+        if case == "adapter_capability_missing"
+        else _unconfigured_adapter(
+            tmp_path, mode="self-chat" if case == "self_chat" else "bot"
+        )
     )
 
     runner._configure_juno_private_read_sender_fence(platform, adapter)

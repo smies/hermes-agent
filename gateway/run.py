@@ -14108,12 +14108,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if profile is None:
                 return
             if trusted_principal is not None:
-                capable = getattr(adapter, "trusted_principal_fence_capable", None)
-                if not callable(capable) or capable(profile) is not True:
-                    return
-            configure = getattr(
-                adapter, "configure_private_read_sender_companion_fence", None,
-            )
+                configure = getattr(
+                    adapter,
+                    "configure_trusted_principal_v2_sender_companion_fence",
+                    None,
+                )
+            else:
+                configure = getattr(
+                    adapter, "configure_private_read_sender_companion_fence", None,
+                )
             if not callable(configure):
                 return
             configure(profile)

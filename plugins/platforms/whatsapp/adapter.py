@@ -535,7 +535,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     def configure_private_read_sender_companion_fence(self, profile: str) -> None:
         """Install a one-adapter attestation authority before bridge launch."""
-        if not self.trusted_principal_fence_capable(profile):
+        if profile != "juno" or self._bridge_process is not None or self._running:
             raise RuntimeError("private-read sender-companion fence cannot be configured")
         if self._private_read_fence_profile is not None:
             raise RuntimeError("private-read sender-companion fence is already configured")
@@ -556,6 +556,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             and self._bridge_process is None
             and not self._running
         )
+
+    def configure_trusted_principal_v2_sender_companion_fence(
+        self, profile: str,
+    ) -> None:
+        """Install the fence only for the dedicated v2 bot-mode producer."""
+        if not self.trusted_principal_fence_capable(profile):
+            raise RuntimeError("trusted-principal-v2 fence cannot be configured")
+        self.configure_private_read_sender_companion_fence(profile)
 
     def _clear_private_read_fence_evidence(self) -> None:
         self._private_read_fence_runtime_id = None
