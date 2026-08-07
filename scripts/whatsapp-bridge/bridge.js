@@ -49,6 +49,10 @@ import {
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
 
+// This is a dedicated process. Keep every subsequently created auth/session
+// artifact owner-only even if the service manager inherited a looser mask.
+process.umask(0o077);
+
 const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 let TRANSPORT_IDENTITY = null;
 
