@@ -35,6 +35,7 @@ function sha256(value) {
 }
 
 async function provision(role, ordinary, sensitive) {
+  let emitPostCodeOpen;
   await provisionOffline({
     request: parseProvisioningRequest({
       version: 1, action: 'provision', role, phone: PHONE,
@@ -49,6 +50,7 @@ async function provision(role, ordinary, sensitive) {
         on(name, handler) { listeners.set(name, handler); },
         removeAllListeners() { listeners.clear(); },
       };
+      emitPostCodeOpen = () => listeners.get('connection.update')?.({ connection: 'open' });
       const socket = {
         ev,
         user: { id: `${PHONE}:4@s.whatsapp.net`, lid: `${LID}@lid` },
@@ -67,7 +69,7 @@ async function provision(role, ordinary, sensitive) {
       });
       return socket;
     },
-    emitCode() {},
+    emitCode() { queueMicrotask(() => emitPostCodeOpen?.()); },
     timeoutMs: 3_000,
   });
 }

@@ -384,10 +384,12 @@ test('offline provisioning uses only requestPairingCode and persists canonical L
           update: () => ({ qr: 'provider-private-readiness' }),
         });
         socket.sendMessage = () => { sendCalls += 1; };
-        queueMicrotask(() => socket.ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
-      emitCode: (code) => assert.equal(code, 'A1B2C3D4'),
+      emitCode: (code) => {
+        assert.equal(code, 'A1B2C3D4');
+        queueMicrotask(() => socket.ev.emit('connection.update', { connection: 'open' }));
+      },
       timeoutMs: 2_000,
     });
     assert.deepEqual(result, { account_namespace: 's.whatsapp.net', lid_ready: true });
@@ -528,6 +530,7 @@ test('explicit reprovision replaces unsafe legacy auth with fresh owner-only sta
   const phone = `1${'9'.repeat(10)}`;
   const lid = '424242424';
   let pairingCalls = 0;
+  let socket;
   try {
     await chmod(root, 0o700);
     await mkdir(ordinary, { mode: 0o755 });
@@ -566,7 +569,7 @@ test('explicit reprovision replaces unsafe legacy auth with fresh owner-only sta
       },
       makeSocket: () => {
         const ev = new EventEmitter();
-        const socket = {
+        socket = {
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => `${lid}@lid` } },
@@ -574,10 +577,12 @@ test('explicit reprovision replaces unsafe legacy auth with fresh owner-only sta
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { qr: 'provider-private-readiness' }));
-        queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
-      emitCode: (code) => assert.equal(code, 'M3GYC9DE'),
+      emitCode: (code) => {
+        assert.equal(code, 'M3GYC9DE');
+        queueMicrotask(() => socket.ev.emit('connection.update', { connection: 'open' }));
+      },
       timeoutMs: 2_000,
     });
     assert.deepEqual(result, { account_namespace: 's.whatsapp.net', lid_ready: true });
@@ -596,6 +601,7 @@ test('post-install staged failure restores the exact unsafe legacy tree', async 
   const sensitive = path.join(root, 'sensitive');
   const phone = `1${'8'.repeat(10)}`;
   const original = 'legacy-exact-bytes';
+  let socket;
   try {
     await chmod(root, 0o700);
     await mkdir(ordinary, { mode: 0o755 });
@@ -636,7 +642,7 @@ test('post-install staged failure restores the exact unsafe legacy tree', async 
       },
       makeSocket: () => {
         const ev = new EventEmitter();
-        const socket = {
+        socket = {
           ev,
           user: { id: `${phone}@s.whatsapp.net` },
           signalRepository: { lidMapping: { getLIDForPN: async () => '818181818@lid' } },
@@ -644,10 +650,11 @@ test('post-install staged failure restores the exact unsafe legacy tree', async 
           end() {},
         };
         queueMicrotask(() => ev.emit('connection.update', { qr: 'provider-private-readiness' }));
-        queueMicrotask(() => ev.emit('connection.update', { connection: 'open' }));
         return socket;
       },
-      emitCode: () => {},
+      emitCode: () => {
+        queueMicrotask(() => socket.ev.emit('connection.update', { connection: 'open' }));
+      },
       beforeDurableConfirmation: async () => { throw new Error('injected_commit_failure'); },
       timeoutMs: 2_000,
     }), /provisioning_failed/);
@@ -714,6 +721,7 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
   const phone = `1${'2'.repeat(10)}`;
   let releaseFirst;
   let lockHeld = false;
+  const firstCodeEmitted = deferred();
   const acquireLock = () => {
     if (lockHeld) throw new Error('provisioning_lock_unavailable');
     lockHeld = true;
@@ -757,11 +765,12 @@ test('cross-role lock permits only one concurrent same-account provisioning atte
         queueMicrotask(async () => {
           ev.emit('connection.update', { qr: 'provider-private-readiness' });
           await firstMayContinue;
+          await firstCodeEmitted.promise;
           ev.emit('connection.update', { connection: 'open' });
         });
         return socket;
       },
-      emitCode: () => {},
+      emitCode: () => { firstCodeEmitted.resolve(); },
       timeoutMs: 2_000,
       acquireLock,
     });
@@ -919,7 +928,7 @@ test('515 recovery rejects pre-registration, repeated restart, save failure, and
   }
 });
 
-test('open before QR waits for its active generation to emit a pairing code', async () => {
+test('open before QR is discarded and a fresh post-code open is required', async () => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-open-code-race-')));
   const ordinary = path.join(root, 'ordinary');
   const sensitive = path.join(root, 'sensitive');
@@ -1004,6 +1013,13 @@ test('open before QR waits for its active generation to emit a pairing code', as
     assert.equal(existsSync(ordinary), false, 'session committed during pairing-code request');
 
     pairingResult.resolve('P3ND1NG9');
+    await waitFor(() => milestones.includes('code'), 'pairing code was not emitted');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(provisioningState, 'pending');
+    assert.deepEqual(milestones, ['code']);
+    assert.equal(existsSync(ordinary), false, 'pre-code open authenticated the staged session');
+
+    socket.ev.emit('connection.update', { connection: 'open' });
     assert.deepEqual(await provisioning, {
       account_namespace: 's.whatsapp.net', lid_ready: true,
     });
@@ -1203,7 +1219,10 @@ test('deadline cannot settle or release the lock after canonical rename begins',
       sockets.push(socket);
       return socket;
     },
-    emitCode: code => assert.equal(code, 'C4N1N1C4'),
+    emitCode: code => {
+      assert.equal(code, 'C4N1N1C4');
+      queueMicrotask(() => sockets[0].ev.emit('connection.update', { connection: 'open' }));
+    },
     timeoutMs: 40,
     acquireLock: () => {
       lockHeld = true;
@@ -1217,7 +1236,6 @@ test('deadline cannot settle or release the lock after canonical rename begins',
   try {
     await waitFor(() => sockets.length === 1, 'socket was not created');
     sockets[0].ev.emit('connection.update', { qr: 'provider-private-readiness' });
-    sockets[0].ev.emit('connection.update', { connection: 'open' });
     await confirmationEntered.promise;
     assert.equal(existsSync(path.join(ordinary, 'creds.json')), true, 'canonical rename did not occur');
     const early = await Promise.race([
@@ -1287,7 +1305,10 @@ test('late credential writes in the final drain quiesce before timeout releases 
       };
       return socket;
     },
-    emitCode: code => assert.equal(code, 'D4R41N3D'),
+    emitCode: code => {
+      assert.equal(code, 'D4R41N3D');
+      queueMicrotask(() => socket.ev.emit('connection.update', { connection: 'open' }));
+    },
     timeoutMs: 40,
     acquireLock: () => {
       lockHeld = true;
@@ -1298,7 +1319,6 @@ test('late credential writes in the final drain quiesce before timeout releases 
     await waitFor(() => Boolean(socket), 'socket was not created');
     socket.ev.emit('creds.update', { late: true });
     socket.ev.emit('connection.update', { qr: 'provider-private-readiness' });
-    socket.ev.emit('connection.update', { connection: 'open' });
     await firstSaveStarted.promise;
     const early = await Promise.race([
       provisioning.then(() => 'success', () => 'failure'),

@@ -514,7 +514,6 @@ export async function provisionOffline({
     let finishing = false;
     let generationCounter = 0;
     let activeGeneration = 0;
-    let pendingOpenGeneration = 0;
     let pendingRestartGeneration = 0;
     let restartCount = 0;
     let settled = false;
@@ -531,7 +530,6 @@ export async function provisionOffline({
         if (settled) return false;
         settled = true;
         activeGeneration = 0;
-        pendingOpenGeneration = 0;
         pendingRestartGeneration = 0;
         close();
         if (error) reject(error instanceof Error ? error : new Error(error));
@@ -553,7 +551,8 @@ export async function provisionOffline({
       };
       let startSocket;
       const onConnectionUpdate = async (
-        candidate, generation, onCredsUpdate, update, restartFenced = false,
+        candidate, generation, onCredsUpdate, update,
+        restartFenced = false, postCodeOpen = false,
       ) => {
         if (restartFenced) {
           if (settled || pendingRestartGeneration !== generation) return;
@@ -610,13 +609,7 @@ export async function provisionOffline({
             emitCode(code);
             codeEmitted = true;
           }
-          const opened = update?.connection === 'open';
-          if (!codeEmitted) {
-            if (opened) pendingOpenGeneration = generation;
-            return;
-          }
-          if (!opened && pendingOpenGeneration !== generation) return;
-          pendingOpenGeneration = 0;
+          if (!codeEmitted || !postCodeOpen) return;
           if (finishing) return;
           finishing = true;
           // Fence later provider writes, then drain every already-scheduled
@@ -744,7 +737,6 @@ export async function provisionOffline({
             // the serialized close transition validates restart eligibility
             // after all earlier connection transitions have quiesced.
             activeGeneration = 0;
-            pendingOpenGeneration = 0;
             pendingRestartGeneration = generation;
             candidate.ev.off?.('creds.update', onCredsUpdate);
             void enqueueTransition(() => onConnectionUpdate(
@@ -752,8 +744,13 @@ export async function provisionOffline({
             ));
             return;
           }
+          // Capture authentication eligibility at event ingress. An `open`
+          // received before the operator code exists is transport readiness,
+          // even if a queued handler runs after code emission. The provider
+          // must emit a fresh post-code `open` before credentials are trusted.
+          const postCodeOpen = codeEmitted && update?.connection === 'open';
           void enqueueTransition(() => onConnectionUpdate(
-            candidate, generation, onCredsUpdate, update,
+            candidate, generation, onCredsUpdate, update, false, postCodeOpen,
           ));
         });
       };
