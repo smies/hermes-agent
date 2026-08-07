@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import hmac
 import os
@@ -10,6 +12,7 @@ import sqlite3
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -46,48 +49,101 @@ class MappingStore:
     accepted by this API.
     """
 
+    _LOCK_TIMEOUT_SECONDS = 30.0
+
     def __init__(self, path: str | Path, mapping_key: bytes):
         self.path = Path(path).expanduser()
         if len(mapping_key) < 32:
             raise MappingSecurityError("mapping key must contain at least 32 bytes")
         self._mapping_key = bytes(mapping_key)
         self._lock = threading.RLock()
-        boundary_fd, identity = self._open_secure_path()
+        self._fd, self._identity = self._open_secure_path()
         self._db: Optional[sqlite3.Connection] = None
         try:
-            self._db = sqlite3.connect(
-                str(self.path), timeout=30, isolation_level=None, check_same_thread=False
-            )
-            # Detect a same-owner path replacement between the fd boundary and
-            # sqlite's open.  The owner-only parent prevents later untrusted
-            # replacement; keeping this check after connect closes the only
-            # creation/open gap without ever chmodding through a pathname.
-            self._validate_path_identity(identity)
+            self._db = self._new_memory_connection()
+            self._create_schema()
         except Exception:
             if self._db is not None:
                 self._db.close()
+            os.close(self._fd)
             raise
-        finally:
-            os.close(boundary_fd)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA busy_timeout = 30000")
-        self._enable_wal()
-        self._db.execute("PRAGMA synchronous = FULL")
-        self._db.execute("PRAGMA foreign_keys = ON")
-        self._create_schema()
 
-    def _enable_wal(self) -> None:
-        deadline = time.monotonic() + 30
+    @staticmethod
+    def _new_memory_connection() -> sqlite3.Connection:
+        """Create SQLite's ephemeral working copy, never a pathname connection."""
+        db = sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout = 30000")
+        db.execute("PRAGMA journal_mode = MEMORY")
+        db.execute("PRAGMA synchronous = FULL")
+        db.execute("PRAGMA foreign_keys = ON")
+        return db
+
+    def _acquire_file_lock(self) -> None:
+        deadline = time.monotonic() + self._LOCK_TIMEOUT_SECONDS
         while True:
             try:
-                mode = self._db.execute("PRAGMA journal_mode = WAL").fetchone()
-                if mode and str(mode[0]).lower() == "wal":
-                    return
-                raise MappingSecurityError("mapping database refused WAL mode")
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                     raise
+                if time.monotonic() >= deadline:
+                    raise MappingSecurityError("mapping database lock timed out") from exc
                 time.sleep(0.01)
+
+    def _reload_locked(self) -> None:
+        """Load the authenticated inode into the ephemeral SQLite connection."""
+        info = os.fstat(self._fd)
+        self._validate_file_info(info)
+        size = info.st_size
+        chunks = []
+        offset = 0
+        while offset < size:
+            chunk = os.pread(self._fd, min(1024 * 1024, size - offset), offset)
+            if not chunk:
+                raise MappingSecurityError("mapping database could not be read completely")
+            chunks.append(chunk)
+            offset += len(chunk)
+
+        if self._db is not None:
+            self._db.close()
+        self._db = self._new_memory_connection()
+        if chunks:
+            try:
+                self._db.deserialize(b"".join(chunks))
+            except sqlite3.DatabaseError as exc:
+                raise MappingSecurityError("mapping database is not valid SQLite") from exc
+            self._db.execute("PRAGMA foreign_keys = ON")
+
+    def _persist_locked(self) -> None:
+        """Durably replace bytes on the authenticated fd, never through its path."""
+        assert self._db is not None
+        data = self._db.serialize()
+        offset = 0
+        while offset < len(data):
+            written = os.pwrite(self._fd, data[offset:], offset)
+            if written <= 0:
+                raise MappingSecurityError("mapping database could not be written completely")
+            offset += written
+        os.ftruncate(self._fd, len(data))
+        os.fsync(self._fd)
+
+    @contextmanager
+    def _database(self, *, write: bool):
+        """Serialize every store operation around the authenticated inode."""
+        with self._lock:
+            self._acquire_file_lock()
+            try:
+                self._validate_path_identity(self._identity)
+                self._reload_locked()
+                assert self._db is not None
+                yield self._db
+                if write:
+                    self._validate_path_identity(self._identity)
+                    self._persist_locked()
+            finally:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
 
     @staticmethod
     def _validate_owner_only_directory(path: Path) -> None:
@@ -168,8 +224,8 @@ class MappingStore:
             raise MappingSecurityError("mapping database path changed during secure open")
 
     def _create_schema(self) -> None:
-        with self._lock:
-            self._db.executescript(
+        with self._database(write=True) as db:
+            db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS mappings (
                     principal TEXT NOT NULL,
@@ -228,15 +284,15 @@ class MappingStore:
         if not principal or not conversation_key:
             raise ValueError("principal and conversation key are required")
         digest = self._conversation_digest(principal, conversation_key)
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
+        with self._database(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
             try:
-                row = self._db.execute(
+                row = db.execute(
                     "SELECT * FROM mappings WHERE principal = ? AND conversation_digest = ?",
                     (principal, digest),
                 ).fetchone()
                 if row is None:
-                    self._db.execute(
+                    db.execute(
                         """INSERT OR IGNORE INTO mappings
                            (principal, conversation_digest, context_id, correlation_id)
                            VALUES (?, ?, ?, ?)""",
@@ -247,21 +303,21 @@ class MappingStore:
                             "corr-" + secrets.token_urlsafe(12),
                         ),
                     )
-                    row = self._db.execute(
+                    row = db.execute(
                         "SELECT * FROM mappings WHERE principal = ? AND conversation_digest = ?",
                         (principal, digest),
                     ).fetchone()
-                self._db.execute("COMMIT")
+                db.execute("COMMIT")
             except Exception:
-                self._db.execute("ROLLBACK")
+                db.execute("ROLLBACK")
                 raise
         if row is None:  # pragma: no cover - protected by the transaction
             raise RuntimeError("mapping creation failed")
         return self._mapping_from_row(row)
 
     def get_by_context(self, context_id: str) -> Optional[MappingRecord]:
-        with self._lock:
-            row = self._db.execute(
+        with self._database(write=False) as db:
+            row = db.execute(
                 "SELECT * FROM mappings WHERE context_id = ?", (str(context_id),)
             ).fetchone()
         return self._mapping_from_row(row) if row is not None else None
@@ -273,8 +329,8 @@ class MappingStore:
         policy_generation: str,
         expires_at: int,
     ) -> None:
-        with self._lock:
-            self._db.execute(
+        with self._database(write=True) as db:
+            db.execute(
                 """INSERT INTO request_ledger
                    (request_id, context_id, correlation_id, policy_generation, expires_at, state)
                    VALUES (?, ?, ?, ?, ?, 'issued')""",
@@ -295,34 +351,34 @@ class MappingStore:
         policy_generation: str,
         now: int,
     ) -> Optional[RequestRecord]:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
+        with self._database(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
             try:
-                changed = self._db.execute(
+                changed = db.execute(
                     """UPDATE request_ledger SET state = 'bound'
                        WHERE request_id = ? AND context_id = ? AND correlation_id = ?
                          AND policy_generation = ? AND expires_at > ? AND state = 'issued'""",
                     (request_id, context_id, correlation_id, policy_generation, int(now)),
                 ).rowcount
-                row = self._db.execute(
+                row = db.execute(
                     "SELECT * FROM request_ledger WHERE request_id = ?", (request_id,)
                 ).fetchone()
-                self._db.execute("COMMIT")
+                db.execute("COMMIT")
             except Exception:
-                self._db.execute("ROLLBACK")
+                db.execute("ROLLBACK")
                 raise
         return self._request_from_row(row) if changed == 1 and row is not None else None
 
     def get_request(self, request_id: str) -> Optional[RequestRecord]:
-        with self._lock:
-            row = self._db.execute(
+        with self._database(write=False) as db:
+            row = db.execute(
                 "SELECT * FROM request_ledger WHERE request_id = ?", (request_id,)
             ).fetchone()
         return self._request_from_row(row) if row is not None else None
 
     def claim_action(self, request_id: str, fingerprint: str, now: int) -> bool:
-        with self._lock:
-            changed = self._db.execute(
+        with self._database(write=True) as db:
+            changed = db.execute(
                 """UPDATE request_ledger SET action_fingerprint = ?
                    WHERE request_id = ? AND state = 'bound' AND action_fingerprint = ''
                      AND expires_at > ?""",
@@ -330,9 +386,20 @@ class MappingStore:
             ).rowcount
         return changed == 1
 
+    def verify_action(self, request_id: str, fingerprint: str, now: int) -> bool:
+        """Recheck the claimed exact action at the final handler boundary."""
+        with self._database(write=False) as db:
+            row = db.execute(
+                """SELECT 1 FROM request_ledger
+                   WHERE request_id = ? AND state = 'bound'
+                     AND action_fingerprint = ? AND expires_at > ?""",
+                (request_id, fingerprint, int(now)),
+            ).fetchone()
+        return row is not None
+
     def release_request(self, request_id: str, now: int) -> bool:
-        with self._lock:
-            changed = self._db.execute(
+        with self._database(write=True) as db:
+            changed = db.execute(
                 """UPDATE request_ledger SET state = 'released'
                    WHERE request_id = ? AND state = 'bound' AND expires_at > ?""",
                 (request_id, int(now)),
@@ -347,8 +414,8 @@ class MappingStore:
         policy_generation: str,
         now: int,
     ) -> bool:
-        with self._lock:
-            changed = self._db.execute(
+        with self._database(write=True) as db:
+            changed = db.execute(
                 """UPDATE request_ledger SET state = 'consumed'
                    WHERE request_id = ? AND context_id = ? AND correlation_id = ?
                      AND policy_generation = ? AND expires_at > ? AND state = 'released'""",
@@ -364,4 +431,7 @@ class MappingStore:
 
     def close(self) -> None:
         with self._lock:
-            self._db.close()
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+            os.close(self._fd)

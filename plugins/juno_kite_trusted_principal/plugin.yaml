@@ -11,4 +11,5 @@ provides_tools:
 provides_hooks:
   - pre_llm_call
   - pre_tool_call
+  - pre_tool_dispatch
   - transform_llm_output

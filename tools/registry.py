@@ -1053,6 +1053,8 @@ class ToolRegistry:
         # and is forwarded only to reviewed terminal handlers that can accept
         # it. Ordinary handler call signatures remain unchanged.
         host_tool_call_id = kwargs.pop("tool_call_id", None)
+        host_turn_id = kwargs.pop("turn_id", None)
+        host_api_request_id = kwargs.pop("api_request_id", None)
         current_enabled_toolsets = kwargs.pop("enabled_toolsets", None)
         current_disabled_toolsets = kwargs.pop("disabled_toolsets", None)
         current_session_scope = kwargs.pop("session_scope", None)
@@ -1136,6 +1138,23 @@ class ToolRegistry:
                 # protects name lookup. Ordinary mutation behavior is unchanged.
                 handler = entry.handler
                 is_async = entry.is_async
+        try:
+            from hermes_cli.plugins import resolve_pre_tool_dispatch_block
+
+            final_block = resolve_pre_tool_dispatch_block(
+                name,
+                args,
+                task_id=str(kwargs.get("task_id") or ""),
+                session_id=str(kwargs.get("session_id") or ""),
+                tool_call_id=str(host_tool_call_id or ""),
+                turn_id=str(host_turn_id or ""),
+                api_request_id=str(host_api_request_id or ""),
+            )
+        except Exception as exc:
+            logger.debug("pre_tool_dispatch hook error: %s", exc)
+            final_block = f"BLOCKED: final tool dispatch policy failed for {name}"
+        if final_block is not None:
+            return tool_error(final_block)
         if terminal_invocation is not None:
             try:
                 available = check_fn is None or _check_fn_cached(check_fn)

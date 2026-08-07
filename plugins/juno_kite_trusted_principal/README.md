@@ -8,14 +8,16 @@ plugin runs in one of two modes:
   canonical Juno conversation from authenticated session ContextVars, resolves
   an opaque Kite context, and sends one bounded signed A2A request to a fixed
   localhost peer.
-- `kite` registers the standard `pre_llm_call`, `pre_tool_call`, and
-  `transform_llm_output` policy hooks. It binds only authenticated A2A peer
-  `juno`, defaults unknown tools to deny, gates mutations by exact canonical
-  arguments, and releases only a signed minimized envelope.
+- `kite` registers `pre_llm_call`, `pre_tool_call`, the generic veto-only
+  `pre_tool_dispatch` integrity hook, and `transform_llm_output`. It binds only
+  authenticated A2A peer `juno`, defaults unknown tools to deny, gates
+  mutations by exact canonical arguments, and releases only a signed minimized
+  envelope.
 
 The plugin does not register generic A2A discovery, URL, history, context,
-peer-selection, or fan-out tools. It does not change Hermes' agent, session,
-gateway, hook, or A2A protocols.
+peer-selection, or fan-out tools. Its only core dependency is Hermes's generic
+final handler-boundary veto hook; it does not change agent, session, gateway,
+or A2A protocols and no core branch knows this plugin's name.
 
 ## Shared prerequisites
 
@@ -43,7 +45,10 @@ stored. The request and response keys bind the two envelope directions. The
 SQLite database contains mappings and a request/replay ledger only--never a
 prompt, transcript, memory, raw platform ID, credential, or tool result. The
 plugin refuses a directory with group/other permission bits and keeps the DB
-file at `0600`.
+file at `0600`. It authenticates and retains the database fd, serializes each
+SQLite operation through a bounded OS file lock, and loads/persists an
+ephemeral `:memory:` connection through that fd. SQLite never reopens the
+configured pathname after authentication.
 
 Use the same `mapping_path`, key values, principal bindings, policy generation,
 limits, and semantic policy in both profiles. A principal binding is keyed only
@@ -66,6 +71,18 @@ tools:
     - web
     - clarify
     - juno_kite
+
+# Suppress resolver-added or inherited capability classes as a final
+# subtraction. These names remain disabled even when credentials or a runtime
+# mode would otherwise make their check_fn succeed.
+agent:
+  disabled_toolsets:
+    - a2a
+    - bfl
+    - delegation
+    - file
+    - kanban
+    - terminal
 
 platform_toolsets:
   whatsapp:
@@ -244,9 +261,12 @@ pass for the deployed configuration.
 
 Audit Kite's enabled plugin inventory before activation. The standard hook
 manager uses the first non-empty `transform_llm_output` result, so no other
-enabled hook may return transformed output for this A2A lane. Likewise, no
-other `pre_tool_call` hook may mutate tool arguments. This plugin does not
-replace or special-case the standard hook composition rules.
+enabled hook may return transformed output for this A2A lane. Request or
+execution middleware and later `pre_tool_call` hooks may still transform their
+ordinary payloads, but any change to an exact authorized mutation is rechecked
+and vetoed by `pre_tool_dispatch` immediately before the registry handler. The
+final hook receives an isolated argument snapshot and cannot mutate the real
+handler payload.
 
 ## Enable, health, reload, and rollback
 
@@ -266,11 +286,65 @@ private provider or production action:
    plugins loaded with no configuration error. Logs from this plugin contain
    only opaque `corr-...` labels and error classes.
 5. Send a synthetic request with an intentionally wrong bearer and confirm it
-   is rejected before agent dispatch. Then run a synthetic authenticated-Juno
-   canary. Evidence is a signed bounded
-   answer for the expected opaque context plus deny results for a wrong bearer,
-   wrong context, unknown tool, and changed action argument. Do not use a real
-   private provider or real mutation for the canary.
+   is rejected before agent dispatch. Run the checked-in provider-free canary
+   from the repository root:
+
+   ```bash
+   python -m plugins.juno_kite_trusted_principal.synthetic_canary
+   ```
+
+   The helper creates a temporary `HOME`, `HERMES_HOME`, three synthetic HMAC
+   keys, and the literal non-production bearer
+   `synthetic-juno-bearer-not-a-production-secret`; starts Hermes's real A2A
+   adapter on an ephemeral `127.0.0.1` port; and removes the adapter, mapping
+   DB, and temporary directory in `finally`. It loads no model or provider and
+   registers only an in-process synthetic mutation handler whose expected
+   effect count is zero.
+
+   These are the exact HTTP request classes sent by the helper (`<port>`,
+   `<signed-request>`, and `<issued-context>` are generated synthetic values):
+
+   - Health: `GET http://127.0.0.1:<port>/health`, header
+     `Accept: application/json`, no body. Expect HTTP `200`, JSON object with
+     `status: "ok"`, and at most 16,384 response bytes.
+   - Wrong bearer: `POST http://127.0.0.1:<port>/`, headers
+     `Content-Type: application/json`, `A2A-Version: 1.0`, and
+     `Authorization: Bearer synthetic-wrong-bearer`, with body:
+
+     ```json
+     {"jsonrpc":"2.0","id":"wrong-bearer","method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"synthetic wrong bearer body","mediaType":"text/plain"}],"messageId":"<generated>","contextId":"canary-wrong-bearer"}}}
+     ```
+
+     Expect HTTP `401`, a bounded JSON-RPC `error` object, and no handler
+     dispatch.
+   - Authenticated Juno: the same endpoint/method and content headers, with
+     `Authorization: Bearer synthetic-juno-bearer-not-a-production-secret` and
+     body:
+
+     ```json
+     {"jsonrpc":"2.0","id":"<generated>","method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"<opaque-audit-guard>\nJUNO_KITE_REQUEST_V1 <signed-request>","mediaType":"text/plain"}],"messageId":"<generated>","contextId":"<issued-context>"}}}
+     ```
+
+     Expect HTTP `200`, a completed A2A task, a
+     `JUNO_KITE_RESPONSE_V1` HMAC envelope no larger than 16,384 bytes, and the
+     exact minimized answer `synthetic bounded answer` after Juno verifies it.
+   - Wrong context: resend a freshly issued signed request with only the A2A
+     message `contextId` changed to `<issued-context>-changed`. Expect HTTP
+     `200` and a bounded signed envelope containing `"denied":true`.
+   - Unknown tool: send a fresh authenticated signed request whose bounded
+     question is `synthetic unknown tool`. The provider-free Kite handler calls
+     `pre_tool_call` for literal `synthetic_unknown_tool`; expect a block and a
+     verified minimized answer `unknown tool denied`.
+   - Changed action argument: send a fresh authenticated signed request whose
+     bounded question is `synthetic changed action`. The synthetic exact rule
+     authorizes `{"target":"fixture","value":"approved"}`; a later standard
+     hook changes only `value` before the real registry handler boundary.
+     Expect the final dispatch veto, answer `changed action denied`, and
+     `handler effects=0`.
+
+   Every successful line begins with `PASS`; a mismatch raises and exits
+   nonzero. Do not substitute a real bearer, provider, profile, private value,
+   or action destination.
 6. Restart Juno only: `hermes -p juno gateway restart`.
 
 Configuration and keys are read at plugin initialization, so policy generation,

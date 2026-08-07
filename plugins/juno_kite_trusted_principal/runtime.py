@@ -743,6 +743,45 @@ class TrustedPrincipalRuntime:
             logger.warning("Kite tool gate blocked: %s", type(exc).__name__)
             return self._block("internal or missing policy binding")
 
+    def pre_tool_dispatch(
+        self,
+        tool_name: str = "",
+        args: Any = None,
+        session_id: str = "",
+        turn_id: str = "",
+        **_: Any,
+    ) -> Optional[dict]:
+        """Recheck exact mutation authority at the real handler boundary."""
+        platform, _peer, _context = self._a2a_lane()
+        if platform != "a2a":
+            return None
+        try:
+            binding = self._current_valid_binding(
+                session_id=str(session_id or ""), turn_id=str(turn_id or "")
+            )
+            if not isinstance(args, dict):
+                return self._block("final arguments must be a complete object")
+            if tool_name in self.read_tools:
+                return None
+            if tool_name not in self.mutating_tools:
+                return self._block("tool is not explicitly classified at dispatch")
+            assert binding.mapping is not None and binding.request is not None
+            canonical_args = canonical_json(args)
+            rule = (binding.mapping.principal, str(tool_name), canonical_args)
+            if rule not in self.action_rules:
+                return self._block("final arguments do not match the exact action rule")
+            fingerprint = hashlib.sha256(
+                f"{tool_name}\0{canonical_args}".encode("utf-8")
+            ).hexdigest()
+            if not self.store.verify_action(
+                binding.request.request_id, fingerprint, int(self.clock())
+            ):
+                return self._block("final action does not match claimed authority")
+            return None
+        except Exception as exc:
+            logger.warning("Kite final tool gate blocked: %s", type(exc).__name__)
+            return self._block("internal or missing final policy binding")
+
     def _signed_response(
         self,
         binding: Optional[TurnBinding],
@@ -902,7 +941,13 @@ class TrustedPrincipalRuntime:
             str(peer["url"]).rstrip("/"), data=data, headers=headers, method="POST"
         )
 
-        opener = urllib.request.build_opener(_RefuseRedirects())
+        # Supplying an explicit empty ProxyHandler prevents build_opener() from
+        # importing HTTP(S)/ALL_PROXY from the ambient environment. Redirects
+        # remain disabled so the bearer and signed body can reach only the
+        # configured loopback origin.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _RefuseRedirects()
+        )
         with opener.open(request, timeout=int(peer["timeout"])) as http_response:
             response = json.loads(http_response.read().decode("utf-8"))
         if "error" in response:
@@ -940,6 +985,11 @@ class FailClosedRuntime:
         return None
 
     def pre_tool_call(self, **_: Any) -> Optional[dict]:
+        if str(get_session_env("HERMES_SESSION_PLATFORM") or "").lower() == "a2a":
+            return {"action": "block", "message": "Juno--Kite policy configuration is unavailable"}
+        return None
+
+    def pre_tool_dispatch(self, **_: Any) -> Optional[dict]:
         if str(get_session_env("HERMES_SESSION_PLATFORM") or "").lower() == "a2a":
             return {"action": "block", "message": "Juno--Kite policy configuration is unavailable"}
         return None

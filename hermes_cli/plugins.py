@@ -42,6 +42,7 @@ import os
 import sys
 import threading
 import types
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
@@ -134,6 +135,10 @@ _install_plugin_debug_handler()
 
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
+    # Final veto-only integrity seam immediately before a tool
+    # handler. Each callback receives its own deep-copied args snapshot, so
+    # callbacks cannot mutate the handler payload or one another's verdict.
+    "pre_tool_dispatch",
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
@@ -2322,6 +2327,56 @@ def resolve_pre_tool_block(
                 f"{tool_name}"
             )
         return f"BLOCKED: plugin pre-tool resolution failed for {tool_name}"
+
+
+def resolve_pre_tool_dispatch_block(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+) -> Optional[str]:
+    """Return a final handler-boundary veto without exposing mutable args.
+
+    This hook is deliberately smaller than ``pre_tool_call``: it supports only
+    ``{"action": "block", "message": ...}``, performs no approval flow, and
+    runs after request/execution middleware has selected the exact arguments
+    that would enter the handler. There were no legacy listeners, so the
+    isolated snapshot contract cannot change existing tool behavior.
+    """
+    callbacks = list(get_plugin_manager()._hooks.get("pre_tool_dispatch", []))
+    for callback in callbacks:
+        try:
+            try:
+                callback_args = deepcopy(args) if isinstance(args, dict) else {}
+            except Exception:
+                return f"BLOCKED: final tool arguments could not be isolated for {tool_name}"
+            result = callback(
+                tool_name=tool_name,
+                args=callback_args,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                telemetry_schema_version=OBSERVER_SCHEMA_VERSION,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Hook 'pre_tool_dispatch' callback %s raised: %s",
+                getattr(callback, "__name__", repr(callback)),
+                exc,
+            )
+            return f"BLOCKED: final tool dispatch policy failed for {tool_name}"
+        if not isinstance(result, dict) or result.get("action") != "block":
+            continue
+        message = result.get("message")
+        if isinstance(message, str) and message:
+            return message
+        return f"BLOCKED: final tool dispatch policy denied {tool_name}"
+    return None
 
 
 def get_pre_verify_continue_message(

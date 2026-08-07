@@ -17,36 +17,32 @@ TOOL_DESCRIPTION = (
 def _schema(runtime) -> dict:
     limits = runtime.limits
     return {
-        "type": "function",
-        "function": {
-            "name": "consult_kite",
-            "description": TOOL_DESCRIPTION,
-            "parameters": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "question_or_goal": {
-                        "type": "string",
-                        "maxLength": limits.question_chars,
-                        "description": "The bounded question or goal that specifically requires Kite.",
-                    },
-                    "relevant_context": {
-                        "type": "array",
-                        "maxItems": limits.context_turns,
-                        "description": "Optional minimal relevant Juno turns; never a whole transcript.",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "role": {"type": "string", "enum": ["user", "assistant"]},
-                                "text": {"type": "string", "maxLength": limits.context_turn_chars},
-                            },
-                            "required": ["role", "text"],
+        "description": TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "question_or_goal": {
+                    "type": "string",
+                    "maxLength": limits.question_chars,
+                    "description": "The bounded question or goal that specifically requires Kite.",
+                },
+                "relevant_context": {
+                    "type": "array",
+                    "maxItems": limits.context_turns,
+                    "description": "Optional minimal relevant Juno turns; never a whole transcript.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "role": {"type": "string", "enum": ["user", "assistant"]},
+                            "text": {"type": "string", "maxLength": limits.context_turn_chars},
                         },
+                        "required": ["role", "text"],
                     },
                 },
-                "required": ["question_or_goal"],
             },
+            "required": ["question_or_goal"],
         },
     }
 
@@ -59,6 +55,7 @@ def register(ctx) -> None:
     # a profile/mode/configuration mismatch occurs.
     ctx.register_hook("pre_llm_call", runtime.pre_llm_call)
     ctx.register_hook("pre_tool_call", runtime.pre_tool_call)
+    ctx.register_hook("pre_tool_dispatch", runtime.pre_tool_dispatch)
     ctx.register_hook("transform_llm_output", runtime.transform_llm_output)
 
     if runtime.mode == "juno":

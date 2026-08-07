@@ -7,9 +7,11 @@ fixture; these tests never contact an A2A peer or private provider.
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
 import re
+import sqlite3
 import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -471,6 +473,102 @@ class TestPrincipalAndDispatch:
         assert origin_hits == ["Bearer redirect-canary"]
         assert target_headers == []
 
+    def test_consult_transport_ignores_hostile_environment_proxy(self, tmp_path, monkeypatch):
+        proxy_bytes = []
+        origin_requests = []
+        context_id = "jk-proxy-safe-context"
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                proxy_bytes.append(
+                    (self.headers.get("Authorization"), self.rfile.read(length))
+                )
+                self.send_response(502)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return None
+
+        class OriginHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length)
+                origin_requests.append((self.headers.get("Authorization"), body))
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": "fixture",
+                    "result": {
+                        "task": {
+                            "id": "fixture-task",
+                            "contextId": context_id,
+                            "status": {"state": "completed"},
+                            "artifacts": [
+                                {
+                                    "artifactId": "fixture-artifact",
+                                    "parts": [{"text": "bounded fixture reply"}],
+                                }
+                            ],
+                        }
+                    },
+                }
+                encoded = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *_args):
+                return None
+
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), OriginHandler)
+        threads = [
+            threading.Thread(target=server.serve_forever, daemon=True)
+            for server in (proxy, origin)
+        ]
+        for thread in threads:
+            thread.start()
+        proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+        for name in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            monkeypatch.setenv(name, proxy_url)
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        try:
+            peer = {
+                "url": f"http://127.0.0.1:{origin.server_port}",
+                "auth": {"type": "bearer", "token": "proxy-safe-token"},
+                "timeout": 5,
+            }
+            reply, returned_context, state = TrustedPrincipalRuntime._a2a_transport(
+                "kite", peer, "bounded synthetic body", context_id
+            )
+        finally:
+            proxy.shutdown()
+            origin.shutdown()
+            proxy.server_close()
+            origin.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        assert proxy_bytes == []
+        assert len(origin_requests) == 1
+        assert origin_requests[0][0] == "Bearer proxy-safe-token"
+        assert b"bounded synthetic body" in origin_requests[0][1]
+        assert (reply, returned_context, state) == (
+            "bounded fixture reply",
+            context_id,
+            "completed",
+        )
+
 
 class TestMappingStore:
     def test_mapping_reuses_across_restart_and_separates_principal_and_conversation(self, tmp_path):
@@ -505,34 +603,49 @@ class TestMappingStore:
         assert len(same_pair) == 1
         assert len(all_pairs) == 3
 
-    def test_path_swap_to_symlink_never_opens_or_chmods_victim(self, tmp_path, monkeypatch):
+    def test_path_swap_victim_database_is_never_opened_or_mutated(self, tmp_path, monkeypatch):
         owner = tmp_path / "owner"
         owner.mkdir(mode=0o700)
-        victim = tmp_path / "victim.txt"
-        victim.write_text("must remain untouched", encoding="utf-8")
-        victim.chmod(0o644)
         db_path = owner / "mapping.sqlite3"
+        victim = tmp_path / "victim.sqlite3"
+        victim_db = sqlite3.connect(victim)
+        victim_db.execute("CREATE TABLE sentinel(value TEXT)")
+        victim_db.execute("INSERT INTO sentinel VALUES ('untouched')")
+        victim_db.commit()
+        victim_db.close()
+        victim.chmod(0o600)
+        authenticated = tmp_path / "authenticated.sqlite3"
+        real_connect = mapping_store.sqlite3.connect
+        opened_targets = []
+        swapped = False
 
-        class FakeConnection:
-            def __init__(self):
-                self.closed = False
-
-            def close(self):
-                self.closed = True
-
-        fake = FakeConnection()
-
-        def swap_connect(*_args, **_kwargs):
-            db_path.unlink()
-            db_path.symlink_to(victim)
-            return fake
+        def swap_connect(database, *args, **kwargs):
+            nonlocal swapped
+            opened_targets.append(database)
+            if not swapped:
+                os.replace(db_path, authenticated)
+                os.replace(victim, db_path)
+                swapped = True
+            return real_connect(database, *args, **kwargs)
 
         monkeypatch.setattr(mapping_store.sqlite3, "connect", swap_connect)
         with pytest.raises(MappingSecurityError):
             MappingStore(db_path, b"mapping-key-with-at-least-thirty-two-bytes")
-        assert fake.closed is True
-        assert victim.read_text(encoding="utf-8") == "must remain untouched"
-        assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+        assert opened_targets == [":memory:"]
+        victim_db = real_connect(db_path)
+        try:
+            tables = {
+                row[0]
+                for row in victim_db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            assert tables == {"sentinel"}
+            assert victim_db.execute("SELECT value FROM sentinel").fetchone() == (
+                "untouched",
+            )
+        finally:
+            victim_db.close()
 
     def test_symlinked_parent_is_rejected(self, tmp_path):
         real_owner = tmp_path / "real-owner"
@@ -621,6 +734,21 @@ class TestMappingStore:
         assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert b"question_or_goal" not in path.read_bytes()
+
+    def test_cross_instance_file_lock_is_bounded(self, tmp_path, monkeypatch):
+        path = tmp_path / "owner" / "mapping.sqlite3"
+        key = b"mapping-key-with-at-least-thirty-two-bytes"
+        first = MappingStore(path, key)
+        second = MappingStore(path, key)
+        monkeypatch.setattr(second, "_LOCK_TIMEOUT_SECONDS", 0.02)
+        fcntl.flock(first._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with pytest.raises(MappingSecurityError, match="lock timed out"):
+                second.get_by_context("fixture")
+        finally:
+            fcntl.flock(first._fd, fcntl.LOCK_UN)
+            first.close()
+            second.close()
 
     def test_insecure_existing_directory_is_rejected(self, tmp_path):
         owner = tmp_path / "owner"
@@ -935,8 +1063,11 @@ class TestExactToolGate:
             assert kite.pre_tool_call(
                 "write_file", exact, session_id="kite-session", turn_id="kite-turn"
             ) is None
+            assert kite.pre_tool_dispatch(
+                "write_file", exact, session_id="kite-session", turn_id="kite-turn"
+            ) is None
             exact["content"] = "post-gate mutation"
-            assert kite.pre_tool_call(
+            assert kite.pre_tool_dispatch(
                 "write_file", exact, session_id="kite-session", turn_id="kite-turn"
             )["action"] == "block"
 
@@ -1002,6 +1133,55 @@ class TestExactToolGate:
             )["action"] == "block"
 
         run(checks)
+
+    def test_real_handler_boundary_blocks_later_hook_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        import model_tools
+        import tools.registry as registry_module
+        from hermes_cli.plugins import get_plugin_manager
+        from tools.registry import ToolRegistry
+
+        run = self._bound_runtime(tmp_path)
+        exact = {
+            "path": str(tmp_path / "approved-write.txt"),
+            "content": "approved fixture content",
+            "encoding": "utf-8",
+        }
+        effects = []
+
+        def checks(kite):
+            registry = ToolRegistry()
+            monkeypatch.setattr(registry_module, "registry", registry)
+            monkeypatch.setattr(model_tools, "registry", registry)
+            registry.register(
+                name="write_file",
+                toolset="fixture_file",
+                schema={"description": "fixture", "parameters": {"type": "object"}},
+                handler=lambda args, **_kwargs: effects.append(dict(args)) or "written",
+            )
+
+            def later_hook(**kwargs):
+                kwargs["args"]["content"] = "post-policy mutation"
+
+            manager = get_plugin_manager()
+            monkeypatch.setitem(
+                manager._hooks, "pre_tool_call", [kite.pre_tool_call, later_hook]
+            )
+            monkeypatch.setitem(
+                manager._hooks, "pre_tool_dispatch", [kite.pre_tool_dispatch]
+            )
+            monkeypatch.setitem(manager._middleware, "tool_execution", [])
+            result = model_tools.handle_function_call(
+                "write_file",
+                exact,
+                session_id="kite-session",
+                turn_id="kite-turn",
+            )
+            assert "final arguments do not match" in result
+
+        run(checks)
+        assert effects == []
 
 
 class TestOutputAndEnvelope:
@@ -1195,13 +1375,43 @@ class TestRegistrationAndGuidance:
         register(ctx)
         assert [item["name"] for item in ctx.tools] == ["consult_kite"]
         assert ctx.tools[0]["toolset"] == "juno_kite"
-        schema = ctx.tools[0]["schema"]["function"]
+        schema = ctx.tools[0]["schema"]
         assert set(schema["parameters"]["properties"]) == {"question_or_goal", "relevant_context"}
         assert "session" in schema["description"].lower()
         assert "local" in schema["description"].lower()
         assert "private authority" in schema["description"].lower()
         assert not {"a2a_call", "a2a_history", "a2a_orchestrate"} & {item["name"] for item in ctx.tools}
         assert ctx.direct_tools == {"web_search", "web_extract", "read_file"}
+
+    def test_real_plugin_context_normalizes_consult_schema_once(self, tmp_path, monkeypatch):
+        import plugins.juno_kite_trusted_principal as plugin
+        import tools.registry as registry_module
+        from hermes_cli.plugins import PluginContext, PluginManifest
+        from tools.registry import ToolRegistry
+
+        runtime = _runtime(tmp_path)
+        monkeypatch.setattr(plugin, "runtime_from_host", lambda _profile: runtime)
+        local_registry = ToolRegistry()
+        monkeypatch.setattr(registry_module, "registry", local_registry)
+
+        class Manager:
+            _plugin_tool_names = set()
+            _hooks = {}
+
+        ctx = PluginContext(
+            PluginManifest(name="juno_kite_trusted_principal", source="bundled"),
+            Manager(),
+        )
+        plugin.register(ctx)
+        definition = local_registry.get_definitions({"consult_kite"})[0]
+        assert definition["type"] == "function"
+        function = definition["function"]
+        assert "function" not in function
+        assert function["name"] == "consult_kite"
+        assert function["parameters"]["required"] == ["question_or_goal"]
+        assert function["parameters"]["properties"]["question_or_goal"][
+            "maxLength"
+        ] == runtime.limits.question_chars
 
     def test_documented_config_uses_real_shape_and_narrow_toolset(
         self, tmp_path, monkeypatch
@@ -1236,12 +1446,25 @@ class TestRegistrationAndGuidance:
         assert "juno_kite_trusted_principal" in juno["plugins"]["enabled"]
         assert "juno_kite" in juno["tools"]["enabled"]
         assert "a2a" not in juno["tools"]["enabled"]
+        assert set(juno["agent"]["disabled_toolsets"]) == {
+            "a2a",
+            "bfl",
+            "delegation",
+            "file",
+            "kanban",
+            "terminal",
+        }
         whatsapp_toolsets = juno["platform_toolsets"]["whatsapp"]
         assert "juno_kite" in whatsapp_toolsets
         assert "web" in whatsapp_toolsets
         assert "a2a" not in whatsapp_toolsets
         assert "file" not in whatsapp_toolsets
         assert "terminal" not in whatsapp_toolsets
+
+        from hermes_cli.tools_config import _get_platform_tools
+
+        resolved_toolsets = _get_platform_tools(juno, "whatsapp")
+        assert resolved_toolsets == {"clarify", "juno_kite", "web"}
 
         parsed_kite, kite_source = yaml_after("## Kite profile configuration")
         kite = load_documented("kite-home", kite_source)
@@ -1291,8 +1514,91 @@ class TestRegistrationAndGuidance:
         assert {name for name, _callback in ctx.hooks} == {
             "pre_llm_call",
             "pre_tool_call",
+            "pre_tool_dispatch",
             "transform_llm_output",
         }
+
+    def test_documented_juno_config_resolves_exact_production_surface(
+        self, tmp_path, monkeypatch
+    ):
+        import model_tools
+        import plugins.juno_kite_trusted_principal as plugin
+        import tools.registry as registry_module
+        import hermes_cli.tools_config as tools_config_module
+        from hermes_cli.config import load_config
+        from hermes_cli.plugins import PluginContext, PluginManifest
+        from hermes_cli.tools_config import _get_platform_tools
+        from tools.registry import ToolRegistry
+
+        readme = (
+            Path(__file__).parents[2]
+            / "plugins"
+            / "juno_kite_trusted_principal"
+            / "README.md"
+        ).read_text(encoding="utf-8")
+        source = re.search(
+            r"## Juno profile configuration.*?```yaml\n(.*?)```", readme, re.S
+        ).group(1)
+        hermes_home = tmp_path / "resolver-home"
+        hermes_home.mkdir(mode=0o700)
+        (hermes_home / "config.yaml").write_text(source, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        config = load_config()
+
+        registry = ToolRegistry()
+        monkeypatch.setattr(registry_module, "registry", registry)
+        monkeypatch.setattr(model_tools, "registry", registry)
+        monkeypatch.setattr(
+            tools_config_module, "_get_plugin_toolset_keys", lambda: {"juno_kite"}
+        )
+        model_tools._clear_tool_defs_cache()
+        for name, toolset in (
+            ("web_search", "web"),
+            ("web_extract", "web"),
+            ("clarify", "clarify"),
+        ):
+            registry.register(
+                name=name,
+                toolset=toolset,
+                schema={"description": "fixture", "parameters": {"type": "object"}},
+                handler=lambda _args, **_kwargs: "fixture",
+            )
+
+        runtime = _runtime(tmp_path)
+        monkeypatch.setattr(plugin, "runtime_from_host", lambda _profile: runtime)
+
+        class Manager:
+            _plugin_tool_names = set()
+            _hooks = {}
+
+        plugin.register(
+            PluginContext(
+                PluginManifest(
+                    name="juno_kite_trusted_principal", source="bundled"
+                ),
+                Manager(),
+            )
+        )
+        enabled_toolsets = sorted(_get_platform_tools(config, "whatsapp"))
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        names = {definition["function"]["name"] for definition in definitions}
+        assert enabled_toolsets == ["clarify", "juno_kite", "web"]
+        assert names == {"clarify", "consult_kite", "web_extract", "web_search"}
+        assert not names & {
+            "a2a_call",
+            "a2a_discover",
+            "a2a_history",
+            "a2a_orchestrate",
+            "delegate_task",
+            "read_file",
+            "terminal",
+            "write_file",
+        }
+        runtime.store.close()
 
     def test_fixture_principals_are_separate_without_provider_access(self, tmp_path):
         runtime = _runtime(tmp_path)
