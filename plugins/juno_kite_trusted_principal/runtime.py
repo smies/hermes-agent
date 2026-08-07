@@ -8,6 +8,7 @@ protocol semantics.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -30,27 +31,34 @@ from .mapping_store import MappingRecord, MappingStore, RequestRecord
 
 logger = logging.getLogger(__name__)
 
-REQUEST_PREFIX = "JUNO_KITE_REQUEST_V1 "
-RESPONSE_PREFIX = "JUNO_KITE_RESPONSE_V1 "
-DENIAL_PREFIX = "JUNO_KITE_DENIAL_V1 "
-AUDIT_PREFIX = "JUNO_KITE_AUDIT_V1 "
+REQUEST_PREFIX = "JUNO_KITE_REQUEST_V2 "
+RESPONSE_PREFIX = "JUNO_KITE_RESPONSE_V2 "
+DENIAL_PREFIX = "JUNO_KITE_DENIAL_V2 "
+AUDIT_PREFIX = "JUNO_KITE_AUDIT_V2 "
 _A2A_AUDIT_SUMMARY_CHARS = 500
 
 _REQUEST_FIELDS = frozenset(
     {
         "context_id",
+        "version",
         "correlation_id",
         "request_id",
         "policy_generation",
         "expires_at",
         "question_or_goal",
         "relevant_context",
+        "audience_digest",
+        "conversation_binding",
+        "effective_read_capability_ids",
+        "effective_action_capability_ids",
+        "roster_generation",
         "signature",
     }
 )
 _RESPONSE_FIELDS = frozenset(
     {
         "context_id",
+        "version",
         "correlation_id",
         "request_id",
         "policy_generation",
@@ -58,6 +66,11 @@ _RESPONSE_FIELDS = frozenset(
         "answer",
         "denied",
         "reason",
+        "audience_digest",
+        "conversation_binding",
+        "effective_read_capability_ids",
+        "effective_action_capability_ids",
+        "roster_generation",
         "signature",
     }
 )
@@ -148,6 +161,23 @@ class Limits:
     output_chars: int
     response_bytes: int
     turn_ttl_seconds: int
+    roster_timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class AudienceBinding:
+    """Opaque host-derived authority for one current conversation audience."""
+
+    principal: str
+    conversation_kind: str
+    conversation_binding: str
+    audience_digest: str
+    roster_generation: str
+    effective_read_capability_ids: tuple[str, ...]
+    effective_action_capability_ids: tuple[str, ...]
+    private_eligible: bool
+    policy_generation: str
+    revalidate: Optional[Callable[[], dict]] = None
 
 
 @dataclass(frozen=True)
@@ -158,10 +188,15 @@ class TurnBinding:
     request: Optional[RequestRecord] = None
     session_id: str = ""
     turn_id: str = ""
+    effective_read_capability_ids: tuple[str, ...] = ()
+    effective_action_capability_ids: tuple[str, ...] = ()
 
 
 _ACTIVE_BINDING: ContextVar[Optional[TurnBinding]] = ContextVar(
     "juno_kite_active_binding", default=None
+)
+_ACTIVE_AUDIENCE: ContextVar[Optional[AudienceBinding]] = ContextVar(
+    "juno_kite_active_audience", default=None
 )
 
 
@@ -215,6 +250,10 @@ class TrustedPrincipalRuntime:
         self.private_identifiers = {
             user_id for _platform, user_id, _principal in self.principal_bindings
         }
+        self.allowed_group_conversations = self._load_allowed_group_conversations()
+        self.private_identifiers.update(
+            chat_id for _platform, chat_id in self.allowed_group_conversations
+        )
         self.policy = section.get("policy")
         if not isinstance(self.policy, dict):
             raise ValueError("policy must be a mapping")
@@ -242,9 +281,12 @@ class TrustedPrincipalRuntime:
             "output_chars": int(raw.get("output_chars", 0)),
             "response_bytes": int(raw.get("response_bytes", 0)),
             "turn_ttl_seconds": int(raw.get("turn_ttl_seconds", 0)),
+            "roster_timeout_seconds": int(raw.get("roster_timeout_seconds", 0)),
         }
         if any(value <= 0 for value in values.values()):
             raise ValueError("all handoff/output limits must be positive")
+        if values["roster_timeout_seconds"] > 5:
+            raise ValueError("roster timeout must remain short and bounded")
         return Limits(**values)
 
     def _validate_static_config(self) -> None:
@@ -290,27 +332,102 @@ class TrustedPrincipalRuntime:
                 raise ValueError("principal binding values cannot be empty")
             if platform in NON_MESSAGING_SESSION_SURFACES or platform in {"a2a", "cron"}:
                 raise ValueError("principal bindings must name human messaging platforms")
+            if platform == "whatsapp" and re.fullmatch(
+                r"\d{1,32}@(s\.whatsapp\.net|lid)", user_id
+            ) is None:
+                raise ValueError("WhatsApp principal bindings require canonical JID/LID values")
             bindings.append((platform, user_id, principal))
         return tuple(bindings)
 
+    def _load_allowed_group_conversations(self) -> frozenset[tuple[str, str]]:
+        raw = self.config.get("allowed_group_conversations")
+        if not isinstance(raw, list):
+            raise ValueError("allowed_group_conversations must be an explicit list")
+        groups: set[tuple[str, str]] = set()
+        for entry in raw:
+            if not isinstance(entry, dict) or set(entry) != {"platform", "chat_id"}:
+                raise ValueError("group allowlist entries require only platform and chat_id")
+            platform = str(entry.get("platform") or "").strip().lower()
+            chat_id = str(entry.get("chat_id") or "").strip()
+            if platform != "whatsapp" or re.fullmatch(r"\d{1,32}@g\.us", chat_id) is None:
+                raise ValueError("Slice A group allowlists require canonical WhatsApp group IDs")
+            if (platform, chat_id) in groups:
+                raise ValueError("duplicate allowed group conversation")
+            groups.add((platform, chat_id))
+        return frozenset(groups)
+
     def _validate_policy(self) -> None:
+        if set(self.policy) != {"principals", "tool_classes", "action_rules"}:
+            raise ValueError("policy requires the exact audience-policy fields")
         principals = self.policy.get("principals")
         classes = self.policy.get("tool_classes")
         rules = self.policy.get("action_rules", [])
         if not isinstance(principals, dict) or not isinstance(classes, dict):
             raise ValueError("policy principals and tool_classes are required")
+        if set(classes) != {"read", "mutating"}:
+            raise ValueError("tool_classes requires exact read and mutating fields")
         bound_principals = {principal for _platform, _user_id, principal in self.principal_bindings}
         if not bound_principals.issubset(principals):
             raise ValueError("every bound principal must have an explicit policy")
         if any(not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name)) for name in principals):
             raise ValueError("policy principal names must be bounded opaque labels")
+        expected_principal_fields = {
+            "conversation_eligibility",
+            "required_group_co_principals",
+            "read_capability_ids",
+            "action_capability_ids",
+            "semantic_policy",
+        }
+        self.conversation_eligibility: dict[str, dict[str, bool]] = {}
+        self.required_group_co_principals: dict[str, frozenset[str]] = {}
+        self.principal_read_capabilities: dict[str, frozenset[str]] = {}
+        self.principal_action_capabilities: dict[str, frozenset[str]] = {}
+        capability_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
         for principal_name, principal_policy in principals.items():
-            if not isinstance(principal_policy, dict):
-                raise ValueError("each principal policy must be a semantic mapping")
-            if self._leak_reason(canonical_json(principal_policy), output=False):
+            if not isinstance(principal_policy, dict) or set(principal_policy) != expected_principal_fields:
+                raise ValueError("each principal policy requires the exact audience-policy fields")
+            eligibility = principal_policy.get("conversation_eligibility")
+            if (
+                not isinstance(eligibility, dict)
+                or set(eligibility) != {"dm", "group"}
+                or type(eligibility.get("dm")) is not bool
+                or type(eligibility.get("group")) is not bool
+            ):
+                raise ValueError("conversation eligibility requires exact DM/group booleans")
+            required = principal_policy.get("required_group_co_principals")
+            read_caps = principal_policy.get("read_capability_ids")
+            action_caps = principal_policy.get("action_capability_ids")
+            semantic_policy = principal_policy.get("semantic_policy")
+            if not isinstance(required, list) or not isinstance(read_caps, list) or not isinstance(action_caps, list):
+                raise ValueError("principal group requirements and capabilities must be lists")
+            if not isinstance(semantic_policy, dict):
+                raise ValueError("principal semantic_policy must be a mapping")
+            if len(set(map(str, required))) != len(required):
+                raise ValueError("required co-principals must be unique")
+            if any(str(name) not in principals or str(name) == str(principal_name) for name in required):
+                raise ValueError("required co-principals must name other configured principals")
+            for values in (read_caps, action_caps):
+                if len(set(map(str, values))) != len(values) or any(
+                    capability_pattern.fullmatch(str(value)) is None for value in values
+                ):
+                    raise ValueError("semantic capability IDs must be unique bounded labels")
+            if eligibility["dm"] is False and action_caps:
+                raise ValueError("group-only principals cannot have action capabilities")
+            if set(map(str, semantic_policy)) != set(map(str, read_caps)):
+                raise ValueError(
+                    "semantic_policy must map every read capability ID exactly once"
+                )
+            if self._leak_reason(canonical_json(semantic_policy), output=False):
                 raise ValueError(
                     f"principal policy {principal_name!r} contains non-semantic private data"
                 )
+            name = str(principal_name)
+            self.conversation_eligibility[name] = {
+                "dm": eligibility["dm"], "group": eligibility["group"]
+            }
+            self.required_group_co_principals[name] = frozenset(map(str, required))
+            self.principal_read_capabilities[name] = frozenset(map(str, read_caps))
+            self.principal_action_capabilities[name] = frozenset(map(str, action_caps))
         read_tools = classes.get("read")
         mutating_tools = classes.get("mutating")
         if not isinstance(read_tools, list) or not isinstance(mutating_tools, list):
@@ -336,6 +453,8 @@ class TrustedPrincipalRuntime:
                 raise ValueError("action rule tool must be classified as mutating")
             if str(rule["principal"]) not in principals:
                 raise ValueError("action rule principal must have a policy")
+            if not self.principal_action_capabilities[str(rule["principal"])]:
+                raise ValueError("action rule principal has no semantic action capability")
             if _contains_wildcard(rule):
                 raise ValueError("wildcard mutation rules are forbidden")
             normalized.append(
@@ -411,6 +530,305 @@ class TrustedPrincipalRuntime:
             raise ValueError("principal binding is missing or ambiguous")
         return next(iter(matches)), conversation_key
 
+    @staticmethod
+    def _capability_fingerprint(values: tuple[str, ...] | list[str]) -> str:
+        return hashlib.sha256(canonical_json(list(values)).encode("utf-8")).hexdigest()
+
+    def _opaque_digest(self, label: str, value: Any) -> str:
+        material = label.encode("ascii") + b"\0" + canonical_json(value).encode("utf-8")
+        return hmac.new(self.mapping_key, material, hashlib.sha256).hexdigest()
+
+    def _principal_for_transport_identity(self, platform: str, identity: str) -> set[str]:
+        return {
+            principal
+            for bound_platform, bound_identity, principal in self.principal_bindings
+            if bound_platform == platform and hmac.compare_digest(bound_identity, identity)
+        }
+
+    def _audience_from_roster(
+        self,
+        *,
+        initiating_principal: str,
+        platform: str,
+        chat_id: str,
+        roster: dict,
+        revalidate: Callable[[], dict],
+    ) -> AudienceBinding:
+        if not isinstance(roster, dict) or set(roster) != {
+            "group_id", "participants", "bot_identities", "generation"
+        }:
+            raise ValueError("authenticated roster evidence is malformed")
+        if roster.get("group_id") != chat_id:
+            raise ValueError("authenticated roster group is mismatched")
+        generation = roster.get("generation")
+        if not isinstance(generation, str) or re.fullmatch(r"[a-f0-9]{64}", generation) is None:
+            raise ValueError("authenticated roster generation is malformed")
+        participants = roster.get("participants")
+        bot_identities = roster.get("bot_identities")
+        if not isinstance(participants, list) or not participants:
+            raise ValueError("authenticated roster is empty")
+        if not isinstance(bot_identities, list) or not bot_identities:
+            raise ValueError("authenticated bot identity evidence is missing")
+        identity_pattern = re.compile(r"\d{1,32}@(s\.whatsapp\.net|lid)")
+        if len(set(bot_identities)) != len(bot_identities) or any(
+            not isinstance(value, str) or identity_pattern.fullmatch(value) is None
+            for value in bot_identities
+        ):
+            raise ValueError("authenticated bot identity evidence is malformed")
+        bot_set = frozenset(bot_identities)
+        canonical_members: list[tuple[str, ...]] = []
+        seen_transport_ids: set[str] = set()
+        human_principals: list[str] = []
+        audience_unknown = False
+        for raw_member in participants:
+            if not isinstance(raw_member, list) or not raw_member:
+                raise ValueError("authenticated roster member is malformed")
+            if len(set(raw_member)) != len(raw_member) or any(
+                not isinstance(value, str) or identity_pattern.fullmatch(value) is None
+                for value in raw_member
+            ):
+                raise ValueError("authenticated roster identity is malformed")
+            member = tuple(sorted(raw_member))
+            if any(value in seen_transport_ids for value in member):
+                raise ValueError("authenticated roster contains duplicate identities")
+            seen_transport_ids.update(member)
+            canonical_members.append(member)
+            bot_overlap = bot_set.intersection(member)
+            if bot_overlap:
+                if not set(member).issubset(bot_set):
+                    raise ValueError("bot and human identities are ambiguously combined")
+                continue
+            matches: set[str] = set()
+            for identity in member:
+                matches.update(self._principal_for_transport_identity(platform, identity))
+            if len(matches) != 1:
+                audience_unknown = True
+                continue
+            human_principals.append(next(iter(matches)))
+        if not human_principals and not audience_unknown:
+            raise ValueError("authenticated roster has no human members")
+        if len(set(human_principals)) != len(human_principals):
+            # Separate roster records cannot be collapsed merely because two
+            # configured aliases name the same principal. Only aliases carried
+            # together by one transport participant record prove equivalence.
+            audience_unknown = True
+        proved_principals = frozenset(human_principals)
+        if initiating_principal not in proved_principals:
+            raise PermissionError("initiating-principal-unproved")
+        required = self.required_group_co_principals[initiating_principal]
+        if not required.issubset(proved_principals):
+            raise PermissionError("required-co-principal-unproved")
+        if audience_unknown:
+            read_caps: tuple[str, ...] = ()
+            action_caps: tuple[str, ...] = ()
+        else:
+            read_sets = [self.principal_read_capabilities[name] for name in proved_principals]
+            read_caps = tuple(sorted(set.intersection(*(set(values) for values in read_sets))))
+            # Mixed/group conversations intentionally expose no actions in
+            # Slice A. Later action handlers require their own final audience
+            # revalidation seam before this can be non-empty.
+            action_caps = ()
+        conversation_binding = self._opaque_digest(
+            "conversation-v2", {"platform": platform, "kind": "group", "chat": chat_id}
+        )
+        audience_digest = self._opaque_digest(
+            "audience-v2",
+            {
+                "conversation": conversation_binding,
+                "members": sorted(canonical_members),
+                "bots": sorted(bot_set),
+                "generation": generation,
+            },
+        )
+        return AudienceBinding(
+            principal=initiating_principal,
+            conversation_kind="group",
+            conversation_binding=conversation_binding,
+            audience_digest=audience_digest,
+            roster_generation=generation,
+            effective_read_capability_ids=read_caps,
+            effective_action_capability_ids=action_caps,
+            private_eligible=bool(read_caps),
+            policy_generation=self.policy_generation,
+            revalidate=revalidate,
+        )
+
+    def _single_principal_audience(
+        self, principal: str, platform: str, destination: str
+    ) -> AudienceBinding:
+        if not self.conversation_eligibility[principal]["dm"]:
+            raise ValueError("conversation is not eligible")
+        conversation_binding = self._opaque_digest(
+            "conversation-v2",
+            {"platform": platform, "kind": "dm", "chat": destination},
+        )
+        return AudienceBinding(
+            principal=principal,
+            conversation_kind="dm",
+            conversation_binding=conversation_binding,
+            audience_digest=self._opaque_digest(
+                "audience-v2", {"conversation": conversation_binding, "principal": principal}
+            ),
+            roster_generation=self._opaque_digest(
+                "roster-v2", {"kind": "single-principal", "principal": principal}
+            ),
+            effective_read_capability_ids=tuple(
+                sorted(self.principal_read_capabilities[principal])
+            ),
+            effective_action_capability_ids=tuple(
+                sorted(self.principal_action_capabilities[principal])
+            ),
+            private_eligible=bool(self.principal_read_capabilities[principal]),
+            policy_generation=self.policy_generation,
+        )
+
+    def current_audience_binding(self) -> AudienceBinding:
+        binding = _ACTIVE_AUDIENCE.get()
+        if binding is None:
+            raise ValueError("no active authenticated audience")
+        return binding
+
+    @staticmethod
+    def _ingress_skip(reason: str) -> dict:
+        return {"action": "skip", "reason": reason, "redact_scope": True}
+
+    async def pre_gateway_dispatch(
+        self, event: Any = None, gateway: Any = None, **_: Any
+    ) -> Optional[dict]:
+        """Bind eligible Juno audience authority before auth/session/model work."""
+        if self.mode != "juno" or not self.juno_available():
+            return None
+        _ACTIVE_AUDIENCE.set(None)
+        source = getattr(event, "source", None)
+        platform_value = getattr(getattr(source, "platform", None), "value", None)
+        platform = str(platform_value or getattr(source, "platform", "") or "").lower()
+        user_id = str(getattr(source, "user_id", "") or "")
+        matches = self._principal_for_transport_identity(platform, user_id)
+        if not matches:
+            return None
+        # Ambiguous configured identities are protected and therefore skipped,
+        # never passed through to pairing/auth/model behavior.
+        if len(matches) != 1:
+            return self._ingress_skip("protected-principal-ambiguous")
+        principal = next(iter(matches))
+        try:
+            chat_type = str(getattr(source, "chat_type", "") or "").lower()
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            eligibility = self.conversation_eligibility[principal]
+            if chat_type not in {"dm", "group"} or not eligibility[chat_type]:
+                return self._ingress_skip("conversation-ineligible")
+            if chat_type == "dm":
+                _ACTIVE_AUDIENCE.set(
+                    self._single_principal_audience(principal, platform, chat_id)
+                )
+                return None
+            if (
+                platform != "whatsapp"
+                or (platform, chat_id) not in self.allowed_group_conversations
+            ):
+                return self._ingress_skip("conversation-ineligible")
+            metadata = getattr(event, "metadata", None) or {}
+            if metadata.get("whatsapp_inbound_provenance") != (
+                "messages.upsert:registered-emitting-socket:v1"
+            ):
+                raise ValueError("authenticated inbound socket provenance is missing")
+            inbound_runtime_id = metadata.get("whatsapp_inbound_runtime_id")
+            inbound_socket_generation = metadata.get(
+                "whatsapp_inbound_socket_generation"
+            )
+            if (
+                not isinstance(inbound_runtime_id, str)
+                or re.fullmatch(r"[a-f0-9]{64}", inbound_runtime_id) is None
+                or not isinstance(inbound_socket_generation, int)
+                or isinstance(inbound_socket_generation, bool)
+                or inbound_socket_generation <= 0
+            ):
+                raise ValueError("authenticated inbound socket generation is missing")
+            adapters = getattr(gateway, "adapters", None) or {}
+            adapter = adapters.get(getattr(source, "platform", None))
+            fetch = getattr(adapter, "authenticated_group_roster", None)
+            if not callable(fetch):
+                raise ValueError("authenticated managed roster provider is unavailable")
+
+            def provider() -> dict:
+                return fetch(
+                    self.configured_profile,
+                    chat_id,
+                    timeout=self.limits.roster_timeout_seconds,
+                    expected_runtime_id=inbound_runtime_id,
+                    expected_socket_generation=inbound_socket_generation,
+                )
+
+            roster = await asyncio.wait_for(
+                asyncio.to_thread(provider), timeout=self.limits.roster_timeout_seconds + 0.5
+            )
+            _ACTIVE_AUDIENCE.set(
+                self._audience_from_roster(
+                    initiating_principal=principal,
+                    platform=platform,
+                    chat_id=chat_id,
+                    roster=roster,
+                    revalidate=provider,
+                )
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except PermissionError:
+            return self._ingress_skip("required-co-principal-unproved")
+        except Exception as exc:
+            logger.warning("Juno audience ingress blocked: %s", type(exc).__name__)
+            # Group-only principals must remain silent when roster/co-member
+            # proof is unavailable. Other protected group principals are also
+            # skipped: allowing on hook failure would bypass the pre-model gate.
+            return self._ingress_skip("audience-authority-unavailable")
+
+    def _revalidate_audience(self, binding: AudienceBinding) -> AudienceBinding:
+        if binding.policy_generation != self.policy_generation:
+            raise ValueError("audience policy generation changed")
+        if binding.conversation_kind == "dm":
+            return binding
+        if binding.revalidate is None:
+            raise ValueError("group audience cannot be revalidated")
+        roster = binding.revalidate()
+        current = self._audience_from_roster(
+            initiating_principal=binding.principal,
+            platform="whatsapp",
+            chat_id=next(
+                chat_id
+                for platform, chat_id in self.allowed_group_conversations
+                if platform == "whatsapp"
+                and self._opaque_digest(
+                    "conversation-v2",
+                    {"platform": platform, "kind": "group", "chat": chat_id},
+                ) == binding.conversation_binding
+            ),
+            roster=roster,
+            revalidate=binding.revalidate,
+        )
+        expected = (
+            binding.conversation_binding,
+            binding.audience_digest,
+            binding.roster_generation,
+            binding.effective_read_capability_ids,
+            binding.effective_action_capability_ids,
+            binding.private_eligible,
+        )
+        observed = (
+            current.conversation_binding,
+            current.audience_digest,
+            current.roster_generation,
+            current.effective_read_capability_ids,
+            current.effective_action_capability_ids,
+            current.private_eligible,
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(canonical_json(expected).encode()).digest(),
+            hashlib.sha256(canonical_json(observed).encode()).digest(),
+        ):
+            raise ValueError("authenticated audience changed")
+        return current
+
     def _leak_reason(self, text: str, *, output: bool) -> str:
         value = str(text or "")
         for pattern in _CREDENTIAL_PATTERNS:
@@ -454,8 +872,36 @@ class TrustedPrincipalRuntime:
 
     def consult_kite(self, args: dict, **_: Any) -> str:
         """Tool handler: derive authority from ContextVars and call fixed Kite."""
+        request_id = ""
         try:
             principal, conversation_key = self._derive_juno_principal()
+            audience = _ACTIVE_AUDIENCE.get()
+            chat_type = str(get_session_env("HERMES_SESSION_CHAT_TYPE") or "").lower()
+            platform = str(get_session_env("HERMES_SESSION_PLATFORM") or "").lower()
+            chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID") or "")
+            if audience is None:
+                if chat_type != "dm":
+                    raise ValueError("group audience was not authenticated at ingress")
+                audience = self._single_principal_audience(
+                    principal, platform, chat_id
+                )
+                _ACTIVE_AUDIENCE.set(audience)
+            if audience.principal != principal:
+                raise ValueError("audience principal does not match authenticated sender")
+            if audience.conversation_kind != chat_type:
+                raise ValueError("audience conversation classification changed")
+            expected_conversation_binding = self._opaque_digest(
+                "conversation-v2",
+                {"platform": platform, "kind": chat_type, "chat": chat_id},
+            )
+            if not hmac.compare_digest(
+                audience.conversation_binding, expected_conversation_binding
+            ):
+                raise ValueError("audience destination binding changed")
+            if audience.policy_generation != self.policy_generation:
+                raise ValueError("audience policy generation is stale")
+            if not audience.private_eligible or not audience.effective_read_capability_ids:
+                raise ValueError("effective audience is public-only")
             question = str((args or {}).get("question_or_goal") or "").strip()
             if not question or len(question) > self.limits.question_chars:
                 raise ValueError("question_or_goal is empty or over its configured limit")
@@ -480,10 +926,15 @@ class TrustedPrincipalRuntime:
                 for turn in relevant_context
             ):
                 raise ValueError("relevant context contains a raw authenticated session identifier")
+            # First live group recheck. This happens before mapping or request
+            # creation, so a changed/missing audience cannot leave authority
+            # state or issue an A2A call.
+            audience = self._revalidate_audience(audience)
             mapping = self.store.resolve(principal, conversation_key)
             request_id = "req-" + secrets.token_urlsafe(18)
             expires_at = int(self.clock()) + self.limits.turn_ttl_seconds
             unsigned = {
+                "version": 2,
                 "context_id": mapping.context_id,
                 "correlation_id": mapping.correlation_id,
                 "request_id": request_id,
@@ -491,6 +942,15 @@ class TrustedPrincipalRuntime:
                 "expires_at": expires_at,
                 "question_or_goal": question,
                 "relevant_context": relevant_context,
+                "audience_digest": audience.audience_digest,
+                "conversation_binding": audience.conversation_binding,
+                "effective_read_capability_ids": list(
+                    audience.effective_read_capability_ids
+                ),
+                "effective_action_capability_ids": list(
+                    audience.effective_action_capability_ids
+                ),
+                "roster_generation": audience.roster_generation,
             }
             payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
             guard = _audit_guard(mapping.correlation_id, request_id, mapping.context_id)
@@ -502,7 +962,23 @@ class TrustedPrincipalRuntime:
                 message = guard + REQUEST_PREFIX + canonical_json(payload)
             if len(message.encode("utf-8")) > self.limits.handoff_bytes:
                 raise ValueError("bounded handoff exceeds its byte limit")
-            self.store.issue_request(mapping, request_id, self.policy_generation, expires_at)
+            read_fingerprint = self._capability_fingerprint(
+                audience.effective_read_capability_ids
+            )
+            action_fingerprint = self._capability_fingerprint(
+                audience.effective_action_capability_ids
+            )
+            self.store.issue_request(
+                mapping,
+                request_id,
+                self.policy_generation,
+                expires_at,
+                audience.audience_digest,
+                audience.conversation_binding,
+                read_fingerprint,
+                action_fingerprint,
+                audience.roster_generation,
+            )
             logger.info("Juno--Kite dispatch correlation=%s", mapping.correlation_id)
             raw, returned_context, state = self.transport(
                 self.peer_name, dict(self.peer), message, mapping.context_id
@@ -513,8 +989,25 @@ class TrustedPrincipalRuntime:
                 "task_state_completed",
             }:
                 raise ValueError("Kite returned a mismatched context or incomplete task")
-            return self._verify_response(raw, mapping, request_id)
+            payload = self._validate_response(raw, mapping, request_id)
+            # Verify the signed response first, then acquire a second live
+            # roster immediately before private content can return to Juno.
+            self._revalidate_audience(audience)
+            if not self.store.consume_response(
+                request_id,
+                mapping.context_id,
+                mapping.correlation_id,
+                self.policy_generation,
+                int(self.clock()),
+            ):
+                raise ValueError("Kite response is replayed or not releasable")
+            return str(payload["answer"])
         except Exception as exc:
+            if request_id:
+                try:
+                    self.store.abort_request(request_id)
+                except Exception:
+                    logger.warning("Juno--Kite request abort failed closed")
             logger.warning("Juno--Kite consultation blocked: %s", type(exc).__name__)
             return f"BLOCKED: consult_kite denied ({self._public_reason(exc)})."
 
@@ -534,6 +1027,8 @@ class TrustedPrincipalRuntime:
         payload = json.loads(encoded)
         if not isinstance(payload, dict) or set(payload) != _REQUEST_FIELDS:
             raise ValueError("malformed or authority-bearing request body")
+        if payload.get("version") != 2:
+            raise ValueError("unsupported trusted-principal envelope version")
         if not _verify_signature(payload, self.request_key):
             raise ValueError("invalid request signature")
         question = payload.get("question_or_goal")
@@ -547,6 +1042,28 @@ class TrustedPrincipalRuntime:
             raise ValueError("request question violates bounded handoff policy")
         if context != self._bounded_context(context):
             raise ValueError("request context violates bounded handoff policy")
+        for name in ("audience_digest", "conversation_binding", "roster_generation"):
+            if not isinstance(payload.get(name), str) or re.fullmatch(
+                r"[a-f0-9]{64}", payload[name]
+            ) is None:
+                raise ValueError("request audience binding is malformed")
+        capability_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+        for name in (
+            "effective_read_capability_ids", "effective_action_capability_ids"
+        ):
+            values = payload.get(name)
+            if (
+                not isinstance(values, list)
+                or values != sorted(set(values))
+                or any(
+                    not isinstance(value, str)
+                    or capability_pattern.fullmatch(value) is None
+                    for value in values
+                )
+            ):
+                raise ValueError("request effective capabilities are malformed")
+        if not payload["effective_read_capability_ids"]:
+            raise ValueError("public-only audience cannot request private consultation")
         return payload
 
     def _a2a_lane(self) -> tuple[str, str, str]:
@@ -586,20 +1103,48 @@ class TrustedPrincipalRuntime:
             raise ValueError("request mapping does not match authenticated context")
         if mapping.principal not in self.policy.get("principals", {}):
             raise ValueError("principal has no policy")
+        read_caps = tuple(payload["effective_read_capability_ids"])
+        action_caps = tuple(payload["effective_action_capability_ids"])
+        if not set(read_caps).issubset(
+            self.principal_read_capabilities[mapping.principal]
+        ) or not set(action_caps).issubset(
+            self.principal_action_capabilities[mapping.principal]
+        ):
+            raise ValueError("requested semantic policy exceeds principal audience authority")
         request = self.store.claim_request(
             str(payload["request_id"]),
             context_id,
             mapping.correlation_id,
             self.policy_generation,
             now,
+            str(payload["audience_digest"]),
+            str(payload["conversation_binding"]),
+            self._capability_fingerprint(read_caps),
+            self._capability_fingerprint(action_caps),
+            str(payload["roster_generation"]),
         )
         if request is None:
             raise ValueError("request is unissued, replayed, stale, or cross-bound")
-        return TurnBinding(True, "", mapping, request, session_id, turn_id)
+        return TurnBinding(
+            True,
+            "",
+            mapping,
+            request,
+            session_id,
+            turn_id,
+            read_caps,
+            action_caps,
+        )
 
     def _policy_view(self, binding: TurnBinding) -> str:
         assert binding.mapping is not None and binding.request is not None
-        principal_policy = self.policy["principals"][binding.mapping.principal]
+        configured_semantic_policy = self.policy["principals"][
+            binding.mapping.principal
+        ]["semantic_policy"]
+        principal_policy = {
+            capability_id: configured_semantic_policy[capability_id]
+            for capability_id in binding.effective_read_capability_ids
+        }
         view = {
             "policy_generation": self.policy_generation,
             "mapped_scope": binding.mapping.correlation_id,
@@ -607,6 +1152,12 @@ class TrustedPrincipalRuntime:
             "authenticated_peer": "juno",
             "principal": binding.mapping.principal,
             "principal_policy": principal_policy,
+            "effective_read_capability_ids": list(
+                binding.effective_read_capability_ids
+            ),
+            "effective_action_capability_ids": list(
+                binding.effective_action_capability_ids
+            ),
             "data_class": "operator-configured semantic classes",
             "subject": binding.mapping.principal,
             "purpose": "answer the current bounded consultation",
@@ -645,6 +1196,7 @@ class TrustedPrincipalRuntime:
         if platform != "a2a":
             _ACTIVE_BINDING.set(None)
             return None
+        binding: Optional[TurnBinding] = None
         try:
             binding = self._bind_request(
                 str(user_message or ""), str(session_id or ""), str(turn_id or "")
@@ -652,6 +1204,11 @@ class TrustedPrincipalRuntime:
             _ACTIVE_BINDING.set(binding)
             return {"context": self._policy_view(binding)}
         except Exception as exc:
+            if binding and binding.request:
+                try:
+                    self.store.abort_request(binding.request.request_id)
+                except Exception:
+                    logger.warning("Kite bind abort failed closed")
             _ACTIVE_BINDING.set(
                 TurnBinding(
                     False,
@@ -726,6 +1283,8 @@ class TrustedPrincipalRuntime:
                 return None
             if tool_name not in self.mutating_tools:
                 return self._block("tool is not explicitly classified")
+            if not binding.effective_action_capability_ids:
+                return self._block("effective audience has no action capability")
             assert binding.mapping is not None and binding.request is not None
             canonical_args = canonical_json(args)
             rule = (binding.mapping.principal, str(tool_name), canonical_args)
@@ -765,6 +1324,8 @@ class TrustedPrincipalRuntime:
                 return None
             if tool_name not in self.mutating_tools:
                 return self._block("tool is not explicitly classified at dispatch")
+            if not binding.effective_action_capability_ids:
+                return self._block("effective audience has no final action capability")
             assert binding.mapping is not None and binding.request is not None
             canonical_args = canonical_json(args)
             rule = (binding.mapping.principal, str(tool_name), canonical_args)
@@ -793,6 +1354,7 @@ class TrustedPrincipalRuntime:
         mapping = binding.mapping if binding else None
         request = binding.request if binding else None
         unsigned = {
+            "version": 2,
             "context_id": mapping.context_id if mapping else "",
             "correlation_id": mapping.correlation_id if mapping else "",
             "request_id": request.request_id if request else "",
@@ -801,6 +1363,15 @@ class TrustedPrincipalRuntime:
             "answer": answer,
             "denied": bool(denied),
             "reason": reason,
+            "audience_digest": request.audience_digest if request else "",
+            "conversation_binding": request.conversation_binding if request else "",
+            "effective_read_capability_ids": (
+                list(binding.effective_read_capability_ids) if binding else []
+            ),
+            "effective_action_capability_ids": (
+                list(binding.effective_action_capability_ids) if binding else []
+            ),
+            "roster_generation": request.roster_generation if request else "",
         }
         payload = {**unsigned, "signature": sign_payload(unsigned, self.response_key)}
         return (
@@ -846,6 +1417,11 @@ class TrustedPrincipalRuntime:
             return envelope
         except Exception as exc:
             logger.warning("Kite output release denied: %s", type(exc).__name__)
+            if binding and binding.request:
+                try:
+                    self.store.abort_request(binding.request.request_id)
+                except Exception:
+                    logger.warning("Kite request abort failed closed")
             try:
                 return self._signed_response(
                     binding if binding and binding.valid else None,
@@ -856,7 +1432,7 @@ class TrustedPrincipalRuntime:
             except Exception:
                 return DENIAL_PREFIX + "no releasable envelope"
 
-    def _verify_response(self, raw: str, mapping: MappingRecord, request_id: str) -> str:
+    def _validate_response(self, raw: str, mapping: MappingRecord, request_id: str) -> dict:
         encoded = str(raw or "")
         if len(encoded.encode("utf-8")) > self.limits.response_bytes:
             raise ValueError("Kite response exceeds configured byte limit")
@@ -871,6 +1447,8 @@ class TrustedPrincipalRuntime:
             raise ValueError("Kite response is malformed") from exc
         if not isinstance(payload, dict) or set(payload) != _RESPONSE_FIELDS:
             raise ValueError("Kite response has an invalid envelope")
+        if payload.get("version") != 2:
+            raise ValueError("Kite response has an unsupported envelope version")
         if not _verify_signature(payload, self.response_key):
             raise ValueError("Kite response signature is invalid")
         expected = {
@@ -890,22 +1468,62 @@ class TrustedPrincipalRuntime:
             or payload["expires_at"] <= now
         ):
             raise ValueError("Kite response is stale or expired")
+        authority_expected = {
+            "audience_digest": request.audience_digest,
+            "conversation_binding": request.conversation_binding,
+            "roster_generation": request.roster_generation,
+            "effective_read_capability_ids": payload.get(
+                "effective_read_capability_ids"
+            ),
+            "effective_action_capability_ids": payload.get(
+                "effective_action_capability_ids"
+            ),
+        }
+        if any(
+            payload.get(name) != authority_expected[name]
+            for name in ("audience_digest", "conversation_binding", "roster_generation")
+        ):
+            raise ValueError("Kite response audience scope is mismatched")
+        if any(
+            not isinstance(authority_expected[name], str)
+            or re.fullmatch(r"[a-f0-9]{64}", authority_expected[name]) is None
+            for name in ("audience_digest", "conversation_binding", "roster_generation")
+        ):
+            raise ValueError("Kite response audience binding is malformed")
+        read_caps = authority_expected["effective_read_capability_ids"]
+        action_caps = authority_expected["effective_action_capability_ids"]
+        if (
+            not isinstance(read_caps, list)
+            or read_caps != sorted(set(read_caps))
+            or not isinstance(action_caps, list)
+            or action_caps != sorted(set(action_caps))
+            or self._capability_fingerprint(tuple(read_caps))
+            != request.read_capability_fingerprint
+            or self._capability_fingerprint(tuple(action_caps))
+            != request.action_capability_fingerprint
+        ):
+            raise ValueError("Kite response effective capabilities are mismatched")
         answer = payload.get("answer")
         if not isinstance(answer, str) or len(answer) > self.limits.output_chars:
             raise ValueError("Kite response answer exceeds its minimized limit")
         if self._leak_reason(answer, output=True):
             raise ValueError("Kite response contains leak-shaped data")
+        if payload.get("denied") is not False:
+            raise ValueError("Kite denied release under current policy")
+        return payload
+
+    def _verify_response(self, raw: str, mapping: MappingRecord, request_id: str) -> str:
+        """Compatibility helper: verify and consume one already released response."""
+        payload = self._validate_response(raw, mapping, request_id)
         if not self.store.consume_response(
             request_id,
             mapping.context_id,
             mapping.correlation_id,
             self.policy_generation,
-            now,
+            int(self.clock()),
         ):
             raise ValueError("Kite response is replayed or not releasable")
-        if payload.get("denied") is not False:
-            raise ValueError("Kite denied release under current policy")
-        return answer
+        return str(payload["answer"])
 
     @staticmethod
     def _a2a_transport(
@@ -966,18 +1584,39 @@ class TrustedPrincipalRuntime:
 class FailClosedRuntime:
     """Keeps A2A output and tools closed when configured plugin startup fails."""
 
-    def __init__(self, error: Exception, *, mode: str, active_profile: str):
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        mode: str,
+        active_profile: str,
+        configured_profile: str,
+    ):
         self.error = error
         self.mode = mode
         self.active_profile = active_profile
+        self.configured_profile = configured_profile
         self.enabled = False
-        self.limits = Limits(1, 1, 1, 1, 1, 1, 1, 1)
+        self.limits = Limits(1, 1, 1, 1, 1, 1, 1, 1, 1)
 
     def juno_available(self) -> bool:
         return False
 
     def consult_kite(self, _args: dict, **_: Any) -> str:
         return "BLOCKED: consult_kite configuration is unavailable."
+
+    def pre_gateway_dispatch(self, **_: Any) -> Optional[dict]:
+        if (
+            self.mode == "juno"
+            and bool(self.configured_profile)
+            and self.active_profile == self.configured_profile
+        ):
+            return {
+                "action": "skip",
+                "reason": "audience-policy-unavailable",
+                "redact_scope": True,
+            }
+        return None
 
     def pre_llm_call(self, **_: Any) -> Optional[dict]:
         if str(get_session_env("HERMES_SESSION_PLATFORM") or "").lower() == "a2a":
@@ -1016,4 +1655,5 @@ def runtime_from_host(active_profile: str) -> TrustedPrincipalRuntime | FailClos
             exc,
             mode=str(section.get("mode") or "").strip().lower(),
             active_profile=active_profile,
+            configured_profile=str(section.get("profile") or "").strip(),
         )

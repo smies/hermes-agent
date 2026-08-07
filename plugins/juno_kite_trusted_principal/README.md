@@ -4,7 +4,8 @@ This bundled, opt-in plugin implements the narrow working vertical in
 `docs/architecture/adr-juno-kite-trusted-principal-architecture.md`. The same
 plugin runs in one of two modes:
 
-- `juno` registers only `consult_kite`. It derives a human principal and the
+- `juno` registers `consult_kite` plus a fail-closed `pre_gateway_dispatch`
+  ingress hook. It derives a human principal and the
   canonical Juno conversation from authenticated session ContextVars, resolves
   an opaque Kite context, and sends one bounded signed A2A request to a fixed
   localhost peer.
@@ -14,10 +15,22 @@ plugin runs in one of two modes:
   mutations by exact canonical arguments, and releases only a signed minimized
   envelope.
 
+For an allowlisted WhatsApp group, the ingress hook reads a complete current
+roster only from the exact adapter-managed bridge that authenticated the
+event. The bridge binds the roster to a one-use challenge, its secret sender
+companion fence, runtime, socket generation, group, and proved phone/LID alias
+sets. Every human member must bind to exactly one configured principal; an
+unknown or ambiguous human yields public-only authority. Group-only principals
+are silent in DMs and whenever a required co-principal cannot be proved.
+Roster identifiers never enter prompts, ordinary logs, envelopes, or SQLite;
+only opaque audience/freshness digests and semantic capability IDs cross the
+Juno--Kite boundary.
+
 The plugin does not register generic A2A discovery, URL, history, context,
 peer-selection, or fan-out tools. Its only core dependency is Hermes's generic
-final handler-boundary veto hook; it does not change agent, session, gateway,
-or A2A protocols and no core branch knows this plugin's name.
+final handler-boundary veto hook. The gateway's generic pre-dispatch loop also
+awaits bounded asynchronous hook results; no core branch knows this plugin's
+name.
 
 ## Shared prerequisites
 
@@ -112,8 +125,12 @@ juno_kite_trusted_principal:
   kite_plugin: juno_kite_trusted_principal
   policy_generation: "juno-kite-v1"
   principal_bindings:
-    - {platform: telegram, user_id: "<authenticated-james-id>", principal: james}
-    - {platform: telegram, user_id: "<authenticated-lucy-id>", principal: lucy}
+    - {platform: whatsapp, user_id: "10000000001@s.whatsapp.net", principal: owner}
+    - {platform: whatsapp, user_id: "20000000001@lid", principal: owner}
+    - {platform: whatsapp, user_id: "10000000002@s.whatsapp.net", principal: group_member}
+    - {platform: whatsapp, user_id: "20000000002@lid", principal: group_member}
+  allowed_group_conversations:
+    - {platform: whatsapp, chat_id: "300000000000000@g.us"}
   limits:
     question_chars: 2000
     context_turns: 4
@@ -123,10 +140,24 @@ juno_kite_trusted_principal:
     output_chars: 4000
     response_bytes: 16384
     turn_ttl_seconds: 120
+    roster_timeout_seconds: 2
   policy:
     principals:
-      james: {trust_class: trusted-family, disclose: [own, shared]}
-      lucy: {trust_class: trusted-family, disclose: [own, shared]}
+      owner:
+        conversation_eligibility: {dm: true, group: true}
+        required_group_co_principals: []
+        read_capability_ids: [private.own, private.shared]
+        action_capability_ids: []
+        semantic_policy:
+          private.own: {disclose: [own]}
+          private.shared: {trust_class: trusted-family, disclose: [shared]}
+      group_member:
+        conversation_eligibility: {dm: false, group: true}
+        required_group_co_principals: [owner]
+        read_capability_ids: [private.shared]
+        action_capability_ids: []
+        semantic_policy:
+          private.shared: {trust_class: trusted-family, disclose: [shared]}
     tool_classes:
       read: [read_file]
       mutating: [write_file]
@@ -186,8 +217,12 @@ juno_kite_trusted_principal:
   kite_plugin: juno_kite_trusted_principal
   policy_generation: "juno-kite-v1"
   principal_bindings:
-    - {platform: telegram, user_id: "<authenticated-james-id>", principal: james}
-    - {platform: telegram, user_id: "<authenticated-lucy-id>", principal: lucy}
+    - {platform: whatsapp, user_id: "10000000001@s.whatsapp.net", principal: owner}
+    - {platform: whatsapp, user_id: "20000000001@lid", principal: owner}
+    - {platform: whatsapp, user_id: "10000000002@s.whatsapp.net", principal: group_member}
+    - {platform: whatsapp, user_id: "20000000002@lid", principal: group_member}
+  allowed_group_conversations:
+    - {platform: whatsapp, chat_id: "300000000000000@g.us"}
   limits:
     question_chars: 2000
     context_turns: 4
@@ -197,10 +232,24 @@ juno_kite_trusted_principal:
     output_chars: 4000
     response_bytes: 16384
     turn_ttl_seconds: 120
+    roster_timeout_seconds: 2
   policy:
     principals:
-      james: {trust_class: trusted-family, disclose: [own, shared]}
-      lucy: {trust_class: trusted-family, disclose: [own, shared]}
+      owner:
+        conversation_eligibility: {dm: true, group: true}
+        required_group_co_principals: []
+        read_capability_ids: [private.own, private.shared]
+        action_capability_ids: []
+        semantic_policy:
+          private.own: {disclose: [own]}
+          private.shared: {trust_class: trusted-family, disclose: [shared]}
+      group_member:
+        conversation_eligibility: {dm: false, group: true}
+        required_group_co_principals: [owner]
+        read_capability_ids: [private.shared]
+        action_capability_ids: []
+        semantic_policy:
+          private.shared: {trust_class: trusted-family, disclose: [shared]}
     tool_classes:
       read: [read_file]
       mutating: [write_file]
@@ -228,30 +277,12 @@ token must be the same value assigned to peer `juno` above. The top-level
 `platforms.a2a` and `a2a.trusted_peers` shapes are intentional Hermes config;
 do not nest the platform beneath `gateway`.
 
-Action rules are intentionally empty by default. To authorize a demonstrated
-low-risk mutation, add one rule with a literal principal, the canonical tool
-name, and every argument including defaults. For example, an isolated test-only
-write would be shaped as follows (do not copy its destination into production):
-
-```yaml
-juno_kite_trusted_principal:
-  policy:
-    principals:
-      james: {trust_class: trusted-family, disclose: [own, shared]}
-      lucy: {trust_class: trusted-family, disclose: [own, shared]}
-    tool_classes:
-      read: [read_file]
-      mutating: [write_file]
-    action_rules:
-      - principal: james
-        tool: write_file
-        arguments:
-          path: /an/operator-approved/exact/path.txt
-          content: "the exact approved content"
-          encoding: utf-8
-```
-
-The `action_rules` list must stay nested at
+Action rules and every `action_capability_ids` list are intentionally empty in
+the Slice A deployment configuration. The existing exact-argument enforcement
+remains regression-tested, but no new action is activated by this slice. A
+later action slice must add a final-handler live audience revalidation seam
+before any group-capable action can become available. If a later approved slice
+uses `action_rules`, that list must remain nested at
 `juno_kite_trusted_principal.policy.action_rules`; a top-level list is ignored.
 
 Aliases, missing defaults, extra keys, changed destinations/content, wildcard
@@ -322,11 +353,11 @@ private provider or production action:
      body:
 
      ```json
-     {"jsonrpc":"2.0","id":"<generated>","method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"<opaque-audit-guard>\nJUNO_KITE_REQUEST_V1 <signed-request>","mediaType":"text/plain"}],"messageId":"<generated>","contextId":"<issued-context>"}}}
+     {"jsonrpc":"2.0","id":"<generated>","method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"<opaque-audit-guard>\nJUNO_KITE_REQUEST_V2 <signed-request>","mediaType":"text/plain"}],"messageId":"<generated>","contextId":"<issued-context>"}}}
      ```
 
      Expect HTTP `200`, a completed A2A task, a
-     `JUNO_KITE_RESPONSE_V1` HMAC envelope no larger than 16,384 bytes, and the
+     `JUNO_KITE_RESPONSE_V2` HMAC envelope no larger than 16,384 bytes, and the
      exact minimized answer `synthetic bounded answer` after Juno verifies it.
    - Wrong context: resend a freshly issued signed request with only the A2A
      message `contextId` changed to `<issued-context>-changed`. Expect HTTP

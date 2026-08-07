@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -22,6 +24,11 @@ from typing import Any
 TOKEN = "synthetic-juno-bearer-not-a-production-secret"
 WRONG_TOKEN = "synthetic-wrong-bearer"
 PRINCIPAL_ID = "synthetic-user-101"
+OWNER_JID = "11111111111@s.whatsapp.net"
+OWNER_LID = "21111111111@lid"
+FAMILY_JID = "12222222222@s.whatsapp.net"
+FAMILY_LID = "22222222222@lid"
+GROUP_ID = "300000000000000@g.us"
 MAX_HTTP_BODY = 16_384
 
 
@@ -48,7 +55,30 @@ def _config(root: Path, url: str) -> dict:
                     "platform": "telegram",
                     "user_id": PRINCIPAL_ID,
                     "principal": "synthetic-principal",
-                }
+                },
+                {
+                    "platform": "whatsapp",
+                    "user_id": OWNER_JID,
+                    "principal": "synthetic-principal",
+                },
+                {
+                    "platform": "whatsapp",
+                    "user_id": OWNER_LID,
+                    "principal": "synthetic-principal",
+                },
+                {
+                    "platform": "whatsapp",
+                    "user_id": FAMILY_JID,
+                    "principal": "synthetic-family",
+                },
+                {
+                    "platform": "whatsapp",
+                    "user_id": FAMILY_LID,
+                    "principal": "synthetic-family",
+                },
+            ],
+            "allowed_group_conversations": [
+                {"platform": "whatsapp", "chat_id": GROUP_ID},
             ],
             "kite_peer": "kite",
             "kite_url": url,
@@ -63,13 +93,35 @@ def _config(root: Path, url: str) -> dict:
                 "output_chars": 200,
                 "response_bytes": MAX_HTTP_BODY,
                 "turn_ttl_seconds": 60,
+                "roster_timeout_seconds": 2,
             },
             "policy": {
                 "principals": {
                     "synthetic-principal": {
-                        "trust_class": "synthetic",
-                        "disclose": ["synthetic-only"],
-                    }
+                        "conversation_eligibility": {"dm": True, "group": True},
+                        "required_group_co_principals": [],
+                        "read_capability_ids": ["synthetic.owner", "synthetic.shared"],
+                        "action_capability_ids": ["synthetic.mutation"],
+                        "semantic_policy": {
+                            "synthetic.owner": {"disclose": ["synthetic-owner"]},
+                            "synthetic.shared": {
+                                "trust_class": "synthetic",
+                                "disclose": ["synthetic-shared"],
+                            },
+                        },
+                    },
+                    "synthetic-family": {
+                        "conversation_eligibility": {"dm": False, "group": True},
+                        "required_group_co_principals": ["synthetic-principal"],
+                        "read_capability_ids": ["synthetic.shared"],
+                        "action_capability_ids": [],
+                        "semantic_policy": {
+                            "synthetic.shared": {
+                                "trust_class": "synthetic",
+                                "disclose": ["synthetic-shared"],
+                            },
+                        },
+                    },
                 },
                 "tool_classes": {
                     "read": ["synthetic_read"],
@@ -87,14 +139,22 @@ def _config(root: Path, url: str) -> dict:
     }
 
 
-def _session(callback, *, platform: str, user_id: str, context_id: str, profile: str):
+def _session(
+    callback,
+    *,
+    platform: str,
+    user_id: str,
+    context_id: str,
+    profile: str,
+    chat_type: str = "dm",
+):
     from gateway.session_context import clear_session_vars, set_session_vars
 
     tokens = set_session_vars(
         platform=platform,
         source=platform,
         chat_id=context_id,
-        chat_type="dm",
+        chat_type=chat_type,
         user_id=user_id,
         user_name="synthetic",
         session_key=f"agent:{profile}:{platform}:dm:{context_id}",
@@ -169,7 +229,9 @@ async def _run() -> None:
         os.environ[name] = value
 
     import model_tools
-    from gateway.config import PlatformConfig
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionSource
     from hermes_cli.plugins import get_plugin_manager
     from plugins.platforms.a2a.adapter import A2AAdapter
     from plugins.platforms.a2a.tools import _reply_text_from_result
@@ -190,6 +252,7 @@ async def _run() -> None:
     kite = TrustedPrincipalRuntime(kite_config, active_profile="kite")
     action_effects: list[dict[str, Any]] = []
     policy_checks: list[str] = []
+    policy_views: list[str] = []
 
     registry.register(
         name="synthetic_mutation",
@@ -219,6 +282,7 @@ async def _run() -> None:
                 turn_id=turn_id,
                 platform="a2a",
             )
+            policy_views.append(str(binding.get("context") or ""))
             if "DENIED" in str(binding.get("context")):
                 answer = "wrong context denied"
             elif "synthetic unknown tool" in event.text:
@@ -275,7 +339,152 @@ async def _run() -> None:
             self.call = (peer_name, peer, message, context_id)
             return "unsigned synthetic capture", context_id, "completed"
 
+    class MutableRoster:
+        def __init__(self):
+            self.participants = [
+                [OWNER_JID, OWNER_LID],
+                [FAMILY_JID, FAMILY_LID],
+                ["19999999999@s.whatsapp.net", "29999999999@lid"],
+            ]
+            self.generation = "a" * 64
+            self.missing = False
+
+        def __call__(
+            self,
+            _profile,
+            _chat_id,
+            *,
+            timeout,
+            expected_runtime_id,
+            expected_socket_generation,
+        ):
+            assert timeout <= 2
+            assert expected_runtime_id == "a" * 64
+            assert expected_socket_generation == 1
+            if self.missing:
+                raise RuntimeError("synthetic roster unavailable")
+            return {
+                "group_id": GROUP_ID,
+                "participants": copy.deepcopy(self.participants),
+                "bot_identities": [
+                    "19999999999@s.whatsapp.net", "29999999999@lid",
+                ],
+                "generation": self.generation,
+            }
+
+    roster = MutableRoster()
+    roster_adapter = type(
+        "SyntheticRosterAdapter", (), {"authenticated_group_roster": roster}
+    )()
+    roster_gateway = type(
+        "SyntheticRosterGateway", (), {"adapters": {Platform.WHATSAPP: roster_adapter}}
+    )()
+
+    def whatsapp_event(sender: str, *, chat_type: str = "group") -> MessageEvent:
+        return MessageEvent(
+            text="synthetic audience question",
+            message_id="synthetic-message",
+            source=SessionSource(
+                platform=Platform.WHATSAPP,
+                user_id=sender,
+                chat_id=GROUP_ID if chat_type == "group" else sender,
+                chat_type=chat_type,
+                user_name="untrusted synthetic display",
+            ),
+            metadata={
+                "whatsapp_inbound_provenance": (
+                    "messages.upsert:registered-emitting-socket:v1"
+                ),
+                "whatsapp_inbound_runtime_id": "a" * 64,
+                "whatsapp_inbound_socket_generation": 1,
+            },
+        )
+
+    def group_consult() -> str:
+        return _session(
+            lambda: juno.consult_kite(
+                {"question_or_goal": "synthetic bounded group request"}
+            ),
+            platform="whatsapp",
+            user_id=FAMILY_JID,
+            context_id=GROUP_ID,
+            profile="juno",
+            chat_type="group",
+        )
+
+    captured_logs = io.StringIO()
+    capture_handler = logging.StreamHandler(captured_logs)
+    runtime_logger = logging.getLogger(
+        "plugins.juno_kite_trusted_principal.runtime"
+    )
+    runtime_logger.addHandler(capture_handler)
+
     try:
+        before = juno.store.count_records()
+        dm_decision = await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID, chat_type="dm"), gateway=roster_gateway
+        )
+        assert dm_decision and dm_decision.get("action") == "skip"
+        assert juno.store.count_records() == before
+        print("PASS group-only DM: silent before model/tool/A2A/store effects")
+
+        roster.participants = [[FAMILY_JID, FAMILY_LID]]
+        absent = await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
+        )
+        assert absent and absent.get("reason") == "required-co-principal-unproved"
+        print("PASS required co-principal absent: silent ingress denial")
+
+        roster.participants = [
+            [OWNER_JID, OWNER_LID],
+            [FAMILY_JID, FAMILY_LID],
+            ["19999999999@s.whatsapp.net", "29999999999@lid"],
+        ]
+        assert await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
+        ) is None
+        first_audience = juno.current_audience_binding()
+        assert first_audience.effective_read_capability_ids == ("synthetic.shared",)
+        assert first_audience.effective_action_capability_ids == ()
+        assert await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
+        ) is None
+        assert juno.current_audience_binding().audience_digest == first_audience.audience_digest
+        print("PASS group audience: deterministic all-human capability intersection")
+
+        roster.participants.append(["13333333333@s.whatsapp.net"])
+        assert await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
+        ) is None
+        assert not juno.current_audience_binding().private_eligible
+        capture_public = CaptureTransport()
+        juno.transport = capture_public
+        request_count = juno.store.count_records()[1]
+        public_only = await asyncio.to_thread(group_consult)
+        assert public_only.startswith("BLOCKED:")
+        assert capture_public.call is None
+        assert juno.store.count_records()[1] == request_count
+        print("PASS unknown group member: public-only with zero private request issuance")
+
+        roster.participants.pop()
+        roster.missing = True
+        missing = await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
+        )
+        assert missing and missing.get("reason") == "audience-authority-unavailable"
+        roster.missing = False
+        print("PASS missing roster: fail-closed silent ingress denial")
+
+        assert await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
+        ) is None
+        roster.generation = "b" * 64
+        changed_before = await asyncio.to_thread(group_consult)
+        assert changed_before.startswith("BLOCKED:") and capture_public.call is None
+        print("PASS roster/fence change before dispatch: zero A2A issuance")
+        roster.generation = "a" * 64
+        juno.transport = juno._a2a_transport
+
         status, raw = await asyncio.to_thread(_request, base_url + "/health", method="GET")
         health = _json(raw)
         assert status == 200 and health.get("status") == "ok"
@@ -301,6 +510,37 @@ async def _run() -> None:
         assert answer == "synthetic bounded answer"
         print("PASS authenticated Juno request: POST / SendMessage -> signed bounded answer")
 
+        roster.generation = "a" * 64
+        assert await juno.pre_gateway_dispatch(
+            event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
+        ) is None
+        real_transport = juno._a2a_transport
+        exchanged: list[str] = []
+        aborted_before = juno.store.request_state_counts().get("aborted", 0)
+
+        def change_before_release(peer_name, peer, message, context_id):
+            reply = real_transport(peer_name, peer, message, context_id)
+            exchanged.extend((message, reply[0]))
+            roster.generation = "b" * 64
+            return reply
+
+        juno.transport = change_before_release
+        blocked_release = await asyncio.to_thread(group_consult)
+        assert blocked_release.startswith("BLOCKED:")
+        assert juno.store.request_state_counts().get("aborted", 0) == aborted_before + 1
+        forbidden = (
+            OWNER_JID, OWNER_LID, FAMILY_JID, FAMILY_LID, GROUP_ID,
+            "19999999999@s.whatsapp.net", "29999999999@lid",
+        )
+        captured = (
+            "\n".join(exchanged + policy_views) + "\n" + captured_logs.getvalue()
+        )
+        assert all(value not in captured for value in forbidden)
+        print("PASS changed roster before release: signed response blocked; request aborted")
+        print("PASS leak canary: no raw roster/transport/group ID in envelopes or logs")
+        roster.generation = "a" * 64
+        juno.transport = juno._a2a_transport
+
         capture = CaptureTransport()
         juno.transport = capture
         await asyncio.to_thread(
@@ -322,6 +562,26 @@ async def _run() -> None:
         print("PASS wrong context: POST / SendMessage -> 200 signed denial envelope")
         juno.transport = juno._a2a_transport
 
+        replayed: list[tuple[str, str, str]] = []
+
+        def replay_transport(peer_name, peer, message, context_id):
+            if not replayed:
+                replayed.append(
+                    juno._a2a_transport(peer_name, peer, message, context_id)
+                )
+            return replayed[0]
+
+        juno.transport = replay_transport
+        assert await asyncio.to_thread(
+            consult, "synthetic replay baseline", "conversation-replay"
+        ) == "synthetic bounded answer"
+        replay_denied = await asyncio.to_thread(
+            consult, "synthetic replay second request", "conversation-replay"
+        )
+        assert replay_denied.startswith("BLOCKED:")
+        print("PASS replay: prior signed response cannot satisfy a new issued request")
+        juno.transport = juno._a2a_transport
+
         unknown = await asyncio.to_thread(
             consult, "synthetic unknown tool", "conversation-003"
         )
@@ -335,6 +595,7 @@ async def _run() -> None:
         print("PASS unknown tool: exact plugin gate blocked; signed bounded response")
         print("PASS changed action argument: final dispatch blocked; handler effects=0")
     finally:
+        runtime_logger.removeHandler(capture_handler)
         manager._hooks["pre_tool_call"] = saved_pre
         manager._hooks["pre_tool_dispatch"] = saved_final
         manager._middleware["tool_execution"] = saved_tool_execution

@@ -87,6 +87,7 @@ async def test_internal_events_bypass_hook(monkeypatch):
     await runner._handle_message(event)
     assert called["count"] == 0
 
+
 @pytest.mark.asyncio
 async def test_hook_fires_without_session_store_attribute(monkeypatch):
     """A runner missing session_store still delivers the event to plugins.
@@ -117,4 +118,34 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     assert result is None
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_awaited_hook_skips_before_auth_and_session_creation(monkeypatch):
+    """Async authority hooks finish on the dispatch task before every auth/session path."""
+    _clear_auth_env(monkeypatch)
+    order = []
+
+    async def _decision():
+        order.append("hook")
+        return {"action": "skip", "reason": "synthetic-protected-principal"}
+
+    def _fake_hook(name, **_kwargs):
+        assert name == "pre_gateway_dispatch"
+        return [_decision()]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(
+        side_effect=AssertionError("authorization ran before authority hook")
+    )
+    runner.async_session_store = SimpleNamespace(
+        get_or_create_session=AsyncMock(
+            side_effect=AssertionError("session creation ran before authority hook")
+        )
+    )
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    assert order == ["hook"]
     adapter.send.assert_not_awaited()

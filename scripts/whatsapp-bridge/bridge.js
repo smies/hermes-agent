@@ -12,6 +12,7 @@
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
  *   POST /typing         - Send typing indicator { chatId }
+ *   POST /private-read-roster - Fence-authenticated complete group roster
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
  *
@@ -26,7 +27,7 @@ import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync, lstatSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { randomBytes, createHash, createHmac } from 'crypto';
+import { randomBytes, createHash, createHmac, timingSafeEqual } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
@@ -136,6 +137,83 @@ export function privateReadFenceEvidence(
     scriptHash: SCRIPT_HASH,
     proof: createHmac('sha256', Buffer.from(PRIVATE_READ_FENCE.key, 'hex'))
       .update(material)
+      .digest('hex'),
+  };
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('non-finite canonical JSON number');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(
+      key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`,
+    ).join(',')}}`;
+  }
+  throw new Error('unsupported canonical JSON value');
+}
+
+function canonicalParticipantIdentity(value) {
+  if (typeof value !== 'string' || !value) return null;
+  let normalized;
+  try { normalized = jidNormalizedUser(value); } catch { return null; }
+  return /^\d{1,32}@(s\.whatsapp\.net|lid)$/.test(normalized) ? normalized : null;
+}
+
+function canonicalRosterMembers(participants) {
+  if (!Array.isArray(participants) || participants.length === 0) {
+    throw new Error('complete group roster unavailable');
+  }
+  const seen = new Set();
+  const members = participants.map(participant => {
+    if (!participant || typeof participant !== 'object') {
+      throw new Error('malformed group participant');
+    }
+    const identities = [...new Set([
+      participant.id,
+      participant.phoneNumber,
+      participant.lid,
+    ].map(canonicalParticipantIdentity).filter(Boolean))].sort();
+    if (identities.length === 0 || identities.some(identity => seen.has(identity))) {
+      throw new Error('ambiguous group participant');
+    }
+    identities.forEach(identity => seen.add(identity));
+    return identities;
+  });
+  members.sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  return members;
+}
+
+export function privateReadRosterEvidence({ groupId, challenge, metadata }) {
+  if (!PRIVATE_READ_FENCE || connectionState !== 'connected'
+      || !/^\d{1,32}@g\.us$/.test(String(groupId || ''))
+      || !/^[a-f0-9]{64}$/.test(String(challenge || ''))
+      || !metadata || typeof metadata !== 'object'
+      || typeof metadata.id !== 'string' || metadata.id !== groupId
+      || !ordinaryAccountPhoneJid || !ordinaryAccountLidJid) {
+    return null;
+  }
+  const unsigned = {
+    version: 1,
+    groupId,
+    isGroup: true,
+    complete: true,
+    participants: canonicalRosterMembers(metadata.participants),
+    botIdentities: [ordinaryAccountPhoneJid, ordinaryAccountLidJid].sort(),
+    runtimeId: PRIVATE_READ_FENCE.runtimeId,
+    socketGeneration,
+    observedAtUs: Date.now() * 1000,
+    challenge,
+  };
+  return {
+    ...unsigned,
+    proof: createHmac('sha256', Buffer.from(PRIVATE_READ_FENCE.key, 'hex'))
+      .update(canonicalJson(unsigned))
       .digest('hex'),
   };
 }
@@ -468,6 +546,7 @@ const PRODUCTION_SOCKET_DEPENDENCIES = Object.freeze({
 export function registerProductionInboundMessageHandler({
   connectionSocket,
   isActiveSocket,
+  generation,
 }) {
   return registerInboundMessageHandler({
     emittingSocket: connectionSocket,
@@ -481,7 +560,14 @@ export function registerProductionInboundMessageHandler({
       replyPrefix: REPLY_PREFIX,
       senderCompanionFenceActive: PRIVATE_READ_FENCE !== null,
       allowlistMatches: id => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
-      extractEvent: extractBridgeEvent,
+      extractEvent: async args => {
+        const event = await extractBridgeEvent(args);
+        if (PRIVATE_READ_FENCE !== null) {
+          event.inboundRuntimeId = PRIVATE_READ_FENCE.runtimeId;
+          event.inboundSocketGeneration = generation;
+        }
+        return event;
+      },
       downloadMedia: async mediaMsg => downloadMediaMessage(
         mediaMsg, 'buffer', {},
         { logger, reuploadRequest: connectionSocket.updateMediaMessage },
@@ -709,7 +795,11 @@ export async function startSocket(dependencies = PRODUCTION_SOCKET_DEPENDENCIES)
     }
   });
 
-  registerProductionInboundMessageHandler({ connectionSocket, isActiveSocket });
+  registerProductionInboundMessageHandler({
+    connectionSocket,
+    isActiveSocket,
+    generation,
+  });
 }
 
 // HTTP server
@@ -1014,6 +1104,58 @@ app.post('/read', async (req, res) => {
   } catch (err) {
     console.warn('[bridge] failed to send read receipt:', err.message);
     return res.status(500).json({ error: 'Failed to send read receipt' });
+  }
+});
+
+// Complete live roster authority for the trusted-principal plugin. This route
+// has no fallback response: it exists only on the managed fenced bridge, and
+// every returned field is bound to a caller challenge plus the current socket
+// generation. Raw participants are never logged here.
+app.post('/private-read-roster', async (req, res) => {
+  if (!sock || connectionState !== 'connected' || !PRIVATE_READ_FENCE) {
+    return res.status(503).json({ error: 'Roster authority unavailable' });
+  }
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).sort().join(',') !== 'challenge,groupId,requestProof,version'
+      || body.version !== 1
+      || !/^\d{1,32}@g\.us$/.test(String(body.groupId || ''))
+      || !/^[a-f0-9]{64}$/.test(String(body.challenge || ''))
+      || !/^[a-f0-9]{64}$/.test(String(body.requestProof || ''))) {
+    return res.status(400).json({ error: 'Invalid roster authority request' });
+  }
+  const requestUnsigned = {
+    version: body.version,
+    groupId: body.groupId,
+    challenge: body.challenge,
+  };
+  const expectedRequestProof = createHmac(
+    'sha256', Buffer.from(PRIVATE_READ_FENCE.key, 'hex'),
+  ).update(canonicalJson(requestUnsigned)).digest();
+  const suppliedRequestProof = Buffer.from(body.requestProof, 'hex');
+  if (suppliedRequestProof.length !== expectedRequestProof.length
+      || !timingSafeEqual(suppliedRequestProof, expectedRequestProof)) {
+    return res.status(403).json({ error: 'Roster authority denied' });
+  }
+  const authoritySocket = sock;
+  const authorityGeneration = socketGeneration;
+  try {
+    const metadata = await authoritySocket.groupMetadata(body.groupId);
+    if (sock !== authoritySocket || socketGeneration !== authorityGeneration
+        || connectionState !== 'connected') {
+      return res.status(503).json({ error: 'Roster authority unavailable' });
+    }
+    const evidence = privateReadRosterEvidence({
+      groupId: body.groupId,
+      challenge: body.challenge,
+      metadata,
+    });
+    if (!evidence) {
+      return res.status(503).json({ error: 'Roster authority unavailable' });
+    }
+    return res.json(evidence);
+  } catch {
+    return res.status(503).json({ error: 'Roster authority unavailable' });
   }
 });
 

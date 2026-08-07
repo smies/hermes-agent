@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -187,3 +189,149 @@ def test_active_adapter_session_a_rejects_signed_claim_for_session_b(
         _health(adapter, session_path=other)
     ) is False
     assert adapter.private_read_runtime_topology("juno") is None
+
+
+def _roster_response(
+    adapter: WhatsAppAdapter,
+    *,
+    challenge: str,
+    group_id: str = "300000000000000@g.us",
+    runtime_id: str = "a" * 64,
+    socket_generation: int = 1,
+    participants=None,
+) -> dict:
+    unsigned = {
+        "version": 1,
+        "groupId": group_id,
+        "isGroup": True,
+        "complete": True,
+        "participants": participants or [
+            ["11111111111@s.whatsapp.net", "21111111111@lid"],
+            ["12222222222@s.whatsapp.net", "22222222222@lid"],
+        ],
+        "botIdentities": ["33333333333@s.whatsapp.net", "44444444444@lid"],
+        "runtimeId": runtime_id,
+        "socketGeneration": socket_generation,
+        "observedAtUs": time.time_ns() // 1000,
+        "challenge": challenge,
+    }
+    material = json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return {
+        **unsigned,
+        "proof": hmac.new(
+            bytes.fromhex(adapter._private_read_fence_key), material, hashlib.sha256
+        ).hexdigest(),
+    }
+
+
+def _resign_roster_response(adapter: WhatsAppAdapter, response: dict) -> None:
+    unsigned = {key: value for key, value in response.items() if key != "proof"}
+    material = json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    response["proof"] = hmac.new(
+        bytes.fromhex(adapter._private_read_fence_key), material, hashlib.sha256
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "stopped",
+        "stale_health",
+        "non_group",
+        "empty",
+        "malformed",
+        "duplicate",
+        "uncanonical",
+        "wrong_group",
+        "fallback_chat",
+        "inbound_generation",
+        "wrong_generation",
+        "wrong_proof",
+    ),
+)
+def test_authenticated_managed_roster_strict_rejection_table(
+    mutation: str, tmp_path: Path
+) -> None:
+    adapter = _adapter(tmp_path)
+    adapter._running = True
+    adapter._bridge_process = SimpleNamespace(poll=lambda: None, pid=12345)
+    health = _health(adapter)
+
+    def request(path, payload, timeout):
+        assert timeout <= 2
+        if path == "/health":
+            return health
+        response = _roster_response(adapter, challenge=payload["challenge"])
+        if mutation == "non_group":
+            response["isGroup"] = False
+        elif mutation == "empty":
+            response["participants"] = []
+        elif mutation == "malformed":
+            response["participants"] = "not-a-roster"
+        elif mutation == "duplicate":
+            response["participants"].append(response["participants"][0])
+        elif mutation == "uncanonical":
+            response["participants"][0] = ["11111111111:4@s.whatsapp.net"]
+        elif mutation == "wrong_group":
+            response["groupId"] = "300000000000001@g.us"
+        elif mutation == "fallback_chat":
+            return {"name": "fallback", "isGroup": True, "participants": []}
+        elif mutation == "wrong_generation":
+            response["socketGeneration"] = 2
+        if mutation == "wrong_proof":
+            response["proof"] = "0" * 64
+        else:
+            _resign_roster_response(adapter, response)
+        return response
+
+    if mutation == "stopped":
+        adapter._bridge_process = SimpleNamespace(poll=lambda: 1, pid=12345)
+    elif mutation == "stale_health":
+        health = _health(adapter, observed_at_us=time.time_ns() // 1000 - 10_000_000)
+    adapter._private_read_bridge_request = request
+
+    with pytest.raises(RuntimeError):
+        adapter.authenticated_group_roster(
+            "juno",
+            "300000000000000@g.us",
+            timeout=2,
+            expected_runtime_id="a" * 64,
+            expected_socket_generation=2 if mutation == "inbound_generation" else 1,
+        )
+
+
+def test_authenticated_managed_roster_accepts_exact_signed_socket_generation(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter(tmp_path)
+    adapter._running = True
+    adapter._bridge_process = SimpleNamespace(poll=lambda: None, pid=12345)
+    health = _health(adapter)
+
+    def request(path, payload, _timeout):
+        if path == "/health":
+            return health
+        return _roster_response(adapter, challenge=payload["challenge"])
+
+    adapter._private_read_bridge_request = request
+    roster = adapter.authenticated_group_roster(
+        "juno",
+        "300000000000000@g.us",
+        timeout=2,
+        expected_runtime_id="a" * 64,
+        expected_socket_generation=1,
+    )
+    assert roster == {
+        "group_id": "300000000000000@g.us",
+        "participants": [
+            ["11111111111@s.whatsapp.net", "21111111111@lid"],
+            ["12222222222@s.whatsapp.net", "22222222222@lid"],
+        ],
+        "bot_identities": ["33333333333@s.whatsapp.net", "44444444444@lid"],
+        "generation": roster["generation"],
+    }
+    assert len(roster["generation"]) == 64

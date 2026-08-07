@@ -54,6 +54,7 @@ def register(ctx) -> None:
     # human turns, but keep an accidentally received A2A turn fail-closed when
     # a profile/mode/configuration mismatch occurs.
     ctx.register_hook("pre_llm_call", runtime.pre_llm_call)
+    ctx.register_hook("pre_gateway_dispatch", runtime.pre_gateway_dispatch)
     ctx.register_hook("pre_tool_call", runtime.pre_tool_call)
     ctx.register_hook("pre_tool_dispatch", runtime.pre_tool_dispatch)
     ctx.register_hook("transform_llm_output", runtime.transform_llm_output)

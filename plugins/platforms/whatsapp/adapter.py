@@ -18,6 +18,7 @@ with different backends via a bridge pattern.
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import platform
@@ -25,7 +26,9 @@ import re
 import secrets
 import signal
 import subprocess
+import threading
 import time
+import urllib.request
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -71,6 +74,11 @@ _OWNER_REPLY_PREFIX = "[owner reply] "
 _MAX_INBOUND_MESSAGE_ID_BYTES = 256
 _PRIVATE_READ_FENCE_MAX_AGE_SECONDS = 5.0
 _PRIVATE_READ_FENCE_FUTURE_SKEW_US = 250_000
+
+
+class _RefusePrivateReadRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
 
 
 def _validated_inbound_message_id(value: Any) -> Optional[str]:
@@ -498,6 +506,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._private_read_fence_received_monotonic: float = 0.0
         self._private_read_adapter_generation: Optional[str] = None
         self._private_read_topology: Optional[dict[str, object]] = None
+        self._private_read_roster_lock = threading.RLock()
         # Set to True by disconnect() before we SIGTERM our child bridge so
         # _check_managed_bridge_exit() can distinguish an intentional
         # shutdown-time exit (returncode -15 / -2 / 0) from a real crash.
@@ -669,6 +678,245 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return None
         topology = getattr(self, "_private_read_topology", None)
         return dict(topology) if type(topology) is dict else None
+
+    def _private_read_bridge_request(
+        self, path: str, payload: dict, timeout: float
+    ) -> dict:
+        """Bounded loopback request whose response is separately fence-authenticated."""
+        if path not in {"/health", "/private-read-roster"}:
+            raise RuntimeError("unsupported private-read bridge path")
+        url = f"http://127.0.0.1:{self._bridge_port}{path}"
+        if path == "/health":
+            request = urllib.request.Request(url, method="GET")
+        else:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=encoded,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _RefusePrivateReadRedirects()
+        )
+        with opener.open(request, timeout=float(timeout)) as response:
+            if getattr(response, "status", 200) != 200:
+                raise RuntimeError("managed bridge authority request failed")
+            raw = response.read(128 * 1024 + 1)
+        if len(raw) > 128 * 1024:
+            raise RuntimeError("managed bridge authority response is oversized")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("managed bridge authority response is malformed") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("managed bridge authority response is malformed")
+        return value
+
+    def authenticated_group_roster(
+        self,
+        profile: str,
+        chat_id: str,
+        *,
+        timeout: float = 2,
+        expected_runtime_id: Optional[str] = None,
+        expected_socket_generation: Optional[int] = None,
+    ) -> dict:
+        """Return a complete roster proven by this adapter's managed socket.
+
+        Raw participant identifiers remain inside the adapter/plugin process.
+        Callers receive them only through this in-process authority seam and
+        must reduce them to opaque audience/freshness digests before signing,
+        persistence, logging, or model exposure.
+        """
+        timeout = min(float(timeout), 2.0)
+        if timeout <= 0:
+            raise RuntimeError("managed roster timeout is invalid")
+        deadline = time.monotonic() + timeout
+
+        def remaining_timeout() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("managed roster acquisition timed out")
+            return remaining
+
+        if profile != "juno" or re.fullmatch(r"\d{1,32}@g\.us", str(chat_id)) is None:
+            raise RuntimeError("managed roster request scope is invalid")
+        if expected_runtime_id is not None and (
+            not isinstance(expected_runtime_id, str)
+            or re.fullmatch(r"[a-f0-9]{64}", expected_runtime_id) is None
+        ):
+            raise RuntimeError("expected managed runtime is malformed")
+        if expected_socket_generation is not None and (
+            not isinstance(expected_socket_generation, int)
+            or isinstance(expected_socket_generation, bool)
+            or expected_socket_generation <= 0
+        ):
+            raise RuntimeError("expected managed socket generation is malformed")
+        with self._private_read_roster_lock:
+            process = getattr(self, "_bridge_process", None)
+            if (
+                not getattr(self, "_running", False)
+                or process is None
+                or process.poll() is not None
+            ):
+                raise RuntimeError("managed bridge process is not current")
+            health = self._private_read_bridge_request(
+                "/health", {}, remaining_timeout()
+            )
+            if not self._observe_private_read_fence_health(health):
+                raise RuntimeError("managed bridge fence evidence is unavailable")
+            topology = self.private_read_runtime_topology(profile)
+            if topology is None:
+                raise RuntimeError("managed bridge topology is unavailable")
+            if (
+                expected_runtime_id is not None
+                and expected_runtime_id != topology.get("ordinary_runtime_id")
+            ) or (
+                expected_socket_generation is not None
+                and expected_socket_generation
+                != topology.get("ordinary_socket_generation")
+            ):
+                raise RuntimeError("inbound and roster socket generations differ")
+            challenge = secrets.token_hex(32)
+            request_unsigned = {
+                "version": 1,
+                "groupId": chat_id,
+                "challenge": challenge,
+            }
+            key = getattr(self, "_private_read_fence_key", None)
+            if not isinstance(key, str):
+                raise RuntimeError("managed bridge roster key is unavailable")
+            request_proof = hmac.new(
+                bytes.fromhex(key),
+                json.dumps(
+                    request_unsigned,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            response = self._private_read_bridge_request(
+                "/private-read-roster",
+                {**request_unsigned, "requestProof": request_proof},
+                remaining_timeout(),
+            )
+            required = {
+                "version", "groupId", "isGroup", "complete", "participants",
+                "botIdentities", "runtimeId", "socketGeneration", "observedAtUs",
+                "challenge", "proof",
+            }
+            if set(response) != required:
+                raise RuntimeError("managed roster response has an invalid shape")
+            unsigned = {name: response[name] for name in required if name != "proof"}
+            proof = response.get("proof")
+            material = json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if (
+                not isinstance(proof, str)
+                or not hmac.compare_digest(
+                    proof,
+                    hmac.new(bytes.fromhex(key), material, hashlib.sha256).hexdigest(),
+                )
+            ):
+                raise RuntimeError("managed roster proof is invalid")
+            observed_at_us = response.get("observedAtUs")
+            now_us = time.time_ns() // 1000
+            if (
+                response.get("version") != 1
+                or response.get("groupId") != chat_id
+                or response.get("isGroup") is not True
+                or response.get("complete") is not True
+                or response.get("challenge") != challenge
+                or response.get("runtimeId") != topology.get("ordinary_runtime_id")
+                or response.get("socketGeneration")
+                != topology.get("ordinary_socket_generation")
+                or not isinstance(observed_at_us, int)
+                or now_us - int(_PRIVATE_READ_FENCE_MAX_AGE_SECONDS * 1_000_000)
+                > observed_at_us
+                or observed_at_us > now_us + _PRIVATE_READ_FENCE_FUTURE_SKEW_US
+            ):
+                raise RuntimeError("managed roster scope or freshness is invalid")
+            bot_identities = response.get("botIdentities")
+            expected_bots = {
+                topology.get("ordinary_account_phone"),
+                topology.get("ordinary_account_lid"),
+            }
+            jid_pattern = re.compile(r"\d{1,32}@(s\.whatsapp\.net|lid)")
+            if (
+                not isinstance(bot_identities, list)
+                or len(bot_identities) != 2
+                or set(bot_identities) != expected_bots
+                or len(set(bot_identities)) != len(bot_identities)
+                or any(
+                    not isinstance(value, str) or jid_pattern.fullmatch(value) is None
+                    for value in bot_identities
+                )
+            ):
+                raise RuntimeError("managed roster bot evidence is invalid")
+            participants = response.get("participants")
+            if not isinstance(participants, list) or not participants:
+                raise RuntimeError("managed roster is empty or malformed")
+            normalized: list[list[str]] = []
+            seen: set[str] = set()
+            seen_members: set[tuple[str, ...]] = set()
+            for raw_member in participants:
+                if (
+                    not isinstance(raw_member, list)
+                    or not raw_member
+                    or len(set(raw_member)) != len(raw_member)
+                    or raw_member != sorted(raw_member)
+                    or any(
+                        not isinstance(value, str) or jid_pattern.fullmatch(value) is None
+                        for value in raw_member
+                    )
+                ):
+                    raise RuntimeError("managed roster participant is malformed")
+                member = tuple(raw_member)
+                if member in seen_members or any(value in seen for value in member):
+                    raise RuntimeError("managed roster contains duplicates")
+                seen_members.add(member)
+                seen.update(member)
+                normalized.append(list(member))
+            if normalized != sorted(normalized):
+                raise RuntimeError("managed roster is not canonical")
+            if process is not getattr(self, "_bridge_process", None) or process.poll() is not None:
+                raise RuntimeError("managed bridge process changed during roster read")
+            if self.private_read_runtime_topology(profile) != topology:
+                raise RuntimeError("managed bridge topology changed during roster read")
+            generation_material = {
+                "adapter": topology.get("adapter_generation"),
+                "runtime": topology.get("ordinary_runtime_id"),
+                "socket": topology.get("ordinary_socket_generation"),
+            }
+            generation = hmac.new(
+                bytes.fromhex(key),
+                json.dumps(
+                    generation_material,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            return {
+                "group_id": chat_id,
+                "participants": normalized,
+                "bot_identities": list(bot_identities),
+                "generation": generation,
+            }
 
     def _fence_configuration_matches_health(self, health: object) -> bool:
         if getattr(self, "_private_read_fence_profile", None) is None:
@@ -1854,6 +2102,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             inbound_provenance = data.get("inboundProvenance")
             if inbound_provenance == "messages.upsert:registered-emitting-socket:v1":
                 metadata["whatsapp_inbound_provenance"] = inbound_provenance
+            inbound_runtime_id = data.get("inboundRuntimeId")
+            inbound_socket_generation = data.get("inboundSocketGeneration")
+            if (
+                isinstance(inbound_runtime_id, str)
+                and re.fullmatch(r"[a-f0-9]{64}", inbound_runtime_id)
+                and isinstance(inbound_socket_generation, int)
+                and not isinstance(inbound_socket_generation, bool)
+                and inbound_socket_generation > 0
+            ):
+                metadata["whatsapp_inbound_runtime_id"] = inbound_runtime_id
+                metadata["whatsapp_inbound_socket_generation"] = (
+                    inbound_socket_generation
+                )
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:

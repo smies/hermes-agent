@@ -14756,16 +14756,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _hook_results = []
 
             for _result in _hook_results:
+                # A pre-model authority hook may need bounded transport I/O
+                # (for example, an authenticated current group roster). Await
+                # it on this dispatch task so any task-local evidence it binds
+                # is inherited by the later agent executor via copy_context().
+                # Existing synchronous hooks retain their exact behavior.
+                if inspect.isawaitable(_result):
+                    try:
+                        _result = await _result
+                    except Exception as _hook_exc:
+                        logger.warning(
+                            "async pre_gateway_dispatch result failed: %s",
+                            type(_hook_exc).__name__,
+                        )
+                        continue
                 if not isinstance(_result, dict):
                     continue
                 _action = _result.get("action")
                 if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
-                    )
+                    if _result.get("redact_scope") is True:
+                        logger.info(
+                            "pre_gateway_dispatch protected-scope skip: reason=%s",
+                            _result.get("reason"),
+                        )
+                    else:
+                        logger.info(
+                            "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                            _result.get("reason"),
+                            source.platform.value if source.platform else "unknown",
+                            source.chat_id or "unknown",
+                        )
                     return None
                 if _action == "rewrite":
                     _new_text = _result.get("text")

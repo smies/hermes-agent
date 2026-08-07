@@ -92,16 +92,41 @@ def _base_config(tmp_path: Path) -> dict:
                 "question_chars": 120,
                 "context_turns": 2,
                 "context_turn_chars": 48,
-                "handoff_bytes": 1400,
+                "handoff_bytes": 2400,
                 "policy_view_chars": 3000,
                 "output_chars": 64,
                 "response_bytes": 1800,
                 "turn_ttl_seconds": 30,
+                "roster_timeout_seconds": 2,
             },
+            "allowed_group_conversations": [],
             "policy": {
                 "principals": {
-                    "james": {"trust_class": "trusted-family", "disclose": ["own", "shared"]},
-                    "lucy": {"trust_class": "trusted-family", "disclose": ["own", "shared"]},
+                    "james": {
+                        "conversation_eligibility": {"dm": True, "group": True},
+                        "required_group_co_principals": [],
+                        "read_capability_ids": ["fixture.own", "fixture.shared"],
+                        "action_capability_ids": ["fixture.write"],
+                        "semantic_policy": {
+                            "fixture.own": {"disclose": ["own"]},
+                            "fixture.shared": {
+                                "trust_class": "trusted-family",
+                                "disclose": ["shared"],
+                            },
+                        },
+                    },
+                    "lucy": {
+                        "conversation_eligibility": {"dm": False, "group": True},
+                        "required_group_co_principals": ["james"],
+                        "read_capability_ids": ["fixture.shared"],
+                        "action_capability_ids": [],
+                        "semantic_policy": {
+                            "fixture.shared": {
+                                "trust_class": "trusted-family",
+                                "disclose": ["shared"],
+                            },
+                        },
+                    },
                 },
                 "tool_classes": {
                     "read": ["read_file"],
@@ -793,7 +818,7 @@ class TestBoundedHandoff:
             {"role": "user", "text": "a" * 48},
             {"role": "assistant", "text": "b" * 48},
         ]
-        assert len(transport.calls[0]["message"].encode()) <= 1400
+        assert len(transport.calls[0]["message"].encode()) <= 2400
         assert "bounded" not in transport.calls[0]["message"][:500]
         assert "fixture-user" not in transport.calls[0]["message"][:500]
 
@@ -1374,6 +1399,7 @@ class TestRegistrationAndGuidance:
         ctx = Context()
         register(ctx)
         assert [item["name"] for item in ctx.tools] == ["consult_kite"]
+        assert "pre_gateway_dispatch" in {name for name, _callback in ctx.hooks}
         assert ctx.tools[0]["toolset"] == "juno_kite"
         schema = ctx.tools[0]["schema"]
         assert set(schema["parameters"]["properties"]) == {"question_or_goal", "relevant_context"}
@@ -1512,6 +1538,7 @@ class TestRegistrationAndGuidance:
         register(ctx)
         assert ctx.tools == []
         assert {name for name, _callback in ctx.hooks} == {
+            "pre_gateway_dispatch",
             "pre_llm_call",
             "pre_tool_call",
             "pre_tool_dispatch",

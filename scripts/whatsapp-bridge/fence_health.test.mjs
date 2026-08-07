@@ -9,10 +9,16 @@ import test from 'node:test';
 const key = 'ab'.repeat(32);
 process.env.HERMES_INTERNAL_WHATSAPP_FENCE_PROFILE = 'juno';
 process.env.HERMES_INTERNAL_WHATSAPP_FENCE_KEY = key;
+process.env.WHATSAPP_ALLOWED_USERS = '11111111111@s.whatsapp.net';
 const session = mkdtempSync(path.join(tmpdir(), 'ordinary-fence-health-'));
 process.argv.push('--session', session);
 
-const { privateReadFenceEvidence, startSocket } = await import(`./bridge.js?fence-health=${Date.now()}`);
+const {
+  privateReadFenceEvidence,
+  privateReadRosterEvidence,
+  startSocket,
+  takeProductionInboundMessages,
+} = await import(`./bridge.js?fence-health=${Date.now()}`);
 
 test('bridge emits fresh profile runtime and topology bound fence evidence', async () => {
   const ev = new EventEmitter();
@@ -59,4 +65,55 @@ test('bridge emits fresh profile runtime and topology bound fence evidence', asy
     .update(material)
     .digest('hex');
   assert.equal(evidence.proof, expected);
+
+  const inbound = ev.listeners('messages.upsert')[0];
+  const outcome = await inbound({
+    type: 'notify',
+    messages: [{
+      key: {
+        id: 'SYNTHETIC-GROUP-MESSAGE',
+        remoteJid: '300000000000000@g.us',
+        participant: '11111111111@s.whatsapp.net',
+        fromMe: false,
+      },
+      messageTimestamp: 1_786_000_000,
+      message: { conversation: 'synthetic group question' },
+    }],
+  });
+  assert.equal(outcome.action, 'queued');
+  const [queued] = takeProductionInboundMessages();
+  assert.equal(queued.inboundRuntimeId, evidence.runtimeId);
+  assert.equal(queued.inboundSocketGeneration, evidence.socketGeneration);
+});
+
+test('bridge signs exact group roster and transport-proved phone/LID aliases', () => {
+  const groupId = '300000000000000@g.us';
+  const challenge = 'c'.repeat(64);
+  const evidence = privateReadRosterEvidence({
+    groupId,
+    challenge,
+    metadata: {
+      id: groupId,
+      participants: [
+        { id: '11111111111:4@s.whatsapp.net', lid: '21111111111@lid' },
+        { id: '12222222222@s.whatsapp.net', phoneNumber: '12222222222@s.whatsapp.net' },
+      ],
+    },
+  });
+  assert.equal(evidence.groupId, groupId);
+  assert.equal(evidence.complete, true);
+  assert.deepEqual(evidence.participants, [
+    ['11111111111@s.whatsapp.net', '21111111111@lid'],
+    ['12222222222@s.whatsapp.net'],
+  ]);
+  assert.deepEqual(evidence.botIdentities, [
+    '33333333333@s.whatsapp.net', '44444444444@lid',
+  ]);
+  assert.equal(evidence.challenge, challenge);
+  assert.match(evidence.proof, /^[a-f0-9]{64}$/);
+  assert.equal(privateReadRosterEvidence({
+    groupId,
+    challenge,
+    metadata: { participants: [{ id: '11111111111@s.whatsapp.net' }] },
+  }), null);
 });

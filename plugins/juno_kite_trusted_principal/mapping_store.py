@@ -39,6 +39,11 @@ class RequestRecord:
     expires_at: int
     state: str
     action_fingerprint: str
+    audience_digest: str
+    conversation_binding: str
+    read_capability_fingerprint: str
+    action_capability_fingerprint: str
+    roster_generation: str
 
 
 class MappingStore:
@@ -225,8 +230,10 @@ class MappingStore:
 
     def _create_schema(self) -> None:
         with self._database(write=True) as db:
-            db.executescript(
-                """
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS mappings (
                     principal TEXT NOT NULL,
                     conversation_digest TEXT NOT NULL,
@@ -234,24 +241,84 @@ class MappingStore:
                     correlation_id TEXT NOT NULL UNIQUE,
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                     PRIMARY KEY (principal, conversation_digest)
-                );
-                CREATE TABLE IF NOT EXISTS request_ledger (
+                )
+                    """
+                )
+                columns = {
+                    str(row[1])
+                    for row in db.execute("PRAGMA table_info(request_ledger)").fetchall()
+                }
+                legacy_columns = {
+                    "request_id", "context_id", "correlation_id",
+                    "policy_generation", "expires_at", "state",
+                    "action_fingerprint", "created_at",
+                }
+                current_columns = legacy_columns | {
+                    "audience_digest", "conversation_binding",
+                    "read_capability_fingerprint", "action_capability_fingerprint",
+                    "roster_generation",
+                }
+                if (
+                    columns
+                    and columns != legacy_columns
+                    and columns != current_columns
+                ):
+                    raise MappingSecurityError("mapping request schema is not recognized")
+                if columns == legacy_columns:
+                    # The v1 envelope has no authenticated audience authority.
+                    # Preserve its history, but terminally abort every state
+                    # that could otherwise be replayed after migration.
+                    db.execute("ALTER TABLE request_ledger RENAME TO request_ledger_v1")
+                if not columns or columns == legacy_columns:
+                    db.execute(
+                        """
+                CREATE TABLE request_ledger (
                     request_id TEXT PRIMARY KEY,
                     context_id TEXT NOT NULL,
                     correlation_id TEXT NOT NULL,
                     policy_generation TEXT NOT NULL,
                     expires_at INTEGER NOT NULL,
                     state TEXT NOT NULL CHECK (
-                        state IN ('issued', 'bound', 'released', 'consumed')
+                        state IN ('issued', 'bound', 'released', 'consumed', 'aborted')
                     ),
                     action_fingerprint TEXT NOT NULL DEFAULT '',
+                    audience_digest TEXT NOT NULL DEFAULT '',
+                    conversation_binding TEXT NOT NULL DEFAULT '',
+                    read_capability_fingerprint TEXT NOT NULL DEFAULT '',
+                    action_capability_fingerprint TEXT NOT NULL DEFAULT '',
+                    roster_generation TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                     FOREIGN KEY (context_id) REFERENCES mappings(context_id)
-                );
+                )
+                        """
+                    )
+                if columns == legacy_columns:
+                    db.execute(
+                        """
+                        INSERT INTO request_ledger (
+                            request_id, context_id, correlation_id,
+                            policy_generation, expires_at, state,
+                            action_fingerprint, created_at
+                        )
+                        SELECT request_id, context_id, correlation_id,
+                               policy_generation, expires_at,
+                               CASE WHEN state = 'consumed' THEN 'consumed' ELSE 'aborted' END,
+                               action_fingerprint, created_at
+                        FROM request_ledger_v1
+                        """
+                    )
+                    db.execute("DROP TABLE request_ledger_v1")
+                db.execute("DROP INDEX IF EXISTS request_ledger_context")
+                db.execute(
+                    """
                 CREATE INDEX IF NOT EXISTS request_ledger_context
-                    ON request_ledger(context_id, state);
-                """
-            )
+                    ON request_ledger(context_id, state)
+                    """
+                )
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
 
     def _conversation_digest(self, principal: str, conversation_key: str) -> str:
         material = f"{principal}\0{conversation_key}".encode("utf-8")
@@ -276,6 +343,11 @@ class MappingStore:
             expires_at=int(row["expires_at"]),
             state=str(row["state"]),
             action_fingerprint=str(row["action_fingerprint"]),
+            audience_digest=str(row["audience_digest"]),
+            conversation_binding=str(row["conversation_binding"]),
+            read_capability_fingerprint=str(row["read_capability_fingerprint"]),
+            action_capability_fingerprint=str(row["action_capability_fingerprint"]),
+            roster_generation=str(row["roster_generation"]),
         )
 
     def resolve(self, principal: str, conversation_key: str) -> MappingRecord:
@@ -328,18 +400,30 @@ class MappingStore:
         request_id: str,
         policy_generation: str,
         expires_at: int,
+        audience_digest: str = "",
+        conversation_binding: str = "",
+        read_capability_fingerprint: str = "",
+        action_capability_fingerprint: str = "",
+        roster_generation: str = "",
     ) -> None:
         with self._database(write=True) as db:
             db.execute(
                 """INSERT INTO request_ledger
-                   (request_id, context_id, correlation_id, policy_generation, expires_at, state)
-                   VALUES (?, ?, ?, ?, ?, 'issued')""",
+                   (request_id, context_id, correlation_id, policy_generation, expires_at, state,
+                    audience_digest, conversation_binding, read_capability_fingerprint,
+                    action_capability_fingerprint, roster_generation)
+                   VALUES (?, ?, ?, ?, ?, 'issued', ?, ?, ?, ?, ?)""",
                 (
                     request_id,
                     mapping.context_id,
                     mapping.correlation_id,
                     policy_generation,
                     int(expires_at),
+                    audience_digest,
+                    conversation_binding,
+                    read_capability_fingerprint,
+                    action_capability_fingerprint,
+                    roster_generation,
                 ),
             )
 
@@ -350,6 +434,11 @@ class MappingStore:
         correlation_id: str,
         policy_generation: str,
         now: int,
+        audience_digest: str = "",
+        conversation_binding: str = "",
+        read_capability_fingerprint: str = "",
+        action_capability_fingerprint: str = "",
+        roster_generation: str = "",
     ) -> Optional[RequestRecord]:
         with self._database(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -357,8 +446,17 @@ class MappingStore:
                 changed = db.execute(
                     """UPDATE request_ledger SET state = 'bound'
                        WHERE request_id = ? AND context_id = ? AND correlation_id = ?
-                         AND policy_generation = ? AND expires_at > ? AND state = 'issued'""",
-                    (request_id, context_id, correlation_id, policy_generation, int(now)),
+                         AND policy_generation = ? AND expires_at > ? AND state = 'issued'
+                         AND audience_digest = ? AND conversation_binding = ?
+                         AND read_capability_fingerprint = ?
+                         AND action_capability_fingerprint = ?
+                         AND roster_generation = ?""",
+                    (
+                        request_id, context_id, correlation_id, policy_generation, int(now),
+                        audience_digest, conversation_binding,
+                        read_capability_fingerprint, action_capability_fingerprint,
+                        roster_generation,
+                    ),
                 ).rowcount
                 row = db.execute(
                     "SELECT * FROM request_ledger WHERE request_id = ?", (request_id,)
@@ -376,6 +474,23 @@ class MappingStore:
             ).fetchone()
         return self._request_from_row(row) if row is not None else None
 
+    def count_records(self) -> tuple[int, int]:
+        """Return opaque mapping/request counts for provider-free canaries."""
+        with self._database(write=False) as db:
+            mappings = int(db.execute("SELECT COUNT(*) FROM mappings").fetchone()[0])
+            requests = int(
+                db.execute("SELECT COUNT(*) FROM request_ledger").fetchone()[0]
+            )
+        return mappings, requests
+
+    def request_state_counts(self) -> dict[str, int]:
+        """Return state-only request totals without exposing ledger identifiers."""
+        with self._database(write=False) as db:
+            rows = db.execute(
+                "SELECT state, COUNT(*) AS count FROM request_ledger GROUP BY state"
+            ).fetchall()
+        return {str(row["state"]): int(row["count"]) for row in rows}
+
     def claim_action(self, request_id: str, fingerprint: str, now: int) -> bool:
         with self._database(write=True) as db:
             changed = db.execute(
@@ -383,6 +498,16 @@ class MappingStore:
                    WHERE request_id = ? AND state = 'bound' AND action_fingerprint = ''
                      AND expires_at > ?""",
                 (fingerprint, request_id, int(now)),
+            ).rowcount
+        return changed == 1
+
+    def abort_request(self, request_id: str) -> bool:
+        """Terminally invalidate any request that has not been consumed."""
+        with self._database(write=True) as db:
+            changed = db.execute(
+                """UPDATE request_ledger SET state = 'aborted'
+                   WHERE request_id = ? AND state IN ('issued', 'bound', 'released')""",
+                (request_id,),
             ).rowcount
         return changed == 1
 
