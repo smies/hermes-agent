@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -17,6 +18,7 @@ from hermes_cli.whatsapp_provisioning import (
     _PAIRING_CODE_ALPHABET,
     _PAIRING_CODE_RE,
     _provisioner_script,
+    _SENSITIVE_PROVISION_LAUNCHER_SHA256,
     WhatsAppProvisioningError,
     command,
     resolve_provisioning_roots,
@@ -37,7 +39,12 @@ def test_python_pairing_validator_uses_exact_rc14_alphabet() -> None:
 
 
 def test_sensitive_provision_launcher_is_bound_by_host_source_identity() -> None:
-    assert _provisioner_script().name == "provision_launcher.js"
+    launcher = _provisioner_script()
+    assert launcher.name == "provision_launcher.js"
+    assert (
+        hashlib.sha256(launcher.read_bytes()).hexdigest()
+        == _SENSITIVE_PROVISION_LAUNCHER_SHA256
+    )
     with patch.object(Path, "read_bytes", return_value=b"synthetic-tampering"):
         with pytest.raises(WhatsAppProvisioningError, match="identity mismatch"):
             _provisioner_script()
