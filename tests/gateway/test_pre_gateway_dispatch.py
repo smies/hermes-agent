@@ -5,6 +5,7 @@ agent dispatch. It runs in _handle_message and acts on returned action
 dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -57,6 +58,76 @@ def _make_runner(platform: Platform):
     runner.session_store = MagicMock()
     runner._running_agents = {}
     runner._update_prompt_pending = {}
+    return runner, adapter
+
+
+def _critical_juno_runner():
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    runner.config = GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+        enabled_plugins=("juno_kite_trusted_principal",),
+        juno_kite_trusted_principal={
+            "version": 2,
+            "enabled": True,
+            "mode": "juno",
+            "profile": "juno",
+            "kite_plugin": "juno_kite_trusted_principal",
+            "mapping_path": "/private/tmp/synthetic-juno-critical.sqlite3",
+            "mapping_key_env": "SYNTHETIC_MAPPING_KEY",
+            "request_key_env": "SYNTHETIC_REQUEST_KEY",
+            "response_key_env": "SYNTHETIC_RESPONSE_KEY",
+            "kite_peer": "kite",
+            "kite_url": "http://127.0.0.1:9917",
+            "policy_generation": "synthetic-v2",
+            "allowed_group_conversations": [
+                {"platform": "whatsapp", "chat_id": "300000000000000@g.us"}
+            ],
+            "principal_bindings": [
+                {
+                    "platform": "whatsapp",
+                    "user_id": "15551234567@s.whatsapp.net",
+                    "principal": "owner",
+                }
+            ],
+            "policy": {
+                "principals": {
+                    "owner": {
+                        "conversation_eligibility": {"dm": True, "group": True},
+                        "required_group_co_principals": [],
+                        "read_capability_ids": ["private.owner"],
+                        "action_capability_ids": [],
+                        "semantic_policy": {"private.owner": {"disclose": ["own"]}},
+                    }
+                },
+                "tool_classes": {"read": ["read_file"], "mutating": []},
+                "action_rules": [],
+            },
+            "limits": {
+                "question_chars": 120,
+                "context_turns": 2,
+                "context_turn_chars": 48,
+                "handoff_bytes": 2400,
+                "policy_view_chars": 3000,
+                "output_chars": 64,
+                "response_bytes": 1800,
+                "turn_ttl_seconds": 30,
+                "roster_timeout_seconds": 2,
+            },
+        },
+    )
+    runner._active_profile_name = lambda: "juno"
+    runner._is_user_authorized = MagicMock(
+        side_effect=AssertionError("authorization must not run")
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            side_effect=AssertionError("session access must not run")
+        ),
+    )
+    runner._handle_message_with_agent = AsyncMock(
+        side_effect=AssertionError("model dispatch must not run")
+    )
     return runner, adapter
 
 
@@ -140,7 +211,8 @@ async def test_awaited_hook_skips_before_auth_and_session_creation(monkeypatch):
     runner._is_user_authorized = MagicMock(
         side_effect=AssertionError("authorization ran before authority hook")
     )
-    runner.async_session_store = SimpleNamespace(
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
         get_or_create_session=AsyncMock(
             side_effect=AssertionError("session creation ran before authority hook")
         )
@@ -149,3 +221,154 @@ async def test_awaited_hook_skips_before_auth_and_session_creation(monkeypatch):
     assert await runner._handle_message(_make_event("protected")) is None
     assert order == ["hook"]
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_critical_sync_callback_failure_is_silent_before_all_effects(
+    monkeypatch, caplog
+):
+    from hermes_cli.plugins import get_plugin_manager
+
+    def broken_callback(**_kwargs):
+        raise RuntimeError("synthetic callback failure")
+
+    manager = get_plugin_manager()
+    monkeypatch.setitem(manager._hooks, "pre_gateway_dispatch", [broken_callback])
+    runner, adapter = _critical_juno_runner()
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    adapter.send.assert_not_awaited()
+    assert "15551234567" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_critical_async_callback_failure_is_silent_before_all_effects(
+    monkeypatch, caplog
+):
+    async def broken_callback():
+        raise RuntimeError("synthetic awaited failure")
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda _name, **_kwargs: [broken_callback()],
+    )
+    runner, adapter = _critical_juno_runner()
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    adapter.send.assert_not_awaited()
+    assert "15551234567" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_critical_hook_invoker_failure_is_silent_before_all_effects(
+    monkeypatch, caplog
+):
+    def broken_invoker(*_args, **_kwargs):
+        raise RuntimeError("synthetic invoker failure")
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", broken_invoker)
+    runner, adapter = _critical_juno_runner()
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    adapter.send.assert_not_awaited()
+    assert "15551234567" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_malformed_critical_result_is_silent_before_all_effects(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda _name, **_kwargs: [
+            {
+                "action": "critical_allow",
+                "scope": "juno-trusted-principal-v2",
+            }
+        ],
+    )
+    runner, adapter = _critical_juno_runner()
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", (None, {"version": 2, "mode": "juno", "profile": "juno"}))
+async def test_missing_or_malformed_dedicated_config_is_silent_before_all_effects(
+    malformed, monkeypatch
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda _name, **_kwargs: [])
+    runner, adapter = _critical_juno_runner()
+    runner.config.juno_kite_trusted_principal = malformed
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_critical_await_cancellation_is_silent_before_all_effects(monkeypatch):
+    async def cancelled_callback():
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda _name, **_kwargs: [cancelled_callback()],
+    )
+    runner, adapter = _critical_juno_runner()
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_juno_hook_failure_retains_legacy_nonfatal_behavior(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        MagicMock(side_effect=RuntimeError("ordinary plugin failure")),
+    )
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    handled = AsyncMock(return_value="ordinary-result")
+    runner._handle_message_with_agent = handled
+
+    assert await runner._handle_message(_make_event("ordinary")) == "ordinary-result"
+    handled.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mismatch",
+    ("platform", "profile", "mode", "configured_profile", "version", "disabled", "multiplex"),
+)
+async def test_critical_scope_mismatches_cannot_claim_fail_closed_behavior(
+    mismatch, monkeypatch
+):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, _adapter = _critical_juno_runner()
+    event = _make_event("ordinary")
+    if mismatch == "platform":
+        event = _make_event("ordinary", Platform.TELEGRAM)
+        runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
+    elif mismatch == "profile":
+        runner._active_profile_name = lambda: "default"
+    elif mismatch == "mode":
+        runner.config.juno_kite_trusted_principal["mode"] = "kite"
+    elif mismatch == "configured_profile":
+        runner.config.juno_kite_trusted_principal["profile"] = "other"
+    elif mismatch == "version":
+        runner.config.juno_kite_trusted_principal["version"] = 1
+    elif mismatch == "disabled":
+        runner.config.enabled_plugins = ()
+    else:
+        runner.config.multiplex_profiles = True
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        MagicMock(side_effect=RuntimeError("ordinary isolated failure")),
+    )
+    runner._is_user_authorized = MagicMock(return_value=True)
+    handled = AsyncMock(return_value="ordinary-result")
+    runner._handle_message_with_agent = handled
+
+    assert await runner._handle_message(event) == "ordinary-result"
+    handled.assert_awaited_once()

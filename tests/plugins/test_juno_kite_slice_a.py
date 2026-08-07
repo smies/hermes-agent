@@ -83,6 +83,7 @@ def _config(tmp_path: Path, *, mode="juno") -> dict:
             }
         },
         "juno_kite_trusted_principal": {
+            "version": 2,
             "enabled": True,
             "mode": mode,
             "profile": mode,
@@ -203,7 +204,7 @@ def _session(callback, *, sender=_PHONE_B, chat_type="group", chat_id=_GROUP):
 async def test_group_only_dm_is_silent_before_auth_session_model_and_store(tmp_path, monkeypatch):
     runtime = _runtime(tmp_path)
     monkeypatch.setattr(
-        "plugins.juno_kite_trusted_principal.runtime.runtime_from_host",
+        "plugins.juno_kite_trusted_principal.runtime_from_host",
         lambda _profile: runtime,
     )
     from plugins.juno_kite_trusted_principal import register
@@ -216,6 +217,8 @@ async def test_group_only_dm_is_silent_before_auth_session_model_and_store(tmp_p
     )
     register(ctx)
     assert "pre_gateway_dispatch" in hooks
+    assert hooks["pre_gateway_dispatch"] == runtime.pre_gateway_dispatch
+    assert asyncio.iscoroutinefunction(hooks["pre_gateway_dispatch"])
 
     runner = MagicMock()
     runner.config = GatewayConfig(platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)})
@@ -275,14 +278,14 @@ async def test_intersection_alias_equivalence_bot_exclusion_and_unknown_public_o
     gateway = SimpleNamespace(
         adapters={Platform.WHATSAPP: SimpleNamespace(authenticated_group_roster=roster)}
     )
-    assert await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway) is None
+    assert (await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway))["action"] == "critical_allow"
     binding = runtime.current_audience_binding()
     assert binding.effective_read_capability_ids == ("private.shared",)
     assert binding.effective_action_capability_ids == ()
     assert binding.private_eligible is True
 
     roster.participants.append([_PHONE_UNKNOWN])
-    assert await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway) is None
+    assert (await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway))["action"] == "critical_allow"
     unknown = runtime.current_audience_binding()
     assert unknown.effective_read_capability_ids == ()
     assert unknown.effective_action_capability_ids == ()
@@ -297,7 +300,7 @@ async def test_unknown_public_only_denies_before_mapping_or_request(tmp_path):
     gateway = SimpleNamespace(
         adapters={Platform.WHATSAPP: SimpleNamespace(authenticated_group_roster=roster)}
     )
-    assert await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway) is None
+    assert (await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway))["action"] == "critical_allow"
     result = await asyncio.to_thread(
         _session,
         lambda: runtime.consult_kite({"question_or_goal": "bounded synthetic question"}),
@@ -318,21 +321,58 @@ async def test_concurrent_conversations_keep_task_local_audiences_isolated(tmp_p
     )
 
     async def group_turn():
-        assert await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway) is None
+        assert (await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway))["action"] == "critical_allow"
         await asyncio.sleep(0)
         return runtime.current_audience_binding().effective_read_capability_ids
 
     async def dm_turn():
-        assert await runtime.pre_gateway_dispatch(
+        assert (await runtime.pre_gateway_dispatch(
             event=_event(sender=_PHONE_A, chat_type="dm", chat_id=_PHONE_A),
             gateway=gateway,
-        ) is None
+        ))["action"] == "critical_allow"
         await asyncio.sleep(0)
         return runtime.current_audience_binding().effective_read_capability_ids
 
     group_caps, dm_caps = await asyncio.gather(group_turn(), dm_turn())
     assert group_caps == ("private.shared",)
     assert dm_caps == ("private.owner", "private.shared")
+
+
+@pytest.mark.asyncio
+async def test_sequential_events_rebind_exact_principal_and_reject_stale_cross_principal(
+    tmp_path,
+):
+    calls = []
+    runtime = _runtime(tmp_path, transport=lambda *args: calls.append(args))
+    roster = MutableRoster()
+    gateway = SimpleNamespace(
+        adapters={Platform.WHATSAPP: SimpleNamespace(authenticated_group_roster=roster)}
+    )
+
+    family = await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway)
+    assert family["action"] == "critical_allow"
+    assert runtime.current_audience_binding().principal == "family"
+
+    stale_owner = await asyncio.to_thread(
+        _session,
+        lambda: runtime.consult_kite({"question_or_goal": "bounded owner question"}),
+        sender=_PHONE_A,
+        chat_type="dm",
+        chat_id=_PHONE_A,
+    )
+    assert stale_owner.startswith("BLOCKED:")
+    assert calls == []
+
+    owner = await runtime.pre_gateway_dispatch(
+        event=_event(sender=_PHONE_A, chat_type="dm", chat_id=_PHONE_A),
+        gateway=gateway,
+    )
+    assert owner["action"] == "critical_allow"
+    assert runtime.current_audience_binding().principal == "owner"
+
+    family_again = await runtime.pre_gateway_dispatch(event=_event(), gateway=gateway)
+    assert family_again["action"] == "critical_allow"
+    assert runtime.current_audience_binding().principal == "family"
 
 
 @pytest.mark.asyncio
@@ -380,7 +420,7 @@ async def test_roster_or_generation_change_aborts_nonreusable_request(
     gateway = SimpleNamespace(
         adapters={Platform.WHATSAPP: SimpleNamespace(authenticated_group_roster=roster)}
     )
-    assert await juno.pre_gateway_dispatch(event=_event(), gateway=gateway) is None
+    assert (await juno.pre_gateway_dispatch(event=_event(), gateway=gateway))["action"] == "critical_allow"
     if change_boundary == "before_dispatch":
         roster.generation = "b" * 64
     result = await asyncio.to_thread(

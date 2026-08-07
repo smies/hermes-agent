@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.whatsapp_common import (
     ORDINARY_VERIFIED_LAUNCHER_SHA256,
     ORDINARY_VERIFIED_MANIFEST_SHA256,
@@ -23,15 +23,171 @@ from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 BRIDGE_ROOT = Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
 
 
+def _trusted_principal_activation() -> dict:
+    return {
+        "version": 2,
+        "enabled": True,
+        "mode": "juno",
+        "profile": "juno",
+        "kite_plugin": "juno_kite_trusted_principal",
+        "mapping_path": "/private/tmp/synthetic-juno-activation.sqlite3",
+        "mapping_key_env": "SYNTHETIC_MAPPING_KEY",
+        "request_key_env": "SYNTHETIC_REQUEST_KEY",
+        "response_key_env": "SYNTHETIC_RESPONSE_KEY",
+        "kite_peer": "kite",
+        "kite_url": "http://127.0.0.1:9917",
+        "policy_generation": "synthetic-v2",
+        "allowed_group_conversations": [
+            {"platform": "whatsapp", "chat_id": "300000000000000@g.us"}
+        ],
+        "principal_bindings": [
+            {
+                "platform": "whatsapp",
+                "user_id": "11111111111@s.whatsapp.net",
+                "principal": "owner",
+            }
+        ],
+        "policy": {
+            "principals": {
+                "owner": {
+                    "conversation_eligibility": {"dm": True, "group": True},
+                    "required_group_co_principals": [],
+                    "read_capability_ids": ["private.owner"],
+                    "action_capability_ids": [],
+                    "semantic_policy": {"private.owner": {"disclose": ["own"]}},
+                }
+            },
+            "tool_classes": {"read": ["read_file"], "mutating": []},
+            "action_rules": [],
+        },
+        "limits": {
+            "question_chars": 120,
+            "context_turns": 2,
+            "context_turn_chars": 48,
+            "handoff_bytes": 2400,
+            "policy_view_chars": 3000,
+            "output_chars": 64,
+            "response_bytes": 1800,
+            "turn_ttl_seconds": 30,
+            "roster_timeout_seconds": 2,
+        },
+    }
+
+
+def _activation_runner(raw=None, *, profile="juno", multiplex=False):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+        multiplex_profiles=multiplex,
+        trusted_private_read={"version": 2, "enabled": False},
+        enabled_plugins=("juno_kite_trusted_principal",),
+        juno_kite_trusted_principal=(
+            _trusted_principal_activation() if raw is None else raw
+        ),
+    )
+    runner._active_profile_name = lambda: profile
+    return runner
+
+
+def _unconfigured_adapter(tmp_path: Path, *, mode: str = "bot") -> WhatsAppAdapter:
+    session = tmp_path / "ordinary-session"
+    session.mkdir(mode=0o700, parents=True)
+    return WhatsAppAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bridge_script": str(BRIDGE_ROOT / "launcher.js"),
+                "session_path": str(session),
+                "mode": mode,
+            },
+        )
+    )
+
+
 def _adapter(tmp_path: Path) -> WhatsAppAdapter:
     session = tmp_path / "ordinary-session"
     session.mkdir(mode=0o700, parents=True)
     adapter = WhatsAppAdapter(PlatformConfig(enabled=True, extra={
         "bridge_script": str(BRIDGE_ROOT / "launcher.js"),
         "session_path": str(session),
+        "mode": "bot",
     }))
     adapter.configure_private_read_sender_companion_fence("juno")
     return adapter
+
+
+def test_exact_trusted_principal_v2_configures_fence_without_legacy_service(
+    tmp_path: Path,
+) -> None:
+    raw = _trusted_principal_activation()
+    raw["principal_bindings"].append(
+        {"platform": "telegram", "user_id": "synthetic-owner", "principal": "owner"}
+    )
+    runner = _activation_runner(raw)
+    adapter = _unconfigured_adapter(tmp_path)
+
+    runner._configure_juno_private_read_sender_fence(Platform.WHATSAPP, adapter)
+
+    assert adapter._private_read_fence_profile == "juno"
+    assert runner.config.trusted_private_read == {"version": 2, "enabled": False}
+    assert not hasattr(runner, "_trusted_private_read_host")
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing",
+        "disabled",
+        "wrong_version",
+        "wrong_profile",
+        "wrong_mode",
+        "self_chat",
+        "multiplex",
+        "wrong_platform",
+        "no_groups",
+        "bad_policy",
+        "plugin_disabled",
+    ),
+)
+def test_trusted_principal_fence_activation_requires_exact_scope(
+    case: str, tmp_path: Path
+) -> None:
+    raw = _trusted_principal_activation()
+    profile = "juno"
+    multiplex = False
+    platform = Platform.WHATSAPP
+    if case == "missing":
+        raw = _trusted_principal_activation()
+    elif case == "disabled":
+        raw["enabled"] = False
+    elif case == "wrong_version":
+        raw["version"] = 1
+    elif case == "wrong_profile":
+        profile = "default"
+    elif case == "wrong_mode":
+        raw["mode"] = "kite"
+    elif case == "multiplex":
+        multiplex = True
+    elif case == "wrong_platform":
+        platform = Platform.TELEGRAM
+    elif case == "no_groups":
+        raw["allowed_group_conversations"] = []
+    elif case == "bad_policy":
+        raw["policy"]["principals"]["owner"]["semantic_policy"] = {}
+    runner = _activation_runner(raw, profile=profile, multiplex=multiplex)
+    if case == "missing":
+        runner.config.juno_kite_trusted_principal = None
+    elif case == "plugin_disabled":
+        runner.config.enabled_plugins = ()
+    adapter = _unconfigured_adapter(
+        tmp_path, mode="self-chat" if case == "self_chat" else "bot"
+    )
+
+    runner._configure_juno_private_read_sender_fence(platform, adapter)
+
+    assert adapter._private_read_fence_profile is None
 
 
 def _health(

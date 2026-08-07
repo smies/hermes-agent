@@ -43,6 +43,7 @@ def _config(root: Path, url: str) -> dict:
             }
         },
         "juno_kite_trusted_principal": {
+            "version": 2,
             "enabled": True,
             "mode": "juno",
             "profile": "juno",
@@ -323,12 +324,18 @@ async def _run() -> None:
     adapter.handle_message = synthetic_kite_handler  # type: ignore[method-assign]
     adapter._message_handler = object()
 
-    def consult(question: str, conversation: str) -> str:
-        return _session(
+    async def consult(question: str, conversation: str) -> str:
+        decision = await juno.pre_gateway_dispatch(
+            event=whatsapp_event(OWNER_JID, chat_type="dm"),
+            gateway=roster_gateway,
+        )
+        assert decision and decision.get("action") == "critical_allow"
+        return await asyncio.to_thread(
+            _session,
             lambda: juno.consult_kite({"question_or_goal": question}),
-            platform="telegram",
-            user_id=PRINCIPAL_ID,
-            context_id=conversation,
+            platform="whatsapp",
+            user_id=OWNER_JID,
+            context_id=OWNER_JID,
             profile="juno",
         )
 
@@ -440,22 +447,22 @@ async def _run() -> None:
             [FAMILY_JID, FAMILY_LID],
             ["19999999999@s.whatsapp.net", "29999999999@lid"],
         ]
-        assert await juno.pre_gateway_dispatch(
+        assert (await juno.pre_gateway_dispatch(
             event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
-        ) is None
+        ))["action"] == "critical_allow"
         first_audience = juno.current_audience_binding()
         assert first_audience.effective_read_capability_ids == ("synthetic.shared",)
         assert first_audience.effective_action_capability_ids == ()
-        assert await juno.pre_gateway_dispatch(
+        assert (await juno.pre_gateway_dispatch(
             event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
-        ) is None
+        ))["action"] == "critical_allow"
         assert juno.current_audience_binding().audience_digest == first_audience.audience_digest
         print("PASS group audience: deterministic all-human capability intersection")
 
         roster.participants.append(["13333333333@s.whatsapp.net"])
-        assert await juno.pre_gateway_dispatch(
+        assert (await juno.pre_gateway_dispatch(
             event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
-        ) is None
+        ))["action"] == "critical_allow"
         assert not juno.current_audience_binding().private_eligible
         capture_public = CaptureTransport()
         juno.transport = capture_public
@@ -475,15 +482,28 @@ async def _run() -> None:
         roster.missing = False
         print("PASS missing roster: fail-closed silent ingress denial")
 
-        assert await juno.pre_gateway_dispatch(
+        assert (await juno.pre_gateway_dispatch(
             event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
-        ) is None
+        ))["action"] == "critical_allow"
         roster.generation = "b" * 64
         changed_before = await asyncio.to_thread(group_consult)
         assert changed_before.startswith("BLOCKED:") and capture_public.call is None
         print("PASS roster/fence change before dispatch: zero A2A issuance")
         roster.generation = "a" * 64
         juno.transport = juno._a2a_transport
+
+        stale_owner = await asyncio.to_thread(
+            _session,
+            lambda: juno.consult_kite(
+                {"question_or_goal": "synthetic stale owner request"}
+            ),
+            platform="whatsapp",
+            user_id=OWNER_JID,
+            context_id=OWNER_JID,
+            profile="juno",
+        )
+        assert stale_owner.startswith("BLOCKED:")
+        print("PASS family -> owner: stale audience cannot cross principals")
 
         status, raw = await asyncio.to_thread(_request, base_url + "/health", method="GET")
         health = _json(raw)
@@ -504,16 +524,17 @@ async def _run() -> None:
         assert status == 401 and isinstance(wrong.get("error"), dict)
         print("PASS wrong bearer: POST / SendMessage -> 401 JSON-RPC error, no dispatch")
 
-        answer = await asyncio.to_thread(
-            consult, "synthetic authenticated request", "conversation-001"
-        )
+        answer = await consult("synthetic authenticated request", "conversation-001")
         assert answer == "synthetic bounded answer"
         print("PASS authenticated Juno request: POST / SendMessage -> signed bounded answer")
 
         roster.generation = "a" * 64
-        assert await juno.pre_gateway_dispatch(
+        stale_family = await asyncio.to_thread(group_consult)
+        assert stale_family.startswith("BLOCKED:")
+        print("PASS owner -> family: stale audience cannot cross principals")
+        assert (await juno.pre_gateway_dispatch(
             event=whatsapp_event(FAMILY_JID), gateway=roster_gateway
-        ) is None
+        ))["action"] == "critical_allow"
         real_transport = juno._a2a_transport
         exchanged: list[str] = []
         aborted_before = juno.store.request_state_counts().get("aborted", 0)
@@ -543,9 +564,7 @@ async def _run() -> None:
 
         capture = CaptureTransport()
         juno.transport = capture
-        await asyncio.to_thread(
-            consult, "synthetic wrong context", "conversation-002"
-        )
+        await consult("synthetic wrong context", "conversation-002")
         assert capture.call is not None
         _peer_name, _peer, message, context_id = capture.call
         wrong_context_body = _send_body(message, context_id + "-changed", "wrong-context")
@@ -572,22 +591,18 @@ async def _run() -> None:
             return replayed[0]
 
         juno.transport = replay_transport
-        assert await asyncio.to_thread(
-            consult, "synthetic replay baseline", "conversation-replay"
+        assert await consult(
+            "synthetic replay baseline", "conversation-replay"
         ) == "synthetic bounded answer"
-        replay_denied = await asyncio.to_thread(
-            consult, "synthetic replay second request", "conversation-replay"
+        replay_denied = await consult(
+            "synthetic replay second request", "conversation-replay"
         )
         assert replay_denied.startswith("BLOCKED:")
         print("PASS replay: prior signed response cannot satisfy a new issued request")
         juno.transport = juno._a2a_transport
 
-        unknown = await asyncio.to_thread(
-            consult, "synthetic unknown tool", "conversation-003"
-        )
-        changed = await asyncio.to_thread(
-            consult, "synthetic changed action", "conversation-004"
-        )
+        unknown = await consult("synthetic unknown tool", "conversation-003")
+        changed = await consult("synthetic changed action", "conversation-004")
         assert unknown == "unknown tool denied"
         assert changed == "changed action denied"
         assert policy_checks == ["unknown-tool-blocked", "changed-action-blocked"]

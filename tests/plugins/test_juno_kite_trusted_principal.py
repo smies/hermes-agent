@@ -76,6 +76,7 @@ def _base_config(tmp_path: Path) -> dict:
             }
         },
         "juno_kite_trusted_principal": {
+            "version": 2,
             "enabled": True,
             "mode": "juno",
             "profile": "juno",
@@ -206,17 +207,22 @@ def _parse_prefixed(text: str, prefix: str) -> dict:
 
 
 def _issue_request(juno, *, user_id="fixture-user-101", session_key="conversation-a"):
-    transport = RecordingTransport()
-    juno.transport = transport
-    result = _run_in_session(
-        lambda: juno.consult_kite({"question_or_goal": "What is the bounded answer?"}),
+    prepared = _run_in_session(
+        lambda: juno._prepare_request(  # noqa: SLF001 - production request seam
+            {"question_or_goal": "What is the bounded answer?"}
+        ),
         platform="telegram",
         user_id=user_id,
         session_key=session_key,
         profile="juno",
     )
-    assert result.startswith("BLOCKED:")  # fixture transport deliberately returns unsigned text
-    call = transport.calls[0]
+    assert juno.store.get_request(prepared.request_id).state == "issued"
+    call = {
+        "peer_name": juno.peer_name,
+        "peer": copy.deepcopy(juno.peer),
+        "message": prepared.message,
+        "context_id": prepared.mapping.context_id,
+    }
     return call, _parse_prefixed(call["message"], REQUEST_PREFIX)
 
 
@@ -1372,6 +1378,42 @@ class TestOutputAndEnvelope:
             assert second.startswith("BLOCKED:")
         else:
             assert invoke("conversation-a").startswith("BLOCKED:")
+
+    def test_unsigned_abort_is_terminal_and_next_prepared_request_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        transport = RecordingTransport()
+        juno = _runtime(tmp_path, transport=transport)
+        prepared = []
+        production_prepare = juno._prepare_request
+
+        def tracked_prepare(args):
+            request = production_prepare(args)
+            prepared.append(request)
+            return request
+
+        monkeypatch.setattr(juno, "_prepare_request", tracked_prepare)
+
+        def invoke(conversation):
+            return _run_in_session(
+                lambda: juno.consult_kite({"question_or_goal": "Need approved context"}),
+                platform="telegram",
+                user_id="fixture-user-101",
+                session_key=conversation,
+                profile="juno",
+            )
+
+        assert invoke("conversation-aborted").startswith("BLOCKED:")
+        assert len(prepared) == 1
+        assert juno.store.get_request(prepared[0].request_id).state == "aborted"
+
+        aborted_call = transport.calls[0]
+        kite = _runtime(tmp_path, mode="kite")
+        assert "DENIED" in _bind_kite(kite, aborted_call)["context"]
+
+        juno.transport = _round_trip_transport(kite, answer="subsequent valid answer")
+        assert invoke("conversation-subsequent") == "subsequent valid answer"
+        assert len(prepared) == 2
 
 
 class TestRegistrationAndGuidance:

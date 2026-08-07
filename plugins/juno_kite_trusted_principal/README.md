@@ -113,6 +113,7 @@ a2a_agents:
     timeout: 120
 
 juno_kite_trusted_principal:
+  version: 2
   enabled: true
   mode: juno
   profile: juno
@@ -205,6 +206,7 @@ a2a:
   trusted_peers: [juno]
 
 juno_kite_trusted_principal:
+  version: 2
   enabled: true
   mode: kite
   profile: default
@@ -305,6 +307,14 @@ Before enabling, run the focused and regression commands listed in the frozen
 contract with a temporary `HERMES_HOME`. Then perform these checks without a
 private provider or production action:
 
+The Juno gateway fence activates only when this root configuration block has
+`version: 2`, `enabled: true`, `mode: juno`, `profile: juno`, a non-empty exact
+WhatsApp group allowlist, and the plugin is enabled in the dedicated,
+non-multiplex Juno process. The ordinary WhatsApp adapter must run in `bot`
+mode. This activation installs only the adapter's in-process roster/fence
+producer before bridge connect; it does not start or publish the historical
+private-read service.
+
 1. Run `hermes plugins list` for the active `default` Kite profile and confirm
    both `a2a-platform` and `juno_kite_trusted_principal` are enabled. Run the
    corresponding `hermes -p juno plugins list` command and confirm only the
@@ -393,4 +403,6 @@ Rollback is recoverable and does not delete state:
    archival/deletion.
 
 The historical `gateway.trusted_private_read.enabled` setting remains `false`.
-This plugin neither reads nor changes it.
+The dedicated v2 activation path neither reads nor changes that flag. Removing
+the plugin from Juno's enabled list and restarting Juno also removes the
+ordinary adapter fence authority; no legacy private-read host is revived.

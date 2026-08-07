@@ -181,6 +181,16 @@ class AudienceBinding:
 
 
 @dataclass(frozen=True)
+class PreparedRequest:
+    """One signed, durably issued request ready for the fixed A2A transport."""
+
+    mapping: MappingRecord
+    request_id: str
+    message: str
+    audience: AudienceBinding
+
+
+@dataclass(frozen=True)
 class TurnBinding:
     valid: bool
     reason: str
@@ -198,9 +208,19 @@ _ACTIVE_BINDING: ContextVar[Optional[TurnBinding]] = ContextVar(
 _ACTIVE_AUDIENCE: ContextVar[Optional[AudienceBinding]] = ContextVar(
     "juno_kite_active_audience", default=None
 )
+_ACTIVE_INGRESS_TOKEN: ContextVar[Any] = ContextVar(
+    "juno_kite_active_ingress_token", default=None
+)
+
+CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
 
 
 Transport = Callable[[str, dict, str, str], tuple[str, str, str]]
+
+
+def critical_ingress_satisfied(token: Any) -> bool:
+    """Prove the trusted callback completed for this exact dispatch event."""
+    return token is not None and _ACTIVE_INGRESS_TOKEN.get() is token
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -290,6 +310,8 @@ class TrustedPrincipalRuntime:
         return Limits(**values)
 
     def _validate_static_config(self) -> None:
+        if self.config.get("version") != 2:
+            raise ValueError("trusted-principal config version must be exactly 2")
         if not self.enabled:
             raise ValueError("plugin is disabled")
         if self.mode not in {"juno", "kite"}:
@@ -692,13 +714,27 @@ class TrustedPrincipalRuntime:
     def _ingress_skip(reason: str) -> dict:
         return {"action": "skip", "reason": reason, "redact_scope": True}
 
+    @staticmethod
+    def _ingress_allow(critical_ingress_token: Any) -> dict:
+        _ACTIVE_INGRESS_TOKEN.set(critical_ingress_token)
+        return {
+            "action": "critical_allow",
+            "scope": CRITICAL_INGRESS_SCOPE,
+            "redact_scope": True,
+        }
+
     async def pre_gateway_dispatch(
-        self, event: Any = None, gateway: Any = None, **_: Any
+        self,
+        event: Any = None,
+        gateway: Any = None,
+        critical_ingress_token: Any = None,
+        **_: Any,
     ) -> Optional[dict]:
         """Bind eligible Juno audience authority before auth/session/model work."""
         if self.mode != "juno" or not self.juno_available():
             return None
         _ACTIVE_AUDIENCE.set(None)
+        _ACTIVE_INGRESS_TOKEN.set(None)
         source = getattr(event, "source", None)
         platform_value = getattr(getattr(source, "platform", None), "value", None)
         platform = str(platform_value or getattr(source, "platform", "") or "").lower()
@@ -721,7 +757,7 @@ class TrustedPrincipalRuntime:
                 _ACTIVE_AUDIENCE.set(
                     self._single_principal_audience(principal, platform, chat_id)
                 )
-                return None
+                return self._ingress_allow(critical_ingress_token)
             if (
                 platform != "whatsapp"
                 or (platform, chat_id) not in self.allowed_group_conversations
@@ -771,7 +807,7 @@ class TrustedPrincipalRuntime:
                     revalidate=provider,
                 )
             )
-            return None
+            return self._ingress_allow(critical_ingress_token)
         except asyncio.CancelledError:
             raise
         except PermissionError:
@@ -870,118 +906,114 @@ class TrustedPrincipalRuntime:
             bounded.append({"role": role, "text": _truncate_chars(text, self.limits.context_turn_chars)})
         return bounded
 
+    def _prepare_request(self, args: dict) -> PreparedRequest:
+        """Validate current host authority and durably issue one signed request."""
+        principal, conversation_key = self._derive_juno_principal()
+        audience = _ACTIVE_AUDIENCE.get()
+        chat_type = str(get_session_env("HERMES_SESSION_CHAT_TYPE") or "").lower()
+        platform = str(get_session_env("HERMES_SESSION_PLATFORM") or "").lower()
+        chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID") or "")
+        if audience is None:
+            if chat_type != "dm":
+                raise ValueError("group audience was not authenticated at ingress")
+            audience = self._single_principal_audience(principal, platform, chat_id)
+            _ACTIVE_AUDIENCE.set(audience)
+        if audience.principal != principal:
+            raise ValueError("audience principal does not match authenticated sender")
+        if audience.conversation_kind != chat_type:
+            raise ValueError("audience conversation classification changed")
+        expected_conversation_binding = self._opaque_digest(
+            "conversation-v2",
+            {"platform": platform, "kind": chat_type, "chat": chat_id},
+        )
+        if not hmac.compare_digest(
+            audience.conversation_binding, expected_conversation_binding
+        ):
+            raise ValueError("audience destination binding changed")
+        if audience.policy_generation != self.policy_generation:
+            raise ValueError("audience policy generation is stale")
+        if not audience.private_eligible or not audience.effective_read_capability_ids:
+            raise ValueError("effective audience is public-only")
+        question = str((args or {}).get("question_or_goal") or "").strip()
+        if not question or len(question) > self.limits.question_chars:
+            raise ValueError("question_or_goal is empty or over its configured limit")
+        if self._leak_reason(question, output=False):
+            raise ValueError("question contains private or credential-shaped data")
+        session_private_values = {
+            str(get_session_env(name) or "").strip()
+            for name in (
+                "HERMES_SESSION_USER_ID",
+                "HERMES_SESSION_CHAT_ID",
+                "HERMES_SESSION_THREAD_ID",
+                "HERMES_SESSION_KEY",
+                "HERMES_SESSION_ID",
+            )
+        }
+        if any(value and value in question for value in session_private_values):
+            raise ValueError("question contains a raw authenticated session identifier")
+        relevant_context = self._bounded_context((args or {}).get("relevant_context"))
+        if any(
+            value and value in turn["text"]
+            for value in session_private_values
+            for turn in relevant_context
+        ):
+            raise ValueError("relevant context contains a raw authenticated session identifier")
+        # First live group recheck. This happens before mapping or request
+        # creation, so a changed/missing audience cannot leave authority state
+        # or issue an A2A call.
+        audience = self._revalidate_audience(audience)
+        mapping = self.store.resolve(principal, conversation_key)
+        request_id = "req-" + secrets.token_urlsafe(18)
+        expires_at = int(self.clock()) + self.limits.turn_ttl_seconds
+        unsigned = {
+            "version": 2,
+            "context_id": mapping.context_id,
+            "correlation_id": mapping.correlation_id,
+            "request_id": request_id,
+            "policy_generation": self.policy_generation,
+            "expires_at": expires_at,
+            "question_or_goal": question,
+            "relevant_context": relevant_context,
+            "audience_digest": audience.audience_digest,
+            "conversation_binding": audience.conversation_binding,
+            "effective_read_capability_ids": list(audience.effective_read_capability_ids),
+            "effective_action_capability_ids": list(audience.effective_action_capability_ids),
+            "roster_generation": audience.roster_generation,
+        }
+        payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
+        guard = _audit_guard(mapping.correlation_id, request_id, mapping.context_id)
+        message = guard + REQUEST_PREFIX + canonical_json(payload)
+        while len(message.encode("utf-8")) > self.limits.handoff_bytes and relevant_context:
+            relevant_context.pop()
+            unsigned["relevant_context"] = relevant_context
+            payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
+            message = guard + REQUEST_PREFIX + canonical_json(payload)
+        if len(message.encode("utf-8")) > self.limits.handoff_bytes:
+            raise ValueError("bounded handoff exceeds its byte limit")
+        self.store.issue_request(
+            mapping,
+            request_id,
+            self.policy_generation,
+            expires_at,
+            audience.audience_digest,
+            audience.conversation_binding,
+            self._capability_fingerprint(audience.effective_read_capability_ids),
+            self._capability_fingerprint(audience.effective_action_capability_ids),
+            audience.roster_generation,
+        )
+        logger.info("Juno--Kite dispatch correlation=%s", mapping.correlation_id)
+        return PreparedRequest(mapping, request_id, message, audience)
+
     def consult_kite(self, args: dict, **_: Any) -> str:
         """Tool handler: derive authority from ContextVars and call fixed Kite."""
         request_id = ""
         try:
-            principal, conversation_key = self._derive_juno_principal()
-            audience = _ACTIVE_AUDIENCE.get()
-            chat_type = str(get_session_env("HERMES_SESSION_CHAT_TYPE") or "").lower()
-            platform = str(get_session_env("HERMES_SESSION_PLATFORM") or "").lower()
-            chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID") or "")
-            if audience is None:
-                if chat_type != "dm":
-                    raise ValueError("group audience was not authenticated at ingress")
-                audience = self._single_principal_audience(
-                    principal, platform, chat_id
-                )
-                _ACTIVE_AUDIENCE.set(audience)
-            if audience.principal != principal:
-                raise ValueError("audience principal does not match authenticated sender")
-            if audience.conversation_kind != chat_type:
-                raise ValueError("audience conversation classification changed")
-            expected_conversation_binding = self._opaque_digest(
-                "conversation-v2",
-                {"platform": platform, "kind": chat_type, "chat": chat_id},
-            )
-            if not hmac.compare_digest(
-                audience.conversation_binding, expected_conversation_binding
-            ):
-                raise ValueError("audience destination binding changed")
-            if audience.policy_generation != self.policy_generation:
-                raise ValueError("audience policy generation is stale")
-            if not audience.private_eligible or not audience.effective_read_capability_ids:
-                raise ValueError("effective audience is public-only")
-            question = str((args or {}).get("question_or_goal") or "").strip()
-            if not question or len(question) > self.limits.question_chars:
-                raise ValueError("question_or_goal is empty or over its configured limit")
-            if self._leak_reason(question, output=False):
-                raise ValueError("question contains private or credential-shaped data")
-            session_private_values = {
-                str(get_session_env(name) or "").strip()
-                for name in (
-                    "HERMES_SESSION_USER_ID",
-                    "HERMES_SESSION_CHAT_ID",
-                    "HERMES_SESSION_THREAD_ID",
-                    "HERMES_SESSION_KEY",
-                    "HERMES_SESSION_ID",
-                )
-            }
-            if any(value and value in question for value in session_private_values):
-                raise ValueError("question contains a raw authenticated session identifier")
-            relevant_context = self._bounded_context((args or {}).get("relevant_context"))
-            if any(
-                value and value in turn["text"]
-                for value in session_private_values
-                for turn in relevant_context
-            ):
-                raise ValueError("relevant context contains a raw authenticated session identifier")
-            # First live group recheck. This happens before mapping or request
-            # creation, so a changed/missing audience cannot leave authority
-            # state or issue an A2A call.
-            audience = self._revalidate_audience(audience)
-            mapping = self.store.resolve(principal, conversation_key)
-            request_id = "req-" + secrets.token_urlsafe(18)
-            expires_at = int(self.clock()) + self.limits.turn_ttl_seconds
-            unsigned = {
-                "version": 2,
-                "context_id": mapping.context_id,
-                "correlation_id": mapping.correlation_id,
-                "request_id": request_id,
-                "policy_generation": self.policy_generation,
-                "expires_at": expires_at,
-                "question_or_goal": question,
-                "relevant_context": relevant_context,
-                "audience_digest": audience.audience_digest,
-                "conversation_binding": audience.conversation_binding,
-                "effective_read_capability_ids": list(
-                    audience.effective_read_capability_ids
-                ),
-                "effective_action_capability_ids": list(
-                    audience.effective_action_capability_ids
-                ),
-                "roster_generation": audience.roster_generation,
-            }
-            payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
-            guard = _audit_guard(mapping.correlation_id, request_id, mapping.context_id)
-            message = guard + REQUEST_PREFIX + canonical_json(payload)
-            while len(message.encode("utf-8")) > self.limits.handoff_bytes and relevant_context:
-                relevant_context.pop()
-                unsigned["relevant_context"] = relevant_context
-                payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
-                message = guard + REQUEST_PREFIX + canonical_json(payload)
-            if len(message.encode("utf-8")) > self.limits.handoff_bytes:
-                raise ValueError("bounded handoff exceeds its byte limit")
-            read_fingerprint = self._capability_fingerprint(
-                audience.effective_read_capability_ids
-            )
-            action_fingerprint = self._capability_fingerprint(
-                audience.effective_action_capability_ids
-            )
-            self.store.issue_request(
-                mapping,
-                request_id,
-                self.policy_generation,
-                expires_at,
-                audience.audience_digest,
-                audience.conversation_binding,
-                read_fingerprint,
-                action_fingerprint,
-                audience.roster_generation,
-            )
-            logger.info("Juno--Kite dispatch correlation=%s", mapping.correlation_id)
+            prepared = self._prepare_request(args)
+            mapping = prepared.mapping
+            request_id = prepared.request_id
+            audience = prepared.audience
             raw, returned_context, state = self.transport(
-                self.peer_name, dict(self.peer), message, mapping.context_id
+                self.peer_name, dict(self.peer), prepared.message, mapping.context_id
             )
             if returned_context != mapping.context_id or state.lower() not in {
                 "completed",
@@ -1579,6 +1611,80 @@ class TrustedPrincipalRuntime:
             state = str((payload.get("status") or {}).get("state") or "")
         protocol.persist_message(reply_context, "agent", reply, task_id)
         return reply, reply_context, state
+
+
+def valid_juno_gateway_activation_config(raw: Any, active_profile: str) -> bool:
+    """Purely validate the config needed to activate Juno's adapter fence.
+
+    This deliberately performs no environment reads and opens no mapping
+    store. Plugin initialization remains authoritative for secrets, the fixed
+    A2A peer entry, and durable state.
+    """
+    try:
+        if (
+            type(raw) is not dict
+            or active_profile != "juno"
+            or raw.get("version") != 2
+            or raw.get("enabled") is not True
+            or raw.get("mode") != "juno"
+            or raw.get("profile") != "juno"
+        ):
+            return False
+        validator = object.__new__(TrustedPrincipalRuntime)
+        validator.config = raw
+        validator.enabled = raw.get("enabled") is True
+        validator.mode = str(raw.get("mode") or "").strip().lower()
+        validator.configured_profile = str(raw.get("profile") or "").strip()
+        validator.policy_generation = str(raw.get("policy_generation") or "").strip()
+        validator.secret_values = set()
+        validator._validate_static_config()
+        validator.limits = validator._load_limits(raw.get("limits"))
+        key_refs = [
+            str(raw.get(name) or "").strip()
+            for name in (
+                "mapping_key_env",
+                "request_key_env",
+                "response_key_env",
+            )
+        ]
+        if any(not value for value in key_refs) or len(set(key_refs)) != 3:
+            return False
+        validator.principal_bindings = validator._load_principal_bindings()
+        if not any(
+            platform == "whatsapp"
+            for platform, _user_id, _principal in validator.principal_bindings
+        ):
+            return False
+        validator.private_identifiers = {
+            user_id for _platform, user_id, _principal in validator.principal_bindings
+        }
+        validator.allowed_group_conversations = (
+            validator._load_allowed_group_conversations()
+        )
+        if not validator.allowed_group_conversations:
+            return False
+        validator.private_identifiers.update(
+            chat_id for _platform, chat_id in validator.allowed_group_conversations
+        )
+        validator.policy = raw.get("policy")
+        if not isinstance(validator.policy, dict):
+            return False
+        validator._validate_policy()
+        peer_name = str(raw.get("kite_peer") or "").strip()
+        peer_url = str(raw.get("kite_url") or "").strip().rstrip("/")
+        parsed = urlparse(peer_url)
+        return bool(
+            peer_name
+            and raw.get("kite_plugin") == "juno_kite_trusted_principal"
+            and parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 class FailClosedRuntime:

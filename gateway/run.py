@@ -14016,32 +14016,107 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import hashlib
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
+    def _juno_trusted_principal_v2_config(self) -> Optional[dict[str, Any]]:
+        """Return the exact dedicated Juno v2 activation config, or ``None``.
+
+        This is intentionally a narrow startup qualification, not a second
+        policy parser.  The plugin performs the complete semantic/secret/store
+        validation; the gateway only decides whether the ordinary WhatsApp
+        adapter may receive its in-process fence authority.
+        """
+        config = getattr(self, "config", None)
+        if (
+            config is None
+            or bool(getattr(config, "multiplex_profiles", False))
+            or self._active_profile_name() != "juno"
+            or "juno_kite_trusted_principal"
+            not in set(getattr(config, "enabled_plugins", ()) or ())
+        ):
+            return None
+        raw = getattr(config, "juno_kite_trusted_principal", None)
+        try:
+            from plugins.juno_kite_trusted_principal.runtime import (
+                valid_juno_gateway_activation_config,
+            )
+
+            if valid_juno_gateway_activation_config(raw, "juno"):
+                return raw
+        except Exception:
+            pass
+        return None
+
+    def _juno_critical_ingress_required(self, event: Any) -> bool:
+        """Whether this exact event must prove the critical Juno callback ran."""
+        source = getattr(event, "source", None)
+        platform = getattr(source, "platform", None)
+        if platform is not Platform.WHATSAPP:
+            return False
+        config = getattr(self, "config", None)
+        if (
+            config is None
+            or bool(getattr(config, "multiplex_profiles", False))
+            or self._active_profile_name() != "juno"
+            or "juno_kite_trusted_principal"
+            not in set(getattr(config, "enabled_plugins", ()) or ())
+        ):
+            return False
+        raw = getattr(config, "juno_kite_trusted_principal", None)
+        # An absent/unreadable block on the dedicated enabled profile cannot
+        # safely identify the protected roster, so all its WhatsApp ingress is
+        # held before pairing/session/model. Explicit version/mode/profile
+        # mismatches are outside this contract and retain legacy behavior.
+        if type(raw) is not dict:
+            return True
+        if (
+            raw.get("version") != 2
+            or raw.get("mode") != "juno"
+            or raw.get("profile") != "juno"
+        ):
+            return False
+        valid = self._juno_trusted_principal_v2_config()
+        if valid is None:
+            return True
+        user_id = str(getattr(source, "user_id", "") or "")
+        return any(
+            binding["platform"] == "whatsapp" and binding["user_id"] == user_id
+            for binding in valid["principal_bindings"]
+        )
+
     def _configure_juno_private_read_sender_fence(
         self, platform: Platform, adapter: BasePlatformAdapter,
     ) -> None:
         """Attest the exact dedicated Juno ordinary adapter before connect."""
         if platform is not Platform.WHATSAPP:
             return
-        raw = getattr(self.config, "trusted_private_read", None)
-        if (
-            type(raw) is not dict
-            or raw.get("version") != 2
-            or raw.get("enabled") is not True
-            or bool(getattr(self.config, "multiplex_profiles", False))
-        ):
-            return
+        trusted_principal = self._juno_trusted_principal_v2_config()
+        legacy = getattr(self.config, "trusted_private_read", None)
         try:
-            from gateway.juno_private_read_mvp import JunoPrivateReadMvpConfig
+            profile = None
+            if trusted_principal is not None:
+                profile = "juno"
+            elif (
+                type(legacy) is dict
+                and legacy.get("version") == 2
+                and legacy.get("enabled") is True
+                and not bool(getattr(self.config, "multiplex_profiles", False))
+            ):
+                from gateway.juno_private_read_mvp import JunoPrivateReadMvpConfig
 
-            parsed = JunoPrivateReadMvpConfig.parse(raw)
-            if parsed is None or self._active_profile_name() != parsed.profile:
+                parsed = JunoPrivateReadMvpConfig.parse(legacy)
+                if parsed is not None and self._active_profile_name() == parsed.profile:
+                    profile = parsed.profile
+            if profile is None:
                 return
+            if trusted_principal is not None:
+                capable = getattr(adapter, "trusted_principal_fence_capable", None)
+                if not callable(capable) or capable(profile) is not True:
+                    return
             configure = getattr(
                 adapter, "configure_private_read_sender_companion_fence", None,
             )
             if not callable(configure):
                 return
-            configure(parsed.profile)
+            configure(profile)
         except BaseException:
             # Adapter startup remains ordinary/generic. The private host later
             # refuses publication because no attested fence evidence exists.
@@ -14740,6 +14815,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
+            _critical_required = self._juno_critical_ingress_required(event)
+            _critical_token = object() if _critical_required else None
+            _critical_marker = False
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
@@ -14750,9 +14828,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # object.__new__ without __init__ (pitfall #17), and the
                     # hook must not fail dispatch over a missing attribute.
                     session_store=getattr(self, "session_store", None),
+                    critical_ingress_token=_critical_token,
                 )
+                if not isinstance(_hook_results, list):
+                    _hook_results = []
+            except asyncio.CancelledError:
+                if _critical_required:
+                    logger.warning(
+                        "protected pre_gateway_dispatch invocation cancelled; ingress skipped"
+                    )
+                    return None
+                raise
             except Exception as _hook_exc:
-                logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
+                if _critical_required:
+                    logger.warning(
+                        "protected pre_gateway_dispatch invocation failed; ingress skipped"
+                    )
+                else:
+                    logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
             for _result in _hook_results:
@@ -14764,15 +14857,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if inspect.isawaitable(_result):
                     try:
                         _result = await _result
+                    except asyncio.CancelledError:
+                        if _critical_required:
+                            logger.warning(
+                                "protected async pre_gateway_dispatch cancelled; ingress skipped"
+                            )
+                            return None
+                        raise
                     except Exception as _hook_exc:
-                        logger.warning(
-                            "async pre_gateway_dispatch result failed: %s",
-                            type(_hook_exc).__name__,
-                        )
+                        if _critical_required:
+                            logger.warning(
+                                "protected async pre_gateway_dispatch failed; ingress skipped"
+                            )
+                        else:
+                            logger.warning(
+                                "async pre_gateway_dispatch result failed: %s",
+                                type(_hook_exc).__name__,
+                            )
                         continue
                 if not isinstance(_result, dict):
                     continue
                 _action = _result.get("action")
+                if _action == "critical_allow":
+                    _critical_marker = (
+                        set(_result) == {"action", "scope", "redact_scope"}
+                        and _result.get("scope") == "juno-trusted-principal-v2"
+                        and _result.get("redact_scope") is True
+                    )
+                    continue
                 if _action == "skip":
                     if _result.get("redact_scope") is True:
                         logger.info(
@@ -14795,6 +14907,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
+
+            if _critical_required:
+                try:
+                    from plugins.juno_kite_trusted_principal.runtime import (
+                        critical_ingress_satisfied,
+                    )
+
+                    _critical_satisfied = critical_ingress_satisfied(_critical_token)
+                except Exception:
+                    _critical_satisfied = False
+                if not (_critical_marker and _critical_satisfied):
+                    logger.warning(
+                        "protected pre_gateway_dispatch proof missing; ingress skipped"
+                    )
+                    return None
 
         if is_internal:
             pass

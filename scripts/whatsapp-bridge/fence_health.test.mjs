@@ -10,6 +10,7 @@ const key = 'ab'.repeat(32);
 process.env.HERMES_INTERNAL_WHATSAPP_FENCE_PROFILE = 'juno';
 process.env.HERMES_INTERNAL_WHATSAPP_FENCE_KEY = key;
 process.env.WHATSAPP_ALLOWED_USERS = '11111111111@s.whatsapp.net';
+process.env.WHATSAPP_MODE = 'bot';
 const session = mkdtempSync(path.join(tmpdir(), 'ordinary-fence-health-'));
 process.argv.push('--session', session);
 
@@ -116,4 +117,47 @@ test('bridge signs exact group roster and transport-proved phone/LID aliases', (
     challenge,
     metadata: { participants: [{ id: '11111111111@s.whatsapp.net' }] },
   }), null);
+});
+
+test('self-chat mode keeps non-self group input ignored', async () => {
+  process.env.WHATSAPP_MODE = 'self-chat';
+  try {
+    const selfChatBridge = await import(`./bridge.js?self-chat=${Date.now()}`);
+    const ev = new EventEmitter();
+    const sock = {
+      user: { id: '33333333333:4@s.whatsapp.net', lid: '44444444444@lid' },
+      ev,
+    };
+    await selfChatBridge.startSocket({
+      useAuthState: async () => ({
+        state: { creds: { registered: true, me: { id: sock.user.id } } },
+        saveCreds() {},
+      }),
+      verifyBootstrap: async () => sock.user.lid,
+      resolveVersion: async () => null,
+      createSocket: () => sock,
+      canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+    });
+    const inbound = ev.listeners('messages.upsert')[0];
+    const outcome = await inbound({
+      type: 'notify',
+      messages: [{
+        key: {
+          id: 'SYNTHETIC-SELF-CHAT-NEGATIVE',
+          remoteJid: '300000000000000@g.us',
+          participant: '11111111111@s.whatsapp.net',
+          fromMe: false,
+        },
+        messageTimestamp: 1_786_000_001,
+        message: { conversation: 'must remain ignored' },
+      }],
+    });
+    assert.deepEqual(outcome, {
+      action: 'ignored',
+      reason: 'self_chat_mode_rejects_non_self',
+    });
+    assert.deepEqual(selfChatBridge.takeProductionInboundMessages(), []);
+  } finally {
+    process.env.WHATSAPP_MODE = 'bot';
+  }
 });

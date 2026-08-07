@@ -1,5 +1,6 @@
 """Tests for gateway configuration management."""
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -278,6 +279,30 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_juno_trusted_principal_activation_is_snapshotted_not_serialized(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        trusted = {"version": 2, "enabled": True, "mode": "juno"}
+        (hermes_home / "config.yaml").write_text(
+            json.dumps(
+                {
+                    "plugins": {"enabled": ["juno_kite_trusted_principal"]},
+                    "juno_kite_trusted_principal": trusted,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.enabled_plugins == ("juno_kite_trusted_principal",)
+        assert config.juno_kite_trusted_principal == trusted
+        assert "juno_kite_trusted_principal" not in config.to_dict()
+        assert "plugins" not in config.to_dict()
+
     def test_whatsapp_explicit_yaml_true_beats_legacy_env_false(
         self, tmp_path, monkeypatch
     ):

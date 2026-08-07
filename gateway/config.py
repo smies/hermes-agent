@@ -1001,6 +1001,13 @@ class GatewayConfig:
     # installations have no feature config surface or tool schema.
     trusted_private_read: Optional[Dict[str, Any]] = None
 
+    # Startup-snapshotted configuration for the bundled Juno--Kite
+    # trusted-principal ingress authority.  The gateway uses this only to
+    # qualify the critical pre-dispatch contract and ordinary WhatsApp fence;
+    # the plugin remains the owner of policy/runtime validation.
+    juno_kite_trusted_principal: Any = field(default=None, repr=False)
+    enabled_plugins: tuple[str, ...] = field(default=(), repr=False)
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1268,6 +1275,12 @@ class GatewayConfig:
                 if isinstance(data.get("trusted_private_read"), dict)
                 else None
             ),
+            juno_kite_trusted_principal=data.get("juno_kite_trusted_principal"),
+            enabled_plugins=tuple(
+                str(name)
+                for name in data.get("enabled_plugins", ())
+                if isinstance(name, str)
+            ) if isinstance(data.get("enabled_plugins", ()), (list, tuple)) else (),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -1367,6 +1380,18 @@ def load_gateway_config() -> GatewayConfig:
             # already established for gateway.multiplex_profiles/streaming/
             # write_sessions_json: top-level wins, nested gateway.* falls back.
             gateway_section = yaml_cfg.get("gateway")
+
+            # Preserve the dedicated trusted-principal block and plugin
+            # enablement in the immutable GatewayConfig snapshot.  The
+            # pre-dispatch critical-scope check must not re-read mutable live
+            # configuration after startup.
+            if "juno_kite_trusted_principal" in yaml_cfg:
+                gw_data["juno_kite_trusted_principal"] = yaml_cfg[
+                    "juno_kite_trusted_principal"
+                ]
+            plugins_cfg = yaml_cfg.get("plugins")
+            if isinstance(plugins_cfg, dict):
+                gw_data["enabled_plugins"] = plugins_cfg.get("enabled", [])
 
             # Map config.yaml keys → GatewayConfig.from_dict() schema.
             # Each key overwrites whatever gateway.json may have set.
@@ -1809,6 +1834,12 @@ def load_gateway_config() -> GatewayConfig:
     except Exception as e:
         if primary_present:
             gw_data.pop("trusted_private_read", None)
+            gw_data.pop("juno_kite_trusted_principal", None)
+            # The dedicated Juno runner must not fall through to pairing/model
+            # when its primary configuration is unreadable.  Preserve a
+            # fail-closed intent marker in the startup snapshot; non-Juno
+            # profiles remain outside the scope-aware gateway check.
+            gw_data["enabled_plugins"] = ["juno_kite_trusted_principal"]
         logger.warning(
             "Failed to process config.yaml — private read remains fail-closed; "
             "using other legacy values only. "
