@@ -919,7 +919,7 @@ test('515 recovery rejects pre-registration, repeated restart, save failure, and
   }
 });
 
-test('open waits for its active pairing-code request before completion and commit', async () => {
+test('open before QR waits for its active generation to emit a pairing code', async () => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-open-code-race-')));
   const ordinary = path.join(root, 'ordinary');
   const sensitive = path.join(root, 'sensitive');
@@ -929,7 +929,9 @@ test('open waits for its active pairing-code request before completion and commi
   const creds = { registered: true, me: { id: phoneJid, lid: lidJid } };
   const pairingStarted = deferred();
   const pairingResult = deferred();
+  const credentialSaveStarted = deferred();
   const milestones = [];
+  let provisioningState = 'pending';
   let socket;
   await chmod(root, 0o700);
   const request = parseProvisioningRequest({
@@ -945,6 +947,7 @@ test('open waits for its active pairing-code request before completion and commi
         keys: { get: async () => ({ [phone]: lidJid.split('@')[0] }), set: async () => {} },
       },
       saveCreds: async () => {
+        credentialSaveStarted.resolve();
         await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
       },
     }),
@@ -969,19 +972,36 @@ test('open waits for its active pairing-code request before completion and commi
     beforeDurableConfirmation: async () => { milestones.push('commit'); },
     timeoutMs: 2_000,
   });
+  void provisioning.then(
+    () => { provisioningState = 'completed'; },
+    () => { provisioningState = 'failed'; },
+  );
   try {
     await waitFor(() => Boolean(socket), 'socket was not created');
     socket.ev.emit('connection.update', { connection: 'open' });
-    socket.ev.emit('connection.update', { qr: 'provider-private-readiness' });
-    const firstOutcome = await Promise.race([
-      pairingStarted.promise.then(() => 'pairing_started'),
-      provisioning.then(() => 'completed', () => 'failed'),
+    const firstTransition = await Promise.race([
+      credentialSaveStarted.promise.then(() => 'credential_save_started'),
+      new Promise(resolve => setImmediate(() => resolve('event_loop_turn'))),
     ]);
-    assert.equal(firstOutcome, 'pairing_started');
-    socket.ev.emit('connection.update', { connection: 'open' });
-    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(firstTransition, 'event_loop_turn');
+    assert.equal(provisioningState, 'pending');
     assert.deepEqual(milestones, []);
     assert.equal(existsSync(ordinary), false, 'session committed before pairing code emission');
+
+    socket.ev.emit('connection.update', { connection: 'connecting' });
+    const secondTransition = await Promise.race([
+      credentialSaveStarted.promise.then(() => 'credential_save_started'),
+      new Promise(resolve => setImmediate(() => resolve('event_loop_turn'))),
+    ]);
+    assert.equal(secondTransition, 'event_loop_turn');
+    assert.equal(provisioningState, 'pending');
+
+    socket.ev.emit('connection.update', { qr: 'provider-private-readiness' });
+    await pairingStarted.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(provisioningState, 'pending');
+    assert.deepEqual(milestones, []);
+    assert.equal(existsSync(ordinary), false, 'session committed during pairing-code request');
 
     pairingResult.resolve('P3ND1NG9');
     assert.deepEqual(await provisioning, {
@@ -1177,13 +1197,13 @@ test('deadline cannot settle or release the lock after canonical rename begins',
         ev,
         user: { id: phoneJid },
         signalRepository: { lidMapping: { getLIDForPN: async () => lidJid } },
-        requestPairingCode: async () => assert.fail('registered fixture must not request a code'),
+        requestPairingCode: async () => 'C4N1N1C4',
         end() {},
       };
       sockets.push(socket);
       return socket;
     },
-    emitCode: () => assert.fail('registered fixture must not emit a code'),
+    emitCode: code => assert.equal(code, 'C4N1N1C4'),
     timeoutMs: 40,
     acquireLock: () => {
       lockHeld = true;
@@ -1196,6 +1216,7 @@ test('deadline cannot settle or release the lock after canonical rename begins',
   });
   try {
     await waitFor(() => sockets.length === 1, 'socket was not created');
+    sockets[0].ev.emit('connection.update', { qr: 'provider-private-readiness' });
     sockets[0].ev.emit('connection.update', { connection: 'open' });
     await confirmationEntered.promise;
     assert.equal(existsSync(path.join(ordinary, 'creds.json')), true, 'canonical rename did not occur');
@@ -1261,12 +1282,12 @@ test('late credential writes in the final drain quiesce before timeout releases 
         ev,
         user: { id: phoneJid },
         signalRepository: { lidMapping: { getLIDForPN: async () => lidJid } },
-        requestPairingCode: async () => assert.fail('registered fixture must not request a code'),
+        requestPairingCode: async () => 'D4R41N3D',
         end() {},
       };
       return socket;
     },
-    emitCode: () => assert.fail('registered fixture must not emit a code'),
+    emitCode: code => assert.equal(code, 'D4R41N3D'),
     timeoutMs: 40,
     acquireLock: () => {
       lockHeld = true;
@@ -1276,6 +1297,7 @@ test('late credential writes in the final drain quiesce before timeout releases 
   try {
     await waitFor(() => Boolean(socket), 'socket was not created');
     socket.ev.emit('creds.update', { late: true });
+    socket.ev.emit('connection.update', { qr: 'provider-private-readiness' });
     socket.ev.emit('connection.update', { connection: 'open' });
     await firstSaveStarted.promise;
     const early = await Promise.race([

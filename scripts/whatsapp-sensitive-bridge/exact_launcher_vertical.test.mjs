@@ -62,6 +62,7 @@ async function provision(role, ordinary, sensitive) {
         await auth.keys.set({ 'lid-mapping': { [PHONE]: LID } });
         auth.creds.registered = true;
         auth.creds.me = { id: socket.user.id, lid: socket.user.lid };
+        listeners.get('connection.update')?.({ qr: 'provider-private-readiness' });
         listeners.get('connection.update')?.({ connection: 'open' });
       });
       return socket;
