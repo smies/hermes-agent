@@ -514,6 +514,8 @@ export async function provisionOffline({
     let finishing = false;
     let generationCounter = 0;
     let activeGeneration = 0;
+    let pendingOpenGeneration = 0;
+    let pendingPairingGeneration = 0;
     let pendingRestartGeneration = 0;
     let restartCount = 0;
     let settled = false;
@@ -530,6 +532,8 @@ export async function provisionOffline({
         if (settled) return false;
         settled = true;
         activeGeneration = 0;
+        pendingOpenGeneration = 0;
+        pendingPairingGeneration = 0;
         pendingRestartGeneration = 0;
         close();
         if (error) reject(error instanceof Error ? error : new Error(error));
@@ -607,8 +611,15 @@ export async function provisionOffline({
             }
             emitCode(code);
             codeEmitted = true;
+            pendingPairingGeneration = 0;
           }
-          if (update?.connection !== 'open') return;
+          const opened = update?.connection === 'open';
+          if (opened && pendingPairingGeneration === generation && !codeEmitted) {
+            pendingOpenGeneration = generation;
+            return;
+          }
+          if (!opened && pendingOpenGeneration !== generation) return;
+          pendingOpenGeneration = 0;
           if (finishing) return;
           finishing = true;
           // Fence later provider writes, then drain every already-scheduled
@@ -730,12 +741,17 @@ export async function provisionOffline({
         candidate.ev.on('creds.update', onCredsUpdate);
         candidate.ev.on('connection.update', (update) => {
           if (!isActive(generation)) return;
+          // Record pairing readiness at ingress so an already-queued open
+          // cannot begin completion before this generation emits its code.
+          if (!pairedCode && update?.qr) pendingPairingGeneration = generation;
           if (update?.connection === 'close') {
             // Fence synchronously at event ingress. An already-entered open
             // handler will observe the lost generation after its next await;
             // the serialized close transition validates restart eligibility
             // after all earlier connection transitions have quiesced.
             activeGeneration = 0;
+            pendingOpenGeneration = 0;
+            pendingPairingGeneration = 0;
             pendingRestartGeneration = generation;
             candidate.ev.off?.('creds.update', onCredsUpdate);
             void enqueueTransition(() => onConnectionUpdate(

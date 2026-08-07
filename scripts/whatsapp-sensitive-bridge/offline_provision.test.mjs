@@ -919,6 +919,82 @@ test('515 recovery rejects pre-registration, repeated restart, save failure, and
   }
 });
 
+test('open waits for its active pairing-code request before completion and commit', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-open-code-race-')));
+  const ordinary = path.join(root, 'ordinary');
+  const sensitive = path.join(root, 'sensitive');
+  const phone = `1${'1'.repeat(10)}`;
+  const phoneJid = `${phone}@s.whatsapp.net`;
+  const lidJid = '171717171@lid';
+  const creds = { registered: true, me: { id: phoneJid, lid: lidJid } };
+  const pairingStarted = deferred();
+  const pairingResult = deferred();
+  const milestones = [];
+  let socket;
+  await chmod(root, 0o700);
+  const request = parseProvisioningRequest({
+    version: 1, action: 'provision', role: 'ordinary', phone,
+    ordinary_session: ordinary, sensitive_session: sensitive,
+  });
+  const provisioning = provisionOffline({
+    request,
+    canonicalizeJid: value => String(value).replace(/:\d+@/, '@'),
+    useAuthState: async session => ({
+      state: {
+        creds,
+        keys: { get: async () => ({ [phone]: lidJid.split('@')[0] }), set: async () => {} },
+      },
+      saveCreds: async () => {
+        await writeFile(path.join(session, 'creds.json'), JSON.stringify(creds), { mode: 0o600 });
+      },
+    }),
+    makeSocket: () => {
+      const ev = new EventEmitter();
+      socket = {
+        ev,
+        user: { id: phoneJid },
+        signalRepository: { lidMapping: { getLIDForPN: async () => lidJid } },
+        requestPairingCode: async () => {
+          pairingStarted.resolve();
+          return pairingResult.promise;
+        },
+        end() {},
+      };
+      return socket;
+    },
+    emitCode: code => {
+      assert.equal(code, 'P3ND1NG9');
+      milestones.push('code');
+    },
+    beforeDurableConfirmation: async () => { milestones.push('commit'); },
+    timeoutMs: 2_000,
+  });
+  try {
+    await waitFor(() => Boolean(socket), 'socket was not created');
+    socket.ev.emit('connection.update', { connection: 'open' });
+    socket.ev.emit('connection.update', { qr: 'provider-private-readiness' });
+    const firstOutcome = await Promise.race([
+      pairingStarted.promise.then(() => 'pairing_started'),
+      provisioning.then(() => 'completed', () => 'failed'),
+    ]);
+    assert.equal(firstOutcome, 'pairing_started');
+    socket.ev.emit('connection.update', { connection: 'open' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(milestones, []);
+    assert.equal(existsSync(ordinary), false, 'session committed before pairing code emission');
+
+    pairingResult.resolve('P3ND1NG9');
+    assert.deepEqual(await provisioning, {
+      account_namespace: 's.whatsapp.net', lid_ready: true,
+    });
+    assert.deepEqual(milestones, ['code', 'commit']);
+  } finally {
+    pairingResult.resolve('P3ND1NG9');
+    await provisioning.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('close ingress suppresses a blocked pairing code before non-515 failure', async () => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hermes-wa-pair-close-')));
   const ordinary = path.join(root, 'ordinary');
