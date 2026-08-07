@@ -1,12 +1,14 @@
 # ADR: Juno learns locally and consults Kite for private authority
 
-- **Status:** accepted architecture; implementation and deployment are not commissioned
+- **Status:** accepted architecture; implementation commissioned on `deploy/juno-20260804`, not deployed
 - **Decision date:** 2026-08-07
-- **Scope:** documentation only
+- **Scope:** architecture plus commissioned branch implementation
 
-This ADR is the authoritative direction for Juno–Kite work. It authorizes no
-code, configuration, credential, service, pairing, mailbox, policy-store, or
-runtime change. Private read remains disabled. The superseded designs remain
+This ADR is the authoritative direction for Juno–Kite work. The frozen working
+vertical is commissioned as plugin code, configuration documentation, and
+tests on the named branch only. It does not authorize deployment, live-profile
+configuration, credential, service, pairing, mailbox, provider, or private-read
+runtime changes. Private read remains disabled. The superseded designs remain
 in the repository as history and are neither activated nor deleted by this
 decision.
 

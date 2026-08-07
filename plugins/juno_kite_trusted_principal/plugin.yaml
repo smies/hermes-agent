@@ -1,0 +1,14 @@
+name: juno_kite_trusted_principal
+label: Juno--Kite trusted principal
+kind: standalone
+version: "0.1.0"
+description: >
+  Host-bound, principal-scoped Juno-to-Kite consultation using standard A2A,
+  session ContextVars, exact-argument policy hooks, and signed minimized output.
+author: Nous Research
+provides_tools:
+  - consult_kite
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - transform_llm_output

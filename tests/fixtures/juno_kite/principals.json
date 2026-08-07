@@ -1,0 +1,4 @@
+[
+  {"platform": "telegram", "user_id": "fixture-user-101", "principal": "james"},
+  {"platform": "telegram", "user_id": "fixture-user-202", "principal": "lucy"}
+]
