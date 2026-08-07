@@ -49,22 +49,33 @@ learning first, including policy-safe built-in memory. **When that context is
 sufficient, Juno answers directly and does not call Kite.** Juno may learn from
 the conversation through the normal Hermes memory/session mechanisms.
 
+Juno also keeps a deliberately low-privilege direct toolset. It should use
+public-information tools such as web search and extraction itself, without
+turning Kite into a proxy. It may also use other explicitly allowlisted
+low-privilege tools and actions that belong to Juno's own authority. Tool
+availability is not authorization: any external mutation still requires the
+applicable principal policy and exact-argument gate.
+
 Generic profile-wide `session_search` is not automatically principal-scoped.
 Juno must not use it for person-specific recall unless a host-enforced
 principal/session filter exists and has been verified. The standard active
 session remains the initial scoped recall boundary; this ADR does not invent a
-replacement session-search subsystem.
+replacement session-search subsystem. With that verified filter (or a
+dedicated standard profile for the principal), Juno may search its own session
+history directly and does not consult Kite merely to recall Juno's own past.
 
 Only when the answer or requested action requires Kite's private/global
-knowledge, credentials, or tools does Juno call a host-bound `consult_kite`
-surface. That surface uses standard A2A to reach the independent Kite profile.
-Kite, not a separate daemon, is the broker: it interprets policy, consults its
-own context and resources, uses its existing tools where allowed, and returns a
-minimized answer.
+knowledge, Kite-held credentials, or higher authority does Juno call a
+host-bound `consult_kite` surface. That surface uses standard A2A to reach the
+independent Kite profile. Kite, not a separate daemon, is the broker: it
+interprets policy, consults its own context and resources, uses its existing
+tools where allowed, and returns a minimized answer.
 
-MCP and other connectors belong inside Kite. They expose resources and tools
-to Kite, not to Juno. A2A is for the Juno-to-Kite agent boundary; MCP is for
-resource and tool access within Kite. Juno never receives Kite's raw tool
+Private or credential-bearing MCP and other connectors belong inside Kite.
+They expose those private resources and tools to Kite, not to Juno. A2A is for
+the Juno-to-Kite agent boundary; MCP remains available to whichever profile
+legitimately owns a connection. Juno's public and low-privilege direct tools do
+not need to be routed through Kite. Juno never receives Kite's raw tool
 schemas, raw source results, private memory, or credentials.
 
 The initial custom surface is limited to:
@@ -78,6 +89,30 @@ The initial custom surface is limited to:
 
 No other broker, identity, memory, credential, transport, or core-agent layer
 is part of the first implementation.
+
+## Juno's direct low-privilege capabilities
+
+Juno is not a restricted chat frontend whose only useful tool is
+`consult_kite`. Its standard profile should directly expose the smallest
+allowlist needed for ordinary independent assistance, including:
+
+- public web search and public-page extraction;
+- the active Juno conversation and verified principal-scoped search over
+  Juno's own sessions;
+- local, non-sensitive reasoning utilities; and
+- other explicitly approved low-privilege reads or actions whose credentials
+  and authority, if any, are intentionally owned by Juno.
+
+Public read-only use does not require a Kite consultation or private-disclosure
+decision. A Juno-owned action may also execute directly when the authenticated
+principal's standing policy permits the exact call and the action gate passes.
+Juno delegates when it needs Kite's private knowledge, Kite-held account
+authority, or a higher-risk decision—not merely because the task uses a tool.
+
+Do not duplicate Kite's credentials into Juno to make an action direct. Do not
+describe unfiltered profile-wide session search as "Juno's own sessions" in a
+multi-principal profile. The host-selected principal/session scope is the
+boundary, and an absent or ambiguous scope fails closed.
 
 ## Identity and authority
 
@@ -203,6 +238,17 @@ resource.
 3. If sufficient, Juno answers directly and learns normally. Kite is not
    contacted.
 
+### Direct low-privilege lookup or action
+
+1. Juno selects a tool from its restricted direct allowlist, such as public
+   web search or verified principal-scoped search of Juno's own sessions.
+2. Public read-only calls execute directly. No Kite turn is created.
+3. Any mutating call is canonicalized and checked against the authenticated
+   principal, exact arguments, destination, and Juno's granted authority.
+4. If the operation instead needs Kite-held credentials, private context, or
+   higher authority, Juno does not expand its own privileges; it uses
+   `consult_kite`.
+
 ### Read-only Kite consultation
 
 1. Juno decides that scoped private/global knowledge is required and calls
@@ -244,14 +290,18 @@ a callback exception as denial.
 
 Implement only one thin vertical at a time:
 
-1. **Read-only A2A, memory first.** Use standard Juno and Kite profiles,
-   sessions, and A2A. Add only `consult_kite`, the stable opaque mapping, and
-   bounded handoff. Demonstrate Juno answering locally when it can, then one
-   correctly scoped Kite consultation. Keep all action tools off.
+1. **Direct public/session reads, then read-only A2A.** Use standard Juno and
+   Kite profiles, sessions, and A2A. Confirm Juno can search the public web and
+   its verified principal-scoped own sessions without Kite. Add only
+   `consult_kite`, the stable opaque mapping, and bounded handoff. Demonstrate
+   Juno answering locally when it can, then one correctly scoped Kite
+   consultation. Keep mutating tools off.
 2. **Generated policy and disclosure.** Add the source-agnostic policy view and
    Kite plugin. Prove correct-principal routing, cross-principal denial, mapped
    context reuse, minimization, partial answers, and no raw-result return.
-3. **One exact-arguments low-risk action.** Reuse one existing tool. Prove the
+3. **One exact-arguments low-risk action.** Reuse one existing tool. Prefer a
+   direct Juno action when it needs only Juno's deliberately limited authority;
+   use Kite when the credential or private context is Kite-owned. Prove the
    exact tool/arguments gate and all deny paths before enabling it.
 4. **Durable approval only when a real operation requires it.** Add the minimum
    frozen-grant persistence only for a demonstrated delayed, restartable,
@@ -276,8 +326,11 @@ authorization service fails this ADR's maintenance test and does not proceed.
 Do not build now:
 
 - a separate broker daemon—Kite is the broker;
-- duplicate provider credentials, connectors, or source adapters in Juno, or
-  a parallel replacement for Juno's standard session and memory substrate;
+- forcing Juno's public web tools or safely scoped own-session recall through
+  Kite;
+- duplicate private provider credentials, connectors, or source adapters in
+  Juno, or a parallel replacement for Juno's standard session and memory
+  substrate;
 - a preference database or shared-memory service;
 - a credential executor or a new core model tool;
 - per-source policy or a Gmail-specific newest-message flow;
