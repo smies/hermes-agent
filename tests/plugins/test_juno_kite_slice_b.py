@@ -1215,6 +1215,56 @@ def test_output_tiers(question, tier):
     assert classify_output_tier(question) == tier
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Named real-world documents: people do not say "PDF" or "file".
+        "Send me the nacho engagement letter",
+        "attach the engagement letter",
+        "email me the file",
+        "forward me the birth certificate",
+        "can you send me the tenancy agreement",
+        "whatsapp me Albie's boarding pass",
+        "I need the survey report",
+        "share my driving licence",
+        "send me the signed engagement letter PDF from Nacho",
+        # Existing artifact-noun phrasings must keep working.
+        "send me the passport scan",
+        "send me the document",
+        # Plural and polite forms.
+        "send over the boarding passes",
+        "can you send me the engagement letter",
+    ],
+)
+def test_named_document_requests_select_the_document_tier(question):
+    assert classify_output_tier(question) == DOCUMENT_DESCRIPTOR
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Informational intent wins even next to a delivery verb, so an
+        # ordinary question never escalates into a file-release proposal.
+        "what did nacho say",
+        "send me a summary of the engagement letter",
+        "tell me about the engagement letter",
+        "what's in the terms of business",
+        "when did nacho email",
+        "send me an update on the villa",
+        "send me a note about the letter",
+        "remind me about the tenancy agreement",
+        # A question about a document is not a request to be sent one.
+        "did nacho send the agreement",
+        "has the certificate arrived",
+        "is the tenancy agreement signed",
+        "have you got the invoice",
+        "send Lucy a note",
+    ],
+)
+def test_informational_requests_stay_minimized(question):
+    assert classify_output_tier(question) == MINIMIZED
+
+
 def test_semantic_james_lucy_domain_matrix():
     shared = {
         "juno.shared.children",

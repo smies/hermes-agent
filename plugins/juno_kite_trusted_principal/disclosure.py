@@ -58,12 +58,40 @@ _RAW_PATTERNS = (
         r"(?i)\b(?:dump|export)\b.{0,32}\b(?:Property Intel|property records?|portal records?)\b"
     ),
 )
+_DOCUMENT_DELIVERY = (
+    r"(?:send|forward|attach|share|deliver|upload|download|give\s+me|"
+    r"email\s+me|whatsapp\s+me|text\s+me|i\s+need)"
+)
+_DOCUMENT_ARTIFACT = r"(?:document|scan|passport|pdf|file|attachment|copy)"
+# Real-world document names people actually use.  A request rarely says "PDF";
+# it says "the engagement letter" or "Albie's boarding pass".
+_DOCUMENT_NOUN = (
+    r"(?:letter|certificate|agreement|contract|invoice|statement|report|pass|"
+    r"ticket|licence|license|deed|policy|form|receipt|itinerary|permit|record)"
+    r"(?:e?s)?"
+)
+# Informational intent, which must never escalate into a file release even when
+# it sits next to a delivery verb ("send me a summary of the engagement letter").
+_DOCUMENT_INFORMATIONAL = re.compile(
+    r"(?i)(?:\b(?:summary|summarise|summarize|update|note|gist|overview|"
+    r"tell\s+me|remind|what|when|who|how|why|which|where)\b"
+    # A leading auxiliary makes it a question about a document, not a request
+    # for one ("did nacho send the agreement").
+    r"|^\s*(?:did|do|does|has|have|had|is|are|was|were|will|can|could|should)\b"
+    r"(?!\s+you\s+" + _DOCUMENT_DELIVERY + r"\b))"
+)
 _DOCUMENT_PATTERNS = (
     re.compile(
-        r"(?i)\b(?:send|deliver|attach|upload|download|give me)\b.{0,40}\b(?:document|scan|passport|pdf|file|attachment)\b"
+        r"(?i)\b" + _DOCUMENT_DELIVERY + r"\b.{0,40}\b" + _DOCUMENT_ARTIFACT + r"\b"
     ),
     re.compile(
-        r"(?i)\b(?:full|actual|original)\s+(?:document|scan|passport|pdf|file|attachment)\b"
+        r"(?i)\b(?:full|actual|original)\s+" + _DOCUMENT_ARTIFACT + r"\b"
+    ),
+    # Delivery of a definite or possessive named document.
+    re.compile(
+        r"(?i)\b" + _DOCUMENT_DELIVERY + r"\b[^.?!]{0,40}?"
+        r"(?:\b(?:the|my|our|his|her|their|this|that)\b\s+|\b[a-z]+['\u2019]s\s+)"
+        r"(?:[a-z0-9'\u2019\-]+\s+){0,3}" + _DOCUMENT_NOUN + r"\b"
     ),
 )
 _EXCERPT_PATTERNS = (
@@ -76,7 +104,9 @@ def classify_output_tier(question: str) -> str:
     value = str(question or "")
     if any(pattern.search(value) for pattern in _RAW_PATTERNS):
         return BULK_RAW
-    if any(pattern.search(value) for pattern in _DOCUMENT_PATTERNS):
+    if not _DOCUMENT_INFORMATIONAL.search(value) and any(
+        pattern.search(value) for pattern in _DOCUMENT_PATTERNS
+    ):
         return DOCUMENT_DESCRIPTOR
     if any(pattern.search(value) for pattern in _EXCERPT_PATTERNS):
         return BOUNDED_EXCERPT
