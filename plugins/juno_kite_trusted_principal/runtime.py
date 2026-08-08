@@ -20,6 +20,7 @@ import time
 import urllib.request
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
@@ -161,44 +162,17 @@ _PROPERTY_TABLE_SEPARATOR_PATTERN = re.compile(
 
 _PRIVATE_SOURCE_FRAGMENT_CHARS = 48
 _PRIVATE_SOURCE_MAX_RECORDED_FRAGMENTS = 128
-# Minimized answers may repeat a small amount of source identity (for example,
-# email subjects). These independent bounds allow at most twelve distinct
-# matched fragments and at most 480 matched provenance characters per answer.
 _MINIMIZED_PROVENANCE_MAX_DISTINCT_FRAGMENTS = 12
 _MINIMIZED_PROVENANCE_MAX_TOTAL_CHARS = 480
 _PROVENANCE_IDENTITY_FIELDS = frozenset({
-    "author",
-    "authorname",
-    "bcc",
-    "canonicaltitle",
-    "cc",
-    "date",
-    "datetime",
-    "documenttitle",
-    "filename",
-    "from",
-    "sender",
-    "sendername",
-    "subject",
-    "time",
-    "timestamp",
-    "title",
-    "to",
+    "author", "authorname", "bcc", "canonicaltitle", "cc", "date",
+    "datetime", "documenttitle", "filename", "from", "sender",
+    "sendername", "subject", "time", "timestamp", "title", "to",
 })
 _CONTENT_FIELDS = frozenset({
-    "attachmenttext",
-    "body",
-    "content",
-    "description",
-    "extractedtext",
-    "html",
-    "htmlbody",
-    "message",
-    "notes",
-    "plaintext",
-    "snippet",
-    "text",
-    "transcript",
+    "attachmenttext", "body", "content", "description", "extractedtext",
+    "html", "htmlbody", "message", "notes", "plaintext", "snippet",
+    "text", "transcript",
 })
 
 
@@ -315,6 +289,7 @@ class AudienceBinding:
     effective_action_capability_ids: tuple[str, ...]
     private_eligible: bool
     policy_generation: str
+    human_principals: tuple[str, ...] = ()
     revalidate: Optional[Callable[[], dict]] = None
 
 
@@ -459,6 +434,25 @@ class TrustedPrincipalRuntime:
         # Open durable state only after the entire behavior/authority config
         # validates, so a malformed profile cannot create partial state.
         self.store = MappingStore(Path(str(section["mapping_path"])), self.mapping_key)
+        from .document_release import DocumentReleaseService
+
+        self.document_releases = DocumentReleaseService(
+            section.get("document_release"),
+            store=self.store,
+            mapping_key=self.mapping_key,
+            clock=self.clock,
+        )
+        if self.document_releases.enabled:
+            if not self.private_reads.enabled:
+                raise ValueError("document release requires Slice B private reads")
+            james_caps = self.principal_read_capabilities.get("james")
+            if not james_caps or "juno.private.james" not in james_caps:
+                raise ValueError("document release requires the exact James private capability")
+            if any(
+                name != "james" and "juno.private.james" in capabilities
+                for name, capabilities in self.principal_read_capabilities.items()
+            ):
+                raise ValueError("the James-only document phase cannot be shared")
 
     @staticmethod
     def _load_limits(raw: Any) -> Limits:
@@ -943,6 +937,7 @@ class TrustedPrincipalRuntime:
             effective_action_capability_ids=action_caps,
             private_eligible=bool(read_caps),
             policy_generation=self.policy_generation,
+            human_principals=tuple(sorted(proved_principals)),
             revalidate=revalidate,
         )
 
@@ -974,6 +969,7 @@ class TrustedPrincipalRuntime:
             ),
             private_eligible=bool(self.principal_read_capabilities[principal]),
             policy_generation=self.policy_generation,
+            human_principals=(principal,),
         )
 
     def current_audience_binding(self) -> AudienceBinding:
@@ -995,6 +991,129 @@ class TrustedPrincipalRuntime:
             "redact_scope": True,
         }
 
+    @staticmethod
+    def _is_document_approval_text(value: Any) -> bool:
+        text = str(value or "").strip()
+        return text == "APPROVE" or text.startswith("APPROVE ")
+
+    @staticmethod
+    async def _send_document_receipt(adapter: Any, chat_id: str, text: str) -> None:
+        send = getattr(adapter, "send", None)
+        if not callable(send):
+            return
+        try:
+            await send(chat_id=chat_id, content=text)
+        except Exception:
+            logger.warning("Juno document receipt transport failed closed")
+
+    async def _handle_document_approval(
+        self,
+        *,
+        event: Any,
+        adapter: Any,
+        audience: AudienceBinding,
+    ) -> dict:
+        """Consume and dispatch one exact approval without invoking the model."""
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        denied = "Document release denied."
+        text = str(getattr(event, "text", "") or "").strip()
+        match = re.fullmatch(r"APPROVE (C7-[A-Z2-9]{16})", text)
+        if (
+            match is None
+            or audience.principal.casefold() != "james"
+            or audience.human_principals != ("james",)
+            or "juno.private.james" not in audience.effective_read_capability_ids
+        ):
+            await self._send_document_receipt(adapter, chat_id, denied)
+            return self._ingress_skip("document-release-handled")
+
+        record = None
+        try:
+            self.document_releases.cleanup()
+            record = self.document_releases.claim(
+                match.group(1),
+                principal=audience.principal,
+                policy_generation=self.policy_generation,
+                audience_digest=audience.audience_digest,
+                conversation_binding=audience.conversation_binding,
+                roster_generation=audience.roster_generation,
+            )
+            if record is None or record.state != "dispatching":
+                if record is not None:
+                    self.document_releases.unlink_record(record)
+                await self._send_document_receipt(adapter, chat_id, denied)
+                return self._ingress_skip("document-release-handled")
+
+            # A second managed-roster read sits immediately at the final effect
+            # boundary. No staged bytes are handed to transport before it and
+            # the artifact identity check both succeed.
+            await asyncio.to_thread(self._revalidate_audience, audience)
+            expected_destination = self._opaque_digest(
+                "conversation-v2",
+                {"platform": "whatsapp", "kind": audience.conversation_kind, "chat": chat_id},
+            )
+            if not hmac.compare_digest(
+                expected_destination, record.conversation_binding
+            ):
+                raise ValueError("document destination changed")
+            path = self.document_releases.revalidate(record)
+            send_document = getattr(adapter, "send_document", None)
+            if not callable(send_document):
+                raise ValueError("authenticated document delivery seam is unavailable")
+            from .document_release import ALLOWED_MIME_EXTENSIONS
+
+            extension = ALLOWED_MIME_EXTENSIONS.get(record.artifact_mime)
+            if extension is None:
+                raise ValueError("document MIME is unsupported")
+        except Exception as exc:
+            logger.warning("Juno document dispatch denied: %s", type(exc).__name__)
+            if record is not None and record.state == "dispatching":
+                self.document_releases.terminalize(record, "denied")
+                self.document_releases.unlink_record(record)
+            await self._send_document_receipt(adapter, chat_id, denied)
+            return self._ingress_skip("document-release-handled")
+
+        try:
+            result = await send_document(
+                chat_id=chat_id,
+                file_path=str(path),
+                file_name="requested-document" + extension,
+            )
+            success = getattr(result, "success", None)
+            message_id = getattr(result, "message_id", None)
+            if success is True and isinstance(message_id, str) and message_id:
+                terminal = "delivered"
+                receipt_text = "Document delivered. Receipt: delivered."
+                provider_receipt = message_id
+            elif success is False:
+                terminal = "failed"
+                receipt_text = "Document delivery failed. Receipt: failed."
+                provider_receipt = ""
+            else:
+                terminal = "uncertain"
+                receipt_text = (
+                    "Document delivery uncertain. Receipt: uncertain; no retry will occur."
+                )
+                provider_receipt = ""
+        except Exception:
+            terminal = "uncertain"
+            receipt_text = (
+                "Document delivery uncertain. Receipt: uncertain; no retry will occur."
+            )
+            provider_receipt = ""
+
+        if not self.document_releases.terminalize(
+            record, terminal, provider_receipt=provider_receipt
+        ):
+            terminal = "uncertain"
+            receipt_text = (
+                "Document delivery uncertain. Receipt: uncertain; no retry will occur."
+            )
+        if terminal != "uncertain":
+            self.document_releases.unlink_record(record)
+        await self._send_document_receipt(adapter, chat_id, receipt_text)
+        return self._ingress_skip("document-release-handled")
+
     async def pre_gateway_dispatch(
         self,
         event: Any = None,
@@ -1011,8 +1130,15 @@ class TrustedPrincipalRuntime:
         platform_value = getattr(getattr(source, "platform", None), "value", None)
         platform = str(platform_value or getattr(source, "platform", "") or "").lower()
         user_id = str(getattr(source, "user_id", "") or "")
+        is_document_approval = bool(
+            self.document_releases.enabled
+            and platform == "whatsapp"
+            and self._is_document_approval_text(getattr(event, "text", ""))
+        )
         matches = self._principal_for_transport_identity(platform, user_id)
         if not matches:
+            if is_document_approval:
+                return self._ingress_skip("document-release-handled")
             return None
         # Ambiguous configured identities are protected and therefore skipped,
         # never passed through to pairing/auth/model behavior.
@@ -1026,9 +1152,18 @@ class TrustedPrincipalRuntime:
             if chat_type not in {"dm", "group"} or not eligibility[chat_type]:
                 return self._ingress_skip("conversation-ineligible")
             if chat_type == "dm":
-                _ACTIVE_AUDIENCE.set(
-                    self._single_principal_audience(principal, platform, chat_id)
-                )
+                audience = self._single_principal_audience(principal, platform, chat_id)
+                _ACTIVE_AUDIENCE.set(audience)
+                if (
+                    self.document_releases.enabled
+                    and platform == "whatsapp"
+                    and self._is_document_approval_text(getattr(event, "text", ""))
+                ):
+                    adapters = getattr(gateway, "adapters", None) or {}
+                    adapter = adapters.get(getattr(source, "platform", None))
+                    return await self._handle_document_approval(
+                        event=event, adapter=adapter, audience=audience
+                    )
                 return self._ingress_allow(critical_ingress_token)
             if (
                 platform != "whatsapp"
@@ -1071,15 +1206,21 @@ class TrustedPrincipalRuntime:
                 asyncio.to_thread(provider),
                 timeout=self.limits.roster_timeout_seconds + 0.5,
             )
-            _ACTIVE_AUDIENCE.set(
-                self._audience_from_roster(
-                    initiating_principal=principal,
-                    platform=platform,
-                    chat_id=chat_id,
-                    roster=roster,
-                    revalidate=provider,
-                )
+            audience = self._audience_from_roster(
+                initiating_principal=principal,
+                platform=platform,
+                chat_id=chat_id,
+                roster=roster,
+                revalidate=provider,
             )
+            _ACTIVE_AUDIENCE.set(audience)
+            if (
+                self.document_releases.enabled
+                and self._is_document_approval_text(getattr(event, "text", ""))
+            ):
+                return await self._handle_document_approval(
+                    event=event, adapter=adapter, audience=audience
+                )
             return self._ingress_allow(critical_ingress_token)
         except asyncio.CancelledError:
             raise
@@ -1123,6 +1264,7 @@ class TrustedPrincipalRuntime:
             binding.effective_read_capability_ids,
             binding.effective_action_capability_ids,
             binding.private_eligible,
+            binding.human_principals,
         )
         observed = (
             current.conversation_binding,
@@ -1131,6 +1273,7 @@ class TrustedPrincipalRuntime:
             current.effective_read_capability_ids,
             current.effective_action_capability_ids,
             current.private_eligible,
+            current.human_principals,
         )
         if not hmac.compare_digest(
             hashlib.sha256(canonical_json(expected).encode()).digest(),
@@ -1583,9 +1726,11 @@ class TrustedPrincipalRuntime:
                 "failures": set(),
                 "gmail_messages": set(),
                 "gmail_attachments": set(),
+                "personal_files": set(),
                 "content_fragments": set(),
                 "provenance_fragments": set(),
                 "successful_tools": set(),
+                "document_candidates": [],
             })
             return {"context": self._policy_view(binding)}
         except Exception as exc:
@@ -1672,7 +1817,7 @@ class TrustedPrincipalRuntime:
             f"{tool_name}\0{canonical_json(args)}".encode("utf-8")
         ).hexdigest()
 
-    def _private_read_state(self) -> dict[str, set[str]]:
+    def _private_read_state(self) -> dict[str, Any]:
         state = _ACTIVE_PRIVATE_READS.get()
         if (
             not isinstance(state, dict)
@@ -1683,9 +1828,11 @@ class TrustedPrincipalRuntime:
                 "failures",
                 "gmail_messages",
                 "gmail_attachments",
+                "personal_files",
                 "content_fragments",
                 "provenance_fragments",
                 "successful_tools",
+                "document_candidates",
             }
             or not isinstance(state["authorized"], set)
             or not isinstance(state["dispatched"], set)
@@ -1693,6 +1840,8 @@ class TrustedPrincipalRuntime:
             or not isinstance(state["content_fragments"], set)
             or not isinstance(state["provenance_fragments"], set)
             or not isinstance(state["successful_tools"], set)
+            or not isinstance(state["personal_files"], set)
+            or not isinstance(state["document_candidates"], list)
         ):
             raise ValueError("private read authorization state is missing")
         return state
@@ -1709,7 +1858,7 @@ class TrustedPrincipalRuntime:
         """Handler-bound defense: require the final-dispatch fingerprint."""
         source = tool_name.removeprefix("kite_").split("_", 1)[0]
         try:
-            self._current_valid_binding(session_id=str(session_id or ""))
+            binding = self._current_valid_binding(session_id=str(session_id or ""))
             if tool_name not in self.private_read_tool_names or not isinstance(
                 args, dict
             ):
@@ -1719,7 +1868,25 @@ class TrustedPrincipalRuntime:
             if digest not in state["dispatched"]:
                 raise ValueError("private read did not pass exact final dispatch")
             state["dispatched"].remove(digest)
-            result = self.private_reads.execute(tool_name, args)
+            candidate_source = None
+            if (
+                binding.output_tier == "specific_full_document_descriptor"
+                and self.document_releases.enabled
+                and tool_name
+                in {
+                    "kite_personal_files_read",
+                    "kite_gmail_attachment_extract",
+                }
+                and (
+                    tool_name == "kite_gmail_attachment_extract"
+                    or args.get("operation") == "read"
+                )
+            ):
+                result, candidate_source = self.private_reads.resolve_document_candidate(
+                    tool_name, args
+                )
+            else:
+                result = self.private_reads.execute(tool_name, args)
             try:
                 parsed = json.loads(result)
                 if isinstance(parsed, dict) and parsed.get("status") == "error":
@@ -1735,6 +1902,48 @@ class TrustedPrincipalRuntime:
                 elif isinstance(parsed, dict) and parsed.get("status") == "ok":
                     state["successful_tools"].add(tool_name)
                     data = parsed.get("data")
+                    if candidate_source is not None:
+                        try:
+                            if "path" in candidate_source:
+                                candidate = self.document_releases.stage_path(
+                                    candidate_source["path"],
+                                    source_class=candidate_source["source_class"],
+                                    display_name=candidate_source["display_name"],
+                                    expected_identity=candidate_source.get(
+                                        "expected_identity"
+                                    ),
+                                    inspection_text=candidate_source.get(
+                                        "inspection_text", ""
+                                    ),
+                                )
+                            else:
+                                candidate = self.document_releases.stage_bytes(
+                                    candidate_source["bytes"],
+                                    source_class=candidate_source["source_class"],
+                                    display_name=candidate_source["display_name"],
+                                    inspection_text=candidate_source.get(
+                                        "inspection_text", ""
+                                    ),
+                                )
+                            if (
+                                candidate.mime_type != candidate_source["expected_mime"]
+                                or candidate.size_bytes != candidate_source["expected_size"]
+                            ):
+                                self.document_releases.discard_candidate(candidate)
+                                raise ValueError("typed source descriptor mismatched artifact")
+                            state["document_candidates"].append(candidate)
+                        except Exception:
+                            state["failures"].add(f"{source}:release_denied")
+                            return canonical_json({
+                                "status": "error",
+                                "source": source,
+                                "complete": False,
+                                "error": {
+                                    "code": "release_denied",
+                                    "message": "document candidate failed the release gate",
+                                    "retryable": False,
+                                },
+                            })
                     stack: list[tuple[Any, tuple[str, ...]]] = [(data, ())]
                     while stack and (
                         len(state["content_fragments"])
@@ -1778,6 +1987,19 @@ class TrustedPrincipalRuntime:
                                 if isinstance(message_id, str) and message_id:
                                     state["gmail_messages"].add(
                                         f"{account}\0{message_id}"
+                                    )
+                    elif (
+                        tool_name == "kite_personal_files_read"
+                        and args.get("operation") == "search"
+                        and isinstance(data, list)
+                    ):
+                        for item in data:
+                            if isinstance(item, dict):
+                                root = item.get("root")
+                                relative = item.get("relative_path")
+                                if isinstance(root, str) and isinstance(relative, str):
+                                    state["personal_files"].add(
+                                        f"{root}\0{relative}"
                                     )
                     elif tool_name == "kite_gmail_get" and isinstance(data, dict):
                         message_id = str(args.get("message_id") or "")
@@ -1867,6 +2089,20 @@ class TrustedPrincipalRuntime:
             if reference not in state["gmail_attachments"]:
                 return self._block(
                     "Gmail attachment ID was not returned by this exact message read"
+                )
+        if (
+            binding.output_tier == "specific_full_document_descriptor"
+            and self.document_releases.enabled
+            and tool_name == "kite_personal_files_read"
+            and args.get("operation") == "read"
+        ):
+            reference = (
+                f"{str(args.get('root') or '')}\0"
+                f"{str(args.get('relative_path') or '')}"
+            )
+            if reference not in state["personal_files"]:
+                return self._block(
+                    "personal file was not returned by this exact bounded search"
                 )
         digest = self._private_read_fingerprint(tool_name, args)
         state["authorized"].add(digest)
@@ -2134,17 +2370,81 @@ class TrustedPrincipalRuntime:
                 return "Property JSON/container dump"
         return ""
 
+    def _document_release_answer(
+        self, binding: TurnBinding, model_text: str, state: dict[str, Any]
+    ) -> str:
+        """Convert one staged candidate into a deterministic approval preview."""
+        candidates = list(state["document_candidates"])
+        try:
+            if state["failures"] or len(candidates) != 1:
+                raise ValueError("one complete staged candidate is required")
+            if (
+                binding.mapping is None
+                or binding.request is None
+                or binding.mapping.principal.casefold() != "james"
+                or "juno.private.james"
+                not in binding.effective_read_capability_ids
+            ):
+                raise ValueError("the phase-one James-only binding is unavailable")
+            selection = json.loads(str(model_text or ""))
+            if not isinstance(selection, dict) or set(selection) != {"capability_id"}:
+                raise ValueError("release selection must choose one semantic capability")
+            capability_id = selection.get("capability_id")
+            purpose_by_capability = {
+                "juno.shared.family": "family administration",
+                "juno.shared.children": "family administration",
+                "juno.shared.mauritius": "travel administration",
+                "juno.shared.property_intel": "property administration",
+                "juno.shared.villa_lena": "property administration",
+            }
+            if (
+                not isinstance(capability_id, str)
+                or capability_id not in purpose_by_capability
+                or capability_id not in binding.effective_read_capability_ids
+            ):
+                raise ValueError("document domain is outside the effective policy")
+            candidate = candidates[0]
+            code, expires_at = self.document_releases.issue(
+                candidate,
+                request=binding.request,
+                principal=binding.mapping.principal,
+            )
+            return canonical_json({
+                "outcome": "approval_required",
+                "document": {
+                    "title": candidate.title,
+                    "source_class": candidate.source_class,
+                    "mime_type": candidate.mime_type,
+                    "size_bytes": candidate.size_bytes,
+                    "page_count": candidate.page_count,
+                },
+                "audience": "James only in this WhatsApp conversation",
+                "purpose": purpose_by_capability[capability_id],
+                "approval": {
+                    "code": code,
+                    "instruction": f"APPROVE {code}",
+                    "expires_at": datetime.fromtimestamp(
+                        expires_at, tz=timezone.utc
+                    ).isoformat(),
+                },
+            })
+        except Exception:
+            for candidate in candidates:
+                self.document_releases.discard_candidate(candidate)
+            return canonical_json({
+                "outcome": "denied",
+                "reason": "specific document release is unavailable under the current exact binding",
+            })
+
     @staticmethod
     def _private_source_overlap_leak_reason(
         answer: str,
         output_tier: str,
-        state: dict[str, set[str]],
+        state: dict[str, Any],
     ) -> str:
         """Allow only bounded path-tagged provenance in minimized answers."""
         content_overlaps = {
-            fragment
-            for fragment in state["content_fragments"]
-            if fragment in answer
+            fragment for fragment in state["content_fragments"] if fragment in answer
         }
         provenance_overlaps = {
             fragment
@@ -2197,10 +2497,14 @@ class TrustedPrincipalRuntime:
                         "reason": "bulk/raw private-source export is not permitted",
                     })
                 elif binding.output_tier == "specific_full_document_descriptor":
-                    answer = canonical_json({
-                        "outcome": "unavailable_next_gate",
-                        "reason": "specific document delivery is unavailable until Slice C",
-                    })
+                    if self.document_releases.enabled:
+                        state = self._private_read_state()
+                        answer = self._document_release_answer(binding, answer, state)
+                    else:
+                        answer = canonical_json({
+                            "outcome": "unavailable_next_gate",
+                            "reason": "specific document delivery is unavailable until Slice C",
+                        })
                 else:
                     state = self._private_read_state()
                     failures = sorted(state["failures"])

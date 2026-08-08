@@ -8,6 +8,7 @@ an argv vector with ``shell=False`` and HTTP uses fixed GET-only routes.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import mimetypes
@@ -66,6 +67,9 @@ _SAFE_EXTENSIONS = frozenset({
     ".yml",
     ".pdf",
     ".docx",
+    ".jpg",
+    ".jpeg",
+    ".png",
 })
 _EXTRACTABLE_MIME = frozenset({
     "text/plain",
@@ -73,6 +77,8 @@ _EXTRACTABLE_MIME = frozenset({
     "text/markdown",
     "application/json",
     "application/pdf",
+    "image/jpeg",
+    "image/png",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 })
 _WORK_FIELDS = frozenset({
@@ -227,7 +233,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
     },
     "kite_gmail_attachment_extract": {
-        "description": "Privately extract one exact supported non-executable Gmail attachment; never delivers the binary.",
+        "description": (
+            "Privately extract one exact supported non-executable Gmail attachment. "
+            "Only the separately gated Slice C flow may stage its exact binary."
+        ),
         "parameters": _object_schema(
             {
                 "account": {"type": "string", "enum": ["personal", "kite"]},
@@ -720,6 +729,16 @@ class PrivateReadService:
         return result
 
     def _gmail_attachment(self, args: dict[str, Any]) -> Any:
+        result = self._gmail_attachment_payload(args)
+        return {
+            key: result[key]
+            for key in ("filename", "mime_type", "size_bytes", "text")
+            if key in result
+        }
+
+    def _gmail_attachment_payload(
+        self, args: dict[str, Any], *, release: bool = False
+    ) -> dict[str, Any]:
         self._require_exact(
             args,
             {"account", "message_id", "attachment_id"},
@@ -756,21 +775,154 @@ class PrivateReadService:
                 "unsupported_content",
                 "attachment type is not safe for private extraction",
             )
+        maximum = 8 * 1024 * 1024 if release else self.output_bytes
         if (
             isinstance(size, bool)
             or not isinstance(size, int)
-            or not 0 <= size <= self.output_bytes
+            or not 0 <= size <= maximum
         ):
             raise SourceFailure("cap_exceeded", "attachment exceeds the extraction cap")
         if not isinstance(result.get("text"), str):
             raise SourceFailure(
                 "malformed_result", "attachment extraction did not return text"
             )
-        return {
-            key: result[key]
-            for key in ("filename", "mime_type", "size_bytes", "text")
-            if key in result
-        }
+        return result
+
+    def resolve_document_candidate(
+        self, tool_name: str, args: dict[str, Any]
+    ) -> tuple[str, Optional[dict[str, Any]]]:
+        """Resolve exactly one binary candidate through an approved typed reader.
+
+        The returned source descriptor is internal to Kite and is never JSON
+        encoded.  The model receives only the closed, content-free candidate
+        descriptor in the first tuple item.
+        """
+        source = tool_name.removeprefix("kite_").split("_", 1)[0]
+        try:
+            if not self.enabled or tool_name not in {
+                "kite_personal_files_read",
+                "kite_gmail_attachment_extract",
+            }:
+                raise SourceFailure(
+                    "operation_denied", "source cannot produce a release candidate"
+                )
+            if tool_name == "kite_personal_files_read":
+                self._require_exact(
+                    args,
+                    {"operation", "root", "relative_path", "max_lines"},
+                    {"operation", "root", "relative_path"},
+                )
+                if args.get("operation") != "read":
+                    raise SourceFailure(
+                        "invalid_arguments", "one exact file read is required"
+                    )
+                roots = self._roots(self.config.get("files"))
+                root_name = str(args.get("root") or "")
+                if root_name not in roots:
+                    raise SourceFailure("path_denied", "personal file root is unavailable")
+                relative = self._bounded_text(
+                    args.get("relative_path"), "relative_path", 512
+                )
+                path = self._safe_file(roots[root_name], relative)
+                source_info = path.lstat()
+                guessed = (mimetypes.guess_type(path.name)[0] or "").lower()
+                descriptor = {
+                    "outcome": "release_candidate",
+                    "source_class": "personal files",
+                    "mime_type": guessed,
+                    "size_bytes": source_info.st_size,
+                }
+                internal = {
+                    "path": path,
+                    "display_name": path.name,
+                    "source_class": "personal files",
+                    "expected_mime": guessed,
+                    "expected_size": source_info.st_size,
+                    "expected_identity": (
+                        source_info.st_dev,
+                        source_info.st_ino,
+                        source_info.st_size,
+                        source_info.st_mtime_ns,
+                    ),
+                }
+            else:
+                payload = self._gmail_attachment_payload(args, release=True)
+                binary_fields = [
+                    name
+                    for name in ("artifact_bytes", "artifact_base64", "artifact_path")
+                    if name in payload
+                ]
+                if len(binary_fields) != 1:
+                    raise SourceFailure(
+                        "binary_unavailable",
+                        "attachment extractor did not return one exact binary artifact",
+                    )
+                field = binary_fields[0]
+                if field == "artifact_bytes":
+                    binary = payload[field]
+                    if not isinstance(binary, bytes):
+                        raise SourceFailure(
+                            "malformed_result", "attachment binary is malformed"
+                        )
+                    source_value: Any = binary
+                elif field == "artifact_base64":
+                    encoded = payload[field]
+                    if not isinstance(encoded, str):
+                        raise SourceFailure(
+                            "malformed_result", "attachment binary is malformed"
+                        )
+                    try:
+                        source_value = base64.b64decode(encoded, validate=True)
+                    except (ValueError, TypeError) as exc:
+                        raise SourceFailure(
+                            "malformed_result", "attachment binary is malformed"
+                        ) from exc
+                else:
+                    value = payload[field]
+                    if not isinstance(value, str) or not Path(value).is_absolute():
+                        raise SourceFailure(
+                            "malformed_result", "attachment artifact is unavailable"
+                        )
+                    source_value = Path(value)
+                filename = self._bounded_text(
+                    payload.get("filename"), "filename", 255
+                )
+                descriptor = {
+                    "outcome": "release_candidate",
+                    "source_class": "personal Gmail attachment",
+                    "mime_type": str(payload.get("mime_type") or "").lower(),
+                    "size_bytes": int(payload.get("size_bytes") or 0),
+                }
+                internal = {
+                    "bytes" if isinstance(source_value, bytes) else "path": source_value,
+                    "display_name": filename,
+                    "source_class": "personal Gmail attachment",
+                    "expected_mime": str(payload.get("mime_type") or "").lower(),
+                    "expected_size": int(payload.get("size_bytes") or 0),
+                    "inspection_text": payload["text"],
+                }
+                if isinstance(source_value, Path):
+                    source_info = source_value.lstat()
+                    internal["expected_identity"] = (
+                        source_info.st_dev,
+                        source_info.st_ino,
+                        source_info.st_size,
+                        source_info.st_mtime_ns,
+                    )
+            return canonical_json(_success(source, descriptor)), internal
+        except SourceFailure as exc:
+            return canonical_json(
+                _failure(source, exc.code, exc.message, retryable=exc.retryable)
+            ), None
+        except Exception:
+            return canonical_json(
+                _failure(
+                    source,
+                    "backend_unavailable",
+                    "source backend is unavailable",
+                    retryable=True,
+                )
+            ), None
 
     def _source_or_google_command(
         self, source: str, operation: str, canonical: dict[str, Any]

@@ -429,9 +429,42 @@ auth, stale archive, ambiguity, malformed output, truncation/cap overflow, and
 backend unavailability produce `status: error` and `complete: false`; a failed
 source can therefore never be interpreted as an empty result. Any such failure
 forces the final answer to a bounded `unverifiable` state. Bulk/raw requests
-are denied before a connector call. Specific document delivery returns
-`unavailable_next_gate` for Slice C. No source bodies are copied into the
-mapping/replay database.
+are denied before a connector call. Without the separately configured Slice C
+gate, specific document delivery remains `unavailable_next_gate`. No source
+bodies are copied into the mapping/replay database.
+
+## Slice C specific-document release
+
+Slice C is a separate opt-in gate and remains James-only until Lucy activation.
+Configure the same owner-only staging directory in the Juno and Kite profiles;
+it must be on the shared host filesystem used by both runtimes:
+
+```yaml
+juno_kite_trusted_principal:
+  # Keep all Slice A/B fields above, then add the identical block to both profiles.
+  document_release:
+    enabled: true
+    staging_path: /Users/james/.hermes/state/juno-kite-document-staging
+```
+
+Kite can stage exactly one candidate only through
+`kite_personal_files_read` or `kite_gmail_attachment_extract`. The model sees
+only a content-free candidate descriptor. The host accepts PDF, JPEG, and PNG
+up to 8 MiB (PDFs up to 25 pages), rejects malformed, encrypted, active-content,
+credential-shaped, and work-marked artifacts, and creates a mode-0600 temporary
+copy beneath a mode-0700 directory. Juno then emits a bounded preview with an
+opaque ten-minute code. Only exact `APPROVE <code>` from the same authenticated
+James principal, conversation, complete live audience, destination, and policy
+generation can claim it. Juno rechecks the managed roster, destination, and
+staged inode/hash/MIME/size immediately before calling the WhatsApp adapter's
+`send_document`; it never uses `MEDIA:`, a public URL, or a generic send tool.
+
+Delivered, failed, denied, and expired copies are removed. An uncertain
+provider outcome is terminal and never retried; its owner-only staged copy is
+retained for at most one hour for bounded reconciliation. The durable ledger
+contains only opaque authority, artifact identity, state, and hashed provider
+receipt metadata—never source selectors, source paths, file content, or raw
+provider identifiers.
 
 Action rules and every `action_capability_ids` list are intentionally empty in
 the Slice A deployment configuration. The existing exact-argument enforcement

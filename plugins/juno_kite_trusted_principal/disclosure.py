@@ -120,18 +120,31 @@ def disclosure_decision(
         return DisclosureDecision(
             False, "denied", "bulk or raw private-source export is unavailable"
         )
-    if output_tier == DOCUMENT_DESCRIPTOR:
-        return DisclosureDecision(
-            False,
-            "unavailable_next_gate",
-            "the document may be described but cannot be delivered before Slice C",
-        )
-    if output_tier not in {MINIMIZED, BOUNDED_EXCERPT}:
-        return DisclosureDecision(False, "denied", "unknown output tier")
     if str(principal).lower() == "lucy" and capability_id == "juno.private.james":
         return DisclosureDecision(
             False, "denied", "James-exclusive information is unavailable to Lucy"
         )
+    if output_tier == DOCUMENT_DESCRIPTOR:
+        document_capabilities = {
+            "juno.shared.family",
+            "juno.shared.children",
+            "juno.shared.mauritius",
+            "juno.shared.property_intel",
+            "juno.shared.villa_lena",
+        }
+        if str(principal).lower() != "james" or capability_id not in document_capabilities:
+            return DisclosureDecision(
+                False,
+                "denied",
+                "specific document release is unavailable under the phase-one binding",
+            )
+        return DisclosureDecision(
+            True,
+            DOCUMENT_DESCRIPTOR,
+            "host-bound Slice C proposal and approval gates are required",
+        )
+    if output_tier not in {MINIMIZED, BOUNDED_EXCERPT}:
+        return DisclosureDecision(False, "denied", "unknown output tier")
     return DisclosureDecision(
         True, output_tier, "effective audience capability permits this minimized form"
     )
@@ -219,12 +232,17 @@ def generated_semantic_guidance(
         "output_tier_rule": {
             MINIMIZED: "answer with necessary facts, status, synthesis, blockers, next steps, and bounded provenance",
             BOUNDED_EXCERPT: "quote only a short necessary excerpt when the effective semantic domain permits it",
-            DOCUMENT_DESCRIPTOR: "return an unavailable_next_gate descriptor; binary delivery belongs to Slice C",
+            DOCUMENT_DESCRIPTOR: (
+                "select exactly one approved typed-reader candidate and return only its "
+                "effective semantic capability; the host either creates the bounded "
+                "Slice C approval preview or denies release"
+            ),
             BULK_RAW: "deny without invoking a private connector",
         }[output_tier],
         "passport_rule": (
             "passport identifiers are identity documents, not credentials; disclose only under an "
-            "effective children/family/Mauritius capability, never as binary delivery in this slice"
+            "effective children/family/Mauritius capability; binary release additionally requires "
+            "the host-bound Slice C staging and approval flow"
         ),
         "provenance": (
             "bounded source class, sender/author display label, date, title, and, only in the "

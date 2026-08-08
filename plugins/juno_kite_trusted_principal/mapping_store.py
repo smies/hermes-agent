@@ -46,6 +46,32 @@ class RequestRecord:
     roster_generation: str
 
 
+@dataclass(frozen=True)
+class DocumentReleaseRecord:
+    """Opaque authority and artifact identity for one document proposal."""
+
+    proposal_id: str
+    approval_fingerprint: str
+    request_id: str
+    context_id: str
+    correlation_id: str
+    principal_fingerprint: str
+    policy_generation: str
+    audience_digest: str
+    conversation_binding: str
+    roster_generation: str
+    expires_at: int
+    state: str
+    artifact_sha256: str
+    artifact_size: int
+    artifact_mime: str
+    artifact_pages: int
+    artifact_device: int
+    artifact_inode: int
+    stage_leaf: str
+    receipt_fingerprint: str
+
+
 class MappingStore:
     """One narrow SQLite store for mappings and their replay ledger.
 
@@ -315,6 +341,46 @@ class MappingStore:
                     ON request_ledger(context_id, state)
                     """
                 )
+                db.execute(
+                    """
+                CREATE TABLE IF NOT EXISTS document_release_ledger (
+                    proposal_id TEXT PRIMARY KEY,
+                    approval_fingerprint TEXT NOT NULL UNIQUE,
+                    request_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    correlation_id TEXT NOT NULL,
+                    principal_fingerprint TEXT NOT NULL,
+                    policy_generation TEXT NOT NULL,
+                    audience_digest TEXT NOT NULL,
+                    conversation_binding TEXT NOT NULL,
+                    roster_generation TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'staged', 'dispatching', 'delivered', 'failed',
+                            'uncertain', 'denied', 'expired'
+                        )
+                    ),
+                    artifact_sha256 TEXT NOT NULL,
+                    artifact_size INTEGER NOT NULL,
+                    artifact_mime TEXT NOT NULL,
+                    artifact_pages INTEGER NOT NULL,
+                    artifact_device INTEGER NOT NULL,
+                    artifact_inode INTEGER NOT NULL,
+                    stage_leaf TEXT NOT NULL,
+                    receipt_fingerprint TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    terminal_at INTEGER,
+                    FOREIGN KEY (context_id) REFERENCES mappings(context_id)
+                )
+                    """
+                )
+                db.execute(
+                    """
+                CREATE INDEX IF NOT EXISTS document_release_state_expiry
+                    ON document_release_ledger(state, expires_at)
+                    """
+                )
                 db.execute("COMMIT")
             except Exception:
                 db.execute("ROLLBACK")
@@ -473,6 +539,163 @@ class MappingStore:
                 "SELECT * FROM request_ledger WHERE request_id = ?", (request_id,)
             ).fetchone()
         return self._request_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _document_release_from_row(row: sqlite3.Row) -> DocumentReleaseRecord:
+        return DocumentReleaseRecord(
+            proposal_id=str(row["proposal_id"]),
+            approval_fingerprint=str(row["approval_fingerprint"]),
+            request_id=str(row["request_id"]),
+            context_id=str(row["context_id"]),
+            correlation_id=str(row["correlation_id"]),
+            principal_fingerprint=str(row["principal_fingerprint"]),
+            policy_generation=str(row["policy_generation"]),
+            audience_digest=str(row["audience_digest"]),
+            conversation_binding=str(row["conversation_binding"]),
+            roster_generation=str(row["roster_generation"]),
+            expires_at=int(row["expires_at"]),
+            state=str(row["state"]),
+            artifact_sha256=str(row["artifact_sha256"]),
+            artifact_size=int(row["artifact_size"]),
+            artifact_mime=str(row["artifact_mime"]),
+            artifact_pages=int(row["artifact_pages"]),
+            artifact_device=int(row["artifact_device"]),
+            artifact_inode=int(row["artifact_inode"]),
+            stage_leaf=str(row["stage_leaf"]),
+            receipt_fingerprint=str(row["receipt_fingerprint"]),
+        )
+
+    def issue_document_release(self, record: DocumentReleaseRecord) -> None:
+        """Durably issue one staged proposal without storing source metadata."""
+        with self._database(write=True) as db:
+            db.execute(
+                """INSERT INTO document_release_ledger (
+                       proposal_id, approval_fingerprint, request_id, context_id,
+                       correlation_id, principal_fingerprint, policy_generation,
+                       audience_digest, conversation_binding, roster_generation,
+                       expires_at, state, artifact_sha256, artifact_size,
+                       artifact_mime, artifact_pages, artifact_device,
+                       artifact_inode, stage_leaf, receipt_fingerprint
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?, ?, ?, ?, ?, ?, '')""",
+                (
+                    record.proposal_id,
+                    record.approval_fingerprint,
+                    record.request_id,
+                    record.context_id,
+                    record.correlation_id,
+                    record.principal_fingerprint,
+                    record.policy_generation,
+                    record.audience_digest,
+                    record.conversation_binding,
+                    record.roster_generation,
+                    int(record.expires_at),
+                    record.artifact_sha256,
+                    int(record.artifact_size),
+                    record.artifact_mime,
+                    int(record.artifact_pages),
+                    int(record.artifact_device),
+                    int(record.artifact_inode),
+                    record.stage_leaf,
+                ),
+            )
+
+    def claim_document_release(
+        self,
+        approval_fingerprint: str,
+        *,
+        now: int,
+        principal_fingerprint: str,
+        policy_generation: str,
+        audience_digest: str,
+        conversation_binding: str,
+        roster_generation: str,
+    ) -> Optional[DocumentReleaseRecord]:
+        """Consume a code once and bind it to the complete live authority."""
+        with self._database(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute(
+                    "SELECT * FROM document_release_ledger WHERE approval_fingerprint = ?",
+                    (str(approval_fingerprint),),
+                ).fetchone()
+                if row is None or str(row["state"]) != "staged":
+                    db.execute("COMMIT")
+                    return None
+                if int(row["expires_at"]) <= int(now):
+                    db.execute(
+                        """UPDATE document_release_ledger
+                           SET state = 'expired', terminal_at = ?
+                           WHERE proposal_id = ? AND state = 'staged'""",
+                        (int(now), str(row["proposal_id"])),
+                    )
+                else:
+                    expected = (
+                        str(principal_fingerprint),
+                        str(policy_generation),
+                        str(audience_digest),
+                        str(conversation_binding),
+                        str(roster_generation),
+                    )
+                    observed = (
+                        str(row["principal_fingerprint"]),
+                        str(row["policy_generation"]),
+                        str(row["audience_digest"]),
+                        str(row["conversation_binding"]),
+                        str(row["roster_generation"]),
+                    )
+                    state = "dispatching" if observed == expected else "denied"
+                    db.execute(
+                        """UPDATE document_release_ledger
+                           SET state = ?, terminal_at = CASE WHEN ? = 'denied' THEN ? ELSE NULL END
+                           WHERE proposal_id = ? AND state = 'staged'""",
+                        (state, state, int(now), str(row["proposal_id"])),
+                    )
+                current = db.execute(
+                    "SELECT * FROM document_release_ledger WHERE proposal_id = ?",
+                    (str(row["proposal_id"]),),
+                ).fetchone()
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+        return self._document_release_from_row(current)
+
+    def terminalize_document_release(
+        self,
+        proposal_id: str,
+        *,
+        state: str,
+        now: int,
+        receipt_fingerprint: str = "",
+    ) -> bool:
+        if state not in {"delivered", "failed", "uncertain", "denied"}:
+            raise ValueError("document release terminal state is invalid")
+        with self._database(write=True) as db:
+            changed = db.execute(
+                """UPDATE document_release_ledger
+                   SET state = ?, terminal_at = ?, receipt_fingerprint = ?
+                   WHERE proposal_id = ? AND state = 'dispatching'""",
+                (state, int(now), str(receipt_fingerprint), str(proposal_id)),
+            ).rowcount
+        return changed == 1
+
+    def document_releases_for_cleanup(
+        self, *, now: int, uncertain_before: int
+    ) -> list[DocumentReleaseRecord]:
+        with self._database(write=True) as db:
+            db.execute(
+                """UPDATE document_release_ledger
+                   SET state = 'expired', terminal_at = ?
+                   WHERE state = 'staged' AND expires_at <= ?""",
+                (int(now), int(now)),
+            )
+            rows = db.execute(
+                """SELECT * FROM document_release_ledger
+                   WHERE state IN ('delivered', 'failed', 'denied', 'expired')
+                      OR (state = 'uncertain' AND terminal_at <= ?)""",
+                (int(uncertain_before),),
+            ).fetchall()
+        return [self._document_release_from_row(row) for row in rows]
 
     def count_records(self) -> tuple[int, int]:
         """Return opaque mapping/request counts for provider-free canaries."""
