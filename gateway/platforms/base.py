@@ -27,6 +27,7 @@ from utils import normalize_proxy_url
 logger = logging.getLogger(__name__)
 
 _BACKGROUND_TASK_CANCEL_TIMEOUT_S = 5.0
+_PROTECTED_LOG_REDACTION_ATTR = "_gateway_protected_log_redaction"
 
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Keep Telegram's narrower attachment/voice sets below separate: formats such
@@ -47,6 +48,20 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+
+
+def _mark_protected_log_event(event) -> bool:
+    """Bind non-persistent operational-log redaction to one proven event."""
+    try:
+        setattr(event, _PROTECTED_LOG_REDACTION_ATTR, True)
+    except BaseException:
+        return False
+    return getattr(event, _PROTECTED_LOG_REDACTION_ATTR, False) is True
+
+
+def _is_protected_log_event(event) -> bool:
+    """Return whether this event's operational logs must omit message identity."""
+    return getattr(event, _PROTECTED_LOG_REDACTION_ATTR, False) is True
 
 
 def _platform_name(platform) -> str:
@@ -6180,12 +6195,19 @@ class BasePlatformAdapter(ABC):
                 # the current transport before sending it.
                 if text_content and not _tts_caption_delivered:
                     delivery_adapter = self._final_delivery_adapter(event.source)
-                    logger.info(
-                        "[%s] Sending response (%d chars) to %s",
-                        delivery_adapter.name,
-                        len(text_content),
-                        event.source.chat_id,
-                    )
+                    if _is_protected_log_event(event):
+                        logger.info(
+                            "[%s] Sending protected response (%d chars)",
+                            delivery_adapter.name,
+                            len(text_content),
+                        )
+                    else:
+                        logger.info(
+                            "[%s] Sending response (%d chars) to %s",
+                            delivery_adapter.name,
+                            len(text_content),
+                            event.source.chat_id,
+                        )
                     _reply_anchor = _reply_anchor_for_event(event)
                     # Delivery-obligation ledger: durably record the final
                     # response BEFORE the send attempt so a gateway crash

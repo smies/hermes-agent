@@ -314,6 +314,90 @@ async def test_well_formed_critical_result_without_bound_token_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_proven_critical_ingress_binds_safe_operational_logging(
+    monkeypatch, caplog
+):
+    from gateway.platforms.base import _is_protected_log_event
+    from gateway.run import _log_gateway_inbound, _log_gateway_response_ready
+
+    event = _make_event("protected inbound message body")
+    event.source.chat_id = "300000000000000@g.us"
+    event.source.user_name = "protected sender name"
+    event.reply_to_message_id = "protected-reply-anchor"
+    event.reply_to_text = "protected quoted message"
+    event.raw_message = {
+        "participants": ["protected-roster-member@s.whatsapp.net"]
+    }
+
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda _name, **_kwargs: [
+            {
+                "action": "critical_allow",
+                "scope": "juno-trusted-principal-v2",
+                "redact_scope": True,
+            }
+        ],
+    )
+    runner, _adapter = _critical_juno_runner()
+    runner._juno_critical_ingress_satisfied = lambda _token: True
+    runner._is_user_authorized = MagicMock(return_value=True)
+
+    async def _successful_dispatch(dispatched, source, _quick_key, _generation):
+        assert dispatched is event
+        assert source is event.source
+        assert _is_protected_log_event(dispatched)
+        return "protected response delivered"
+
+    runner._handle_message_with_agent = _successful_dispatch
+
+    assert await runner._handle_message(event) == "protected response delivered"
+    assert runner._is_user_authorized.call_count == 1
+
+    caplog.clear()
+    caplog.set_level("INFO")
+    _log_gateway_inbound(event, event.source, "whatsapp")
+    _log_gateway_response_ready(event, event.source, "whatsapp", 1.25, 2, 28)
+
+    assert "inbound message: platform=whatsapp scope=protected" in caplog.text
+    assert "response ready: platform=whatsapp scope=protected" in caplog.text
+    for protected_value in (
+        "15551234567@s.whatsapp.net",
+        "300000000000000@g.us",
+        "protected sender name",
+        "protected inbound message body",
+        "protected-reply-anchor",
+        "protected quoted message",
+        "protected-roster-member@s.whatsapp.net",
+    ):
+        assert protected_value not in caplog.text
+
+
+def test_ordinary_gateway_operational_logging_is_unchanged(caplog):
+    from gateway.run import _log_gateway_inbound, _log_gateway_response_ready
+
+    event = _make_event("ordinary inbound body")
+    event.reply_to_message_id = "ordinary-reply-anchor"
+    event.reply_to_text = "ordinary quoted message"
+
+    caplog.set_level("INFO")
+    _log_gateway_inbound(event, event.source, "whatsapp")
+    _log_gateway_response_ready(event, event.source, "whatsapp", 1.25, 2, 17)
+
+    assert (
+        "inbound message: platform=whatsapp user=tester "
+        "chat=15551234567@s.whatsapp.net msg='ordinary inbound body' "
+        "reply_to_id=ordinary-reply-anchor reply_to_text='ordinary quoted message'"
+        in caplog.text
+    )
+    assert (
+        "response ready: platform=whatsapp chat=15551234567@s.whatsapp.net "
+        "time=1.2s api_calls=2 response=17 chars"
+        in caplog.text
+    )
+
+
+@pytest.mark.asyncio
 async def test_gateway_startup_reload_uses_active_juno_profile_and_reaches_dispatch(
     tmp_path, monkeypatch, caplog
 ):

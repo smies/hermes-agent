@@ -30,8 +30,8 @@ def _fresh_db(tmp_path, monkeypatch):
 class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
     """Minimal concrete adapter driving the real base-class pipeline."""
 
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True), Platform.SLACK)
+    def __init__(self, platform=Platform.SLACK):
+        super().__init__(PlatformConfig(enabled=True), platform)
         self.sent = []
 
     async def connect(self, *, is_reconnect: bool = False):  # pragma: no cover
@@ -109,6 +109,48 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+
+    @pytest.mark.asyncio
+    async def test_protected_response_log_omits_destination_but_still_delivers(
+        self, monkeypatch, caplog
+    ):
+        from gateway.platforms.base import _mark_protected_log_event
+
+        monkeypatch.setattr(dl, "ledger_enabled", lambda: False)
+        adapter = _Adapter(Platform.WHATSAPP)
+        event = _event("protected inbound body")
+        event.source.platform = Platform.WHATSAPP
+        event.source.chat_id = "300000000000000@g.us"
+        assert _mark_protected_log_event(event)
+
+        caplog.set_level("INFO")
+        await _run(adapter, event, response="protected response body")
+
+        assert adapter.sent == ["protected response body"]
+        assert "[Whatsapp] Sending protected response (23 chars)" in caplog.text
+        assert "300000000000000@g.us" not in caplog.text
+        assert "protected inbound body" not in caplog.text
+        assert "protected response body" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_ordinary_response_destination_log_is_unchanged(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(dl, "ledger_enabled", lambda: False)
+        adapter = _Adapter(Platform.WHATSAPP)
+        event = _event("ordinary inbound body")
+        event.source.platform = Platform.WHATSAPP
+        event.source.chat_id = "ordinary-destination@s.whatsapp.net"
+
+        caplog.set_level("INFO")
+        await _run(adapter, event, response="ordinary response")
+
+        assert adapter.sent == ["ordinary response"]
+        assert (
+            "[Whatsapp] Sending response (17 chars) to "
+            "ordinary-destination@s.whatsapp.net"
+            in caplog.text
+        )
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):

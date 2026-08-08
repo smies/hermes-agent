@@ -2263,6 +2263,8 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _is_protected_log_event,
+    _mark_protected_log_event,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -2295,6 +2297,56 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_gateway_inbound(event: Any, source: Any, platform_name: str) -> None:
+    """Log accepted ingress without exposing a proven protected message."""
+    if _is_protected_log_event(event):
+        logger.info("inbound message: platform=%s scope=protected", platform_name)
+        return
+    msg_preview = (getattr(event, "text", None) or "")[:80].replace("\n", " ")
+    reply_id = getattr(event, "reply_to_message_id", None)
+    reply_text = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+    logger.info(
+        "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
+        platform_name,
+        getattr(source, "user_name", None)
+        or getattr(source, "user_id", None)
+        or "unknown",
+        getattr(source, "chat_id", None) or "unknown",
+        msg_preview,
+        reply_id,
+        reply_text,
+    )
+
+
+def _log_gateway_response_ready(
+    event: Any,
+    source: Any,
+    platform_name: str,
+    response_time: float,
+    api_calls: int,
+    response_length: int,
+) -> None:
+    """Log response readiness while omitting a protected destination."""
+    if _is_protected_log_event(event):
+        logger.info(
+            "response ready: platform=%s scope=protected time=%.1fs "
+            "api_calls=%d response=%d chars",
+            platform_name,
+            response_time,
+            api_calls,
+            response_length,
+        )
+        return
+    logger.info(
+        "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
+        platform_name,
+        getattr(source, "chat_id", None) or "unknown",
+        response_time,
+        api_calls,
+        response_length,
+    )
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -14955,6 +15007,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "protected pre_gateway_dispatch proof missing; ingress skipped"
                     )
                     return None
+                if not _mark_protected_log_event(event):
+                    logger.warning(
+                        "protected operational-log redaction binding failed; ingress skipped"
+                    )
+                    return None
 
         if is_internal:
             pass
@@ -16815,14 +16872,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
-        _reply_id = getattr(event, "reply_to_message_id", None)
-        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
-        logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
-        )
+        _log_gateway_inbound(event, source, _platform_name)
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -18133,10 +18183,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
-            logger.info(
-                "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
-                _platform_name, source.chat_id or "unknown",
-                _response_time, _api_calls, _resp_len,
+            _log_gateway_response_ready(
+                event,
+                source,
+                _platform_name,
+                _response_time,
+                _api_calls,
+                _resp_len,
             )
 
             # NOTE: the cross-process cache-coherence re-baseline
