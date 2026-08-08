@@ -50,6 +50,13 @@ _RAW_PATTERNS = (
         r"(?i)\b(?:raw|verbatim)\b.{0,24}\b(?:email|thread|headers?|mailbox|source|records?|messages?)\b"
     ),
     re.compile(r"(?i)\bmailbox\s+(?:dump|export)\b"),
+    re.compile(
+        r"(?i)\b(?:bulk|entire|whole|all)\b.{0,32}\b(?:portal|property(?: Intel)?)\s+"
+        r"(?:database|records?|rows?|export|dump)\b"
+    ),
+    re.compile(
+        r"(?i)\b(?:dump|export)\b.{0,32}\b(?:Property Intel|property records?|portal records?)\b"
+    ),
 )
 _DOCUMENT_PATTERNS = (
     re.compile(
@@ -189,6 +196,26 @@ def generated_semantic_guidance(
         "work_boundary": work_boundary,
         "always_denied": denials,
         "output_tier": output_tier,
+        "property_output_mode": {
+            "available": (
+                principal_name == "james"
+                and "juno.shared.property_intel" in capabilities
+            ),
+            "authority": (
+                "exact current James turn, current signed roster/policy, exact "
+                "juno.shared.property_intel capability, and only successful "
+                "kite_property_read provenance"
+            ),
+            "form": (
+                "bounded prose or bullets may use any sanitized Property Intel facts, "
+                "including future fields, nested values, ordinary IDs, URLs, notes, "
+                "history, and document metadata; there is no per-field allowlist"
+            ),
+            "denied": (
+                "JSON/container records, bulk/raw exports, binary documents, over-limit "
+                "answers, credentials, mixed-source provenance, and non-James release"
+            ),
+        },
         "output_tier_rule": {
             MINIMIZED: "answer with necessary facts, status, synthesis, blockers, next steps, and bounded provenance",
             BOUNDED_EXCERPT: "quote only a short necessary excerpt when the effective semantic domain permits it",
@@ -200,8 +227,9 @@ def generated_semantic_guidance(
             "effective children/family/Mauritius capability, never as binary delivery in this slice"
         ),
         "provenance": (
-            "bounded source class, sender/author display label, date, title, and Property Intel "
-            "public link only; never internal paths, client IDs, session IDs, or credentials"
+            "bounded source class, sender/author display label, date, title, and, only in the "
+            "James Property output mode, sanitized portal identifiers and URLs; never internal "
+            "connector paths, connector client IDs, session IDs, or credentials"
         ),
     }
 

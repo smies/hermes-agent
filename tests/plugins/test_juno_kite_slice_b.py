@@ -102,6 +102,7 @@ def _slice_b_config(tmp_path: Path, *, mode="juno") -> dict:
         semantic_policy={name: {"domain": name} for name in james_caps},
     )
     principals["lucy"].update(
+        conversation_eligibility={"dm": True, "group": True},
         read_capability_ids=shared,
         action_capability_ids=[],
         semantic_policy={name: {"domain": name} for name in shared},
@@ -120,14 +121,20 @@ def _runtime(tmp_path: Path, *, mode="juno", backends=None):
 
 
 def _bound_turn(
-    tmp_path: Path, backends, callback, question="What is the current status?"
+    tmp_path: Path,
+    backends,
+    callback,
+    question="What is the current status?",
+    *,
+    principal="james",
 ):
     juno = _runtime(tmp_path, mode="juno", backends=backends)
+    user_id = "fixture-user-101" if principal == "james" else "fixture-user-202"
     prepared = _run_in_session(
         lambda: juno._prepare_request({"question_or_goal": question}),
         platform="telegram",
-        user_id="fixture-user-101",
-        session_key="conversation-slice-b",
+        user_id=user_id,
+        session_key=f"conversation-slice-b-{principal}",
         profile="juno",
     )
     call = {
@@ -763,6 +770,287 @@ def test_property_and_whatsapp_use_typed_read_operations(tmp_path):
     )
 
 
+def test_property_payload_preserves_unknown_nested_fields_and_sanitizes_once(
+    monkeypatch,
+):
+    property_id = "123e4567-e89b-12d3-a456-426614174000"
+    monkeypatch.setenv("PROPERTY_AUTH_TOKEN", "configured-connector-token")
+    backend = RecordingBackend({
+        "property": {
+            "id": property_id,
+            "futureField": {
+                "heritageScore": 97,
+                "history": [
+                    {
+                        "eventId": "ordinary-history-id-44",
+                        "note": (
+                            "Survey complete. Authorization: Bearer escaped-secret; "
+                            "retain this note."
+                        ),
+                    }
+                ],
+            },
+            "documents": [
+                {
+                    "documentId": "doc-ordinary-9",
+                    "url": "https://property.example.test/documents/doc-ordinary-9",
+                    "metadata": {"pages": 14, "mimeType": "application/pdf"},
+                }
+            ],
+            "auditNote": (
+                r'keep this context {\"authorization\":\"Bearer serialized-secret\",'
+                r'\"ordinary\":\"preserved\"}'
+            ),
+            "debugMessage": "prefix configured-connector-token suffix",
+            "PROPERTY_AUTH_TOKEN": "configured-connector-token",
+            "connector": {
+                "headers": {"Authorization": "Bearer nested-secret"},
+                "environment": {"PROPERTY_TOKEN": "environment-secret"},
+                "auth": {"password": "password-secret"},
+            },
+            "refresh\u005ftoken": "escaped-key-secret",
+            "privateKey": "-----BEGIN PRIVATE KEY----- secret material",
+        }
+    })
+    service = PrivateReadService(
+        {
+            "enabled": True,
+            "output_bytes": 65_536,
+            "property_intel": {
+                "base_url": "https://property.example.test",
+                "auth_env": "PROPERTY_AUTH_TOKEN",
+            },
+        },
+        backends={"property_intel": backend},
+    )
+
+    result = json.loads(service.execute(
+        "kite_property_read",
+        {"operation": "property", "property_id": property_id},
+    ))
+
+    assert result["status"] == "ok"
+    data = result["data"]
+    assert data["id"] == property_id
+    assert data["futureField"]["heritageScore"] == 97
+    assert data["futureField"]["history"][0]["eventId"] == "ordinary-history-id-44"
+    assert data["documents"][0]["metadata"] == {
+        "mimeType": "application/pdf",
+        "pages": 14,
+    }
+    assert data["documents"][0]["url"].endswith("/doc-ordinary-9")
+    assert "retain this note" in data["futureField"]["history"][0]["note"]
+    rendered = json.dumps(data)
+    for secret in (
+        "escaped-secret",
+        "nested-secret",
+        "environment-secret",
+        "password-secret",
+        "escaped-key-secret",
+        "PRIVATE KEY",
+        "PROPERTY_TOKEN",
+        "Authorization",
+        "serialized-secret",
+        "configured-connector-token",
+    ):
+        assert secret not in rendered
+
+
+def test_property_payload_fails_closed_on_deep_or_oversized_data():
+    property_id = "123e4567-e89b-12d3-a456-426614174000"
+    deep: object = "leaf"
+    for _ in range(20):
+        deep = {"ordinary": deep}
+    deep_service = PrivateReadService(
+        {"enabled": True, "output_bytes": 65_536},
+        backends={"property_intel": RecordingBackend({"property": deep})},
+    )
+    deep_result = json.loads(deep_service.execute(
+        "kite_property_read",
+        {"operation": "property", "property_id": property_id},
+    ))
+    assert deep_result["status"] == "error"
+    assert deep_result["error"]["code"] == "depth_exceeded"
+    assert deep_result["complete"] is False
+
+    oversized_service = PrivateReadService(
+        {"enabled": True, "output_bytes": 4096},
+        backends={
+            "property_intel": RecordingBackend({
+                "property": {"futureOrdinaryField": "x" * 5000}
+            })
+        },
+    )
+    oversized_result = json.loads(oversized_service.execute(
+        "kite_property_read",
+        {"operation": "property", "property_id": property_id},
+    ))
+    assert oversized_result["status"] == "error"
+    assert oversized_result["error"]["code"] == "cap_exceeded"
+    assert oversized_result["complete"] is False
+
+
+def test_property_mode_releases_arbitrary_sanitized_facts_as_bounded_prose(tmp_path):
+    property_id = "123e4567-e89b-12d3-a456-426614174000"
+    prop = RecordingBackend({
+        "property": {
+            "id": property_id,
+            "futureField": {"heritageScore": 97},
+        }
+    })
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_property_read",
+            {"operation": "property", "property_id": property_id},
+        )
+        answer = (
+            f"- Property ID: {property_id}\n"
+            "- client_id: ordinary-buyer-record-7\n"
+            "- The future heritage score is 97.\n"
+            "- Contact: property-agent@example.test\n"
+            "- Portal link: https://property.example.test/properties/record-44"
+        )
+        envelope_text = kite.transform_llm_output(
+            response_text=answer, session_id="kite-session"
+        )
+        envelope = json.loads(envelope_text.split(RESPONSE_PREFIX, 1)[1])
+        assert envelope["denied"] is False
+        assert envelope["answer"] == answer
+
+    _bound_turn(tmp_path, {"property_intel": prop}, check)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        '{"id":"123e4567-e89b-12d3-a456-426614174000","futureField":97}',
+        "```json\n[{\"id\":\"record-1\"}]\n```",
+        "Authorization: Bearer output-secret",
+    ],
+)
+def test_property_mode_denies_container_dumps_and_credentials(tmp_path, answer):
+    prop = RecordingBackend({"property": {"futureField": 97}})
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_property_read",
+            {
+                "operation": "property",
+                "property_id": "123e4567-e89b-12d3-a456-426614174000",
+            },
+        )
+        envelope_text = kite.transform_llm_output(
+            response_text=answer, session_id="kite-session"
+        )
+        envelope = json.loads(envelope_text.split(RESPONSE_PREFIX, 1)[1])
+        assert envelope["denied"] is True
+        assert answer not in envelope_text
+
+    _bound_turn(tmp_path, {"property_intel": prop}, check)
+
+
+def test_property_mode_denies_over_limit_mixed_source_and_non_james(tmp_path):
+    property_id = "123e4567-e89b-12d3-a456-426614174000"
+
+    def over_limit(kite):
+        _invoke(
+            kite,
+            "kite_property_read",
+            {"operation": "property", "property_id": property_id},
+        )
+        answer = "Property fact. " * 500
+        envelope = json.loads(
+            kite.transform_llm_output(
+                response_text=answer, session_id="kite-session"
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+        assert envelope["denied"] is True
+        assert envelope["answer"] == ""
+
+    _bound_turn(
+        tmp_path,
+        {"property_intel": RecordingBackend({"property": {"id": property_id}})},
+        over_limit,
+    )
+
+    def mixed(kite):
+        _invoke(
+            kite,
+            "kite_property_read",
+            {"operation": "property", "property_id": property_id},
+        )
+        _invoke(
+            kite,
+            "kite_whatsapp_archive_read",
+            {"operation": "search", "query": "property", "max_results": 2},
+        )
+        envelope = json.loads(
+            kite.transform_llm_output(
+                response_text=f"Property ID: {property_id}",
+                session_id="kite-session",
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+        assert envelope["denied"] is True
+
+    _bound_turn(
+        tmp_path,
+        {
+            "property_intel": RecordingBackend({"property": {"id": property_id}}),
+            "whatsapp": RecordingBackend({"search": [{"message": "ordinary"}]}),
+        },
+        mixed,
+    )
+
+    def non_james(kite):
+        _invoke(
+            kite,
+            "kite_property_read",
+            {"operation": "property", "property_id": property_id},
+        )
+        envelope = json.loads(
+            kite.transform_llm_output(
+                response_text="The future heritage score is 97.",
+                session_id="kite-session",
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+        assert envelope["denied"] is True
+
+    _bound_turn(
+        tmp_path,
+        {"property_intel": RecordingBackend({"property": {"futureField": 97}})},
+        non_james,
+        principal="lucy",
+    )
+
+
+def test_property_mode_denies_wrong_final_turn_binding(tmp_path):
+    prop = RecordingBackend({"property": {"futureField": 97}})
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_property_read",
+            {
+                "operation": "property",
+                "property_id": "123e4567-e89b-12d3-a456-426614174000",
+            },
+        )
+        envelope = json.loads(
+            kite.transform_llm_output(
+                response_text="The future heritage score is 97.",
+                session_id="kite-session",
+                turn_id="different-turn",
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+        assert envelope["denied"] is True
+        assert envelope["answer"] == ""
+
+    _bound_turn(tmp_path, {"property_intel": prop}, check)
+
+
 def test_only_configured_property_public_links_may_preserve_uuid(tmp_path):
     config = _slice_b_config(tmp_path, mode="kite")
     config["juno_kite_trusted_principal"]["private_reads"]["property_intel"] = {
@@ -920,6 +1208,7 @@ def test_passport_identifier_is_not_globally_a_credential(tmp_path):
         ("Quote the exact wording needed", BOUNDED_EXCERPT),
         ("Send me the actual passport scan", DOCUMENT_DESCRIPTOR),
         ("Export the whole raw mailbox and headers", BULK_RAW),
+        ("Export all Property Intel records", BULK_RAW),
     ],
 )
 def test_output_tiers(question, tier):

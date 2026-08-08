@@ -72,6 +72,7 @@ _RESPONSE_FIELDS = frozenset({
 })
 _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)authorization\s*:\s*bearer\s+\S+"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(
         r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|secret)\s*[:=]\s*\S+"
     ),
@@ -92,6 +93,10 @@ _CREDENTIAL_PATTERNS = (
     ),
     re.compile(
         r"(?i)https?://\S{0,512}/(?:magic|login|signin|reset|recover|auth)(?:/|\?)[A-Za-z0-9._~!$&'()*+,;=:@%/?-]{8,}"
+    ),
+    re.compile(
+        r"(?i)https?://\S{0,512}[?&](?:access_token|auth_token|refresh_token|"
+        r"session_token|token|api_key|secret)=\S+"
     ),
     re.compile(r"(?i)\b(?:qr|pairing)\s+(?:code|payload|material)\s*[:=]\s*\S+"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -138,6 +143,20 @@ _RAW_EMAIL_HEADER_PATTERN = re.compile(
 _RAW_EMAIL_JSON_PATTERNS = (
     re.compile(r'(?i)"headers"\s*:\s*[\[{]'),
     re.compile(r'(?i)"(?:raw|body|payload)"\s*:\s*"'),
+)
+_PROPERTY_CAPABILITY_ID = "juno.shared.property_intel"
+_PROPERTY_OUTPUT_MAX_CHARS = 4000
+_PROPERTY_OUTPUT_MAX_BYTES = 12_000
+_PROPERTY_OUTPUT_MAX_LINES = 40
+_PROPERTY_OUTPUT_MAX_BULLETS = 30
+_PROPERTY_OUTPUT_INTERNAL_PATTERNS = (
+    re.compile(r"(?i)(?:^|\s)/Users/[^\s]+"),
+    re.compile(r"(?i)(?:^|\s)(?:~|\$HOME)/\.hermes(?:/|\b)"),
+    re.compile(r"(?i)\b(?:connector|oauth)[_-]?client[_-]?id\s*[:=]"),
+    re.compile(r"(?i)\b(?:platform|connector|raw)[_-]?session[_-]?id\s*[:=]"),
+)
+_PROPERTY_TABLE_SEPARATOR_PATTERN = re.compile(
+    r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*"
 )
 
 
@@ -335,6 +354,7 @@ class TrustedPrincipalRuntime:
             backends=private_read_backends,
             command_runner=private_read_command_runner,
             url_opener=private_read_url_opener,
+            secret_values=self.secret_values,
         )
         self.private_read_tool_names = frozenset(self.private_reads.tool_names)
         if self.private_reads.enabled:
@@ -1446,7 +1466,10 @@ class TrustedPrincipalRuntime:
             "semantic_disclosure": semantic_disclosure,
             "rule": (
                 "Return only a minimized answer; raw sources, tool results, "
-                "credentials, and private identifiers stay in Kite."
+                "credentials, and private identifiers stay in Kite. The sole expanded "
+                "form is bounded prose/bullets containing any sanitized Property Intel "
+                "facts when the host verifies James, the exact Property capability, "
+                "and only successful kite_property_read provenance."
             ),
         }
         rendered = (
@@ -1482,6 +1505,7 @@ class TrustedPrincipalRuntime:
                 "gmail_messages": set(),
                 "gmail_attachments": set(),
                 "source_fragments": set(),
+                "successful_tools": set(),
             })
             return {"context": self._policy_view(binding)}
         except Exception as exc:
@@ -1542,6 +1566,15 @@ class TrustedPrincipalRuntime:
             or request.state != "bound"
             or request.expires_at <= now
             or request.policy_generation != self.policy_generation
+            or request.context_id != binding.mapping.context_id
+            or request.correlation_id != binding.mapping.correlation_id
+            or request.audience_digest != binding.request.audience_digest
+            or request.conversation_binding != binding.request.conversation_binding
+            or request.roster_generation != binding.request.roster_generation
+            or request.read_capability_fingerprint
+            != self._capability_fingerprint(binding.effective_read_capability_ids)
+            or request.action_capability_fingerprint
+            != self._capability_fingerprint(binding.effective_action_capability_ids)
         ):
             raise ValueError("same-turn binding is stale, replayed, or mismatched")
         return binding
@@ -1571,10 +1604,12 @@ class TrustedPrincipalRuntime:
                 "gmail_messages",
                 "gmail_attachments",
                 "source_fragments",
+                "successful_tools",
             }
             or not isinstance(state["authorized"], set)
             or not isinstance(state["dispatched"], set)
             or not isinstance(state["failures"], set)
+            or not isinstance(state["successful_tools"], set)
         ):
             raise ValueError("private read authorization state is missing")
         return state
@@ -1615,6 +1650,7 @@ class TrustedPrincipalRuntime:
                         f"{str(error.get('code') or 'source_failure')[:48]}"
                     )
                 elif isinstance(parsed, dict) and parsed.get("status") == "ok":
+                    state["successful_tools"].add(tool_name)
                     data = parsed.get("data")
                     stack = [data]
                     while stack and len(state["source_fragments"]) < 128:
@@ -1896,16 +1932,123 @@ class TrustedPrincipalRuntime:
             + canonical_json(payload)
         )
 
+    def _property_output_authorized(
+        self, binding: TurnBinding, state: dict[str, set[str]]
+    ) -> bool:
+        """Select the expanded Property prose mode from host-bound facts only."""
+        if state["successful_tools"] != {"kite_property_read"}:
+            return False
+        if binding.mapping is None or binding.request is None:
+            return False
+        if binding.mapping.principal != "james":
+            return False
+        if _PROPERTY_CAPABILITY_ID not in binding.effective_read_capability_ids:
+            return False
+        principal_policy = self.policy.get("principals", {}).get("james")
+        if not isinstance(principal_policy, dict):
+            return False
+        configured_caps = self.principal_read_capabilities.get("james", frozenset())
+        semantic_policy = principal_policy.get("semantic_policy")
+        if (
+            _PROPERTY_CAPABILITY_ID not in configured_caps
+            or not isinstance(semantic_policy, dict)
+            or _PROPERTY_CAPABILITY_ID not in semantic_policy
+        ):
+            return False
+        request = self.store.get_request(binding.request.request_id)
+        return bool(
+            request is not None
+            and request.state == "bound"
+            and request.policy_generation == self.policy_generation
+            and request.roster_generation == binding.request.roster_generation
+            and request.read_capability_fingerprint
+            == self._capability_fingerprint(binding.effective_read_capability_ids)
+        )
+
+    def _property_output_leak_reason(self, answer: str) -> str:
+        """Gate form and absolute secrets without inspecting Property fields.
+
+        The connector has already sanitized the complete payload.  This check
+        deliberately does not reconstruct a field allowlist or compare output
+        fragments with source text; it enforces only credentials, containers,
+        and deterministic response bounds.
+        """
+        value = str(answer or "")
+        if len(value) > min(self.limits.output_chars, _PROPERTY_OUTPUT_MAX_CHARS):
+            return "Property answer exceeds its character limit"
+        if len(value.encode("utf-8")) > min(
+            self.limits.response_bytes, _PROPERTY_OUTPUT_MAX_BYTES
+        ):
+            return "Property answer exceeds its byte limit"
+        lines = value.splitlines()
+        if len(lines) > _PROPERTY_OUTPUT_MAX_LINES:
+            return "Property answer exceeds its line limit"
+        if sum(
+            bool(re.match(r"^\s*(?:[-*+] |\d{1,3}[.)] )", line))
+            for line in lines
+        ) > _PROPERTY_OUTPUT_MAX_BULLETS:
+            return "Property answer exceeds its item limit"
+        if "```" in value:
+            return "Property answer is not bounded prose or bullets"
+        if (
+            sum(line.count("|") >= 2 for line in lines) >= 2
+            and any(
+                _PROPERTY_TABLE_SEPARATOR_PATTERN.fullmatch(line)
+                for line in lines
+            )
+        ):
+            return "Property table/container dump"
+        for pattern in _CREDENTIAL_PATTERNS:
+            if pattern.search(value):
+                return "credential-shaped content"
+        if any(
+            secret and secret in value for secret in getattr(self, "secret_values", ())
+        ):
+            return "configured credential value"
+        if any(pattern.search(value) for pattern in _RAW_RESULT_PATTERNS):
+            return "raw tool-result marker"
+        if any(pattern.search(value) for pattern in _PROPERTY_OUTPUT_INTERNAL_PATTERNS):
+            return "internal connector identifier or path"
+
+        stripped = value.strip()
+        decoder = json.JSONDecoder()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = json.loads(stripped)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                return "Property JSON/container dump"
+        for index, character in enumerate(value):
+            if character not in "[{":
+                continue
+            try:
+                parsed, _end = decoder.raw_decode(value, index)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, (dict, list)):
+                return "Property JSON/container dump"
+        return ""
+
     def transform_llm_output(
-        self, response_text: str = "", session_id: str = "", **_: Any
+        self,
+        response_text: str = "",
+        session_id: str = "",
+        turn_id: Optional[str] = None,
+        **_: Any,
     ) -> Optional[str]:
         platform, _peer, _context = self._a2a_lane()
         if platform != "a2a":
             return None
         binding = _ACTIVE_BINDING.get()
         try:
-            binding = self._current_valid_binding(session_id=str(session_id or ""))
+            binding = self._current_valid_binding(
+                session_id=str(session_id or ""),
+                turn_id=None if turn_id is None else str(turn_id),
+            )
             answer = str(response_text or "")
+            property_mode = False
+            property_provenance = False
             if self.private_reads.enabled:
                 if binding.output_tier == "bulk_raw_export":
                     answer = canonical_json({
@@ -1918,23 +2061,35 @@ class TrustedPrincipalRuntime:
                         "reason": "specific document delivery is unavailable until Slice C",
                     })
                 else:
-                    failures = sorted(self._private_read_state()["failures"])
+                    state = self._private_read_state()
+                    failures = sorted(state["failures"])
                     if failures:
                         answer = canonical_json({
                             "outcome": "unverifiable",
                             "reason": "one or more required private sources failed or were incomplete",
                             "source_failures": failures[:8],
                         })
-            leak_reason = self._leak_reason(answer, output=True)
+                    else:
+                        property_provenance = (
+                            "kite_property_read" in state["successful_tools"]
+                        )
+                        property_mode = self._property_output_authorized(binding, state)
+            if property_provenance and not property_mode:
+                leak_reason = "Property output authority or provenance is unavailable"
+            elif property_mode:
+                leak_reason = self._property_output_leak_reason(answer)
+            else:
+                leak_reason = self._leak_reason(answer, output=True)
             if not leak_reason and self.private_reads.enabled:
-                overlaps = sum(
-                    fragment in answer
-                    for fragment in self._private_read_state()["source_fragments"]
-                )
-                if overlaps and (
-                    binding.output_tier != "bounded_excerpt" or len(answer) > 400
-                ):
-                    leak_reason = "raw private-source overlap"
+                if not property_mode:
+                    overlaps = sum(
+                        fragment in answer
+                        for fragment in self._private_read_state()["source_fragments"]
+                    )
+                    if overlaps and (
+                        binding.output_tier != "bounded_excerpt" or len(answer) > 400
+                    ):
+                        leak_reason = "raw private-source overlap"
             denied = bool(leak_reason)
             if denied:
                 answer = ""
@@ -1959,6 +2114,18 @@ class TrustedPrincipalRuntime:
                     "output minimized by deterministic leak policy" if denied else ""
                 ),
             )
+            if (
+                property_mode
+                and len(envelope.encode("utf-8")) > self.limits.response_bytes
+            ):
+                answer = ""
+                denied = True
+                envelope = self._signed_response(
+                    binding,
+                    answer="",
+                    denied=True,
+                    reason="Property output exceeds the signed response byte limit",
+                )
             while len(envelope.encode("utf-8")) > self.limits.response_bytes and answer:
                 answer = answer[:-1]
                 envelope = self._signed_response(

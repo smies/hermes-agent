@@ -9,6 +9,7 @@ an argv vector with ``shell=False`` and HTTP uses fixed GET-only routes.
 from __future__ import annotations
 
 import json
+import math
 import mimetypes
 import os
 import re
@@ -20,7 +21,7 @@ import urllib.request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 PRIVATE_READ_TOOLSET = "juno_kite_private_reads"
 TOOL_NAMES = (
@@ -93,6 +94,91 @@ _WORK_FIELDS = frozenset({
     "company",
     "companyContext",
 })
+
+_PROPERTY_MAX_DEPTH = 12
+_PROPERTY_MAX_CONTAINER_ITEMS = 1024
+_PROPERTY_MAX_TOTAL_ITEMS = 8192
+_PROPERTY_REDACTION = "[REDACTED]"
+_PROPERTY_OPERATIONAL_CONTEXT_KEYS = frozenset({
+    "auth",
+    "authentication",
+    "backend",
+    "config",
+    "connector",
+    "credential",
+    "credentials",
+    "http",
+    "request",
+    "runtime",
+    "transport",
+})
+_PROPERTY_SECRET_KEYS = frozenset({
+    "apikey",
+    "apisecret",
+    "apitoken",
+    "auth",
+    "authconfig",
+    "authenv",
+    "authentication",
+    "authorization",
+    "authorizationheader",
+    "bearertoken",
+    "clientsecret",
+    "cookie",
+    "cookieheader",
+    "credentialconfig",
+    "credentials",
+    "credentialsconfig",
+    "idtoken",
+    "password",
+    "passphrase",
+    "privatekey",
+    "proxyauthorization",
+    "refreshtoken",
+    "secret",
+    "secretconfig",
+    "secretconfiguration",
+    "secretkey",
+    "secrets",
+    "sessioncookie",
+    "sessiontoken",
+    "setcookie",
+    "signingkey",
+    "signingsecret",
+    "token",
+})
+_PROPERTY_HEADER_KEYS = frozenset({
+    "authheaders",
+    "connectorheaders",
+    "headers",
+    "httpheaders",
+    "requestheaders",
+    "responseheaders",
+})
+_PROPERTY_SECRET_VALUE_PATTERNS = (
+    re.compile(
+        r"(?i)(?:\\?[\"'])?\b(?:authorization|proxy[-_ ]?authorization)"
+        r"(?:\\?[\"'])?\s*[:=]\s*(?:\\?[\"'])?"
+        r"(?:bearer|basic)\s+[^\s,;\"']+"
+    ),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(
+        r"(?i)(?:\\?[\"'])?\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|"
+        r"session[-_ ]?token|password|passphrase|client[-_ ]?secret|secret[-_ ]?key|"
+        r"session[-_ ]?cookie|set-cookie|cookie)(?:\\?[\"'])?\s*[:=]\s*"
+        r"(?:\\?[\"'])?[^\s,;\"']+"
+    ),
+    re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
+        r"-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*", re.DOTALL),
+    re.compile(
+        r"(?i)([?&](?:access_token|auth_token|refresh_token|session_token|"
+        r"token|api_key|secret)=)[^&#\s]+"
+    ),
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -329,6 +415,7 @@ class PrivateReadService:
         backends: Optional[Mapping[str, Any]] = None,
         command_runner: Optional[Callable[..., Any]] = None,
         url_opener: Any = None,
+        secret_values: Optional[Iterable[str]] = None,
     ):
         self.config = config if isinstance(config, dict) else {}
         self.enabled = self.config.get("enabled") is True
@@ -344,6 +431,13 @@ class PrivateReadService:
         self.command_runner = command_runner or subprocess.run
         self.url_opener = url_opener or urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirects()
+        )
+        self.secret_values = tuple(
+            sorted(
+                {str(value) for value in (secret_values or ()) if str(value)},
+                key=len,
+                reverse=True,
+            )
         )
         self._validate_config()
         prop = self.config.get("property_intel")
@@ -1016,6 +1110,212 @@ class PrivateReadService:
             raise ValueError("Property Intel base_url must be a fixed origin")
         return base_url
 
+    @staticmethod
+    def _property_key_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+    @classmethod
+    def _property_secret_key(cls, key: str, *, operational: bool) -> bool:
+        normalized = cls._property_key_name(key)
+        if normalized in _PROPERTY_SECRET_KEYS:
+            return True
+        if any(
+            marker in normalized
+            for marker in (
+                "authorizationheader",
+                "privatekey",
+                "secretconfig",
+                "sessioncookie",
+            )
+        ):
+            return True
+        if normalized.endswith("password") or normalized.endswith("passphrase"):
+            return True
+        if normalized.endswith("secret") and normalized.startswith(
+            (
+                "api",
+                "auth",
+                "client",
+                "connector",
+                "database",
+                "encryption",
+                "oauth",
+                "session",
+                "signing",
+                "webhook",
+            )
+        ):
+            return True
+        if normalized.endswith("token") and normalized.startswith(
+            ("access", "api", "auth", "bearer", "id", "refresh", "session")
+        ):
+            return True
+        if "connector" in normalized and any(
+            marker in normalized
+            for marker in ("auth", "config", "env", "header", "secret")
+        ):
+            return True
+        if normalized in _PROPERTY_HEADER_KEYS and (
+            operational
+            or normalized.startswith(
+                ("auth", "connector", "http", "request", "response")
+            )
+        ):
+            return True
+        if operational and normalized in {
+            "authenv",
+            "clientid",
+            "connectionid",
+            "env",
+            "environment",
+            "oauthclientid",
+            "sessionid",
+        }:
+            return True
+        return False
+
+    @staticmethod
+    def _sanitize_property_text(value: str, secret_values: tuple[str, ...]) -> str:
+        sanitized = value
+        for pattern in _PROPERTY_SECRET_VALUE_PATTERNS:
+            sanitized = pattern.sub(_PROPERTY_REDACTION, sanitized)
+        for secret in secret_values:
+            sanitized = sanitized.replace(secret, _PROPERTY_REDACTION)
+        return sanitized
+
+    def _sanitize_property_payload(self, value: Any) -> Any:
+        """Remove only operational secrets while preserving the portal schema.
+
+        Property Intel evolves independently of Hermes, so this traversal has
+        no field allowlist.  It validates one complete JSON-shaped value and
+        fails instead of truncating ordinary portal data when a structural or
+        processing bound is exceeded.
+        """
+        total_items = 0
+        processed_bytes = 0
+        active_containers: set[int] = set()
+        prop = self.config.get("property_intel")
+        auth_env = str(prop.get("auth_env") or "") if isinstance(prop, dict) else ""
+        dynamic_secrets = list(self.secret_values)
+        if auth_env:
+            dynamic_secrets.append(auth_env)
+            auth_value = os.environ.get(auth_env, "")
+            if auth_value:
+                dynamic_secrets.append(auth_value)
+        secret_values = tuple(sorted(set(dynamic_secrets), key=len, reverse=True))
+        auth_env_key = self._property_key_name(auth_env) if auth_env else ""
+
+        def visit(current: Any, depth: int, *, operational: bool = False) -> Any:
+            nonlocal processed_bytes, total_items
+            if depth > _PROPERTY_MAX_DEPTH:
+                raise SourceFailure(
+                    "depth_exceeded",
+                    "Property Intel result exceeded the maximum nesting depth",
+                )
+            if current is None or isinstance(current, (bool, int)):
+                return current
+            if isinstance(current, float):
+                if not math.isfinite(current):
+                    raise SourceFailure(
+                        "malformed_result",
+                        "Property Intel result contains a non-finite number",
+                    )
+                return current
+            if isinstance(current, str):
+                if len(current) > self.output_bytes:
+                    raise SourceFailure(
+                        "cap_exceeded",
+                        "Property Intel result exceeded its processing byte cap",
+                    )
+                processed_bytes += len(current.encode("utf-8"))
+                if processed_bytes > self.output_bytes:
+                    raise SourceFailure(
+                        "cap_exceeded",
+                        "Property Intel result exceeded its processing byte cap",
+                    )
+                return self._sanitize_property_text(current, secret_values)
+            if not isinstance(current, (dict, list)):
+                raise SourceFailure(
+                    "malformed_result",
+                    "Property Intel result is not valid JSON data",
+                )
+
+            identity = id(current)
+            if identity in active_containers:
+                raise SourceFailure(
+                    "malformed_result",
+                    "Property Intel result contains a recursive container",
+                )
+            item_count = len(current)
+            if item_count > _PROPERTY_MAX_CONTAINER_ITEMS:
+                raise SourceFailure(
+                    "cap_exceeded",
+                    "Property Intel container exceeded its item cap",
+                )
+            total_items += item_count
+            if total_items > _PROPERTY_MAX_TOTAL_ITEMS:
+                raise SourceFailure(
+                    "cap_exceeded",
+                    "Property Intel result exceeded its processing item cap",
+                )
+
+            active_containers.add(identity)
+            try:
+                if isinstance(current, list):
+                    return [
+                        visit(item, depth + 1, operational=operational)
+                        for item in current
+                    ]
+
+                sanitized: dict[str, Any] = {}
+                for key, item in current.items():
+                    if not isinstance(key, str):
+                        raise SourceFailure(
+                            "malformed_result",
+                            "Property Intel object keys must be strings",
+                        )
+                    processed_bytes += len(key.encode("utf-8"))
+                    if processed_bytes > self.output_bytes:
+                        raise SourceFailure(
+                            "cap_exceeded",
+                            "Property Intel result exceeded its processing byte cap",
+                        )
+                    if (
+                        (auth_env_key and self._property_key_name(key) == auth_env_key)
+                        or self._property_secret_key(key, operational=operational)
+                    ):
+                        # Removed values still count toward every input bound;
+                        # a huge/deep secret subtree must not evade processing
+                        # limits merely because it will not be disclosed.
+                        visit(item, depth + 1, operational=True)
+                        continue
+                    normalized = self._property_key_name(key)
+                    child_operational = operational or normalized in (
+                        _PROPERTY_OPERATIONAL_CONTEXT_KEYS
+                    ) or any(
+                        marker in normalized
+                        for marker in ("connector", "credential", "transport")
+                    )
+                    sanitized[key] = visit(
+                        item, depth + 1, operational=child_operational
+                    )
+                return sanitized
+            finally:
+                active_containers.remove(identity)
+
+        sanitized = visit(value, 0)
+        try:
+            encoded = canonical_json(sanitized).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise SourceFailure(
+                "malformed_result", "Property Intel result is not valid JSON data"
+            ) from exc
+        if len(encoded) > self.output_bytes:
+            raise SourceFailure(
+                "cap_exceeded", "Property Intel sanitized result exceeded its byte cap"
+            )
+        return sanitized
+
     def _property(self, args: dict[str, Any]) -> Any:
         self._require_exact(
             args,
@@ -1056,22 +1356,24 @@ class PrivateReadService:
         if "query" in canonical:
             canonical["query"] = self._bounded_text(canonical["query"], "query", 200)
         if "property_intel" in self.backends:
-            return self._injected("property_intel", str(operation), canonical)
-        cfg = self.config.get("property_intel")
-        base = self._fixed_http_origin(cfg)
-        quoted = {
-            key: urllib.parse.quote(str(value), safe="")
-            for key, value in canonical.items()
-        }
-        path = {
-            "list": "/api/properties",
-            "property": f"/api/properties/{quoted.get('property_id', '')}",
-            "research_notes": f"/api/properties/{quoted.get('property_id', '')}/research-notes",
-            "note": f"/api/research-notes/{quoted.get('note_id', '')}",
-            "note_entry": f"/api/research-notes/{quoted.get('note_id', '')}/entries/{quoted.get('entry_id', '')}",
-            "transaction": f"/api/properties/{quoted.get('property_id', '')}/transaction",
-        }[str(operation)]
-        data = self._http_get(base + path, cfg)
+            data = self._injected("property_intel", str(operation), canonical)
+        else:
+            cfg = self.config.get("property_intel")
+            base = self._fixed_http_origin(cfg)
+            quoted = {
+                key: urllib.parse.quote(str(value), safe="")
+                for key, value in canonical.items()
+            }
+            path = {
+                "list": "/api/properties",
+                "property": f"/api/properties/{quoted.get('property_id', '')}",
+                "research_notes": f"/api/properties/{quoted.get('property_id', '')}/research-notes",
+                "note": f"/api/research-notes/{quoted.get('note_id', '')}",
+                "note_entry": f"/api/research-notes/{quoted.get('note_id', '')}/entries/{quoted.get('entry_id', '')}",
+                "transaction": f"/api/properties/{quoted.get('property_id', '')}/transaction",
+            }[str(operation)]
+            data = self._http_get(base + path, cfg)
+        data = self._sanitize_property_payload(data)
         if operation in {"list", "research_notes"}:
             if not isinstance(data, list):
                 raise SourceFailure(
