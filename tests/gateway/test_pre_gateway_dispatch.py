@@ -292,6 +292,107 @@ async def test_malformed_critical_result_is_silent_before_all_effects(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_well_formed_critical_result_without_bound_token_fails_closed(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda _name, **_kwargs: [
+            {
+                "action": "critical_allow",
+                "scope": "juno-trusted-principal-v2",
+                "redact_scope": True,
+            }
+        ],
+    )
+    runner, adapter = _critical_juno_runner()
+
+    assert await runner._handle_message(_make_event("protected")) is None
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gateway_startup_reload_uses_active_juno_profile_and_reaches_dispatch(
+    tmp_path, monkeypatch, caplog
+):
+    """Gateway startup replaces a stale hook with the active-profile runtime."""
+    import hermes_cli.plugins as plugins_module
+    import plugins.juno_kite_trusted_principal as juno_plugin
+    import tools.registry as registry_module
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from tools.registry import ToolRegistry
+
+    runner, _adapter = _critical_juno_runner()
+    section = runner.config.juno_kite_trusted_principal
+    section["mapping_path"] = str(tmp_path / "mapping.sqlite3")
+    host_config = {
+        "a2a_agents": {
+            "kite": {
+                "url": "http://127.0.0.1:9917",
+                "auth": {"type": "bearer", "token": "synthetic-peer-token"},
+                "timeout": 5,
+            }
+        },
+        "juno_kite_trusted_principal": section,
+    }
+    monkeypatch.setenv("SYNTHETIC_MAPPING_KEY", "m" * 32)
+    monkeypatch.setenv("SYNTHETIC_REQUEST_KEY", "r" * 32)
+    monkeypatch.setenv("SYNTHETIC_RESPONSE_KEY", "s" * 32)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: host_config)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+    )
+
+    manager = PluginManager()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    monkeypatch.setattr(registry_module, "registry", ToolRegistry())
+    context = PluginContext(
+        PluginManifest(name="juno_kite_trusted_principal", source="bundled"),
+        manager,
+    )
+    juno_plugin.register(context)
+
+    stale_callback = manager._hooks["pre_gateway_dispatch"][0]
+    assert stale_callback.__self__.active_profile == "default"
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "juno"
+    )
+
+    def reload_active_profile_plugins():
+        juno_plugin.register(context)
+
+    monkeypatch.setattr(
+        manager, "_discover_and_load_inner", reload_active_profile_plugins
+    )
+    runner._reload_plugins_for_active_profile()
+
+    callback = manager._hooks["pre_gateway_dispatch"][0]
+    assert callback.__self__.active_profile == "juno"
+    observed = []
+
+    async def tracked_callback(**kwargs):
+        result = await callback(**kwargs)
+        observed.append(result)
+        return result
+
+    manager._hooks["pre_gateway_dispatch"] = [tracked_callback]
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._handle_message_with_agent = AsyncMock(return_value="restored-reply")
+
+    assert await runner._handle_message(_make_event("protected")) == "restored-reply"
+    assert observed == [
+        {
+            "action": "critical_allow",
+            "scope": "juno-trusted-principal-v2",
+            "redact_scope": True,
+        }
+    ]
+    runner._handle_message_with_agent.assert_awaited_once()
+    assert "protected pre_gateway_dispatch proof missing" not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("malformed", (None, {"version": 2, "mode": "juno", "profile": "juno"}))
 async def test_missing_or_malformed_dedicated_config_is_silent_before_all_effects(
     malformed, monkeypatch

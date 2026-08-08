@@ -10940,6 +10940,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("Failed to cancel gateway loop floor timer", exc_info=True)
 
+    @staticmethod
+    def _reload_plugins_for_active_profile() -> None:
+        """Bind profile-owned plugin runtimes to the gateway launch context."""
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins(force=True)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -11205,8 +11212,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so the discover_plugins() side-effect in model_tools.py is NOT
         # guaranteed to have run by the time we reach this point.
         try:
-            from hermes_cli.plugins import discover_plugins
-            discover_plugins()
+            # Discovery may already have run before this gateway's profile
+            # context became active. Reload once at the startup boundary so
+            # profile-bound runtimes capture this gateway's HERMES_HOME before
+            # any inbound message can reach their hooks.
+            self._reload_plugins_for_active_profile()
         except Exception:
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
