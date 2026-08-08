@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .private_reads import PRIVATE_READ_TOOLSET, TOOL_SCHEMAS
 from .runtime import (
     TrustedPrincipalRuntime,
     critical_ingress_satisfied,
@@ -40,7 +41,10 @@ def _schema(runtime) -> dict:
                         "additionalProperties": False,
                         "properties": {
                             "role": {"type": "string", "enum": ["user", "assistant"]},
-                            "text": {"type": "string", "maxLength": limits.context_turn_chars},
+                            "text": {
+                                "type": "string",
+                                "maxLength": limits.context_turn_chars,
+                            },
                         },
                         "required": ["role", "text"],
                     },
@@ -74,6 +78,23 @@ def register(ctx) -> None:
             description=TOOL_DESCRIPTION,
             emoji="🪁",
         )
+    elif (
+        runtime.mode == "kite"
+        and getattr(runtime, "private_reads", None) is not None
+        and runtime.private_reads.enabled
+    ):
+        handlers = runtime.private_read_handlers()
+        for name in sorted(handlers):
+            schema = TOOL_SCHEMAS[name]
+            ctx.register_tool(
+                name=name,
+                toolset=PRIVATE_READ_TOOLSET,
+                schema=schema,
+                handler=handlers[name],
+                check_fn=runtime.private_reads_available,
+                description=str(schema["description"]),
+                emoji="🔒",
+            )
 
 
 __all__ = [

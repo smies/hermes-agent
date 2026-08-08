@@ -13,7 +13,8 @@ plugin runs in one of two modes:
   `pre_tool_dispatch` integrity hook, and `transform_llm_output`. It binds only
   authenticated A2A peer `juno`, defaults unknown tools to deny, gates
   mutations by exact canonical arguments, and releases only a signed minimized
-  envelope.
+  envelope. When the explicit Slice B configuration is present it also
+  registers only the eight `kite_*` typed private-read tools listed below.
 
 For an allowlisted WhatsApp group, the ingress hook reads a complete current
 roster only from the exact adapter-managed bridge that authenticated the
@@ -70,6 +71,9 @@ request text never participate in identity resolution. The example IDs below
 are placeholders.
 
 ## Juno profile configuration
+
+This is the Slice A baseline. Slice B retains these audience and transport
+fields and applies the private-read additions in the later section.
 
 ```yaml
 plugins:
@@ -187,6 +191,9 @@ isolation remains the person-specific continuity boundary.
 
 ## Kite profile configuration
 
+This is the Slice A baseline. The Slice B block below replaces its synthetic
+tool classifications with the exact plugin-owned read surface.
+
 Use the same `juno_kite_trusted_principal` block as Juno, changing only `mode`
 and `profile`. Kite must also enable the bundled inbound A2A platform plugin:
 
@@ -278,6 +285,153 @@ The Juno peer URL must remain exactly `http://127.0.0.1:9917`, and its bearer
 token must be the same value assigned to peer `juno` above. The top-level
 `platforms.a2a` and `a2a.trusted_peers` shapes are intentional Hermes config;
 do not nest the platform beneath `gateway`.
+
+## Slice B private-read configuration
+
+Slice B is opt-in and is not activated merely by installing this code. Add the
+`juno_kite_private_reads` toolset only to Kite. Keep Juno on `juno_kite`; the
+plugin never registers these tools in Juno mode. Kite may retain ordinary
+standard-Hermes tools for unrelated use, but every non-plugin tool is denied on
+an active trusted-principal A2A turn by the existing default-deny hooks.
+
+The exact model surface is:
+
+- `kite_gmail_search`, `kite_gmail_get`, and
+  `kite_gmail_attachment_extract`;
+- `kite_calendar_read`;
+- `kite_things_read`;
+- `kite_property_read`;
+- `kite_whatsapp_archive_read`;
+- `kite_personal_files_read`.
+
+Their complete JSON schemas live in `private_reads.py` and reject additional
+properties. Account identities, paths, project IDs, endpoints, credentials,
+and executables are host configuration, never model arguments. Command-backed
+connectors use an argv vector with `shell=False`; Property Intel uses fixed
+HTTP GET routes with redirects and ambient proxies disabled.
+
+Use the same policy/capability/private-read block in Juno and Kite so the signed
+intersection is stable. The paths and aliases below are the approved boundary;
+do not add `work` to Gmail or another Things project. The Property Intel origin
+is deliberately configurable because its runtime port may move. `auth_env`, if
+needed, names a credential in Kite's `.env`; the token itself is never placed
+in YAML, a prompt, a tool argument, a result, or a log.
+
+```yaml
+tools:
+  enabled:
+    - juno_kite_private_reads
+
+juno_kite_trusted_principal:
+  # Keep the complete Slice A fields above, then add:
+  policy_generation: "juno-kite-slice-b-v1"
+  private_reads:
+    enabled: true
+    timeout_seconds: 15
+    output_bytes: 131072
+    gmail:
+      executable: /Users/james/.hermes/scripts/hermes-google-account
+      account_aliases:
+        personal: personal
+        kite: kite
+    calendar:
+      executable: /Users/james/.hermes/scripts/hermes-google-account
+      account_aliases:
+        personal: personal
+        work_free_busy: work
+      calendar_ids:
+        personal: primary
+        work_free_busy: primary
+    things:
+      client: /Users/james/projects/personal-ops/runtime/scripts/things_mcp_client.py
+      endpoint: http://127.0.0.1:8787/mcp
+      project_uuid: QcGAPSj2vVUsf3ad2buNo3
+      project_title: Personal Action List
+    property_intel:
+      base_url: http://127.0.0.1:<configured-property-port>
+      public_base_url: https://<configured-property-public-origin>
+      auth_env: PROPERTY_INTEL_READ_TOKEN
+    whatsapp:
+      executable: /usr/local/bin/node
+      script: /Users/james/projects/personal-ops/runtime/whatsapp-readonly/scripts/query.mjs
+      state_dir: /Users/james/.hermes/state/whatsapp-readonly
+    files:
+      roots:
+        - name: obsidian
+          path: /Users/james/Documents/Obsidian Vault
+  policy:
+    principals:
+      james:
+        conversation_eligibility: {dm: true, group: true}
+        required_group_co_principals: []
+        read_capability_ids:
+          - juno.private.james
+          - juno.public
+          - juno.shared.family
+          - juno.shared.children
+          - juno.shared.mauritius
+          - juno.shared.property_intel
+          - juno.shared.villa_lena
+        action_capability_ids: []
+        semantic_policy:
+          juno.private.james: {domain: james-personal}
+          juno.public: {domain: public-agent-operational}
+          juno.shared.family: {domain: household-family}
+          juno.shared.children: {domain: children-family}
+          juno.shared.mauritius: {domain: mauritius}
+          juno.shared.property_intel: {domain: property-intel}
+          juno.shared.villa_lena: {domain: villa-lena}
+      lucy:
+        conversation_eligibility: {dm: false, group: true}
+        required_group_co_principals: [james]
+        read_capability_ids:
+          - juno.public
+          - juno.shared.family
+          - juno.shared.children
+          - juno.shared.mauritius
+          - juno.shared.property_intel
+          - juno.shared.villa_lena
+        action_capability_ids: []
+        semantic_policy:
+          juno.public: {domain: public-agent-operational}
+          juno.shared.family: {domain: household-family}
+          juno.shared.children: {domain: children-family}
+          juno.shared.mauritius: {domain: mauritius}
+          juno.shared.property_intel: {domain: property-intel}
+          juno.shared.villa_lena: {domain: villa-lena}
+    tool_classes:
+      read:
+        - kite_gmail_search
+        - kite_gmail_get
+        - kite_gmail_attachment_extract
+        - kite_calendar_read
+        - kite_things_read
+        - kite_property_read
+        - kite_whatsapp_archive_read
+        - kite_personal_files_read
+      mutating: []
+    action_rules: []
+```
+
+The work-calendar projection is code-enforced and emits only `status`, `start`,
+`end`, validated `timezone`, and coarse `constraints`. Source-supplied titles,
+attendees, descriptions, locations, links, IDs, organizers, conferences,
+attachments, company context, and arbitrary constraint text are discarded.
+Gmail accepts only `personal` and `kite`; the fixed identities are
+`smith.js@gmail.com` and `kite.010.kite@gmail.com`. An attachment ID must have
+come from the exact message read in the same signed turn. Things is pinned to
+the exact UUID/title shown above. Files reject absolute/hidden/credential/work/
+Hermes paths, `..`, symlinks, non-regular files, unsupported extensions, and
+byte/line/result overflows.
+
+Every connector returns `status`, `source`, and `complete`. Timeout, missing
+auth, stale archive, ambiguity, malformed output, truncation/cap overflow, and
+backend unavailability produce `status: error` and `complete: false`; a failed
+source can therefore never be interpreted as an empty result. Any such failure
+forces the final answer to a bounded `unverifiable` state. Bulk/raw requests
+are denied before a connector call. Specific document delivery returns
+`unavailable_next_gate` for Slice C. No source bodies are copied into the
+mapping/replay database.
 
 Action rules and every `action_capability_ids` list are intentionally empty in
 the Slice A deployment configuration. The existing exact-argument enforcement
