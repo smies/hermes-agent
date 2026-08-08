@@ -159,6 +159,48 @@ _PROPERTY_TABLE_SEPARATOR_PATTERN = re.compile(
     r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*"
 )
 
+_PRIVATE_SOURCE_FRAGMENT_CHARS = 48
+_PRIVATE_SOURCE_MAX_RECORDED_FRAGMENTS = 128
+# Minimized answers may repeat a small amount of source identity (for example,
+# email subjects). These independent bounds allow at most twelve distinct
+# matched fragments and at most 480 matched provenance characters per answer.
+_MINIMIZED_PROVENANCE_MAX_DISTINCT_FRAGMENTS = 12
+_MINIMIZED_PROVENANCE_MAX_TOTAL_CHARS = 480
+_PROVENANCE_IDENTITY_FIELDS = frozenset({
+    "author",
+    "authorname",
+    "bcc",
+    "canonicaltitle",
+    "cc",
+    "date",
+    "datetime",
+    "documenttitle",
+    "filename",
+    "from",
+    "sender",
+    "sendername",
+    "subject",
+    "time",
+    "timestamp",
+    "title",
+    "to",
+})
+_CONTENT_FIELDS = frozenset({
+    "attachmenttext",
+    "body",
+    "content",
+    "description",
+    "extractedtext",
+    "html",
+    "htmlbody",
+    "message",
+    "notes",
+    "plaintext",
+    "snippet",
+    "text",
+    "transcript",
+})
+
 
 def canonical_json(value: Any) -> str:
     """Deterministic UTF-8 JSON form used by every exact binding."""
@@ -199,6 +241,43 @@ def _contains_wildcard(value: Any) -> bool:
 
 def _truncate_chars(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[:limit]
+
+
+def _normalized_payload_field(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _provenance_identity_path(path: tuple[str, ...]) -> bool:
+    """Classify source text from its payload field path, never answer text."""
+    fields = tuple(_normalized_payload_field(part) for part in path)
+    return bool(
+        fields
+        and fields[-1] in _PROVENANCE_IDENTITY_FIELDS
+        and not _CONTENT_FIELDS.intersection(fields)
+    )
+
+
+def _contains_json_container(value: str) -> bool:
+    """Detect a complete or embedded JSON object/list deterministically."""
+    stripped = value.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return True
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(value):
+        if character not in "[{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(value, index)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, (dict, list)):
+            return True
+    return False
 
 
 def _audit_guard(correlation_id: str, request_id: str, context_id: str) -> str:
@@ -1504,7 +1583,8 @@ class TrustedPrincipalRuntime:
                 "failures": set(),
                 "gmail_messages": set(),
                 "gmail_attachments": set(),
-                "source_fragments": set(),
+                "content_fragments": set(),
+                "provenance_fragments": set(),
                 "successful_tools": set(),
             })
             return {"context": self._policy_view(binding)}
@@ -1603,12 +1683,15 @@ class TrustedPrincipalRuntime:
                 "failures",
                 "gmail_messages",
                 "gmail_attachments",
-                "source_fragments",
+                "content_fragments",
+                "provenance_fragments",
                 "successful_tools",
             }
             or not isinstance(state["authorized"], set)
             or not isinstance(state["dispatched"], set)
             or not isinstance(state["failures"], set)
+            or not isinstance(state["content_fragments"], set)
+            or not isinstance(state["provenance_fragments"], set)
             or not isinstance(state["successful_tools"], set)
         ):
             raise ValueError("private read authorization state is missing")
@@ -1652,19 +1735,40 @@ class TrustedPrincipalRuntime:
                 elif isinstance(parsed, dict) and parsed.get("status") == "ok":
                     state["successful_tools"].add(tool_name)
                     data = parsed.get("data")
-                    stack = [data]
-                    while stack and len(state["source_fragments"]) < 128:
-                        current = stack.pop()
+                    stack: list[tuple[Any, tuple[str, ...]]] = [(data, ())]
+                    while stack and (
+                        len(state["content_fragments"])
+                        + len(state["provenance_fragments"])
+                        < _PRIVATE_SOURCE_MAX_RECORDED_FRAGMENTS
+                    ):
+                        current, path = stack.pop()
                         if isinstance(current, dict):
-                            stack.extend(current.values())
+                            for key in sorted(current, key=str, reverse=True):
+                                stack.append((current[key], (*path, str(key))))
                         elif isinstance(current, list):
-                            stack.extend(current)
-                        elif isinstance(current, str) and len(current) >= 48:
-                            for offset in range(0, len(current) - 47, 48):
-                                state["source_fragments"].add(
-                                    current[offset : offset + 48]
-                                )
-                                if len(state["source_fragments"]) >= 128:
+                            stack.extend((item, path) for item in reversed(current))
+                        elif (
+                            isinstance(current, str)
+                            and len(current) >= _PRIVATE_SOURCE_FRAGMENT_CHARS
+                        ):
+                            fragment_class = (
+                                "provenance_fragments"
+                                if _provenance_identity_path(path)
+                                else "content_fragments"
+                            )
+                            for offset in range(
+                                0,
+                                len(current) - _PRIVATE_SOURCE_FRAGMENT_CHARS + 1,
+                                _PRIVATE_SOURCE_FRAGMENT_CHARS,
+                            ):
+                                state[fragment_class].add(current[
+                                    offset : offset + _PRIVATE_SOURCE_FRAGMENT_CHARS
+                                ])
+                                if (
+                                    len(state["content_fragments"])
+                                    + len(state["provenance_fragments"])
+                                    >= _PRIVATE_SOURCE_MAX_RECORDED_FRAGMENTS
+                                ):
                                     break
                     account = str(args.get("account") or "")
                     if tool_name == "kite_gmail_search" and isinstance(data, list):
@@ -2030,6 +2134,43 @@ class TrustedPrincipalRuntime:
                 return "Property JSON/container dump"
         return ""
 
+    @staticmethod
+    def _private_source_overlap_leak_reason(
+        answer: str,
+        output_tier: str,
+        state: dict[str, set[str]],
+    ) -> str:
+        """Allow only bounded path-tagged provenance in minimized answers."""
+        content_overlaps = {
+            fragment
+            for fragment in state["content_fragments"]
+            if fragment in answer
+        }
+        provenance_overlaps = {
+            fragment
+            for fragment in state["provenance_fragments"]
+            if fragment in answer
+        }
+        if not content_overlaps and not provenance_overlaps:
+            return ""
+        if output_tier == "bounded_excerpt" and len(answer) <= 400:
+            return ""
+        if content_overlaps or output_tier != "minimized_answer":
+            return "raw private-source overlap"
+        if _contains_json_container(answer):
+            return "raw private-source overlap"
+        provenance_characters = sum(
+            answer.count(fragment) * len(fragment)
+            for fragment in provenance_overlaps
+        )
+        if (
+            len(provenance_overlaps)
+            > _MINIMIZED_PROVENANCE_MAX_DISTINCT_FRAGMENTS
+            or provenance_characters > _MINIMIZED_PROVENANCE_MAX_TOTAL_CHARS
+        ):
+            return "raw private-source overlap"
+        return ""
+
     def transform_llm_output(
         self,
         response_text: str = "",
@@ -2082,14 +2223,11 @@ class TrustedPrincipalRuntime:
                 leak_reason = self._leak_reason(answer, output=True)
             if not leak_reason and self.private_reads.enabled:
                 if not property_mode:
-                    overlaps = sum(
-                        fragment in answer
-                        for fragment in self._private_read_state()["source_fragments"]
+                    leak_reason = self._private_source_overlap_leak_reason(
+                        answer,
+                        binding.output_tier,
+                        self._private_read_state(),
                     )
-                    if overlaps and (
-                        binding.output_tier != "bounded_excerpt" or len(answer) > 400
-                    ):
-                        leak_reason = "raw private-source overlap"
             denied = bool(leak_reason)
             if denied:
                 answer = ""

@@ -1346,6 +1346,249 @@ def test_raw_private_source_overlap_is_denied_at_final_output(tmp_path):
     _bound_turn(tmp_path, {"gmail": gmail}, check)
 
 
+def test_minimized_email_summary_allows_bounded_time_sender_subject_provenance(
+    tmp_path,
+):
+    """B-FIX-1: the reproduced long-subject summary shape is releasable."""
+    messages = [
+        {
+            "id": "message-delivered",
+            "date": "08:14",
+            "from": "Green Fulfilment",
+            "subject": "Your parcel from Green Fulfilment has been delivered",
+        },
+        {
+            "id": "message-due",
+            "date": "09:02",
+            "from": "Green Fulfilment",
+            "subject": "Your parcel from Green Fulfilment is due to be delivered today",
+        },
+        {
+            "id": "message-appointment",
+            "date": "10:35",
+            "from": "Synthetic Appointments",
+            "subject": (
+                "Your synthetic appointment booking has been confirmed for "
+                "Tuesday afternoon"
+            ),
+        },
+        {
+            "id": "message-membership",
+            "date": "11:48",
+            "from": "Household Memberships",
+            "subject": (
+                "A household membership renewal notice is ready for your review"
+            ),
+        },
+        {
+            "id": "message-travel",
+            "date": "13:20",
+            "from": "Synthetic Travel",
+            "subject": (
+                "Updated travel itinerary and check-in details for the family journey"
+            ),
+        },
+        {
+            "id": "message-receipt",
+            "date": "15:41",
+            "from": "Synthetic Receipts",
+            "subject": (
+                "Receipt for your recent synthetic household purchase is now available"
+            ),
+        },
+    ]
+    gmail = RecordingBackend({"search": messages})
+    answer = "New emails today:\n" + "\n".join(
+        f"- {item['date']} — {item['from']} — {item['subject']}"
+        for item in messages
+    )
+    assert len(answer) > 400
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_gmail_search",
+            {"account": "personal", "query": "after:today", "max_results": 10},
+        )
+        envelope_text = kite.transform_llm_output(
+            response_text=answer, session_id="kite-session"
+        )
+        envelope = json.loads(envelope_text.split(RESPONSE_PREFIX, 1)[1])
+        assert envelope["denied"] is False
+        assert envelope["answer"] == answer
+
+    _bound_turn(
+        tmp_path,
+        {"gmail": gmail},
+        check,
+        question="Any new emails today?",
+    )
+
+
+@pytest.mark.parametrize("content_field", ["body", "snippet"])
+def test_minimized_email_content_overlap_remains_denied(tmp_path, content_field):
+    """B-FIX-2: provenance does not relax body or snippet overlap."""
+    raw_content = (
+        "This synthetic message content is deliberately longer than forty-eight "
+        "characters and must remain inside Kite."
+    )
+    gmail = RecordingBackend({
+        "search": [{"id": "message-content"}],
+        "get": {"id": "message-content", content_field: raw_content},
+    })
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_gmail_search",
+            {"account": "personal", "query": "synthetic", "max_results": 2},
+        )
+        _invoke(
+            kite,
+            "kite_gmail_get",
+            {"account": "personal", "message_id": "message-content"},
+        )
+        envelope_text = kite.transform_llm_output(
+            response_text=raw_content, session_id="kite-session"
+        )
+        envelope = json.loads(envelope_text.split(RESPONSE_PREFIX, 1)[1])
+        assert envelope["denied"] is True
+        assert raw_content not in envelope_text
+
+    _bound_turn(tmp_path, {"gmail": gmail}, check)
+
+
+@pytest.mark.parametrize("message_count", [11, 13])
+def test_minimized_email_bulk_subject_harvest_exceeds_provenance_bounds(
+    tmp_path, message_count
+):
+    """B-FIX-3: total-character and distinct-fragment bounds block harvesting."""
+    labels = (
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+        "juliet",
+        "kilo",
+        "lima",
+        "mike",
+    )
+    messages = [
+        {
+            "id": f"message-{label}",
+            "subject": (
+                f"Synthetic provenance {label}: household update ready for review"
+            ),
+        }
+        for label in labels[:message_count]
+    ]
+    gmail = RecordingBackend({"search": messages})
+    answer = "\n".join(f"- {item['subject']}" for item in messages)
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_gmail_search",
+            {"account": "personal", "query": "synthetic", "max_results": 25},
+        )
+        envelope = json.loads(
+            kite.transform_llm_output(
+                response_text=answer, session_id="kite-session"
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+        assert envelope["denied"] is True
+        assert envelope["answer"] == ""
+
+    _bound_turn(tmp_path, {"gmail": gmail}, check)
+
+
+@pytest.mark.parametrize(
+    "subject,answer",
+    [
+        (
+            "Security notice: password=synthetic-credential-value must never be exposed",
+            "Security notice: password=synthetic-credential-value must never be exposed",
+        ),
+        (
+            "Synthetic private record 123e4567-e89b-12d3-a456-426614174000 is ready",
+            "Synthetic private record 123e4567-e89b-12d3-a456-426614174000 is ready",
+        ),
+        (
+            "Synthetic household update with enough provenance text for overlap",
+            json.dumps({
+                "subject": (
+                    "Synthetic household update with enough provenance text for overlap"
+                )
+            }),
+        ),
+    ],
+)
+def test_minimized_provenance_does_not_relax_absolute_output_denials(
+    tmp_path, subject, answer
+):
+    """B-FIX-4: credentials, identifiers, and JSON containers stay denied."""
+    gmail = RecordingBackend({
+        "search": [{"id": "message-absolute-denial", "subject": subject}]
+    })
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_gmail_search",
+            {"account": "personal", "query": "synthetic", "max_results": 2},
+        )
+        envelope = json.loads(
+            kite.transform_llm_output(
+                response_text=answer, session_id="kite-session"
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+        assert envelope["denied"] is True
+        assert envelope["answer"] == ""
+
+    _bound_turn(tmp_path, {"gmail": gmail}, check)
+
+
+def test_unrelated_tool_content_cannot_ride_on_matching_provenance(tmp_path):
+    """B-FIX-5: a content-field tag wins even when provenance has the same text."""
+    shared_text = (
+        "Synthetic household update with enough exact wording to test source scope"
+    )
+    gmail = RecordingBackend({
+        "search": [{"id": "message-shared", "subject": shared_text}]
+    })
+    whatsapp = RecordingBackend({"search": [{"text": shared_text}]})
+
+    def check(kite):
+        _invoke(
+            kite,
+            "kite_gmail_search",
+            {"account": "personal", "query": "synthetic", "max_results": 2},
+        )
+        _invoke(
+            kite,
+            "kite_whatsapp_archive_read",
+            {"operation": "search", "query": "synthetic", "max_results": 2},
+        )
+        envelope = json.loads(
+            kite.transform_llm_output(
+                response_text=shared_text, session_id="kite-session"
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+        assert envelope["denied"] is True
+        assert envelope["answer"] == ""
+
+    _bound_turn(
+        tmp_path,
+        {"gmail": gmail, "whatsapp": whatsapp},
+        check,
+    )
+
+
 def test_private_read_config_rejects_generic_read_authority(tmp_path):
     config = _slice_b_config(tmp_path, mode="kite")
     config["juno_kite_trusted_principal"]["policy"]["tool_classes"]["read"] = [
