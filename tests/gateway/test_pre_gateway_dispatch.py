@@ -6,6 +6,8 @@ dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
 import asyncio
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -315,11 +317,11 @@ async def test_well_formed_critical_result_without_bound_token_fails_closed(
 async def test_gateway_startup_reload_uses_active_juno_profile_and_reaches_dispatch(
     tmp_path, monkeypatch, caplog
 ):
-    """Gateway startup replaces a stale hook with the active-profile runtime."""
+    """Production-loaded Juno proof reaches the gateway verifier and dispatch."""
     import hermes_cli.plugins as plugins_module
-    import plugins.juno_kite_trusted_principal as juno_plugin
+    import plugins.juno_kite_trusted_principal.runtime as direct_runtime
     import tools.registry as registry_module
-    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_cli.plugins import PluginManager, PluginManifest
     from tools.registry import ToolRegistry
 
     runner, _adapter = _critical_juno_runner()
@@ -346,13 +348,22 @@ async def test_gateway_startup_reload_uses_active_juno_profile_and_reaches_dispa
     manager = PluginManager()
     monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
     monkeypatch.setattr(registry_module, "registry", ToolRegistry())
-    context = PluginContext(
-        PluginManifest(name="juno_kite_trusted_principal", source="bundled"),
-        manager,
+    manifest = PluginManifest(
+        name="juno_kite_trusted_principal",
+        source="bundled",
+        path=str(
+            Path(__file__).resolve().parents[2]
+            / "plugins"
+            / "juno_kite_trusted_principal"
+        ),
     )
-    juno_plugin.register(context)
+    manager._load_plugin(manifest)
 
     stale_callback = manager._hooks["pre_gateway_dispatch"][0]
+    assert stale_callback.__module__ == (
+        "hermes_plugins.juno_kite_trusted_principal.runtime"
+    )
+    assert sys.modules[stale_callback.__module__] is not direct_runtime
     assert stale_callback.__self__.active_profile == "default"
 
     monkeypatch.setattr(
@@ -360,7 +371,7 @@ async def test_gateway_startup_reload_uses_active_juno_profile_and_reaches_dispa
     )
 
     def reload_active_profile_plugins():
-        juno_plugin.register(context)
+        manager._load_plugin(manifest)
 
     monkeypatch.setattr(
         manager, "_discover_and_load_inner", reload_active_profile_plugins

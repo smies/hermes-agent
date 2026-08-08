@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from .runtime import TrustedPrincipalRuntime, runtime_from_host
+from .runtime import (
+    TrustedPrincipalRuntime,
+    critical_ingress_satisfied,
+    runtime_from_host,
+)
 
 
 TOOL_DESCRIPTION = (
@@ -72,4 +76,9 @@ def register(ctx) -> None:
         )
 
 
-__all__ = ["TrustedPrincipalRuntime", "register", "runtime_from_host"]
+__all__ = [
+    "TrustedPrincipalRuntime",
+    "critical_ingress_satisfied",
+    "register",
+    "runtime_from_host",
+]

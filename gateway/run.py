@@ -14092,6 +14092,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for binding in valid["principal_bindings"]
         )
 
+    @staticmethod
+    def _juno_critical_ingress_satisfied(token: Any) -> bool:
+        """Verify proof through the module instance that registered the hook."""
+        if token is None:
+            return False
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            loaded = get_plugin_manager()._plugins.get(
+                "juno_kite_trusted_principal"
+            )
+            if (
+                loaded is None
+                or not loaded.enabled
+                or loaded.module is None
+                or "pre_gateway_dispatch" not in loaded.hooks_registered
+            ):
+                return False
+            verifier = getattr(
+                loaded.module, "critical_ingress_satisfied", None
+            )
+            return callable(verifier) and verifier(token) is True
+        except Exception:
+            return False
+
     def _configure_juno_private_read_sender_fence(
         self, platform: Platform, adapter: BasePlatformAdapter,
     ) -> None:
@@ -14922,14 +14947,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
             if _critical_required:
-                try:
-                    from plugins.juno_kite_trusted_principal.runtime import (
-                        critical_ingress_satisfied,
-                    )
-
-                    _critical_satisfied = critical_ingress_satisfied(_critical_token)
-                except Exception:
-                    _critical_satisfied = False
+                _critical_satisfied = self._juno_critical_ingress_satisfied(
+                    _critical_token
+                )
                 if not (_critical_marker and _critical_satisfied):
                     logger.warning(
                         "protected pre_gateway_dispatch proof missing; ingress skipped"
