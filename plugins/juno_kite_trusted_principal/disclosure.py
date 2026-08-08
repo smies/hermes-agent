@@ -60,7 +60,8 @@ _RAW_PATTERNS = (
 )
 _DOCUMENT_DELIVERY = (
     r"(?:send|forward|attach|share|deliver|upload|download|give\s+me|"
-    r"email\s+me|whatsapp\s+me|text\s+me|i\s+need)"
+    r"email\s+me|whatsapp\s+me|text\s+me|i\s+need|show\s+me|let\s+me\s+see|"
+    r"pull\s+up)"
 )
 _DOCUMENT_ARTIFACT = r"(?:document|scan|passport|pdf|file|attachment|copy)"
 # Real-world document names people actually use.  A request rarely says "PDF";
@@ -113,6 +114,31 @@ def classify_output_tier(question: str) -> str:
     return MINIMIZED
 
 
+_DOCUMENT_RELEASABLE_CAPABILITIES = frozenset({
+    # James's own personal documents, released only back to James.
+    "juno.private.james",
+    "juno.shared.family",
+    "juno.shared.children",
+    "juno.shared.mauritius",
+    "juno.shared.property_intel",
+    "juno.shared.villa_lena",
+})
+
+
+def _releasable_document_capabilities(
+    principal: str, capabilities: Iterable[str]
+) -> list[str]:
+    """Document classes this principal may release, in stable order.
+
+    Phase one is James-only: no other principal releases any document.
+    """
+    if str(principal).lower() != "james":
+        return []
+    return sorted(
+        set(map(str, capabilities)) & _DOCUMENT_RELEASABLE_CAPABILITIES
+    )
+
+
 @dataclass(frozen=True)
 class DisclosureDecision:
     allowed: bool
@@ -155,14 +181,9 @@ def disclosure_decision(
             False, "denied", "James-exclusive information is unavailable to Lucy"
         )
     if output_tier == DOCUMENT_DESCRIPTOR:
-        document_capabilities = {
-            "juno.shared.family",
-            "juno.shared.children",
-            "juno.shared.mauritius",
-            "juno.shared.property_intel",
-            "juno.shared.villa_lena",
-        }
-        if str(principal).lower() != "james" or capability_id not in document_capabilities:
+        if capability_id not in _releasable_document_capabilities(
+            principal, effective_capability_ids
+        ):
             return DisclosureDecision(
                 False,
                 "denied",
@@ -195,6 +216,9 @@ def generated_semantic_guidance(
         for domain in CAPABILITY_DOMAINS.get(capability_id, ())
     ]
     principal_name = str(principal).lower()
+    releasable_documents = _releasable_document_capabilities(
+        principal, capabilities
+    )
     work_boundary = {
         "gmail": "work Gmail is absent",
         "calendar": (
@@ -239,6 +263,20 @@ def generated_semantic_guidance(
         "work_boundary": work_boundary,
         "always_denied": denials,
         "output_tier": output_tier,
+        "document_release_mode": {
+            "available": bool(releasable_documents),
+            "releasable_capability_ids": releasable_documents,
+            "authority": (
+                "the host decides document release through the Slice C proposal "
+                "and exact APPROVE gates; entitlement is already intersected here"
+            ),
+            "self_refusal": (
+                "do not refuse a document request that falls inside these "
+                "capability IDs, and never invent a privacy or authorization "
+                "reason of your own: attempt the typed read and let the host "
+                "gates allow or deny it, then report the host's actual reason"
+            ),
+        },
         "property_output_mode": {
             "available": (
                 principal_name == "james"

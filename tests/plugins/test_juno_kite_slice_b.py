@@ -22,6 +22,7 @@ from plugins.juno_kite_trusted_principal.disclosure import (
     MINIMIZED,
     classify_output_tier,
     disclosure_decision,
+    generated_semantic_guidance,
 )
 from plugins.juno_kite_trusted_principal.private_reads import (
     KITE_GMAIL,
@@ -1234,6 +1235,13 @@ def test_output_tiers(question, tier):
         # Plural and polite forms.
         "send over the boarding passes",
         "can you send me the engagement letter",
+        # Viewing verbs are delivery requests too: a passport cannot be
+        # "shown" in a chat without releasing the actual image.
+        "Show me Lucy's passport",
+        "show me the engagement letter",
+        "let me see Albie's boarding pass",
+        "pull up the tenancy agreement",
+        "I want you to send me Lucy's passport image as a file",
     ],
 )
 def test_named_document_requests_select_the_document_tier(question):
@@ -1259,10 +1267,91 @@ def test_named_document_requests_select_the_document_tier(question):
         "is the tenancy agreement signed",
         "have you got the invoice",
         "send Lucy a note",
+        # Viewing verbs must not escalate informational questions either.
+        "show me what nacho said",
+        "show me a summary of the letter",
+        "tell me about the passport",
     ],
 )
 def test_informational_requests_stay_minimized(question):
     assert classify_output_tier(question) == MINIMIZED
+
+
+def test_james_may_release_his_own_private_documents():
+    """James asking for his own emailed document is a permitted release."""
+    decision = disclosure_decision(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        capability_id="juno.private.james",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )
+    assert decision.allowed is True
+    assert decision.outcome == DOCUMENT_DESCRIPTOR
+
+
+def test_lucy_may_not_release_james_private_documents():
+    decision = disclosure_decision(
+        principal="lucy",
+        effective_capability_ids=["juno.private.james"],
+        capability_id="juno.private.james",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )
+    assert decision.allowed is False
+
+
+@pytest.mark.parametrize("principal", ["lucy", "someone_else"])
+def test_non_james_never_releases_documents(principal):
+    for capability_id in (
+        "juno.private.james",
+        "juno.shared.family",
+        "juno.shared.children",
+    ):
+        decision = disclosure_decision(
+            principal=principal,
+            effective_capability_ids=[capability_id],
+            capability_id=capability_id,
+            output_tier=DOCUMENT_DESCRIPTOR,
+        )
+        assert decision.allowed is False
+
+
+def test_guidance_names_releasable_document_classes_for_james():
+    """The model must be told which documents are releasable.
+
+    Without this it invents privacy-sounding refusals for requests the
+    policy actually permits, which is indistinguishable from a real denial.
+    """
+    guidance = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=[
+            "juno.private.james",
+            "juno.shared.children",
+            "juno.shared.family",
+        ],
+        configured_policy={
+            "juno.private.james": "personal",
+            "juno.shared.children": "children",
+            "juno.shared.family": "family",
+        },
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )
+    release = guidance["document_release_mode"]
+    assert release["available"] is True
+    assert "juno.shared.children" in release["releasable_capability_ids"]
+    assert "juno.private.james" in release["releasable_capability_ids"]
+    # It must instruct deferral to the host gates rather than self-refusal.
+    assert "refuse" in release["self_refusal"].lower()
+
+
+def test_guidance_document_release_unavailable_for_lucy():
+    guidance = generated_semantic_guidance(
+        principal="lucy",
+        effective_capability_ids=["juno.shared.family"],
+        configured_policy={"juno.shared.family": "family"},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )
+    assert guidance["document_release_mode"]["available"] is False
+    assert guidance["document_release_mode"]["releasable_capability_ids"] == []
 
 
 def test_semantic_james_lucy_domain_matrix():
