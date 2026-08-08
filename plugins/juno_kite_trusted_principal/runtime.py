@@ -1691,6 +1691,47 @@ class TrustedPrincipalRuntime:
             handlers[name] = handler
         return handlers
 
+    def _authorize_private_read(
+        self,
+        binding: TurnBinding,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> Optional[dict]:
+        """Bind one exact typed private read to the final handler dispatch."""
+        if binding.output_tier == "bulk_raw_export":
+            return self._block(
+                "bulk/raw private-source requests cannot invoke connectors"
+            )
+        from .private_reads import validate_tool_arguments
+
+        if not validate_tool_arguments(tool_name, args):
+            return self._block(
+                "arguments do not match the selected private-read schema"
+            )
+        state = self._private_read_state()
+        if tool_name == "kite_gmail_get":
+            reference = (
+                f"{str(args.get('account') or '')}\0"
+                f"{str(args.get('message_id') or '')}"
+            )
+            if reference not in state["gmail_messages"]:
+                return self._block(
+                    "Gmail message ID was not returned by this bounded source turn"
+                )
+        if tool_name == "kite_gmail_attachment_extract":
+            reference = (
+                f"{str(args.get('account') or '')}\0"
+                f"{str(args.get('message_id') or '')}\0"
+                f"{str(args.get('attachment_id') or '')}"
+            )
+            if reference not in state["gmail_attachments"]:
+                return self._block(
+                    "Gmail attachment ID was not returned by this exact message read"
+                )
+        digest = self._private_read_fingerprint(tool_name, args)
+        state["authorized"].add(digest)
+        return None
+
     def pre_tool_call(
         self,
         tool_name: str = "",
@@ -1700,7 +1741,11 @@ class TrustedPrincipalRuntime:
         **_: Any,
     ) -> Optional[dict]:
         platform, _peer, _context = self._a2a_lane()
-        if platform != "a2a":
+        brokered_private_read = (
+            self.mode == "kite"
+            and tool_name in {"tool_describe", "tool_call"}
+        )
+        if platform != "a2a" and not brokered_private_read:
             return None
         try:
             binding = self._current_valid_binding(
@@ -1708,30 +1753,34 @@ class TrustedPrincipalRuntime:
             )
             if not isinstance(args, dict):
                 return self._block("arguments must be a complete object")
-            if tool_name in self.private_read_tool_names:
-                if binding.output_tier == "bulk_raw_export":
+            if tool_name == "tool_describe":
+                if (
+                    set(args) != {"name"}
+                    or not isinstance(args.get("name"), str)
+                    or args["name"] not in self.private_read_tool_names
+                ):
                     return self._block(
-                        "bulk/raw private-source requests cannot invoke connectors"
+                        "broker target is not an exact Slice B private-read tool"
                     )
-                state = self._private_read_state()
-                if tool_name == "kite_gmail_get":
-                    reference = f"{str(args.get('account') or '')}\0{str(args.get('message_id') or '')}"
-                    if reference not in state["gmail_messages"]:
-                        return self._block(
-                            "Gmail message ID was not returned by this bounded source turn"
-                        )
-                if tool_name == "kite_gmail_attachment_extract":
-                    reference = (
-                        f"{str(args.get('account') or '')}\0{str(args.get('message_id') or '')}\0"
-                        f"{str(args.get('attachment_id') or '')}"
-                    )
-                    if reference not in state["gmail_attachments"]:
-                        return self._block(
-                            "Gmail attachment ID was not returned by this exact message read"
-                        )
-                digest = self._private_read_fingerprint(str(tool_name), args)
-                state["authorized"].add(digest)
                 return None
+            if tool_name == "tool_call":
+                if set(args) != {"name", "arguments"}:
+                    return self._block(
+                        "broker call must contain only name and arguments"
+                    )
+                target = args.get("name")
+                nested_args = args.get("arguments")
+                if (
+                    not isinstance(target, str)
+                    or target not in self.private_read_tool_names
+                    or not isinstance(nested_args, dict)
+                ):
+                    return self._block(
+                        "broker target is not an exact Slice B private-read tool"
+                    )
+                return self._authorize_private_read(binding, target, nested_args)
+            if tool_name in self.private_read_tool_names:
+                return self._authorize_private_read(binding, str(tool_name), args)
             if tool_name in self.read_tools:
                 return None
             if tool_name not in self.mutating_tools:

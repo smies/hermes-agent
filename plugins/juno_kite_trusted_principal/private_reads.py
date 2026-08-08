@@ -237,6 +237,61 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+def validate_tool_arguments(tool_name: str, args: Any) -> bool:
+    """Fail-closed validation for brokered private-read arguments.
+
+    Hermes validates model-facing schemas when a tool is listed directly, but
+    the deferred ``tool_call`` broker accepts a generic nested object.  Recheck
+    the selected Slice B schema here before granting the underlying tool's
+    dispatch fingerprint.  This intentionally implements only the schema
+    vocabulary used by ``TOOL_SCHEMAS``; source-specific semantic checks remain
+    in the real handler immediately before backend access.
+    """
+    schema = TOOL_SCHEMAS.get(tool_name)
+    if not isinstance(schema, dict) or not isinstance(args, dict):
+        return False
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, dict) or parameters.get("type") != "object":
+        return False
+    properties = parameters.get("properties")
+    required = parameters.get("required")
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        return False
+    if parameters.get("additionalProperties") is not False:
+        return False
+    if set(args) - set(properties) or any(name not in args for name in required):
+        return False
+
+    for name, value in args.items():
+        field = properties.get(name)
+        if not isinstance(field, dict):
+            return False
+        expected = field.get("type")
+        if expected == "string":
+            if not isinstance(value, str):
+                return False
+            if len(value) < int(field.get("minLength", 0)):
+                return False
+            maximum = field.get("maxLength")
+            if isinstance(maximum, int) and len(value) > maximum:
+                return False
+        elif expected == "integer":
+            if isinstance(value, bool) or not isinstance(value, int):
+                return False
+            minimum = field.get("minimum")
+            maximum = field.get("maximum")
+            if isinstance(minimum, int) and value < minimum:
+                return False
+            if isinstance(maximum, int) and value > maximum:
+                return False
+        else:
+            return False
+        allowed = field.get("enum")
+        if isinstance(allowed, list) and value not in allowed:
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class SourceFailure(Exception):
     code: str

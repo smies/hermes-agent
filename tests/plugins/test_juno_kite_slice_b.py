@@ -26,6 +26,7 @@ from plugins.juno_kite_trusted_principal.disclosure import (
 from plugins.juno_kite_trusted_principal.private_reads import (
     KITE_GMAIL,
     PERSONAL_GMAIL,
+    PRIVATE_READ_TOOLSET,
     THINGS_CLIENT,
     THINGS_ENDPOINT,
     THINGS_PROJECT_TITLE,
@@ -268,6 +269,264 @@ def test_generic_and_mutating_tools_remain_denied_under_claim(tmp_path, tool):
         assert decision["action"] == "block"
 
     _bound_turn(tmp_path, {}, check)
+
+
+def test_deferred_broker_gates_are_exact_and_same_turn_bound(tmp_path):
+    calendar_args = {
+        "account": "personal",
+        "start": "2026-08-08T00:00:00+01:00",
+        "end": "2026-08-09T00:00:00+01:00",
+        "max_results": 5,
+    }
+
+    def check(kite):
+        assert kite.pre_tool_call(
+            "tool_describe",
+            {"name": "kite_calendar_read"},
+            session_id="kite-session",
+            turn_id="kite-turn",
+        ) is None
+        for malformed in (
+            {},
+            {"name": "kite_calendar_read", "extra": True},
+            {"name": "read_file"},
+            {"name": " kite_calendar_read"},
+        ):
+            assert kite.pre_tool_call(
+                "tool_describe",
+                malformed,
+                session_id="kite-session",
+                turn_id="kite-turn",
+            )["action"] == "block"
+        assert kite.pre_tool_call(
+            "tool_describe",
+            {"name": "kite_calendar_read"},
+            session_id="other-session",
+            turn_id="kite-turn",
+        )["action"] == "block"
+
+        broker_call = {"name": "kite_calendar_read", "arguments": calendar_args}
+        assert kite.pre_tool_call(
+            "tool_call",
+            broker_call,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        ) is None
+        assert kite.pre_tool_dispatch(
+            "kite_calendar_read",
+            {**calendar_args, "max_results": 6},
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )["action"] == "block"
+        for malformed in (
+            {"name": "read_file", "arguments": {}},
+            {"name": "kite_calendar_read", "arguments": {}},
+            {
+                "name": "kite_calendar_read",
+                "arguments": {**calendar_args, "max_results": 51},
+            },
+            {**broker_call, "extra": True},
+        ):
+            assert kite.pre_tool_call(
+                "tool_call",
+                malformed,
+                session_id="kite-session",
+                turn_id="kite-turn",
+            )["action"] == "block"
+
+    _bound_turn(tmp_path, {}, check)
+
+
+def test_deferred_brokers_are_blocked_outside_authenticated_a2a_turn(tmp_path):
+    kite = _runtime(tmp_path, mode="kite", backends={})
+
+    def direct():
+        assert kite.pre_tool_call(
+            "tool_describe",
+            {"name": "kite_calendar_read"},
+            session_id="direct-session",
+            turn_id="direct-turn",
+        )["action"] == "block"
+        assert kite.pre_tool_call(
+            "tool_call",
+            {
+                "name": "kite_gmail_search",
+                "arguments": {
+                    "account": "personal",
+                    "query": "synthetic",
+                    "max_results": 2,
+                },
+            },
+            session_id="direct-session",
+            turn_id="direct-turn",
+        )["action"] == "block"
+
+    _run_in_session(
+        direct,
+        platform="cli",
+        user_id="local",
+        session_key="direct-broker",
+        profile="kite",
+    )
+
+
+def test_real_plugin_deferred_broker_describes_and_dispatches_once(
+    tmp_path, monkeypatch
+):
+    """Production registry + deferred broker regression for B-ACTIVE-1/4/6."""
+    import hermes_cli.plugins as plugins_module
+    import model_tools
+    import plugins.juno_kite_trusted_principal as plugin
+    from hermes_cli.plugins import (
+        PluginContext,
+        PluginManager,
+        PluginManifest,
+        resolve_pre_tool_block,
+    )
+    from agent.tool_executor import plan_tool_batch
+    from tools.registry import registry
+
+    gmail = RecordingBackend({"search": [{"id": "synthetic-message-1"}]})
+    calendar = RecordingBackend({"list": []})
+
+    def check(kite):
+        manager = PluginManager()
+        monkeypatch.setattr(plugin, "runtime_from_host", lambda _profile: kite)
+        monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+        context = PluginContext(
+            PluginManifest(
+                name="juno_kite_trusted_principal", source="bundled"
+            ),
+            manager,
+        )
+        plugin.register(context)
+        try:
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=[PRIVATE_READ_TOOLSET], quiet_mode=True
+            )
+            visible_names = {
+                item["function"]["name"] for item in definitions
+            }
+            assert {"tool_search", "tool_describe", "tool_call"} <= visible_names
+            assert not set(TOOL_NAMES).intersection(visible_names)
+
+            for name in ("kite_calendar_read", "kite_gmail_search"):
+                assert resolve_pre_tool_block(
+                    "tool_describe",
+                    {"name": name},
+                    session_id="kite-session",
+                    turn_id="kite-turn",
+                ) is None
+                described = json.loads(model_tools.handle_function_call(
+                    "tool_describe",
+                    {"name": name},
+                    session_id="kite-session",
+                    turn_id="kite-turn",
+                    enabled_toolsets=[PRIVATE_READ_TOOLSET],
+                    skip_pre_tool_call_hook=True,
+                ))
+                assert described["name"] == name
+                assert described["parameters"] == TOOL_SCHEMAS[name]["parameters"]
+
+            calls = (
+                (
+                    "kite_calendar_read",
+                    {
+                        "account": "personal",
+                        "start": "2026-08-08T00:00:00+01:00",
+                        "end": "2026-08-09T00:00:00+01:00",
+                        "max_results": 5,
+                    },
+                ),
+                (
+                    "kite_gmail_search",
+                    {
+                        "account": "personal",
+                        "query": "synthetic",
+                        "max_results": 2,
+                    },
+                ),
+            )
+            for name, nested_args in calls:
+                broker_args = {"name": name, "arguments": nested_args}
+                model_call = SimpleNamespace(
+                    id=f"call-{name}",
+                    function=SimpleNamespace(
+                        name="tool_call", arguments=json.dumps(broker_args)
+                    ),
+                )
+                agent = SimpleNamespace(
+                    enabled_toolsets=[PRIVATE_READ_TOOLSET],
+                    disabled_toolsets=None,
+                    valid_tool_names=visible_names,
+                )
+                planned = plan_tool_batch(agent, [model_call]).calls[0]
+                assert planned.original_name == "tool_call"
+                assert planned.effective_name == name
+                assert planned.args == nested_args
+                assert planned.scope_block is None
+                assert resolve_pre_tool_block(
+                    planned.effective_name,
+                    planned.args,
+                    session_id="kite-session",
+                    turn_id="kite-turn",
+                ) is None
+                result = json.loads(model_tools.handle_function_call(
+                    planned.effective_name,
+                    planned.args,
+                    session_id="kite-session",
+                    turn_id="kite-turn",
+                    enabled_toolsets=[PRIVATE_READ_TOOLSET],
+                    skip_pre_tool_call_hook=True,
+                ))
+                assert result["status"] == "ok"
+
+            assert len(calendar.calls) == 1
+            assert len(gmail.calls) == 1
+
+            mutated = {
+                "account": "personal",
+                "query": "synthetic",
+                "max_results": 3,
+            }
+            assert resolve_pre_tool_block(
+                "kite_gmail_search",
+                {**mutated, "max_results": 2},
+                session_id="kite-session",
+                turn_id="kite-turn",
+            ) is None
+            blocked = json.loads(model_tools.handle_function_call(
+                "kite_gmail_search",
+                mutated,
+                session_id="kite-session",
+                turn_id="kite-turn",
+                enabled_toolsets=[PRIVATE_READ_TOOLSET],
+                skip_pre_tool_call_hook=True,
+            ))
+            assert "blocked" in blocked["error"].lower()
+            assert len(gmail.calls) == 1
+
+            assert resolve_pre_tool_block(
+                "tool_describe",
+                {"name": "read_file"},
+                session_id="kite-session",
+                turn_id="kite-turn",
+            ) is not None
+            assert resolve_pre_tool_block(
+                "read_file",
+                {},
+                session_id="kite-session",
+                turn_id="kite-turn",
+            ) is not None
+        finally:
+            for name in TOOL_NAMES:
+                registry.deregister(name)
+
+    _bound_turn(
+        tmp_path,
+        {"gmail": gmail, "calendar": calendar},
+        check,
+    )
 
 
 def test_read_argument_change_denies_before_backend(tmp_path):
