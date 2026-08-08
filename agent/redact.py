@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+from typing import Any
 from urllib.parse import unquote_plus
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,32 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # warning is logged at gateway and CLI startup so operators see the
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+
+# Inbound message BODIES are logged at turn start for observability. On a
+# messaging surface carrying private personal/family content, that writes real
+# message text to disk in the clear. Operators who need content out of logs set
+# `security.log_message_text: false` in config.yaml (bridged to this env var,
+# same mechanism as redact_secrets) or HERMES_LOG_MESSAGE_TEXT=false in
+# ~/.hermes/.env. Default ON preserves existing debugging behaviour.
+_LOG_MESSAGE_TEXT = os.getenv("HERMES_LOG_MESSAGE_TEXT", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def message_log_preview(text: Any) -> str:
+    """Return a log-safe preview of an inbound user message.
+
+    With message-text logging enabled (the default) the text is returned
+    unchanged. When disabled, the body is replaced by a coarse length hint so
+    the turn stays observable without disclosing any content.
+    """
+    value = "" if text is None else str(text)
+    if _LOG_MESSAGE_TEXT:
+        return value
+    return f"<message text suppressed: {len(value)} chars>"
 
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
