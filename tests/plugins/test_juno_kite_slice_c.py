@@ -1172,3 +1172,24 @@ async def test_host_classified_tier_survives_a_de_escalating_paraphrase(tmp_path
     view = json.loads(context.split("\n", 1)[1])
     assert view["semantic_disclosure"]["output_tier"] == DOCUMENT_DESCRIPTOR
     assert "typed reader" in view["rule"]
+
+
+def test_document_tool_descriptions_do_not_disown_the_staging_step():
+    """The tools must not describe staging as a separate flow to go and find.
+
+    Live transcript, 2026-08-08: the model searched Gmail, read the exact
+    message, fetched the extractor schema, then declined to call it --
+    "releasing the binary requires the separate host-bound Slice C
+    staging-and-approval flow, which is not present in this request". It was
+    reading the tool's own description, which said only that separate flow may
+    stage the binary. In fact calling this tool on a document turn IS the
+    staging step: runtime routes it through resolve_document_candidate.
+    """
+    from plugins.juno_kite_trusted_principal.private_reads import TOOL_SCHEMAS
+
+    for name in ("kite_gmail_attachment_extract", "kite_personal_files_read"):
+        description = TOOL_SCHEMAS[name]["description"]
+        assert "host side effect" in description, name
+        assert "not a separate flow" in description, name
+        # The wording that made the model disown the step must not come back.
+        assert "Only the separately gated" not in description, name

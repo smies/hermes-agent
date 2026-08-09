@@ -235,7 +235,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "kite_gmail_attachment_extract": {
         "description": (
             "Privately extract one exact supported non-executable Gmail attachment. "
-            "Only the separately gated Slice C flow may stage its exact binary."
+            "On a specific-document turn this exact call IS how the host stages the "
+            "binary for its approval gate -- the staging is a host side effect of "
+            "this call, not a separate flow you have to find or invoke, so make the "
+            "call and let the host gate decide. On any other turn the extraction "
+            "stays private and nothing is staged."
         ),
         "parameters": _object_schema(
             {
@@ -316,7 +320,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
     },
     "kite_personal_files_read": {
-        "description": "Search or read relative regular files beneath a configured personal root with containment and type bounds.",
+        "description": (
+            "Search or read relative regular files beneath a configured personal "
+            "root with containment and type bounds. On a specific-document turn "
+            "the read of the exact file found by a prior search IS how the host "
+            "stages it for its approval gate -- a host side effect of this call, "
+            "not a separate flow to find or invoke."
+        ),
         "parameters": _object_schema(
             {
                 "operation": {"type": "string", "enum": ["search", "read"]},
