@@ -1604,9 +1604,9 @@ class TrustedPrincipalRuntime:
         # The adapter always adds this exact peer-specific frame after bearer
         # authentication.  Strip no other prefix and derive no peer identity
         # from message text.
-        from plugins.platforms.a2a.security import PRIVACY_PREFIX
+        from plugins.platforms.a2a.security import inbound_prefix
 
-        privacy_frame = PRIVACY_PREFIX.format(peer="juno")
+        privacy_frame = inbound_prefix("juno")
         if user_message.startswith(privacy_frame):
             user_message = user_message[len(privacy_frame) :]
         payload = self._extract_request(user_message)
