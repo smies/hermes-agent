@@ -2391,6 +2391,7 @@ class TrustedPrincipalRuntime:
                 raise ValueError("release selection must choose one semantic capability")
             capability_id = selection.get("capability_id")
             purpose_by_capability = {
+                "juno.private.james": "personal administration",
                 "juno.shared.family": "family administration",
                 "juno.shared.children": "family administration",
                 "juno.shared.mauritius": "travel administration",

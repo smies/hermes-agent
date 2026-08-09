@@ -283,6 +283,8 @@ async def _propose(
     question="Send me the actual child passport scan",
     relative_path="child-passport.png",
     capability_id="juno.shared.children",
+    purpose="family administration",
+    search_query="passport",
 ):
     juno = _runtime(tmp_path, root, mode="juno", clock=clock)
     gateway = SimpleNamespace(adapters={Platform.WHATSAPP: adapter})
@@ -309,7 +311,7 @@ async def _propose(
             {
                 "operation": "search",
                 "root": "family",
-                "query": "passport",
+                "query": search_query,
                 "max_results": 1,
             },
         )
@@ -350,11 +352,52 @@ async def _propose(
         "page_count",
     }
     assert preview["audience"] == "James only in this WhatsApp conversation"
-    assert preview["purpose"] == "family administration"
+    assert preview["purpose"] == purpose
     assert preview["approval"]["instruction"] == (
         "APPROVE " + preview["approval"]["code"]
     )
     return juno, gateway, preview
+
+
+@pytest.mark.asyncio
+async def test_james_own_private_document_releases_on_a_display_verb(tmp_path):
+    """James's own documents release back to James on natural phrasing.
+
+    Two live defects met here: "Show me ..." had to reach the document tier,
+    and juno.private.james had to be a releasable purpose in the runtime
+    gate, not only in the disclosure oracle.
+    """
+    artifact = _png_bytes()
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "engagement-letter.png").write_bytes(artifact)
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, gateway, preview = await _propose(
+        tmp_path,
+        root,
+        clock,
+        roster,
+        adapter,
+        question="Show me the nacho engagement letter",
+        relative_path="engagement-letter.png",
+        capability_id="juno.private.james",
+        purpose="personal administration",
+        search_query="engagement",
+    )
+    code = preview["approval"]["code"]
+    decision = await juno.pre_gateway_dispatch(
+        event=_event(f"APPROVE {code}"), gateway=gateway
+    )
+    assert decision == {
+        "action": "skip",
+        "reason": "document-release-handled",
+        "redact_scope": True,
+    }
+    assert len(adapter.document_calls) == 1
+    assert adapter.document_calls[0]["bytes"] == artifact
 
 
 @pytest.mark.asyncio

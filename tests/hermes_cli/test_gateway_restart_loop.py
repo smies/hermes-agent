@@ -695,6 +695,21 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_nul_byte_path_does_not_crash_the_script_reader(self):
+        """#76762 follow-up: os.open() raises ValueError, not OSError, for a
+        path containing an embedded NUL.
+
+        The earlier fix tolerated ValueError at Path.resolve() but left the
+        os.open() call catching OSError only, so a junk path tokenized out of
+        a binary's decoded contents still crashed the guard and took down
+        every terminal command that reached the walk.
+        """
+        from pathlib import Path
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        assert _read_referenced_script(Path("/tmp/a\x00b")) == (None, False)
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

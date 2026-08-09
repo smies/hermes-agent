@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/missing/too-long paths. ValueError: an embedded
+        # NUL byte, which reaches here when a binary's decoded contents were
+        # tokenized into a junk path by the caller. A guarded path must never
+        # crash the guard (#76762).
         return None, False
     try:
         metadata = os.fstat(descriptor)
