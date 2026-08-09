@@ -1467,3 +1467,47 @@ def test_delivery_caption_describes_the_artifact_safely():
     })
     assert ".." not in hostile and "/" not in hostile and "\x00" not in hostile
     assert TrustedPrincipalRuntime._delivery_caption({}) == ""
+
+
+@pytest.mark.asyncio
+async def test_typing_settles_once_the_document_is_the_whole_reply(tmp_path):
+    """No lingering "typing…" after a delivery that ends the turn silently.
+
+    The model's follow-up is dropped, so nothing else is sent and the refresh
+    loop would otherwise keep asserting the indicator until the turn ended.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+    paused: list = []
+    stopped: list = []
+    adapter.pause_typing_for_chat = paused.append
+
+    async def _stop_typing(chat_id):
+        stopped.append(chat_id)
+
+    adapter.stop_typing = _stop_typing
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    result = json.loads(await juno._auto_release(json.dumps(preview), audience))
+
+    assert result["outcome"] == "delivered"
+    assert paused == [GROUP]
+    assert stopped == [GROUP]
+
+
+@pytest.mark.asyncio
+async def test_typing_helper_never_breaks_a_delivery(tmp_path):
+    """An adapter without the typing API, or one that raises, is harmless."""
+    class Hostile:
+        def pause_typing_for_chat(self, _chat_id):
+            raise RuntimeError("no typing API here")
+
+    await TrustedPrincipalRuntime._quiet_typing(Hostile(), GROUP)
+    await TrustedPrincipalRuntime._quiet_typing(object(), GROUP)

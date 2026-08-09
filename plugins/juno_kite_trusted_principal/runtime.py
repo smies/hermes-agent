@@ -1181,9 +1181,32 @@ class TrustedPrincipalRuntime:
             )
         if terminal != "uncertain":
             self.document_releases.unlink_record(record)
+        if terminal == "delivered" and not send_receipt:
+            # The file is the whole reply, and the model's follow-up is dropped,
+            # so nothing more will be sent. Without this the indicator keeps
+            # refreshing until the turn ends, leaving Juno apparently typing at
+            # a conversation that already has its answer.
+            await self._quiet_typing(adapter, chat_id)
         if send_receipt:
             await self._send_document_receipt(adapter, chat_id, receipt_text)
         return terminal
+
+    @staticmethod
+    async def _quiet_typing(adapter: Any, chat_id: str) -> None:
+        """Settle the typing indicator. Cosmetic only; never fails a delivery.
+
+        pause_typing_for_chat keeps the refresh loop from re-asserting it; the
+        gateway clears that pause in its own end-of-turn finally.
+        """
+        try:
+            pause = getattr(adapter, "pause_typing_for_chat", None)
+            if callable(pause):
+                pause(chat_id)
+            stop = getattr(adapter, "stop_typing", None)
+            if callable(stop):
+                await stop(chat_id)
+        except Exception:
+            logger.debug("Juno typing indicator did not settle after delivery")
 
     async def pre_gateway_dispatch(
         self,
