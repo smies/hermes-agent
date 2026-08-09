@@ -1844,3 +1844,69 @@ async def test_lane_reset_never_breaks_dispatch(tmp_path):
     assert await kite.pre_gateway_dispatch(
         event=event, gateway=None, session_store=object()
     ) is None
+
+
+def test_attachment_transport_cap_does_not_reject_a_real_document(tmp_path):
+    """The live 22:53 and 22:55 failures: cap_exceeded on the pipe, not the file.
+
+    The engagement letter is 254398 bytes, ~339KB once base64-encoded, against
+    a 256KB text-answer cap. Every real attachment failed to extract while the
+    artifact policy itself would have allowed it.
+    """
+    import base64 as _base64
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        _ATTACHMENT_COMMAND_OUTPUT_BYTES,
+    )
+
+    artifact = b"%PDF-1.4 " + b"x" * 300_000
+    payload = json.dumps({
+        "filename": "engagement letter.pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": len(artifact),
+        "text": "",
+        "artifact_base64": _base64.b64encode(artifact).decode("ascii"),
+    })
+    assert len(payload.encode()) > 262144  # over the ordinary answer cap
+
+    calls: list = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return _NS(returncode=0, stdout=payload, stderr="")
+
+    root = tmp_path / "family"
+    root.mkdir()
+    executable = tmp_path / "reader"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o700)
+    config = _config(tmp_path, root, mode="kite")["juno_kite_trusted_principal"]
+    reads = dict(config["private_reads"])
+    reads["gmail"] = {
+        "executable": str(executable),
+        "account_aliases": {"personal": "personal", "kite": "kite"},
+    }
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+
+    service = PrivateReadService(
+        reads, backends=None, command_runner=runner,
+        url_opener=None, secret_values=set(),
+    )
+    assert service.output_bytes < _ATTACHMENT_COMMAND_OUTPUT_BYTES
+
+    result = service._source_or_google_command(
+        "gmail", "attachment_extract",
+        {"account": "personal", "message_id": "abc", "attachment_id": "xyz"},
+    )
+    assert result["size_bytes"] == len(artifact)
+    assert calls and calls[0][-3:] == ["attachment", "abc", "xyz"]
+
+    # An ordinary Gmail answer keeps the tight cap.
+    capped = False
+    try:
+        service._source_or_google_command(
+            "gmail", "get", {"account": "personal", "message_id": "abc"}
+        )
+    except Exception as exc:  # SourceFailure is frozen; inspect it directly
+        capped = getattr(exc, "code", "") == "cap_exceeded"
+    assert capped
