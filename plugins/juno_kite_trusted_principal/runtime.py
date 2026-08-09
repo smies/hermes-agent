@@ -2443,7 +2443,16 @@ class TrustedPrincipalRuntime:
                 stage = "typed-read"
                 raise ValueError("a required private source failed or was incomplete")
             if not candidates:
-                stage = "staging"
+                # Name the sources that were never searched. A model that
+                # searched one source, found nothing and stopped looks identical
+                # to one that refused, unless the denial says which reader never
+                # ran -- and a document lives in exactly one source.
+                unsearched = sorted(
+                    {"kite_personal_files_read", "kite_gmail_attachment_extract"}
+                    - set(state["successful_tools"])
+                )
+                stage = "search-incomplete" if unsearched else "staging"
+                self._unsearched_document_sources = unsearched
                 raise ValueError(
                     "no document was staged, because no approved typed reader ran "
                     "and succeeded in this turn"
@@ -2521,6 +2530,12 @@ class TrustedPrincipalRuntime:
                 "staging": (
                     "no approved typed reader ran and succeeded in this turn, so "
                     "no document was staged for release"
+                ),
+                "search-incomplete": (
+                    "no approved typed reader staged a document, and these "
+                    "document sources were never searched successfully in this "
+                    "turn: "
+                    + ", ".join(getattr(self, "_unsearched_document_sources", ()))
                 ),
                 "binding": (
                     "the phase-one James-only document binding is unavailable"

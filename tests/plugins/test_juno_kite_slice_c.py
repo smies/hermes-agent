@@ -956,8 +956,11 @@ async def test_document_tier_without_a_typed_read_denies_and_names_staging(
         )
     )
     assert answer["outcome"] == "denied"
-    assert answer["stage"] == "staging"
-    assert "no approved typed reader" in answer["reason"]
+    # Nothing was read at all, so every document source is unsearched and the
+    # denial says which ones rather than only that staging produced nothing.
+    assert answer["stage"] == "search-incomplete"
+    assert "kite_personal_files_read" in answer["reason"]
+    assert "kite_gmail_attachment_extract" in answer["reason"]
     # The oracle allows this exact request, so the denial is a staging failure
     # and must never be phrased as an authorization or entitlement one.
     assert disclosure_decision(
@@ -1226,3 +1229,27 @@ def test_file_root_names_are_bound_into_the_model_facing_schema(tmp_path):
     assert "enum" not in TOOL_SCHEMAS["kite_personal_files_read"]["parameters"][
         "properties"
     ]["root"]
+
+
+def test_document_guidance_requires_searching_every_source_before_concluding():
+    """A miss in one source is not evidence the document does not exist.
+
+    Live turn, 20:38, on a freshly reset session: the model searched Gmail,
+    found nothing, and reported the document missing without ever calling the
+    file reader that actually held it. A local file can never appear in an
+    email search.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        generated_semantic_guidance,
+    )
+
+    rule = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )["output_tier_rule"]
+    assert "BOTH" in rule
+    assert "kite_personal_files_read" in rule
+    assert "kite_gmail_attachment_extract" in rule
+    assert "never grounds to report the document missing" in rule
