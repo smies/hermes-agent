@@ -336,6 +336,12 @@ _ACTIVE_PRIVATE_READS: ContextVar[Optional[dict[str, set[str]]]] = ContextVar(
 _ACTIVE_INBOUND_TEXT: ContextVar[str] = ContextVar(
     "juno_kite_active_inbound_text", default=""
 )
+# The authenticated delivery seam and destination for this turn, captured at
+# ingress so an auto-released document is dispatched by the host rather than by
+# anything the model says or does.
+_ACTIVE_DELIVERY: ContextVar[Optional[tuple[Any, str]]] = ContextVar(
+    "juno_kite_active_delivery", default=None
+)
 
 CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
 
@@ -1033,20 +1039,46 @@ class TrustedPrincipalRuntime:
         denied = "Document release denied."
         text = str(getattr(event, "text", "") or "").strip()
         match = re.fullmatch(r"APPROVE (C7-[A-Z2-9]{16})", text)
+        if match is None:
+            await self._send_document_receipt(adapter, chat_id, denied)
+            return self._ingress_skip("document-release-handled")
+        await self._consume_and_deliver(
+            match.group(1), audience=audience, adapter=adapter, chat_id=chat_id
+        )
+        return self._ingress_skip("document-release-handled")
+
+    async def _consume_and_deliver(
+        self,
+        code: str,
+        *,
+        audience: AudienceBinding,
+        adapter: Any,
+        chat_id: str,
+        send_receipt: bool = True,
+    ) -> str:
+        """Claim one authority, revalidate everything, and dispatch once.
+
+        Shared by the typed APPROVE path and by auto-release, so removing the
+        human confirmation step removes only that step: the one-use claim, the
+        live roster recheck, the destination binding, and the staged-artifact
+        identity check all still run here, in this order, before any byte
+        reaches transport.
+        """
+        denied = "Document release denied."
         if (
-            match is None
-            or audience.principal.casefold() != "james"
+            audience.principal.casefold() != "james"
             or audience.human_principals != ("james",)
             or "juno.private.james" not in audience.effective_read_capability_ids
         ):
-            await self._send_document_receipt(adapter, chat_id, denied)
-            return self._ingress_skip("document-release-handled")
+            if send_receipt:
+                await self._send_document_receipt(adapter, chat_id, denied)
+            return "denied"
 
         record = None
         try:
             self.document_releases.cleanup()
             record = self.document_releases.claim(
-                match.group(1),
+                code,
                 principal=audience.principal,
                 policy_generation=self.policy_generation,
                 audience_digest=audience.audience_digest,
@@ -1056,8 +1088,9 @@ class TrustedPrincipalRuntime:
             if record is None or record.state != "dispatching":
                 if record is not None:
                     self.document_releases.unlink_record(record)
-                await self._send_document_receipt(adapter, chat_id, denied)
-                return self._ingress_skip("document-release-handled")
+                if send_receipt:
+                    await self._send_document_receipt(adapter, chat_id, denied)
+                return "denied"
 
             # A second managed-roster read sits immediately at the final effect
             # boundary. No staged bytes are handed to transport before it and
@@ -1085,8 +1118,9 @@ class TrustedPrincipalRuntime:
             if record is not None and record.state == "dispatching":
                 self.document_releases.terminalize(record, "denied")
                 self.document_releases.unlink_record(record)
-            await self._send_document_receipt(adapter, chat_id, denied)
-            return self._ingress_skip("document-release-handled")
+            if send_receipt:
+                await self._send_document_receipt(adapter, chat_id, denied)
+            return "denied"
 
         try:
             result = await send_document(
@@ -1126,8 +1160,9 @@ class TrustedPrincipalRuntime:
             )
         if terminal != "uncertain":
             self.document_releases.unlink_record(record)
-        await self._send_document_receipt(adapter, chat_id, receipt_text)
-        return self._ingress_skip("document-release-handled")
+        if send_receipt:
+            await self._send_document_receipt(adapter, chat_id, receipt_text)
+        return terminal
 
     async def pre_gateway_dispatch(
         self,
@@ -1141,6 +1176,7 @@ class TrustedPrincipalRuntime:
             return None
         _ACTIVE_AUDIENCE.set(None)
         _ACTIVE_INGRESS_TOKEN.set(None)
+        _ACTIVE_DELIVERY.set(None)
         _ACTIVE_INBOUND_TEXT.set(str(getattr(event, "text", "") or ""))
         source = getattr(event, "source", None)
         platform_value = getattr(getattr(source, "platform", None), "value", None)
@@ -1170,6 +1206,11 @@ class TrustedPrincipalRuntime:
             if chat_type == "dm":
                 audience = self._single_principal_audience(principal, platform, chat_id)
                 _ACTIVE_AUDIENCE.set(audience)
+                _ACTIVE_DELIVERY.set(
+                    ((getattr(gateway, "adapters", None) or {}).get(
+                        getattr(source, "platform", None)
+                    ), chat_id)
+                )
                 if (
                     self.document_releases.enabled
                     and platform == "whatsapp"
@@ -1230,6 +1271,7 @@ class TrustedPrincipalRuntime:
                 revalidate=provider,
             )
             _ACTIVE_AUDIENCE.set(audience)
+            _ACTIVE_DELIVERY.set((adapter, chat_id))
             if (
                 self.document_releases.enabled
                 and self._is_document_approval_text(getattr(event, "text", ""))
@@ -1428,6 +1470,9 @@ class TrustedPrincipalRuntime:
         # creation, so a changed/missing audience cannot leave authority state
         # or issue an A2A call.
         audience = self._revalidate_audience(audience)
+        # Auto-release consumes the authority issued against exactly this
+        # revalidated audience, so publish it rather than the ingress copy.
+        _ACTIVE_AUDIENCE.set(audience)
         from .disclosure import classify_output_tier
 
         mapping = self.store.resolve(principal, conversation_key)
@@ -1525,6 +1570,62 @@ class TrustedPrincipalRuntime:
                     logger.warning("Juno--Kite request abort failed closed")
             logger.warning("Juno--Kite consultation blocked: %s", type(exc).__name__)
             return f"BLOCKED: consult_kite denied ({self._public_reason(exc)})."
+
+    async def consult_kite_delivering(self, args: dict, **kwargs: Any) -> str:
+        """Registered handler: consult Kite, then dispatch any released document.
+
+        consult_kite stays synchronous because the whole authority path and its
+        tests are built around it. Delivery is the only part that must await a
+        transport, so it hangs off this thin wrapper instead of turning the
+        request path async.
+        """
+        answer = self.consult_kite(args, **kwargs)
+        audience = _ACTIVE_AUDIENCE.get()
+        if audience is None:
+            return answer
+        return await self._auto_release(answer, audience)
+
+    async def _auto_release(self, answer: str, audience: AudienceBinding) -> str:
+        """Consume an approval the host just issued, without asking the owner.
+
+        The code is a host-internal one-use authority, not a password: it was
+        minted, carried, and consumed inside this turn and never shown to
+        anyone. Every gate it binds still runs in _consume_and_deliver. Only
+        the owner-confirmation step is removed, so a routine request from the
+        owner for his own document does not have to be re-typed back.
+        """
+        if not self.document_releases.enabled:
+            return answer
+        try:
+            parsed = json.loads(answer)
+            if (
+                not isinstance(parsed, dict)
+                or parsed.get("outcome") != "approval_required"
+            ):
+                return answer
+            code = str((parsed.get("approval") or {}).get("code") or "")
+            document = parsed.get("document")
+            delivery = _ACTIVE_DELIVERY.get()
+            if not code or delivery is None:
+                return answer
+            adapter, chat_id = delivery
+        except (TypeError, ValueError):
+            return answer
+
+        outcome = await self._consume_and_deliver(
+            code, audience=audience, adapter=adapter, chat_id=chat_id,
+            send_receipt=False,
+        )
+        if outcome == "delivered":
+            return canonical_json({"outcome": "delivered", "document": document})
+        return canonical_json({
+            "outcome": "delivery_" + outcome,
+            "document": document,
+            "reason": (
+                "the document was located but the host could not complete "
+                "delivery in this conversation"
+            ),
+        })
 
     @staticmethod
     def _public_reason(exc: Exception) -> str:
@@ -2969,6 +3070,9 @@ class FailClosedRuntime:
         return False
 
     def consult_kite(self, _args: dict, **_: Any) -> str:
+        return "BLOCKED: consult_kite configuration is unavailable."
+
+    async def consult_kite_delivering(self, _args: dict, **_: Any) -> str:
         return "BLOCKED: consult_kite configuration is unavailable."
 
     def pre_gateway_dispatch(self, **_: Any) -> Optional[dict]:

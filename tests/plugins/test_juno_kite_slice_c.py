@@ -1253,3 +1253,79 @@ def test_document_guidance_requires_searching_every_source_before_concluding():
     assert "kite_personal_files_read" in rule
     assert "kite_gmail_attachment_extract" in rule
     assert "never grounds to report the document missing" in rule
+
+
+@pytest.mark.asyncio
+async def test_auto_release_delivers_without_an_approval_message(tmp_path):
+    """James's own document reaches him without re-typing a code back.
+
+    The one-use authority is still minted and consumed -- it is just never
+    shown to anyone, so every binding it carries is still enforced.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    artifact = _png_bytes()
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(artifact)
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    assert audience is not None
+
+    result = json.loads(await juno._auto_release(json.dumps(preview), audience))
+
+    assert result["outcome"] == "delivered"
+    assert len(adapter.document_calls) == 1
+    assert adapter.document_calls[0]["bytes"] == artifact
+    assert adapter.document_calls[0]["chat_id"] == GROUP
+    # The staged artifact is unlinked once delivery is terminal.
+    assert not Path(adapter.document_calls[0]["file_path"]).exists()
+    # The host-internal code is never surfaced to the model or the chat.
+    code = preview["approval"]["code"]
+    assert code not in json.dumps(result)
+    assert not any(code in receipt for receipt in adapter.receipts)
+
+
+@pytest.mark.asyncio
+async def test_auto_release_still_fails_closed_on_a_changed_roster(tmp_path):
+    """Removing the owner prompt must not remove any gate behind it."""
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    # A stranger joins between the release decision and dispatch.
+    roster.change_on_call = roster.calls + 1
+
+    result = json.loads(await juno._auto_release(json.dumps(preview), audience))
+
+    assert result["outcome"].startswith("delivery_")
+    assert adapter.document_calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_release_leaves_a_non_release_answer_untouched(tmp_path):
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, _preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    for answer in ("an ordinary minimized answer", '{"outcome":"denied"}'):
+        assert await juno._auto_release(answer, audience) == answer
+    assert adapter.document_calls == []

@@ -79,8 +79,10 @@ def register(ctx) -> None:
             name="consult_kite",
             toolset="juno_kite",
             schema=schema,
-            handler=runtime.consult_kite,
+            handler=runtime.consult_kite_delivering,
             check_fn=runtime.juno_available,
+            # The handler awaits host-driven document delivery inside the turn.
+            is_async=True,
             description=TOOL_DESCRIPTION,
             emoji="🪁",
         )
