@@ -1665,6 +1665,37 @@ class TrustedPrincipalRuntime:
                 configured_policy=configured_semantic_policy,
                 output_tier=binding.output_tier,
             )
+        # The top-level rule is the most imperative line in this view, so it has
+        # to agree with the tier.  Stating "return only a minimized answer" on a
+        # document turn told the model to answer from context, and it did: one
+        # API call, no typed read, nothing staged, and a host denial every time.
+        staging_turn = (
+            self.private_reads.enabled
+            and self.document_releases.enabled
+            and binding.output_tier == "specific_full_document_descriptor"
+        )
+        if staging_turn:
+            requested_disclosure = (
+                "one staged document candidate plus its semantic capability id"
+            )
+            rule = (
+                "Do not answer this turn from context or memory, and do not send "
+                "a prose answer: prose releases nothing here. First call an "
+                "approved typed reader and let it succeed, so the host stages the "
+                "artifact. Then return only the JSON object "
+                "{\"capability_id\": \"<one effective capability id>\"} and no "
+                "other text. Raw sources, tool results, credentials, and private "
+                "identifiers still stay in Kite."
+            )
+        else:
+            requested_disclosure = "one minimized policy-compliant answer"
+            rule = (
+                "Return only a minimized answer; raw sources, tool results, "
+                "credentials, and private identifiers stay in Kite. The sole expanded "
+                "form is bounded prose/bullets containing any sanitized Property Intel "
+                "facts when the host verifies James, the exact Property capability, "
+                "and only successful kite_property_read provenance."
+            )
         view = {
             "policy_generation": self.policy_generation,
             "mapped_scope": binding.mapping.correlation_id,
@@ -1681,7 +1712,7 @@ class TrustedPrincipalRuntime:
             "data_class": "operator-configured semantic classes",
             "subject": binding.mapping.principal,
             "purpose": "answer the current bounded consultation",
-            "requested_disclosure": "one minimized policy-compliant answer",
+            "requested_disclosure": requested_disclosure,
             "recipient": "the authenticated originating principal",
             "destination": "the mapped originating Juno conversation",
             "action": {
@@ -1693,13 +1724,7 @@ class TrustedPrincipalRuntime:
             "read_tools": sorted(self.read_tools),
             "mutating_tools": sorted(self.mutating_tools),
             "semantic_disclosure": semantic_disclosure,
-            "rule": (
-                "Return only a minimized answer; raw sources, tool results, "
-                "credentials, and private identifiers stay in Kite. The sole expanded "
-                "form is bounded prose/bullets containing any sanitized Property Intel "
-                "facts when the host verifies James, the exact Property capability, "
-                "and only successful kite_property_read provenance."
-            ),
+            "rule": rule,
         }
         rendered = (
             "Juno--Kite source-agnostic policy view (host generated):\n"

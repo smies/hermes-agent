@@ -1014,3 +1014,71 @@ def test_document_tier_guidance_orders_the_typed_read_before_the_selection():
     assert rule.index("kite_personal_files_read") < rule.index("capability_id")
     steps = guidance["document_release_mode"]["required_steps"]
     assert "typed reader" in steps and "capability_id" in steps
+
+
+@pytest.mark.asyncio
+async def test_document_tier_policy_view_rule_does_not_ask_for_a_minimized_answer(
+    tmp_path,
+):
+    """The top-level rule must agree with the tier.
+
+    The nested tier rule said "call the typed reader"; the top-level rule said
+    "return only a minimized answer". The model followed the top-level one --
+    one API call, no typed read, nothing staged -- on every live document turn.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "engagement-letter.png").write_bytes(_png_bytes())
+    clock = Clock()
+    adapter = RecordingWhatsAppAdapter(MutableRoster())
+
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    await juno.pre_gateway_dispatch(
+        event=_event(JAMES_LIVE_REQUEST),
+        gateway=SimpleNamespace(adapters={Platform.WHATSAPP: adapter}),
+        critical_ingress_token=object(),
+    )
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": JAMES_LIVE_REQUEST}),
+        mode="juno",
+    )
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+    context = _session(
+        lambda: kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )["context"],
+        mode="kite",
+        context_id=prepared.mapping.context_id,
+    )
+    view = json.loads(context.split("\n", 1)[1])
+    assert "minimized answer" not in view["rule"]
+    assert "minimized" not in view["requested_disclosure"]
+    assert "typed reader" in view["rule"]
+    assert "capability_id" in view["rule"]
+
+    # An ordinary turn keeps the minimized rule unchanged.
+    ordinary = _runtime(tmp_path, root, mode="juno", clock=clock)
+    await ordinary.pre_gateway_dispatch(
+        event=_event("What did nacho say about the amended terms"),
+        gateway=SimpleNamespace(adapters={Platform.WHATSAPP: adapter}),
+        critical_ingress_token=object(),
+    )
+    plain = _session(
+        lambda: ordinary._prepare_request(
+            {"question_or_goal": "What did nacho say about the amended terms"}
+        ),
+        mode="juno",
+    )
+    plain_context = _session(
+        lambda: kite.pre_llm_call(
+            user_message=plain.message,
+            session_id="kite-session",
+            turn_id="kite-turn-2",
+        )["context"],
+        mode="kite",
+        context_id=plain.mapping.context_id,
+    )
+    plain_view = json.loads(plain_context.split("\n", 1)[1])
+    assert "Return only a minimized answer" in plain_view["rule"]
