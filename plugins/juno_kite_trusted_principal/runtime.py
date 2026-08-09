@@ -458,7 +458,7 @@ class TrustedPrincipalRuntime:
         # Turns whose document the host already delivered, so the model's
         # redundant confirmation can be dropped. Bounded: each entry is
         # consumed by the transform for that same turn.
-        self._auto_delivered: set[tuple[str, str]] = set()
+        self._auto_delivered: set[str] = set()
         from .document_release import DocumentReleaseService
 
         self.document_releases = DocumentReleaseService(
@@ -1067,6 +1067,7 @@ class TrustedPrincipalRuntime:
         chat_id: str,
         send_receipt: bool = True,
         title: Any = "",
+        caption: str = "",
     ) -> str:
         """Claim one authority, revalidate everything, and dispatch once.
 
@@ -1139,6 +1140,7 @@ class TrustedPrincipalRuntime:
                 chat_id=chat_id,
                 file_path=str(path),
                 file_name=self._delivery_file_name(title, extension),
+                caption=caption or None,
             )
             success = getattr(result, "success", None)
             message_id = getattr(result, "message_id", None)
@@ -1606,14 +1608,52 @@ class TrustedPrincipalRuntime:
         audience = _ACTIVE_AUDIENCE.get()
         if audience is None:
             return answer
-        # The tool runs in its own thread and context, so a delivery flag set
-        # here cannot reach the gateway through a ContextVar. Key it by the
-        # exact turn instead, and let transform_llm_output consume it.
-        turn_key = (
-            str(kwargs.get("session_id") or ""),
-            str(kwargs.get("turn_id") or ""),
+        # A tool handler is not given the host's session/turn identifiers --
+        # handler_kwargs is whatever the caller passed -- so keying the delivery
+        # flag off kwargs produced an empty key that never matched the hook.
+        # The session environment does reach this thread, so key off that and
+        # let transform_llm_output match on either identifier it is handed.
+        return await self._auto_release(
+            answer, audience, self._delivery_turn_keys(kwargs)
         )
-        return await self._auto_release(answer, audience, turn_key)
+
+    @staticmethod
+    def _delivery_turn_keys(kwargs: dict) -> frozenset[str]:
+        """Every identifier this turn might be recognised by downstream."""
+        return frozenset(
+            value
+            for value in (
+                str(kwargs.get("session_id") or ""),
+                str(get_session_env("HERMES_SESSION_ID") or ""),
+                str(get_session_env("HERMES_SESSION_KEY") or ""),
+            )
+            if value
+        )
+
+    @classmethod
+    def _delivery_caption(cls, descriptor: dict) -> str:
+        """Describe the artifact on the file itself, not in a second message.
+
+        Host-generated from the staged descriptor only, and reduced the same
+        way the filename is, so nothing crossing the boundary reaches the chat
+        unfiltered.
+        """
+        title = cls._safe_delivery_text(descriptor.get("title"))
+        kind = {
+            "application/pdf": "PDF",
+            "image/jpeg": "JPEG",
+            "image/png": "PNG",
+        }.get(str(descriptor.get("mime_type") or ""), "")
+        pages = descriptor.get("page_count")
+        parts = [part for part in (title, kind) if part]
+        if isinstance(pages, int) and not isinstance(pages, bool) and pages > 1:
+            parts.append(f"{pages} pages")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _safe_delivery_text(value: Any, limit: int = 80) -> str:
+        text = re.sub(r"[^A-Za-z0-9 ()_.-]+", " ", str(value or ""))
+        return re.sub(r"\s+", " ", text).strip(" ._-")[:limit].strip(" ._-")
 
     @staticmethod
     def _delivery_file_name(title: Any, extension: str) -> str:
@@ -1648,7 +1688,10 @@ class TrustedPrincipalRuntime:
         )
 
     async def _auto_release(
-        self, answer: str, audience: AudienceBinding, turn_key: tuple[str, str] = ("", "")
+        self,
+        answer: str,
+        audience: AudienceBinding,
+        turn_keys: frozenset[str] = frozenset(),
     ) -> str:
         """Consume an approval the host just issued, without asking the owner.
 
@@ -1676,15 +1719,22 @@ class TrustedPrincipalRuntime:
         except (TypeError, ValueError):
             return answer
 
+        descriptor = document if isinstance(document, dict) else {}
         outcome = await self._on_gateway_loop(
             self._consume_and_deliver(
                 code, audience=audience, adapter=adapter, chat_id=chat_id,
                 send_receipt=False,
-                title=(document or {}).get("title") if isinstance(document, dict) else "",
+                title=descriptor.get("title"),
+                caption=self._delivery_caption(descriptor),
             )
         )
         if outcome == "delivered":
-            self._auto_delivered.add(turn_key)
+            # Normally consumed by this turn's transform. If a turn dies before
+            # then, keep the residue bounded so one stale key cannot sit there
+            # swallowing a later reply indefinitely.
+            if len(self._auto_delivered) > 16:
+                self._auto_delivered.clear()
+            self._auto_delivered |= turn_keys
             return canonical_json({"outcome": "delivered", "document": document})
         return canonical_json({
             "outcome": "delivery_" + outcome,
@@ -2776,9 +2826,17 @@ class TrustedPrincipalRuntime:
         # in this exact turn, drop the model's follow-up sentence: the gateway
         # strips the returned whitespace to empty and then sends nothing, while
         # returning "" here would mean "leave unchanged".
-        turn_key = (str(session_id or ""), str(turn_id or ""))
-        if turn_key in self._auto_delivered:
-            self._auto_delivered.discard(turn_key)
+        delivered = self._auto_delivered & frozenset(
+            value
+            for value in (
+                str(session_id or ""),
+                str(get_session_env("HERMES_SESSION_ID") or ""),
+                str(get_session_env("HERMES_SESSION_KEY") or ""),
+            )
+            if value
+        )
+        if delivered:
+            self._auto_delivered -= delivered
             return " "
         platform, _peer, _context = self._a2a_lane()
         if platform != "a2a":

@@ -1416,7 +1416,7 @@ async def test_the_document_is_the_answer_so_the_follow_up_line_is_dropped(tmp_p
     (root / "child-passport.png").write_bytes(_png_bytes())
     runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
 
-    runtime._auto_delivered.add(("juno-session", "turn-1"))
+    runtime._auto_delivered.add("juno-session")
     suppressed = runtime.transform_llm_output(
         response_text="The document has been delivered to this conversation.",
         session_id="juno-session",
@@ -1425,9 +1425,45 @@ async def test_the_document_is_the_answer_so_the_follow_up_line_is_dropped(tmp_p
     # The gateway strips this to empty and then sends nothing; returning ""
     # would instead mean "leave the model's sentence unchanged".
     assert suppressed is not None and suppressed.strip() == ""
-    # One turn only: a later turn in the same session is untouched.
+    # Consumed once: the next reply in the same session is untouched.
     assert runtime.transform_llm_output(
         response_text="an ordinary answer",
         session_id="juno-session",
         turn_id="turn-2",
     ) is None
+
+
+def test_delivery_flag_survives_a_handler_that_gets_no_session_id():
+    """The live 21:27 miss: tool handlers are not given session identifiers.
+
+    handler_kwargs is whatever the caller passed, so keying the flag off
+    kwargs produced an empty key and the hook never matched it.
+    """
+    keys = TrustedPrincipalRuntime._delivery_turn_keys({})
+    assert "" not in keys
+    keys_with_id = TrustedPrincipalRuntime._delivery_turn_keys(
+        {"session_id": "juno-session"}
+    )
+    assert "juno-session" in keys_with_id
+
+
+def test_delivery_caption_describes_the_artifact_safely():
+    caption = TrustedPrincipalRuntime._delivery_caption({
+        "title": "Juno Test Engagement Letter",
+        "mime_type": "application/pdf",
+        "page_count": 1,
+    })
+    assert caption == "Juno Test Engagement Letter · PDF"
+    multi = TrustedPrincipalRuntime._delivery_caption({
+        "title": "Deed of Sale",
+        "mime_type": "application/pdf",
+        "page_count": 12,
+    })
+    assert multi == "Deed of Sale · PDF · 12 pages"
+    # Nothing crosses into the chat unreduced, and an empty descriptor is fine.
+    hostile = TrustedPrincipalRuntime._delivery_caption({
+        "title": "../../etc/passwd\x00",
+        "mime_type": "application/pdf",
+    })
+    assert ".." not in hostile and "/" not in hostile and "\x00" not in hostile
+    assert TrustedPrincipalRuntime._delivery_caption({}) == ""
