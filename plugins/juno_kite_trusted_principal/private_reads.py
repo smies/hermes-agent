@@ -765,7 +765,7 @@ class PrivateReadService:
             raise SourceFailure(
                 "invalid_arguments", "message or attachment ID is malformed"
             )
-        result = self._injected(
+        result = self._source_or_google_command(
             "gmail",
             "attachment_extract",
             {
@@ -976,6 +976,19 @@ class PrivateReadService:
                 "gmail",
                 "get",
                 canonical["message_id"],
+            ]
+        elif source == "gmail" and operation == "attachment_extract":
+            # Previously injected-backend only, which meant no production path
+            # at all: every extraction raised backend_unavailable and Slice C
+            # could never release a Gmail attachment.
+            argv = [
+                str(executable),
+                fixed_alias,
+                "api",
+                "gmail",
+                "attachment",
+                canonical["message_id"],
+                canonical["attachment_id"],
             ]
         elif source == "calendar" and operation == "list":
             argv = [
