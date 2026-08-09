@@ -709,7 +709,8 @@ def test_format_gate_rejects_prohibited_text_in_flate_stream(tmp_path, payload):
 
 
 @pytest.mark.parametrize(
-    "token", [b"/JavaScript", b"/Java#53cript", b"/OpenAction", b"/ObjStm"]
+    "token",
+    [b"/JavaScript", b"/Java#53cript", b"/Launch", b"/EmbeddedFile", b"/SubmitForm"],
 )
 def test_format_gate_rejects_active_tokens_in_flate_stream(tmp_path, token):
     root = tmp_path / "family"
@@ -744,14 +745,13 @@ def test_format_gate_accepts_benign_inspectable_streams(tmp_path, filter_name):
 @pytest.mark.parametrize(
     "payload",
     [
-        _pdf_with_stream(b"ordinary text", filter_name=b"LZWDecode"),
         _pdf_with_stream(
             b"unused",
             filter_name=b"FlateDecode",
             encoded_payload=b"not-a-zlib-stream",
         ),
     ],
-    ids=["unsupported-filter", "invalid-flate"],
+    ids=["invalid-flate"],
 )
 def test_format_gate_rejects_uninspectable_streams(tmp_path, payload):
     root = tmp_path / "family"
@@ -1595,3 +1595,117 @@ def test_minimized_guidance_forbids_inventing_a_release_gate():
         output_tier=MINIMIZED,
     )["output_tier_rule"]
     assert "never explain a document you did not return by inventing one" in rule
+
+
+@pytest.mark.parametrize(
+    "token", [b"/URI", b"/AA", b"/OpenAction", b"/AcroForm", b"/ObjStm"]
+)
+def test_ordinary_document_structure_is_not_treated_as_active_content(
+    tmp_path, token
+):
+    """A hyperlink is not an executable.
+
+    The real engagement letter carried /URI six times and /AA eighteen times --
+    a website, a LinkedIn profile, an email address in a signature block -- and
+    was refused as "active-content". That rejected essentially every document a
+    professional actually sends.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "ordinary.pdf"
+    source.write_bytes(_pdf_with_stream(b"BT " + token + b" ET"))
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    inspected = runtime.document_releases.inspect_source_for_test(source)
+    assert inspected is not None, token
+    assert inspected.mime_type == "application/pdf"
+
+
+def test_executable_and_payload_carrying_constructs_stay_refused():
+    """The loosening is bounded: code, external fetch, and embedding still fail."""
+    from plugins.juno_kite_trusted_principal.document_release import (
+        _PDF_ACTIVE_TOKENS,
+        _PDF_INERT_TOKENS,
+    )
+
+    for token in (
+        b"/JavaScript", b"/JS", b"/XFA", b"/Launch", b"/GoToR", b"/SubmitForm",
+        b"/ImportData", b"/EmbeddedFile", b"/FileAttachment", b"/RichMedia",
+        b"/Movie", b"/Sound",
+    ):
+        assert token in _PDF_ACTIVE_TOKENS, token
+    # Nothing may be in both lists.
+    assert not set(_PDF_ACTIVE_TOKENS) & set(_PDF_INERT_TOKENS)
+
+
+def test_script_hidden_inside_an_object_stream_is_still_caught(tmp_path):
+    """Allowing /ObjStm must not create a place to hide /JS.
+
+    Decoded streams are scanned for the refused tokens, so a compressed object
+    stream is inspected rather than trusted.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "hidden.pdf"
+    source.write_bytes(_pdf_with_stream(b"<</Type/ObjStm>> /JavaScript (evil)"))
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is None
+
+
+@pytest.mark.parametrize(
+    "filter_name", [b"DCTDecode", b"CCITTFaxDecode", b"LZWDecode", b"JBIG2Decode"]
+)
+def test_an_image_codec_does_not_make_a_document_unreleasable(tmp_path, filter_name):
+    """A scanned page is not a reason to refuse a letter.
+
+    The real engagement letter failed here after clearing the active-content
+    gate: the scanner refused any stream it could not inflate, and a printed or
+    scanned document is full of them.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "scanned.pdf"
+    source.write_bytes(_pdf_with_stream(b"\xff\xd8\xff image samples", filter_name=filter_name))
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is not None
+
+
+@pytest.mark.parametrize("filter_name", [b"DCTDecode", b"LZWDecode"])
+def test_an_opaque_stream_is_scanned_as_stored(tmp_path, filter_name):
+    """Not inflating a stream must not mean not looking at it.
+
+    The bytes are scanned exactly as they sit in the file. This cannot see
+    through an encoding it cannot decode -- a token buried inside real JPEG
+    entropy data would not be visible -- but a viewer does not execute image
+    samples either; actions have to reach the object graph, which is scanned.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "smuggled.pdf"
+    source.write_bytes(
+        _pdf_with_stream(
+            b"unused",
+            filter_name=filter_name,
+            encoded_payload=b"cover /JavaScript (evil) cover",
+        )
+    )
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is None
+
+
+def test_a_stream_claiming_flate_that_will_not_inflate_is_still_refused(tmp_path):
+    """Opaque is for codecs this cannot read, not for a broken Flate claim."""
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "lying.pdf"
+    source.write_bytes(
+        _pdf_with_stream(
+            b"unused", filter_name=b"FlateDecode", encoded_payload=b"not-zlib"
+        )
+    )
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is None

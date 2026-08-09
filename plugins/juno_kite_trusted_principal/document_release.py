@@ -42,25 +42,41 @@ ALLOWED_MIME_EXTENSIONS = {
 }
 
 _APPROVAL_CODE = re.compile(r"C7-[A-Z2-9]{16}\Z")
+# Constructs that can run code, reach the network or filesystem, or carry a
+# second payload inside the file. These stay refused: the owner asking for his
+# own document is a statement about its contents, not a reason to hand his
+# phone something that acts on its own.
 _PDF_ACTIVE_TOKENS = (
     b"/JavaScript",
     b"/JS",
-    b"/OpenAction",
-    b"/AA",
-    b"/Launch",
-    b"/EmbeddedFile",
-    b"/RichMedia",
     b"/XFA",
-    b"/URI",
+    b"/Launch",
+    b"/GoToR",
     b"/SubmitForm",
     b"/ImportData",
-    b"/GoToR",
-    b"/Sound",
-    b"/Movie",
+    b"/EmbeddedFile",
     b"/FileAttachment",
+    b"/RichMedia",
+    b"/Movie",
+    b"/Sound",
+)
+# Inert structure that ordinary business documents use constantly: hyperlinks,
+# event dictionaries, form fields, compressed object streams. Refusing these
+# rejected essentially every real document -- a solicitor's letter carries a
+# website and a LinkedIn link and nothing more. An event dictionary can only
+# invoke an action type, every dangerous action type above is still refused,
+# and decoded object streams are scanned for those tokens too, so none of
+# these can do anything on their own.
+_PDF_INERT_TOKENS = (
+    b"/URI",
+    b"/AA",
+    b"/OpenAction",
     b"/AcroForm",
     b"/ObjStm",
 )
+# Marks a stream whose encoding this scanner cannot inflate, so its bytes are
+# inspected as they stand instead of the whole document being refused.
+_PDF_OPAQUE_FILTER = b"\x00opaque"
 _PDF_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
 _PDF_STREAM_START = re.compile(rb"(?<![A-Za-z0-9])stream(?:\r\n|\n|\r)")
 _PDF_DIRECT_LENGTH = re.compile(rb"/Length\s+([0-9]+)\s*(?=[/>])")
@@ -244,31 +260,32 @@ class DocumentReleaseService:
 
     @staticmethod
     def _stream_filter(dictionary: bytes) -> Optional[bytes]:
+        """Return FlateDecode, the opaque sentinel, or None for a raw stream.
+
+        A stream this cannot inflate is inspected as opaque bytes rather than
+        refused. Refusing meant that a letter containing a scanned page or any
+        JPEG -- DCTDecode, CCITTFaxDecode, a filter chain -- could never be
+        released, while giving up nothing real: actions live in the object
+        graph, not inside image sample data, and the encoded bytes are still
+        scanned for the refused tokens.
+        """
         normalized = _PDF_NAME_ESCAPE.sub(
             lambda match: bytes((int(match.group(1), 16),)), dictionary
         )
         match = _PDF_FILTER_VALUE.search(normalized)
         if match is None:
             if b"/Filter" in normalized:
-                raise DocumentReleaseDenied("document stream filter is unsupported")
+                return _PDF_OPAQUE_FILTER
             return None
         if _PDF_FILTER_VALUE.search(normalized, match.end()) is not None:
-            raise DocumentReleaseDenied("document stream filter is unsupported")
+            raise DocumentReleaseDenied("document stream is malformed")
 
         names = re.findall(rb"/([^\s<>\[\]()/]+)", match.group(1))
         if len(names) != 1 or names[0] not in {b"FlateDecode", b"Fl"}:
-            raise DocumentReleaseDenied("document stream filter is unsupported")
-
-        if b"/DecodeParms" in normalized:
-            parameters = re.search(
-                rb"/DecodeParms\s*(null|<<.*?>>)", normalized, re.DOTALL
-            )
-            if parameters is None:
-                raise DocumentReleaseDenied("document stream filter is unsupported")
-            value = parameters.group(1)
-            predictor = re.search(rb"/Predictor\s+([0-9]+)", value)
-            if predictor is not None and predictor.group(1) != b"1":
-                raise DocumentReleaseDenied("document stream filter is unsupported")
+            return _PDF_OPAQUE_FILTER
+        # A predictor changes how inflated bytes are laid out, not whether they
+        # inflate, and predictor-encoded xref data carries offsets rather than
+        # actions. Inflate and scan it either way.
         return names[0]
 
     @staticmethod
@@ -353,7 +370,9 @@ class DocumentReleaseService:
 
             encoded = data[content_start:content_end]
             filter_name = cls._stream_filter(dictionary)
-            if filter_name is None:
+            if filter_name is None or filter_name == _PDF_OPAQUE_FILTER:
+                # Raw, or encoded with something this cannot inflate: scan the
+                # bytes as they stand rather than refusing the document.
                 decoded = encoded
                 if (
                     len(decoded) > MAX_PDF_DECOMPRESSED_BYTES_PER_STREAM
