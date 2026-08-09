@@ -1381,3 +1381,53 @@ async def test_delivery_runs_inline_when_no_gateway_loop_is_recorded(tmp_path):
         assert await TrustedPrincipalRuntime._on_gateway_loop(_work()) == "delivered"
     finally:
         _ACTIVE_LOOP.reset(token)
+
+
+def test_delivered_file_is_named_after_the_document():
+    name = TrustedPrincipalRuntime._delivery_file_name(
+        "Juno Test Engagement Letter", ".pdf"
+    )
+    assert name == "Juno Test Engagement Letter.pdf"
+    # Anything unusable falls back rather than producing an odd or empty name.
+    assert TrustedPrincipalRuntime._delivery_file_name("", ".pdf") == (
+        "requested-document.pdf"
+    )
+    assert TrustedPrincipalRuntime._delivery_file_name(None, ".png") == (
+        "requested-document.png"
+    )
+    # A title crossing the boundary is re-reduced on this side: no separators,
+    # no traversal, no control characters, bounded length.
+    for hostile in ("../../etc/passwd", "a/b\\c", "x\x00y", "  ...  "):
+        produced = TrustedPrincipalRuntime._delivery_file_name(hostile, ".pdf")
+        assert "/" not in produced and "\\" not in produced
+        assert ".." not in produced
+        assert "\x00" not in produced
+        assert produced.endswith(".pdf") and len(produced) <= 84
+    assert TrustedPrincipalRuntime._delivery_file_name("A" * 300, ".pdf") == (
+        "A" * 80 + ".pdf"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_document_is_the_answer_so_the_follow_up_line_is_dropped(tmp_path):
+    """One message, not two: the file arrives and nothing narrates it."""
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    runtime._auto_delivered.add(("juno-session", "turn-1"))
+    suppressed = runtime.transform_llm_output(
+        response_text="The document has been delivered to this conversation.",
+        session_id="juno-session",
+        turn_id="turn-1",
+    )
+    # The gateway strips this to empty and then sends nothing; returning ""
+    # would instead mean "leave the model's sentence unchanged".
+    assert suppressed is not None and suppressed.strip() == ""
+    # One turn only: a later turn in the same session is untouched.
+    assert runtime.transform_llm_output(
+        response_text="an ordinary answer",
+        session_id="juno-session",
+        turn_id="turn-2",
+    ) is None

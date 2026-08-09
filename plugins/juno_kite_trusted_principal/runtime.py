@@ -455,6 +455,10 @@ class TrustedPrincipalRuntime:
         # Open durable state only after the entire behavior/authority config
         # validates, so a malformed profile cannot create partial state.
         self.store = MappingStore(Path(str(section["mapping_path"])), self.mapping_key)
+        # Turns whose document the host already delivered, so the model's
+        # redundant confirmation can be dropped. Bounded: each entry is
+        # consumed by the transform for that same turn.
+        self._auto_delivered: set[tuple[str, str]] = set()
         from .document_release import DocumentReleaseService
 
         self.document_releases = DocumentReleaseService(
@@ -1062,6 +1066,7 @@ class TrustedPrincipalRuntime:
         adapter: Any,
         chat_id: str,
         send_receipt: bool = True,
+        title: Any = "",
     ) -> str:
         """Claim one authority, revalidate everything, and dispatch once.
 
@@ -1133,7 +1138,7 @@ class TrustedPrincipalRuntime:
             result = await send_document(
                 chat_id=chat_id,
                 file_path=str(path),
-                file_name="requested-document" + extension,
+                file_name=self._delivery_file_name(title, extension),
             )
             success = getattr(result, "success", None)
             message_id = getattr(result, "message_id", None)
@@ -1601,7 +1606,26 @@ class TrustedPrincipalRuntime:
         audience = _ACTIVE_AUDIENCE.get()
         if audience is None:
             return answer
-        return await self._auto_release(answer, audience)
+        # The tool runs in its own thread and context, so a delivery flag set
+        # here cannot reach the gateway through a ContextVar. Key it by the
+        # exact turn instead, and let transform_llm_output consume it.
+        turn_key = (
+            str(kwargs.get("session_id") or ""),
+            str(kwargs.get("turn_id") or ""),
+        )
+        return await self._auto_release(answer, audience, turn_key)
+
+    @staticmethod
+    def _delivery_file_name(title: Any, extension: str) -> str:
+        """Name the delivered file after the document, not after the plumbing.
+
+        The title crosses the A2A boundary inside the signed envelope and was
+        already reduced to a safe form when it was staged, but it lands here as
+        a filename, so it is re-reduced on this side rather than trusted.
+        """
+        text = re.sub(r"[^A-Za-z0-9 ()_.-]+", " ", str(title or ""))
+        text = re.sub(r"\s+", " ", text).strip(" ._-")[:80].strip(" ._-")
+        return (text or "requested-document") + extension
 
     @staticmethod
     async def _on_gateway_loop(coro: Any) -> Any:
@@ -1623,7 +1647,9 @@ class TrustedPrincipalRuntime:
             asyncio.run_coroutine_threadsafe(coro, loop)
         )
 
-    async def _auto_release(self, answer: str, audience: AudienceBinding) -> str:
+    async def _auto_release(
+        self, answer: str, audience: AudienceBinding, turn_key: tuple[str, str] = ("", "")
+    ) -> str:
         """Consume an approval the host just issued, without asking the owner.
 
         The code is a host-internal one-use authority, not a password: it was
@@ -1654,9 +1680,11 @@ class TrustedPrincipalRuntime:
             self._consume_and_deliver(
                 code, audience=audience, adapter=adapter, chat_id=chat_id,
                 send_receipt=False,
+                title=(document or {}).get("title") if isinstance(document, dict) else "",
             )
         )
         if outcome == "delivered":
+            self._auto_delivered.add(turn_key)
             return canonical_json({"outcome": "delivered", "document": document})
         return canonical_json({
             "outcome": "delivery_" + outcome,
@@ -2744,6 +2772,14 @@ class TrustedPrincipalRuntime:
         turn_id: Optional[str] = None,
         **_: Any,
     ) -> Optional[str]:
+        # The document itself is the answer. When the host already delivered it
+        # in this exact turn, drop the model's follow-up sentence: the gateway
+        # strips the returned whitespace to empty and then sends nothing, while
+        # returning "" here would mean "leave unchanged".
+        turn_key = (str(session_id or ""), str(turn_id or ""))
+        if turn_key in self._auto_delivered:
+            self._auto_delivered.discard(turn_key)
+            return " "
         platform, _peer, _context = self._a2a_lane()
         if platform != "a2a":
             return None
