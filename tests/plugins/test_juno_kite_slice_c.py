@@ -879,3 +879,138 @@ def test_document_release_is_phase_one_exact_james_only(tmp_path):
         capability_id="juno.shared.children",
         output_tier=DOCUMENT_DESCRIPTOR,
     ).allowed
+
+
+# The two document-tier phrasings below are the ones observed in live traffic on
+# 2026-08-09: James's own words in the group, and the exact question_or_goal Juno
+# composed from them for Kite. They are deliberately taken from that recorded
+# turn rather than authored against the classifier's pattern vocabulary.
+JAMES_LIVE_REQUEST = "Show me the nacho engagement letter"
+JUNO_LIVE_QUESTION_OR_GOAL = (
+    "Retrieve the authenticated principal's latest engagement letter involving "
+    "Nacho Rodriguez, previously identified as 'amended Terms of Business' "
+    "received 7 August 2026 at 15:53 CEST, and securely release the actual "
+    "document to this bound current conversation if authorized. Return a "
+    "releasable file reference. Do not contact anyone, modify records, or "
+    "retrieve unrelated files."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question", [JAMES_LIVE_REQUEST, JUNO_LIVE_QUESTION_OR_GOAL]
+)
+async def test_document_tier_without_a_typed_read_denies_and_names_staging(
+    tmp_path, question
+):
+    """A document-tier turn that runs no typed read must name the real stage.
+
+    This is the production failure. Kite answered the document tier in a single
+    API call with no tool call at all, so nothing was staged, and the host
+    returned one generic denial that read as an entitlement problem. The
+    end-to-end test could not catch it because it performs the typed reads
+    itself before calling ``transform_llm_output``.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "engagement-letter.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    ingress = await juno.pre_gateway_dispatch(
+        event=_event(question),
+        gateway=SimpleNamespace(adapters={Platform.WHATSAPP: adapter}),
+        critical_ingress_token=object(),
+    )
+    assert ingress["action"] == "critical_allow"
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": question}), mode="juno"
+    )
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+
+    def kite_turn():
+        policy = kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        assert DOCUMENT_DESCRIPTOR in policy["context"]
+        # No typed reader is invoked here: exactly what the live model did.
+        return kite.transform_llm_output(
+            response_text=json.dumps({"capability_id": "juno.private.james"}),
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    envelope = _session(
+        kite_turn, mode="kite", context_id=prepared.mapping.context_id
+    )
+    answer = json.loads(
+        _session(
+            lambda: juno._verify_response(
+                envelope, prepared.mapping, prepared.request_id
+            ),
+            mode="juno",
+        )
+    )
+    assert answer["outcome"] == "denied"
+    assert answer["stage"] == "staging"
+    assert "no approved typed reader" in answer["reason"]
+    # The oracle allows this exact request, so the denial is a staging failure
+    # and must never be phrased as an authorization or entitlement one.
+    assert disclosure_decision(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        capability_id="juno.private.james",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed is True
+    assert "authoriz" not in answer["reason"].lower()
+
+
+def test_juno_side_document_release_needs_no_private_read_backends(tmp_path):
+    """Juno holds document_release for the APPROVE half without typed readers.
+
+    The delivery side only claims a code, revalidates the staged inode, and
+    sends. Requiring Slice B here would force private-read backends into the
+    low-trust profile, and leaving the requirement in place made the config
+    fix crash the plugin into the fail-closed runtime, silencing Juno.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    config = _config(tmp_path, root, mode="juno")
+    config["juno_kite_trusted_principal"].pop("private_reads")
+    runtime = TrustedPrincipalRuntime(config, active_profile="juno", clock=Clock())
+    assert runtime.document_releases.enabled is True
+    assert runtime.private_reads.enabled is False
+    assert runtime.private_read_tool_names == frozenset()
+
+
+def test_kite_side_document_release_still_requires_private_reads(tmp_path):
+    root = tmp_path / "family"
+    root.mkdir()
+    config = _config(tmp_path, root, mode="kite")
+    config["juno_kite_trusted_principal"].pop("private_reads")
+    with pytest.raises(ValueError, match="Slice B private reads"):
+        TrustedPrincipalRuntime(config, active_profile="kite", clock=Clock())
+
+
+def test_document_tier_guidance_orders_the_typed_read_before_the_selection():
+    """The tier rule must read as an action, not only an output format."""
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        generated_semantic_guidance,
+    )
+
+    guidance = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )
+    rule = guidance["output_tier_rule"]
+    assert "kite_personal_files_read" in rule
+    assert "capability_id" in rule
+    assert rule.index("kite_personal_files_read") < rule.index("capability_id")
+    steps = guidance["document_release_mode"]["required_steps"]
+    assert "typed reader" in steps and "capability_id" in steps

@@ -270,6 +270,13 @@ def generated_semantic_guidance(
                 "the host decides document release through the Slice C proposal "
                 "and exact APPROVE gates; entitlement is already intersected here"
             ),
+            "required_steps": (
+                "1) call an approved typed reader and let it succeed, so the host "
+                "stages exactly one artifact from that live read; 2) only then "
+                "return {\"capability_id\": \"<one effective capability id>\"} as "
+                "the entire response. Step 1 is what creates the release; skipping "
+                "it always produces a host denial and James receives nothing"
+            ),
             "self_refusal": (
                 "do not refuse a document request that falls inside these "
                 "capability IDs, and never invent a privacy or authorization "
@@ -301,9 +308,17 @@ def generated_semantic_guidance(
             MINIMIZED: "answer with necessary facts, status, synthesis, blockers, next steps, and bounded provenance",
             BOUNDED_EXCERPT: "quote only a short necessary excerpt when the effective semantic domain permits it",
             DOCUMENT_DESCRIPTOR: (
-                "select exactly one approved typed-reader candidate and return only its "
-                "effective semantic capability; the host either creates the bounded "
-                "Slice C approval preview or denies release"
+                "two mandatory steps in this same turn, not an output format. "
+                "Step one: actually call an approved typed reader and let it "
+                "succeed, because only a real successful read stages the artifact "
+                "-- a bounded kite_personal_files_read search followed by the exact "
+                "kite_personal_files_read read of the one file it returned, or the "
+                "exact Gmail message read followed by kite_gmail_attachment_extract. "
+                "Step two: once exactly one candidate is staged, reply with only the "
+                "JSON object {\"capability_id\": \"<one effective capability id>\"} "
+                "and no other text. Returning that JSON without having run step one "
+                "stages nothing and the host denies the release, so never skip the "
+                "read and never answer this tier from memory or from context alone"
             ),
             BULK_RAW: "deny without invoking a private connector",
         }[output_tier],

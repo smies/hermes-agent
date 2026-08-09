@@ -15,7 +15,13 @@ TOOL_DESCRIPTION = (
     "Juno's safe local context, and direct public tools first. Use this bounded "
     "surface only when those are insufficient or Kite's private authority is "
     "required. Authority, identity, peer, URL, and conversation mapping are "
-    "host-bound and cannot be supplied in tool arguments."
+    "host-bound and cannot be supplied in tool arguments. "
+    "Entitlement is decided by the host, never by you: do not refuse a request "
+    "on privacy or authorization grounds of your own and do not decide in "
+    "advance that something is unavailable -- call this tool and let the host "
+    "allow or deny. When it denies, report the outcome and reason it actually "
+    "returned, including the stage it names, rather than restating it as a "
+    "general authorization refusal."
 )
 
 

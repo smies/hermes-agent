@@ -443,7 +443,14 @@ class TrustedPrincipalRuntime:
             clock=self.clock,
         )
         if self.document_releases.enabled:
-            if not self.private_reads.enabled:
+            # Only the staging side needs typed readers: it is the read that
+            # produces the artifact.  The Juno side carries the same
+            # document_release config to run the other half -- claiming one
+            # APPROVE code, revalidating the staged inode, and delivering it --
+            # and must never be given private-read backends to do that.  Any
+            # mode other than juno is still required to have them, so an
+            # unrecognized mode stays fail-closed.
+            if self.mode != "juno" and not self.private_reads.enabled:
                 raise ValueError("document release requires Slice B private reads")
             james_caps = self.principal_read_capabilities.get("james")
             if not james_caps or "juno.private.james" not in james_caps:
@@ -2375,9 +2382,20 @@ class TrustedPrincipalRuntime:
     ) -> str:
         """Convert one staged candidate into a deterministic approval preview."""
         candidates = list(state["document_candidates"])
+        stage = "release"
         try:
-            if state["failures"] or len(candidates) != 1:
-                raise ValueError("one complete staged candidate is required")
+            if state["failures"]:
+                stage = "typed-read"
+                raise ValueError("a required private source failed or was incomplete")
+            if not candidates:
+                stage = "staging"
+                raise ValueError(
+                    "no document was staged, because no approved typed reader ran "
+                    "and succeeded in this turn"
+                )
+            if len(candidates) != 1:
+                stage = "staging"
+                raise ValueError("exactly one staged document is required")
             if (
                 binding.mapping is None
                 or binding.request is None
@@ -2385,7 +2403,9 @@ class TrustedPrincipalRuntime:
                 or "juno.private.james"
                 not in binding.effective_read_capability_ids
             ):
+                stage = "binding"
                 raise ValueError("the phase-one James-only binding is unavailable")
+            stage = "selection"
             selection = json.loads(str(model_text or ""))
             if not isinstance(selection, dict) or set(selection) != {"capability_id"}:
                 raise ValueError("release selection must choose one semantic capability")
@@ -2403,8 +2423,10 @@ class TrustedPrincipalRuntime:
                 or capability_id not in purpose_by_capability
                 or capability_id not in binding.effective_read_capability_ids
             ):
+                stage = "policy"
                 raise ValueError("document domain is outside the effective policy")
             candidate = candidates[0]
+            stage = "approval-issue"
             code, expires_at = self.document_releases.issue(
                 candidate,
                 request=binding.request,
@@ -2432,9 +2454,41 @@ class TrustedPrincipalRuntime:
         except Exception:
             for candidate in candidates:
                 self.document_releases.discard_candidate(candidate)
+            # Name the stage that actually denied.  A single generic reason sent
+            # earlier debugging toward deployment and config when the real stage
+            # was staging.  These strings are fixed and stage-only: the caught
+            # exception text is never echoed outward.
+            reason_by_stage = {
+                "typed-read": (
+                    "a required private source failed or was incomplete, so no "
+                    "document could be staged"
+                ),
+                "staging": (
+                    "no approved typed reader ran and succeeded in this turn, so "
+                    "no document was staged for release"
+                ),
+                "binding": (
+                    "the phase-one James-only document binding is unavailable"
+                ),
+                "selection": (
+                    "the response did not select exactly one semantic capability "
+                    "for the staged document"
+                ),
+                "policy": (
+                    "the selected document domain is outside the effective policy"
+                ),
+                "approval-issue": (
+                    "the staged document could not be bound to a one-use approval"
+                ),
+            }
             return canonical_json({
                 "outcome": "denied",
-                "reason": "specific document release is unavailable under the current exact binding",
+                "stage": stage,
+                "reason": reason_by_stage.get(
+                    stage,
+                    "specific document release is unavailable under the current "
+                    "exact binding",
+                ),
             })
 
     @staticmethod
