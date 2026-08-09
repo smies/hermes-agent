@@ -114,6 +114,36 @@ def classify_output_tier(question: str) -> str:
     return MINIMIZED
 
 
+# Ordered least to most restrictive. Escalating adds gates (an approval flow, or
+# an outright denial for bulk/raw), so combining tiers by taking the maximum is
+# the fail-closed direction: an unrecognized value scores highest of all.
+_TIER_RESTRICTIVENESS = {
+    MINIMIZED: 0,
+    BOUNDED_EXCERPT: 1,
+    DOCUMENT_DESCRIPTOR: 2,
+    BULK_RAW: 3,
+}
+
+
+def strongest_output_tier(tiers: Iterable[str]) -> str:
+    """Return the most restrictive tier among the candidates.
+
+    Used where more than one description of the same request is available and
+    only some of them are trustworthy. An unknown or empty tier must never
+    silently relax the outcome, so it is treated as maximally restrictive.
+    """
+    strongest = MINIMIZED
+    for tier in tiers:
+        value = str(tier or "")
+        if not value:
+            continue
+        if value not in _TIER_RESTRICTIVENESS:
+            return BULK_RAW
+        if _TIER_RESTRICTIVENESS[value] > _TIER_RESTRICTIVENESS[strongest]:
+            strongest = value
+    return strongest
+
+
 _DOCUMENT_RELEASABLE_CAPABILITIES = frozenset({
     # James's own personal documents, released only back to James.
     "juno.private.james",
@@ -344,5 +374,6 @@ __all__ = [
     "DisclosureDecision",
     "classify_output_tier",
     "disclosure_decision",
+    "strongest_output_tier",
     "generated_semantic_guidance",
 ]

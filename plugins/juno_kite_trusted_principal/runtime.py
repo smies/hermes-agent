@@ -52,6 +52,7 @@ _REQUEST_FIELDS = frozenset({
     "effective_read_capability_ids",
     "effective_action_capability_ids",
     "roster_generation",
+    "host_output_tier",
     "signature",
 })
 _RESPONSE_FIELDS = frozenset({
@@ -327,6 +328,13 @@ _ACTIVE_INGRESS_TOKEN: ContextVar[Any] = ContextVar(
 )
 _ACTIVE_PRIVATE_READS: ContextVar[Optional[dict[str, set[str]]]] = ContextVar(
     "juno_kite_active_private_reads", default=None
+)
+# The authentic inbound message, captured at ingress before any model sees it.
+# The output tier is a security control and must not be derived from a string
+# the Juno model wrote: its paraphrase varies per turn, and an under-classified
+# document request would skip the staging and approval gates entirely.
+_ACTIVE_INBOUND_TEXT: ContextVar[str] = ContextVar(
+    "juno_kite_active_inbound_text", default=""
 )
 
 CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
@@ -1133,6 +1141,7 @@ class TrustedPrincipalRuntime:
             return None
         _ACTIVE_AUDIENCE.set(None)
         _ACTIVE_INGRESS_TOKEN.set(None)
+        _ACTIVE_INBOUND_TEXT.set(str(getattr(event, "text", "") or ""))
         source = getattr(event, "source", None)
         platform_value = getattr(getattr(source, "platform", None), "value", None)
         platform = str(platform_value or getattr(source, "platform", "") or "").lower()
@@ -1419,6 +1428,8 @@ class TrustedPrincipalRuntime:
         # creation, so a changed/missing audience cannot leave authority state
         # or issue an A2A call.
         audience = self._revalidate_audience(audience)
+        from .disclosure import classify_output_tier
+
         mapping = self.store.resolve(principal, conversation_key)
         request_id = "req-" + secrets.token_urlsafe(18)
         expires_at = int(self.clock()) + self.limits.turn_ttl_seconds
@@ -1440,6 +1451,9 @@ class TrustedPrincipalRuntime:
                 audience.effective_action_capability_ids
             ),
             "roster_generation": audience.roster_generation,
+            # Classified from the authentic inbound message captured at ingress,
+            # never from the model-authored question_or_goal.
+            "host_output_tier": classify_output_tier(_ACTIVE_INBOUND_TEXT.get()),
         }
         payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
         guard = _audit_guard(mapping.correlation_id, request_id, mapping.context_id)
@@ -1632,8 +1646,24 @@ class TrustedPrincipalRuntime:
         )
         if request is None:
             raise ValueError("request is unissued, replayed, stale, or cross-bound")
-        from .disclosure import classify_output_tier
+        from .disclosure import classify_output_tier, strongest_output_tier
 
+        # The peer's question_or_goal is model-authored and reworded every turn,
+        # so it cannot be the sole source of the tier: one live paraphrase said
+        # "release the actual document" (document tier) and the next said
+        # "return a releasable file reference" (minimized), for the same request.
+        # Take the most restrictive of the host-classified inbound message, the
+        # paraphrase, and the quoted context, so an untrusted rewording can only
+        # add gates, never remove them.
+        candidates = [
+            str(payload.get("host_output_tier") or ""),
+            classify_output_tier(str(payload["question_or_goal"])),
+        ]
+        candidates.extend(
+            classify_output_tier(str(turn.get("text") or ""))
+            for turn in payload["relevant_context"]
+            if isinstance(turn, dict) and turn.get("role") == "user"
+        )
         return TurnBinding(
             True,
             "",
@@ -1643,7 +1673,7 @@ class TrustedPrincipalRuntime:
             turn_id,
             read_caps,
             action_caps,
-            classify_output_tier(str(payload["question_or_goal"])),
+            strongest_output_tier(candidates),
         )
 
     def _policy_view(self, binding: TurnBinding) -> str:

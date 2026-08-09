@@ -1082,3 +1082,93 @@ async def test_document_tier_policy_view_rule_does_not_ask_for_a_minimized_answe
     )
     plain_view = json.loads(plain_context.split("\n", 1)[1])
     assert "Return only a minimized answer" in plain_view["rule"]
+
+
+# The exact question_or_goal Juno composed on the second live attempt (18:55).
+# Same James message as JAMES_LIVE_REQUEST, reworded by the model, and the
+# rewording alone drops it out of the document tier.
+JUNO_LIVE_PARAPHRASE_MINIMIZED = (
+    "Retrieve and securely release to this exact bound conversation the "
+    "authenticated principal's latest engagement letter involving Nacho "
+    "Rodriguez, previously identified as 'amended Terms of Business' received "
+    "7 August 2026 at 15:53 CEST. Use the approved typed document/email reader "
+    "and stage the matching attachment for release if authorized. Return only a "
+    "releasable file reference and minimal identification. Do not contact "
+    "anyone, modify records, or access unrelated material."
+)
+
+
+def test_a_reworded_paraphrase_cannot_drop_the_document_tier():
+    """The live 18:55 failure: the model's rewording de-classified the request.
+
+    Both paraphrases came from the same James message. Classifying only the
+    peer-authored string made the tier -- a security control -- depend on
+    wording the model chooses fresh each turn.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED,
+        classify_output_tier,
+        strongest_output_tier,
+    )
+
+    assert classify_output_tier(JAMES_LIVE_REQUEST) == DOCUMENT_DESCRIPTOR
+    assert classify_output_tier(JUNO_LIVE_PARAPHRASE_MINIMIZED) == MINIMIZED
+    # The host-classified inbound message keeps the tier where it belongs.
+    assert strongest_output_tier([
+        classify_output_tier(JAMES_LIVE_REQUEST),
+        classify_output_tier(JUNO_LIVE_PARAPHRASE_MINIMIZED),
+    ]) == DOCUMENT_DESCRIPTOR
+
+
+def test_strongest_output_tier_is_fail_closed():
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        BOUNDED_EXCERPT,
+        BULK_RAW,
+        MINIMIZED,
+        strongest_output_tier,
+    )
+
+    assert strongest_output_tier([]) == MINIMIZED
+    assert strongest_output_tier(["", None]) == MINIMIZED
+    assert strongest_output_tier([MINIMIZED, BOUNDED_EXCERPT]) == BOUNDED_EXCERPT
+    assert strongest_output_tier([DOCUMENT_DESCRIPTOR, MINIMIZED]) == DOCUMENT_DESCRIPTOR
+    assert strongest_output_tier([BULK_RAW, DOCUMENT_DESCRIPTOR]) == BULK_RAW
+    # An unrecognized tier must never relax the outcome.
+    assert strongest_output_tier([MINIMIZED, "anything-else"]) == BULK_RAW
+
+
+@pytest.mark.asyncio
+async def test_host_classified_tier_survives_a_de_escalating_paraphrase(tmp_path):
+    """End to end: James asks naturally, Juno reworders it, tier still holds."""
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "engagement-letter.png").write_bytes(_png_bytes())
+    clock = Clock()
+    adapter = RecordingWhatsAppAdapter(MutableRoster())
+
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    await juno.pre_gateway_dispatch(
+        event=_event(JAMES_LIVE_REQUEST),
+        gateway=SimpleNamespace(adapters={Platform.WHATSAPP: adapter}),
+        critical_ingress_token=object(),
+    )
+    # The model hands back the de-escalating rewording seen in production.
+    prepared = _session(
+        lambda: juno._prepare_request(
+            {"question_or_goal": JUNO_LIVE_PARAPHRASE_MINIMIZED}
+        ),
+        mode="juno",
+    )
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+    context = _session(
+        lambda: kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )["context"],
+        mode="kite",
+        context_id=prepared.mapping.context_id,
+    )
+    view = json.loads(context.split("\n", 1)[1])
+    assert view["semantic_disclosure"]["output_tier"] == DOCUMENT_DESCRIPTOR
+    assert "typed reader" in view["rule"]
