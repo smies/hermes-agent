@@ -1511,3 +1511,87 @@ async def test_typing_helper_never_breaks_a_delivery(tmp_path):
 
     await TrustedPrincipalRuntime._quiet_typing(Hostile(), GROUP)
     await TrustedPrincipalRuntime._quiet_typing(object(), GROUP)
+
+
+def test_a_bare_follow_up_is_only_a_document_request_in_context():
+    """"retrieve and send it again" is James's real 21:36 and 21:43 phrasing.
+
+    It names no document, so on its own it is an ordinary turn. It worked once
+    and failed once purely because Juno happened to quote the earlier request
+    in relevant_context the first time.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED,
+        classify_output_tier,
+        is_document_followup,
+    )
+
+    followup = "retrieve and send it again"
+    assert classify_output_tier(followup) == MINIMIZED
+    assert is_document_followup(followup) is True
+    # A turn that carries its own subject is never treated as a follow-up.
+    for standalone in (
+        "what did nacho say about the amended terms",
+        "send me an update about the villa instead",
+        "remind me when the survey is due",
+    ):
+        assert is_document_followup(standalone) is False, standalone
+    # Nor is anything that already classifies on its own.
+    assert is_document_followup("Show me the juno test engagement letter") is False
+
+
+def test_resend_and_retrieve_classify_without_any_history():
+    from plugins.juno_kite_trusted_principal.disclosure import classify_output_tier
+
+    for phrase in (
+        "resend the engagement letter",
+        "re-send the engagement letter",
+        "retrieve the child passport scan",
+    ):
+        assert classify_output_tier(phrase) == DOCUMENT_DESCRIPTOR, phrase
+
+
+@pytest.mark.asyncio
+async def test_follow_up_inherits_only_a_recent_same_conversation_document_turn(
+    tmp_path,
+):
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    binding = "conversation-binding-digest"
+    other = "a-different-conversation"
+    followup = "retrieve and send it again"
+
+    # With no prior document turn the follow-up stays an ordinary turn.
+    assert juno._host_output_tier(followup, binding) == "minimized_answer"
+    # After a real document request in that conversation it resolves.
+    assert juno._host_output_tier(
+        "Show me the juno test engagement letter", binding
+    ) == DOCUMENT_DESCRIPTOR
+    assert juno._host_output_tier(followup, binding) == DOCUMENT_DESCRIPTOR
+    # Never across conversations.
+    assert juno._host_output_tier(followup, other) == "minimized_answer"
+    # And never after it goes stale.
+    clock.value += 301
+    assert juno._host_output_tier(followup, binding) == "minimized_answer"
+
+
+def test_minimized_guidance_forbids_inventing_a_release_gate():
+    """Kite told James release was "blocked at the next host approval gate".
+
+    No gate runs on a minimized turn; there was nothing to block.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED,
+        generated_semantic_guidance,
+    )
+
+    rule = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=MINIMIZED,
+    )["output_tier_rule"]
+    assert "never explain a document you did not return by inventing one" in rule

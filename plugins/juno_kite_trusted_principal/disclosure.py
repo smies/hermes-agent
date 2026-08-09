@@ -59,9 +59,9 @@ _RAW_PATTERNS = (
     ),
 )
 _DOCUMENT_DELIVERY = (
-    r"(?:send|forward|attach|share|deliver|upload|download|give\s+me|"
-    r"email\s+me|whatsapp\s+me|text\s+me|i\s+need|show\s+me|let\s+me\s+see|"
-    r"pull\s+up)"
+    r"(?:send|resend|re-send|forward|attach|share|deliver|upload|download|"
+    r"retrieve|give\s+me|email\s+me|whatsapp\s+me|text\s+me|i\s+need|"
+    r"show\s+me|let\s+me\s+see|pull\s+up)"
 )
 _DOCUMENT_ARTIFACT = r"(?:document|scan|passport|pdf|file|attachment|copy)"
 # Real-world document names people actually use.  A request rarely says "PDF";
@@ -98,6 +98,43 @@ _DOCUMENT_PATTERNS = (
 _EXCERPT_PATTERNS = (
     re.compile(r"(?i)\b(?:quote|excerpt|exact wording|verbatim sentence)\b"),
 )
+
+
+# A follow-up that names no document at all: a delivery verb pointing at
+# something the previous turn already identified ("retrieve and send it again").
+# It carries no subject of its own, so it can only be resolved against the
+# conversation, never from the message alone.
+_DOCUMENT_FOLLOWUP_OBJECT = re.compile(
+    r"(?i)\b(?:it|that|this|them|those|these|again|one|copy)\b"
+)
+_DOCUMENT_FOLLOWUP_SUBJECT = re.compile(
+    r"(?i)\b(?:about|regarding|instead|summar\w+|status|update)\b"
+)
+_DOCUMENT_FOLLOWUP_MAX_CHARS = 80
+
+
+def is_document_followup(question: str) -> bool:
+    """True when this asks again for whatever the last turn produced.
+
+    Deliberately narrow: it must be short, carry a delivery verb and an
+    anaphoric object, introduce no subject of its own, and not already
+    classify as something else. The caller still has to prove that the
+    previous turn in this same conversation was a document turn -- on its own
+    this text says nothing about documents.
+    """
+    value = str(question or "")
+    if not value or len(value) > _DOCUMENT_FOLLOWUP_MAX_CHARS:
+        return False
+    if classify_output_tier(value) != MINIMIZED:
+        return False
+    if _DOCUMENT_FOLLOWUP_SUBJECT.search(value) or _DOCUMENT_INFORMATIONAL.search(
+        value
+    ):
+        return False
+    return bool(
+        re.search(r"(?i)\b" + _DOCUMENT_DELIVERY + r"\b", value)
+        and _DOCUMENT_FOLLOWUP_OBJECT.search(value)
+    )
 
 
 def classify_output_tier(question: str) -> str:
@@ -335,7 +372,13 @@ def generated_semantic_guidance(
             ),
         },
         "output_tier_rule": {
-            MINIMIZED: "answer with necessary facts, status, synthesis, blockers, next steps, and bounded provenance",
+            MINIMIZED: (
+                "answer with necessary facts, status, synthesis, blockers, next "
+                "steps, and bounded provenance. No document staging or approval "
+                "gate runs on this tier, so never explain a document you did not "
+                "return by inventing one: if a binary was wanted and this turn "
+                "did not ask for one, say exactly that"
+            ),
             BOUNDED_EXCERPT: "quote only a short necessary excerpt when the effective semantic domain permits it",
             DOCUMENT_DESCRIPTOR: (
                 "two mandatory steps in this same turn, not an output format. "

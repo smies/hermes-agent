@@ -351,6 +351,8 @@ _ACTIVE_LOOP: ContextVar[Optional[Any]] = ContextVar(
 )
 
 CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
+# How long a document request stays resolvable by a bare follow-up.
+_DOCUMENT_FOLLOWUP_TTL_SECONDS = 300
 
 
 Transport = Callable[[str, dict, str, str], tuple[str, str, str]]
@@ -459,6 +461,10 @@ class TrustedPrincipalRuntime:
         # redundant confirmation can be dropped. Bounded: each entry is
         # consumed by the transform for that same turn.
         self._auto_delivered: set[str] = set()
+        # Conversations whose last request was a document request, so a bare
+        # "send it again" can be resolved. Keyed by the opaque conversation
+        # binding, never a raw chat id, and short-lived.
+        self._recent_document_turns: dict[str, int] = {}
         from .document_release import DocumentReleaseService
 
         self.document_releases = DocumentReleaseService(
@@ -1546,7 +1552,9 @@ class TrustedPrincipalRuntime:
             "roster_generation": audience.roster_generation,
             # Classified from the authentic inbound message captured at ingress,
             # never from the model-authored question_or_goal.
-            "host_output_tier": classify_output_tier(_ACTIVE_INBOUND_TEXT.get()),
+            "host_output_tier": self._host_output_tier(
+                _ACTIVE_INBOUND_TEXT.get(), audience.conversation_binding
+            ),
         }
         payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
         guard = _audit_guard(mapping.correlation_id, request_id, mapping.context_id)
@@ -1917,6 +1925,40 @@ class TrustedPrincipalRuntime:
             action_caps,
             strongest_output_tier(candidates),
         )
+
+    def _host_output_tier(self, inbound_text: str, conversation_binding: str) -> str:
+        """Classify the authentic message, resolving a bare follow-up.
+
+        "retrieve and send it again" names no document, so on its own it is an
+        ordinary minimized turn. It is only a document request in the light of
+        the turn before it, which the host knows and the message does not. The
+        inheritance is deliberately narrow: same conversation, recent, and only
+        for a delivery verb with an anaphoric object.
+        """
+        from .disclosure import (
+            DOCUMENT_DESCRIPTOR,
+            classify_output_tier,
+            is_document_followup,
+        )
+
+        tier = classify_output_tier(inbound_text)
+        now = int(self.clock())
+        key = str(conversation_binding or "")
+        cutoff = now - _DOCUMENT_FOLLOWUP_TTL_SECONDS
+        self._recent_document_turns = {
+            binding: seen
+            for binding, seen in self._recent_document_turns.items()
+            if seen > cutoff
+        }
+        if tier == DOCUMENT_DESCRIPTOR:
+            if key:
+                self._recent_document_turns[key] = now
+        elif key and key in self._recent_document_turns and is_document_followup(
+            inbound_text
+        ):
+            tier = DOCUMENT_DESCRIPTOR
+            self._recent_document_turns[key] = now
+        return tier
 
     def _policy_view(self, binding: TurnBinding) -> str:
         assert binding.mapping is not None and binding.request is not None
