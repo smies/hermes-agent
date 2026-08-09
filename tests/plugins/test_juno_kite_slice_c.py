@@ -1329,3 +1329,55 @@ async def test_auto_release_leaves_a_non_release_answer_untouched(tmp_path):
     for answer in ("an ordinary minimized answer", '{"outcome":"denied"}'):
         assert await juno._auto_release(answer, audience) == answer
     assert adapter.document_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_is_scheduled_onto_the_gateway_loop(tmp_path):
+    """Dispatch must run where the adapter's HTTP session lives.
+
+    An async tool handler is executed by _run_async on a fresh loop in a
+    disposable thread. The platform adapter's session is bound to the
+    gateway's loop and raises when touched from another one, which the
+    transport surfaces only as SendResult(success=False) -- the live 21:09
+    failure, recorded in the ledger as "failed" with no exception anywhere.
+    """
+    import asyncio as _asyncio
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_LOOP
+
+    seen: dict = {}
+
+    async def _work() -> str:
+        seen["loop"] = _asyncio.get_running_loop()
+        return "delivered"
+
+    gateway_loop = _asyncio.new_event_loop()
+    thread = __import__("threading").Thread(
+        target=gateway_loop.run_forever, daemon=True
+    )
+    thread.start()
+    token = _ACTIVE_LOOP.set(gateway_loop)
+    try:
+        result = await TrustedPrincipalRuntime._on_gateway_loop(_work())
+        assert result == "delivered"
+        assert seen["loop"] is gateway_loop
+        assert seen["loop"] is not _asyncio.get_running_loop()
+    finally:
+        _ACTIVE_LOOP.reset(token)
+        gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+        thread.join(timeout=5)
+        gateway_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_runs_inline_when_no_gateway_loop_is_recorded(tmp_path):
+    import asyncio as _asyncio
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_LOOP
+
+    async def _work() -> str:
+        return "delivered"
+
+    token = _ACTIVE_LOOP.set(None)
+    try:
+        assert await TrustedPrincipalRuntime._on_gateway_loop(_work()) == "delivered"
+    finally:
+        _ACTIVE_LOOP.reset(token)

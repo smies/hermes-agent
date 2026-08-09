@@ -342,6 +342,13 @@ _ACTIVE_INBOUND_TEXT: ContextVar[str] = ContextVar(
 _ACTIVE_DELIVERY: ContextVar[Optional[tuple[Any, str]]] = ContextVar(
     "juno_kite_active_delivery", default=None
 )
+# The gateway's own event loop. An async tool handler is run by _run_async on a
+# fresh loop in a disposable thread, and the platform adapter's HTTP session is
+# bound to the loop that created it, so a document dispatched from the tool's
+# loop fails in the transport. Delivery is scheduled back onto this loop.
+_ACTIVE_LOOP: ContextVar[Optional[Any]] = ContextVar(
+    "juno_kite_active_loop", default=None
+)
 
 CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
 
@@ -1135,6 +1142,13 @@ class TrustedPrincipalRuntime:
                 receipt_text = "Document delivered. Receipt: delivered."
                 provider_receipt = message_id
             elif success is False:
+                # The transport reports a loop/session/bridge fault only as a
+                # failed send, so record its class here rather than leaving the
+                # cause to be reconstructed from a ledger row.
+                logger.warning(
+                    "Juno document transport failed: %s",
+                    str(getattr(result, "error", "") or "unspecified")[:200],
+                )
                 terminal = "failed"
                 receipt_text = "Document delivery failed. Receipt: failed."
                 provider_receipt = ""
@@ -1178,6 +1192,10 @@ class TrustedPrincipalRuntime:
         _ACTIVE_INGRESS_TOKEN.set(None)
         _ACTIVE_DELIVERY.set(None)
         _ACTIVE_INBOUND_TEXT.set(str(getattr(event, "text", "") or ""))
+        try:
+            _ACTIVE_LOOP.set(asyncio.get_running_loop())
+        except RuntimeError:
+            _ACTIVE_LOOP.set(None)
         source = getattr(event, "source", None)
         platform_value = getattr(getattr(source, "platform", None), "value", None)
         platform = str(platform_value or getattr(source, "platform", "") or "").lower()
@@ -1585,6 +1603,26 @@ class TrustedPrincipalRuntime:
             return answer
         return await self._auto_release(answer, audience)
 
+    @staticmethod
+    async def _on_gateway_loop(coro: Any) -> Any:
+        """Await a coroutine on the gateway's loop, wherever we are now.
+
+        An async tool handler runs on a disposable loop in its own thread, but
+        the platform adapter's HTTP session belongs to the gateway's loop and
+        raises if touched from another one -- which the transport reports only
+        as a failed send. Delivery therefore runs where the adapter lives.
+        """
+        loop = _ACTIVE_LOOP.get()
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or loop is running or loop.is_closed():
+            return await coro
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        )
+
     async def _auto_release(self, answer: str, audience: AudienceBinding) -> str:
         """Consume an approval the host just issued, without asking the owner.
 
@@ -1612,9 +1650,11 @@ class TrustedPrincipalRuntime:
         except (TypeError, ValueError):
             return answer
 
-        outcome = await self._consume_and_deliver(
-            code, audience=audience, adapter=adapter, chat_id=chat_id,
-            send_receipt=False,
+        outcome = await self._on_gateway_loop(
+            self._consume_and_deliver(
+                code, audience=audience, adapter=adapter, chat_id=chat_id,
+                send_receipt=False,
+            )
         )
         if outcome == "delivered":
             return canonical_json({"outcome": "delivered", "document": document})
