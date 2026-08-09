@@ -1709,3 +1709,42 @@ def test_a_stream_claiming_flate_that_will_not_inflate_is_still_refused(tmp_path
     runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
 
     assert runtime.document_releases.inspect_source_for_test(source) is None
+
+
+def test_a_real_gmail_attachment_id_fits_the_extractor_schema():
+    """The live 22:25 block: the id was longer than its own schema allowed.
+
+    Gmail attachment handles are hundreds of characters -- the engagement
+    letter's is 319 -- and are regenerated per response, so they cannot be
+    shortened or substituted. A 256 cap rejected the argument before the
+    reader ever ran, making every real attachment unreachable.
+    """
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        TOOL_SCHEMAS,
+        validate_tool_arguments,
+    )
+
+    schema = TOOL_SCHEMAS["kite_gmail_attachment_extract"]["parameters"]
+    assert schema["properties"]["attachment_id"]["maxLength"] >= 512
+    # Message ids stay tightly bounded; only the attachment handle is long.
+    assert schema["properties"]["message_id"]["maxLength"] == 256
+
+    realistic = "ANGjdJ" + "aB9_-x" * 52  # 318 chars, Gmail's alphabet
+    assert len(realistic) > 256
+    assert validate_tool_arguments(
+        "kite_gmail_attachment_extract",
+        {"account": "personal", "message_id": "19fdc822d5bea6a9",
+         "attachment_id": realistic},
+    ) is True
+    # Still bounded, and still only the URL-safe alphabet.
+    assert validate_tool_arguments(
+        "kite_gmail_attachment_extract",
+        {"account": "personal", "message_id": "19fdc822d5bea6a9",
+         "attachment_id": "a" * 4096},
+    ) is False
+    # The alphabet is enforced a layer down, at execution, not by the schema.
+    from plugins.juno_kite_trusted_principal.private_reads import _ATTACHMENT_ID_RE
+
+    assert _ATTACHMENT_ID_RE.fullmatch(realistic) is not None
+    for rejected in ("../../etc/passwd", "a b", "a/b", "x" * 2048, ""):
+        assert _ATTACHMENT_ID_RE.fullmatch(rejected) is None, rejected

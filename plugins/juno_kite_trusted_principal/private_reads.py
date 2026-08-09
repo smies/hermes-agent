@@ -51,6 +51,12 @@ WHATSAPP_QUERY = (
 OBSIDIAN_ROOT = "/Users/james/Documents/Obsidian Vault"
 
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
+# Gmail attachment handles are far longer than message ids -- the engagement
+# letter's is 319 characters -- and are regenerated per response, so they
+# cannot be shortened or cached. A 256 cap silently made every real attachment
+# unreachable: the schema rejected the argument before the reader ever ran.
+_ATTACHMENT_ID_MAX_CHARS = 1024
+_ATTACHMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}\Z" % _ATTACHMENT_ID_MAX_CHARS)
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\Z"
@@ -246,7 +252,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             {
                 "account": {"type": "string", "enum": ["personal", "kite"]},
                 "message_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                "attachment_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "attachment_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": _ATTACHMENT_ID_MAX_CHARS,
+                },
             },
             ("account", "message_id", "attachment_id"),
         ),
@@ -757,10 +767,12 @@ class PrivateReadService:
         )
         alias, identity = self._account(args)
         message_id = self._bounded_text(args["message_id"], "message_id", 256)
-        attachment_id = self._bounded_text(args["attachment_id"], "attachment_id", 256)
+        attachment_id = self._bounded_text(
+            args["attachment_id"], "attachment_id", _ATTACHMENT_ID_MAX_CHARS
+        )
         if (
             _ID_RE.fullmatch(message_id) is None
-            or _ID_RE.fullmatch(attachment_id) is None
+            or _ATTACHMENT_ID_RE.fullmatch(attachment_id) is None
         ):
             raise SourceFailure(
                 "invalid_arguments", "message or attachment ID is malformed"
