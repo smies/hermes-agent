@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .private_reads import PRIVATE_READ_TOOLSET, TOOL_SCHEMAS
+from .private_reads import PRIVATE_READ_TOOLSET
 from .runtime import (
     TrustedPrincipalRuntime,
     critical_ingress_satisfied,
@@ -91,7 +91,7 @@ def register(ctx) -> None:
     ):
         handlers = runtime.private_read_handlers()
         for name in sorted(handlers):
-            schema = TOOL_SCHEMAS[name]
+            schema = runtime.private_reads.schema_for(name)
             ctx.register_tool(
                 name=name,
                 toolset=PRIVATE_READ_TOOLSET,

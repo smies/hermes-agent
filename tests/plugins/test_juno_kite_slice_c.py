@@ -1193,3 +1193,36 @@ def test_document_tool_descriptions_do_not_disown_the_staging_step():
         assert "not a separate flow" in description, name
         # The wording that made the model disown the step must not come back.
         assert "Only the separately gated" not in description, name
+
+
+def test_file_root_names_are_bound_into_the_model_facing_schema(tmp_path):
+    """The model must not have to guess which personal root exists.
+
+    Live turn, 20:26: every kite_personal_files_read call failed with
+    "personal file root is unavailable" because ``root`` was an unconstrained
+    string and the model guessed a name. Root names are host-configured and
+    non-sensitive -- their paths are not, and stay in Kite -- exactly like the
+    Gmail account aliases that were already enumerated.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    config = _config(tmp_path, root, mode="kite")
+    section = config["juno_kite_trusted_principal"]
+    runtime = TrustedPrincipalRuntime(config, active_profile="kite", clock=Clock())
+
+    schema = runtime.private_reads.schema_for("kite_personal_files_read")
+    configured = [
+        entry["name"] for entry in section["private_reads"]["files"]["roots"]
+    ]
+    assert schema["parameters"]["properties"]["root"]["enum"] == sorted(configured)
+    for name in configured:
+        assert name in schema["description"]
+    # The configured path itself must never reach the model.
+    for entry in section["private_reads"]["files"]["roots"]:
+        assert entry["path"] not in json.dumps(schema)
+    # The shared static schema must not be mutated by building a bound one.
+    from plugins.juno_kite_trusted_principal.private_reads import TOOL_SCHEMAS
+
+    assert "enum" not in TOOL_SCHEMAS["kite_personal_files_read"]["parameters"][
+        "properties"
+    ]["root"]

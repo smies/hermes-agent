@@ -9,6 +9,7 @@ an argv vector with ``shell=False`` and HTTP uses fixed GET-only routes.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import math
 import mimetypes
@@ -1667,6 +1668,32 @@ class PrivateReadService:
                 "cap_exceeded", "WhatsApp archive exceeded the requested cap"
             )
         return data
+
+    def root_names(self) -> tuple[str, ...]:
+        """Configured personal-file root names, or empty when unavailable."""
+        try:
+            return tuple(sorted(self._roots(self.config.get("files"))))
+        except Exception:
+            return ()
+
+    def schema_for(self, tool_name: str) -> dict[str, Any]:
+        """Return the model-facing schema with the real root names bound in.
+
+        ``root`` was an unconstrained string, so the model had to guess which
+        root existed and every guess failed with "personal file root is
+        unavailable". The names are host-configured and not sensitive -- unlike
+        their paths, which stay in Kite -- so they belong in the schema exactly
+        as the Gmail account aliases already are.
+        """
+        schema = copy.deepcopy(TOOL_SCHEMAS[tool_name])
+        if tool_name == "kite_personal_files_read":
+            names = self.root_names()
+            if names:
+                schema["parameters"]["properties"]["root"]["enum"] = list(names)
+                schema["description"] += (
+                    " The only selectable root names are: " + ", ".join(names) + "."
+                )
+        return schema
 
     @staticmethod
     def _roots(config: Any) -> dict[str, Path]:
