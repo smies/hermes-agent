@@ -1214,14 +1214,53 @@ class TrustedPrincipalRuntime:
         except Exception:
             logger.debug("Juno typing indicator did not settle after delivery")
 
+    def _is_juno_lane_request(self, event: Any) -> bool:
+        """An inbound signed request from the authenticated Juno peer."""
+        source = getattr(event, "source", None)
+        platform_value = getattr(getattr(source, "platform", None), "value", None)
+        platform = str(platform_value or getattr(source, "platform", "") or "").lower()
+        return bool(
+            platform == "a2a"
+            and str(getattr(source, "user_id", "") or "") == "juno"
+            and REQUEST_PREFIX in str(getattr(event, "text", "") or "")
+        )
+
+    def _reset_lane_session(self, event: Any, session_store: Any) -> None:
+        """Start every Juno request from a clean Kite session.
+
+        Each request is self-contained and independently authorized, so history
+        buys nothing here -- but it accumulates stale tool schemas and stale
+        failures, and the model reasons from those instead of retrying. It
+        reported an attachment id as "still" overlength on a build where the
+        limit had already been raised, and never called the reader at all.
+        """
+        reset = getattr(session_store, "reset_session", None)
+        listing = getattr(session_store, "list_sessions", None)
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        if not callable(reset) or not callable(listing) or not chat_id:
+            return
+        suffix = f":a2a:dm:{chat_id}"
+        try:
+            for entry in listing():
+                key = str(getattr(entry, "session_key", "") or "")
+                if key.endswith(suffix):
+                    reset(key)
+        except Exception:
+            logger.warning("Juno--Kite lane session reset failed; continuing")
+
     async def pre_gateway_dispatch(
         self,
         event: Any = None,
         gateway: Any = None,
+        session_store: Any = None,
         critical_ingress_token: Any = None,
         **_: Any,
     ) -> Optional[dict]:
         """Bind eligible Juno audience authority before auth/session/model work."""
+        if self.mode == "kite":
+            if self.enabled and self._is_juno_lane_request(event):
+                self._reset_lane_session(event, session_store)
+            return None
         if self.mode != "juno" or not self.juno_available():
             return None
         _ACTIVE_AUDIENCE.set(None)

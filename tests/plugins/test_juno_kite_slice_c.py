@@ -1748,3 +1748,99 @@ def test_a_real_gmail_attachment_id_fits_the_extractor_schema():
     assert _ATTACHMENT_ID_RE.fullmatch(realistic) is not None
     for rejected in ("../../etc/passwd", "a b", "a/b", "x" * 2048, ""):
         assert _ATTACHMENT_ID_RE.fullmatch(rejected) is None, rejected
+
+
+class _RecordingSessionStore:
+    def __init__(self, keys):
+        self._keys = list(keys)
+        self.reset_keys: list[str] = []
+
+    def list_sessions(self, active_minutes=None):
+        return [SimpleNamespace(session_key=key) for key in self._keys]
+
+    def reset_session(self, session_key, display_name=None):
+        self.reset_keys.append(session_key)
+        return SimpleNamespace(session_key=session_key)
+
+
+def _a2a_event(text, *, chat_id="jk-context", user_id="juno"):
+    """The A2A lane carries a plain "a2a" platform string, not a Platform member."""
+    return SimpleNamespace(
+        text=text,
+        source=SimpleNamespace(
+            platform="a2a", user_id=user_id, chat_id=chat_id, chat_type="dm"
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_juno_request_starts_from_a_clean_kite_session(tmp_path):
+    """Kite must not reason from a previous turn's stale failure.
+
+    Live 22:40: on a build where the attachment id limit had already been
+    raised, the model reported it as "still" overlength and never called the
+    reader -- quoting its own earlier failure from the same session. That
+    confounded five separate tests today.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import REQUEST_PREFIX
+
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    store = _RecordingSessionStore([
+        "agent:main:a2a:dm:jk-context",
+        "agent:main:whatsapp:group:unrelated",
+        "agent:main:a2a:dm:some-other-context",
+    ])
+
+    await kite.pre_gateway_dispatch(
+        event=_a2a_event("guard\n" + REQUEST_PREFIX + "{}"),
+        gateway=None,
+        session_store=store,
+    )
+    assert store.reset_keys == ["agent:main:a2a:dm:jk-context"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,user_id",
+    [
+        ("an ordinary peer message", "juno"),
+        ("guard\nJUNO_KITE_REQUEST_V2 {}", "someone-else"),
+    ],
+    ids=["not-a-signed-request", "not-the-juno-peer"],
+)
+async def test_unrelated_a2a_traffic_never_resets_a_session(tmp_path, text, user_id):
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    store = _RecordingSessionStore(["agent:main:a2a:dm:jk-context"])
+
+    await kite.pre_gateway_dispatch(
+        event=_a2a_event(text, user_id=user_id), gateway=None, session_store=store
+    )
+    assert store.reset_keys == []
+
+
+@pytest.mark.asyncio
+async def test_lane_reset_never_breaks_dispatch(tmp_path):
+    """A store without the API, or one that raises, must not block a turn."""
+    from plugins.juno_kite_trusted_principal.runtime import REQUEST_PREFIX
+
+    class Hostile:
+        def list_sessions(self, active_minutes=None):
+            raise RuntimeError("no listing here")
+
+        def reset_session(self, session_key, display_name=None):
+            raise RuntimeError("no reset here")
+
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    event = _a2a_event("guard\n" + REQUEST_PREFIX + "{}")
+    assert await kite.pre_gateway_dispatch(
+        event=event, gateway=None, session_store=Hostile()
+    ) is None
+    assert await kite.pre_gateway_dispatch(
+        event=event, gateway=None, session_store=object()
+    ) is None
