@@ -1393,7 +1393,13 @@ async def test_the_requester_is_told_it_is_waiting_and_only_james_gets_the_code(
         "document": {**preview["document"], "requires_owner_approval": True},
     }
 
-    await juno._auto_release(json.dumps(outside), audience)
+    answer = await juno._auto_release(json.dumps(outside), audience)
+
+    # The model is not handed the code. It printed one into the group when it
+    # was, and a model cannot disclose what it never receives.
+    assert code not in answer, "the release code was handed to the model"
+    assert json.loads(answer)["outcome"] == "owner_approval_requested"
+    assert "approval" not in json.loads(answer)
 
     assert adapter.document_calls == []
     sent = {call["chat_id"]: call["content"] for call in adapter.messages}
@@ -1440,12 +1446,14 @@ async def test_a_document_found_outside_a_root_is_not_auto_released(tmp_path):
     outside["document"] = {**preview["document"], "requires_owner_approval": True}
     answer = await juno._auto_release(json.dumps(outside), audience)
 
-    # Nothing was sent, and the proposal came back untouched to be shown.
+    # Nothing was sent, and what comes back says a proposal is outstanding
+    # without carrying the code that would authorise it.
     assert adapter.document_calls == []
-    assert json.loads(answer)["outcome"] == "approval_required"
+    assert json.loads(answer)["outcome"] == "owner_approval_requested"
+    code = preview["approval"]["code"]
+    assert code not in answer
 
     # The code is outstanding, pointed at the conversation that asked.
-    code = preview["approval"]["code"]
     pending = juno._pending_release(code)
     assert pending is not None and pending[0] == GROUP
 

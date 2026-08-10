@@ -1105,11 +1105,26 @@ class TrustedPrincipalRuntime:
     async def _send_document_receipt(adapter: Any, chat_id: str, text: str) -> None:
         send = getattr(adapter, "send", None)
         if not callable(send):
+            # Silence here read as success. The approval messages went
+            # nowhere and nothing said so, which is how a release code ended
+            # up in the room it was meant to stay out of.
+            logger.warning(
+                "Juno message transport is unavailable on %s", type(adapter).__name__
+            )
             return
         try:
-            await send(chat_id=chat_id, content=text)
-        except Exception:
-            logger.warning("Juno document receipt transport failed closed")
+            # On the gateway's loop, not the disposable one this tool call
+            # runs in: the transport's session belongs to the gateway, and
+            # awaiting it from the wrong loop fails in a way this except
+            # clause would quietly absorb.
+            await TrustedPrincipalRuntime._on_gateway_loop(
+                send(chat_id=chat_id, content=text)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Juno message transport failed closed: %s: %s",
+                type(exc).__name__, str(exc)[:200],
+            )
 
     def _owner_dm_target(self) -> str:
         """Where to reach James directly, from authority the host already has.
@@ -2119,7 +2134,22 @@ class TrustedPrincipalRuntime:
                     audience=audience,
                     expires_at=int(self.clock()) + _PENDING_RELEASE_TTL_SECONDS,
                 )
-                return answer
+                # Without this the model is handed the code and prints it,
+                # which is exactly what happened: the approval arrived in the
+                # group it was meant to be kept out of. It cannot disclose
+                # what it never receives, so the approval block is removed
+                # from what comes back and the host carries the code to James
+                # itself.
+                withheld = {
+                    key: value for key, value in parsed.items() if key != "approval"
+                }
+                withheld["outcome"] = "owner_approval_requested"
+                withheld["note"] = (
+                    "The document is staged and James has been asked directly "
+                    "to approve releasing it. Say that it was found and is "
+                    "waiting on him. There is no code for you to relay."
+                )
+                return canonical_json(withheld)
         except (TypeError, ValueError):
             return answer
 
