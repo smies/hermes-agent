@@ -1193,6 +1193,49 @@ def test_personal_file_containment_and_bounds(tmp_path):
     assert allowed["status"] != "error", allowed
 
 
+def test_a_reference_number_is_not_a_phone_number(tmp_path):
+    """Four passport numbers in a list were each read as a phone number.
+
+    The only carve-out was for a value written directly after the words
+    "passport number", and a list does not do that -- Kite's answer was
+    "Alex Morgan Reed - 900000001 - 4 March 2032" and never used the
+    word passport at all, so no rule about surrounding words could have
+    saved it. What separates a phone number from a reference is its shape:
+    a country code, a trunk zero, grouping, or enough digits to dial.
+    """
+    runtime = _runtime(tmp_path, mode="kite")
+    releasable = (
+        "Chris Taylor Reed - 900000002 - 12 June 2031\n"
+        "Alex Morgan Reed - 900000001 - 4 March 2032\n"
+        "Robin Casey Reed - 900000003 - 9 September 2032",
+        "Ref 900000001",
+        # An ISO date is eight digits and two hyphens, and was withheld as a
+        # phone number: every answer that mentioned a plain date was denied.
+        "Filed on 2026-08-10 at 15:37",
+        "Filed 2026-08-10 15:37",
+        "Invoice total GBP 47,500 on 2026-07-27",
+        "Account sort code 20-00-00",
+        # An em dash keeps the digits apart; a hyphen does not, and the list
+        # has to survive either.
+        "Chris Taylor Reed \u2014 900000002 \u2014 12 June 2031",
+    )
+    for answer in releasable:
+        assert runtime._leak_reason(answer, output=True) == "", answer
+
+    for answer in (
+        "Call me on 07700 900123",
+        "Reach him at +44 7973 235379",
+        "His mobile is 07700900123",
+        "US contact 2025550123",
+        "Office: (020) 7946 0018",
+        "Tel 202 555 0123",
+        "+1 (415) 555-2671",
+    ):
+        assert runtime._leak_reason(answer, output=True) == (
+            "phone-shaped private identifier"
+        ), answer
+
+
 def test_formatting_does_not_decide_whether_an_answer_leaks(tmp_path):
     """The answer was refused for containing the thing it was asked for.
 

@@ -120,7 +120,41 @@ _CREDENTIAL_PATTERNS = (
 _EMAIL_PATTERN = re.compile(
     r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I
 )
-_PHONE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\d .()\-]{7,}\d)(?!\w)")
+_ISO_DATE_PATTERN = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?(?!\d)"
+)
+_PHONE_CANDIDATE = re.compile(r"(?<!\w)\+?\d[\d .()\-]{5,}\d(?!\w)")
+
+
+def _is_phone_shaped(token: str) -> bool:
+    """Whether a run of digits looks like someone's phone number.
+
+    Length alone does not say. Four family passport numbers written as a
+    plain list -- "Alex Morgan Reed - 900000001 - 4 March 2032" -- were
+    each read as a phone number and the whole answer was withheld, because
+    the only carve-out was for a value written directly after the words
+    "passport number", which a list does not do. Nothing in that answer even
+    said "passport", so no rule about surrounding words could have saved it.
+
+    What actually distinguishes a phone number is its shape: a country code,
+    a trunk zero, grouping, or enough digits to be dialled. A bare nine-digit
+    run with none of those is a reference of some kind, and this filter is
+    the backstop for contact details leaking in by accident -- what may be
+    disclosed on purpose is decided by the tier and the capability.
+    """
+    digits = re.sub(r"\D", "", token)
+    if not 9 <= len(digits) <= 15:
+        return False
+    if token.lstrip().startswith("+") or digits.startswith("0"):
+        return True
+    groups = [part for part in re.split(r"[ .()\-]+", token.strip()) if part]
+    if len(groups) > 1:
+        # A number is dialled in short groups. A nine-digit run standing next
+        # to something else -- "900000002 - 31 January" -- is a reference and
+        # a date, which the separators alone cannot tell from a dialled
+        # number.
+        return all(len(part) <= 6 for part in groups)
+    return len(digits) >= 10
 # Emphasis is formatting, and formatting must not decide a security verdict.
 # A model writes "Passport number: **900000001**", the bold broke the passport
 # carve-out below, and the number underneath was read as a phone number -- the
@@ -1486,8 +1520,14 @@ class TrustedPrincipalRuntime:
             return "labelled private identifier"
         if _UUID_PATTERN.search(identifier_scan):
             return "UUID-shaped private identifier"
-        phone_scan = _PASSPORT_CONTEXT_PATTERN.sub("", identifier_scan)
-        if _PHONE_PATTERN.search(phone_scan):
+        # A date is not a contact detail, and "2026-08-10 15:37" is otherwise
+        # ten digits in short groups -- indistinguishable from a number.
+        phone_scan = _ISO_DATE_PATTERN.sub(" ", identifier_scan)
+        phone_scan = _PASSPORT_CONTEXT_PATTERN.sub("", phone_scan)
+        if any(
+            _is_phone_shaped(match.group(0))
+            for match in _PHONE_CANDIDATE.finditer(phone_scan)
+        ):
             return "phone-shaped private identifier"
         if any(
             identifier and identifier in value

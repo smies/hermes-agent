@@ -1987,8 +1987,11 @@ def test_a_dated_document_title_is_not_mistaken_for_a_phone_number(tmp_path):
     assert runtime._safe_release_title("Engagement Letter 2026") == (
         "Engagement Letter 2026"
     )
-    # The old scan would have refused this outright.
-    assert runtime._leak_reason("EL MS 07 08 2026", output=True) != ""
+    # This once tripped the phone-shaped scan, which is why the title is
+    # sanitised rather than scanned. The scan no longer confuses a date with
+    # a dialled number, so the title now survives both checks -- the
+    # sanitiser above is still what guarantees it.
+    assert runtime._leak_reason("EL MS 07 08 2026", output=True) == ""
 
 
 def test_a_title_carrying_something_unshippable_is_replaced_not_denied(tmp_path):
@@ -2084,8 +2087,11 @@ def test_juno_accepts_the_host_descriptor_it_cannot_distinguish_by_signature(tmp
                      "expires_at": "2026-08-10T07:01:57+00:00"},
     })
     assert juno._release_descriptor(preview) is not None
-    # The prose scan alone would still refuse it, which is why the shape matters.
-    assert juno._leak_reason(preview, output=True) != ""
+    # The prose scan once refused this descriptor over "07 08 2026" in the
+    # title, which is why recognising the shape is what admits it. The scan
+    # itself no longer objects; the descriptor check above is still the
+    # guarantee, and it is what holds if the scan tightens again.
+    assert juno._leak_reason(preview, output=True) == ""
 
 
 @pytest.mark.parametrize(
