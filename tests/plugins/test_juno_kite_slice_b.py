@@ -1193,6 +1193,33 @@ def test_personal_file_containment_and_bounds(tmp_path):
     assert allowed["status"] != "error", allowed
 
 
+def test_preview_converts_what_a_phone_produces_before_trying_to_read_it(monkeypatch):
+    """A HEIC photo of a document read as blank, not as unreadable.
+
+    The release path converts HEIC and TIFF locally before inspecting them;
+    the preview path dispatched straight on MIME, so the formats a family
+    actually photographs documents in fell to the "" branch -- which the
+    model cannot tell apart from a genuinely unidentifiable file.
+    """
+    import plugins.juno_kite_trusted_principal.private_reads as pr
+
+    converted: list[str] = []
+
+    def _fake_normalise(data, mime_type):
+        if mime_type in {"image/heic", "image/tiff"}:
+            converted.append(mime_type)
+            return data, "image/jpeg"
+        return data, mime_type
+
+    monkeypatch.setattr(pr, "_normalise_artifact", _fake_normalise)
+    monkeypatch.setattr(pr, "_run_preview_reader", lambda argv: "PASSPORT 533812947")
+    monkeypatch.setattr(pr.Path, "exists", lambda self: True)
+
+    for mime in ("image/heic", "image/tiff", "image/jpeg"):
+        assert pr._document_preview(b"synthetic", mime) == "PASSPORT 533812947", mime
+    assert converted == ["image/heic", "image/tiff"]
+
+
 def test_read_caps_a_document_on_what_it_loads_not_on_what_a_text_file_returns(
     tmp_path, monkeypatch
 ):

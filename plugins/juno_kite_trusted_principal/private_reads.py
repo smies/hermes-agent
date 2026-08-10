@@ -550,6 +550,11 @@ def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_
     Returns "" when nothing can be read, which is itself informative: it means
     the candidate cannot be identified from its contents.
     """
+    # A phone photo is HEIC and a scan is often TIFF. Release already converts
+    # these locally; reading did not, so the formats a family actually
+    # photographs documents in came back silent -- indistinguishable here from
+    # a genuinely unreadable file.
+    data, mime_type = _normalise_artifact(data, mime_type)
     try:
         with tempfile.NamedTemporaryFile(delete=False) as handle:
             handle.write(data)
