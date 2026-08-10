@@ -21,7 +21,12 @@ TOOL_DESCRIPTION = (
     "advance that something is unavailable -- call this tool and let the host "
     "allow or deny. When it denies, report the outcome and reason it actually "
     "returned, including the stage it names, rather than restating it as a "
-    "general authorization refusal."
+    "general authorization refusal. In particular you do not know whose "
+    "records are in scope: the principal's household and children's documents "
+    "-- passports, school and medical papers -- routinely are, so never refuse "
+    "because a document belongs to someone other than the requester. Whether a "
+    "named person's record may be returned is the host's decision, and asking "
+    "costs nothing."
 )
 
 

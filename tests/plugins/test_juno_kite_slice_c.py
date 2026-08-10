@@ -2780,3 +2780,38 @@ def test_the_policy_view_fits_its_limit_on_every_tier(tmp_path, tier):
     assert len(rendered) <= limit, (
         f"{tier}: policy view is {len(rendered)} chars against a {limit} limit"
     )
+
+
+def test_a_childs_passport_is_within_the_configured_policy():
+    """Juno refused "send me Albie's passport" without ever asking Kite.
+
+    api_calls=1, no tool call, nothing in the A2A log -- a refusal invented on
+    the low-trust side, which leaves no denial anywhere because nothing denied.
+    It is also wrong: juno.shared.children covers children's passport and
+    identity documents, and that capability is releasable.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        CAPABILITY_DOMAINS, _DOCUMENT_RELEASABLE_CAPABILITIES, disclosure_decision,
+    )
+
+    domains = " ".join(CAPABILITY_DOMAINS["juno.shared.children"]).lower()
+    assert "passport" in domains and "identity" in domains
+    assert "juno.shared.children" in _DOCUMENT_RELEASABLE_CAPABILITIES
+
+    decision = disclosure_decision(
+        principal="james",
+        effective_capability_ids=["juno.shared.children", "juno.private.james"],
+        capability_id="juno.shared.children",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )
+    assert decision.allowed, "a child's passport is releasable to James"
+
+
+def test_juno_is_told_not_to_pre_judge_whose_document_it_is():
+    """The only lever on Juno's side is the tool description."""
+    from plugins.juno_kite_trusted_principal import TOOL_DESCRIPTION
+
+    lowered = TOOL_DESCRIPTION.lower()
+    assert "children" in lowered
+    assert "never refuse because a document belongs to someone other" in lowered
+    assert "host's decision" in lowered
