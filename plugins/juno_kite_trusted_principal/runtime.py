@@ -2755,6 +2755,37 @@ class TrustedPrincipalRuntime:
                 return "Property JSON/container dump"
         return ""
 
+    def _safe_release_title(self, title: Any) -> str:
+        """Keep a real document title unless it carries something that must not ship.
+
+        The full output scan is written for model prose and false-positives on
+        ordinary document names: "EL MS 07 08 2026" is a date, and it reads as a
+        phone number, which blanked the whole release. The title is already
+        reduced to a bounded character allowlist at staging, so what is left to
+        check is the small set of things that genuinely cannot leave Kite --
+        configured secrets, configured private identifiers, an address, or
+        credential-shaped text -- and anything matching is replaced rather than
+        allowed to deny the document.
+        """
+        value = str(title or "").strip()
+        if not value:
+            return "Requested document"
+        if any(
+            secret and secret in value
+            for secret in getattr(self, "secret_values", ())
+        ):
+            return "Requested document"
+        if any(
+            identifier and identifier in value
+            for identifier in self.private_identifiers
+        ):
+            return "Requested document"
+        if _EMAIL_PATTERN.search(value) or any(
+            pattern.search(value) for pattern in _CREDENTIAL_PATTERNS
+        ):
+            return "Requested document"
+        return value
+
     def _document_release_answer(
         self, binding: TurnBinding, model_text: str, state: dict[str, Any]
     ) -> str:
@@ -2813,6 +2844,7 @@ class TrustedPrincipalRuntime:
                 stage = "policy"
                 raise ValueError("document domain is outside the effective policy")
             candidate = candidates[0]
+            title = self._safe_release_title(candidate.title)
             stage = "approval-issue"
             code, expires_at = self.document_releases.issue(
                 candidate,
@@ -2822,7 +2854,7 @@ class TrustedPrincipalRuntime:
             return canonical_json({
                 "outcome": "approval_required",
                 "document": {
-                    "title": candidate.title,
+                    "title": title,
                     "source_class": candidate.source_class,
                     "mime_type": candidate.mime_type,
                     "size_bytes": candidate.size_bytes,
@@ -2991,6 +3023,11 @@ class TrustedPrincipalRuntime:
                 leak_reason = "Property output authority or provenance is unavailable"
             elif property_mode:
                 leak_reason = self._property_output_leak_reason(answer)
+            elif host_authored:
+                # A closed host-built descriptor, not prose. Its only free field
+                # is the title, already reduced at staging and checked again by
+                # _safe_release_title against what actually cannot ship.
+                leak_reason = ""
             else:
                 leak_reason = self._leak_reason(answer, output=True)
             # The overlap check exists to stop the model echoing raw source

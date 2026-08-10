@@ -1957,3 +1957,90 @@ def test_only_a_document_turn_skips_the_overlap_check():
     # It is set in exactly one place: right after the host replaces the answer.
     assert source.count("host_authored = True") == 1
     assert source.count("host_authored = False") == 1
+
+
+def test_a_dated_document_title_is_not_mistaken_for_a_phone_number(tmp_path):
+    """The 07:35 failure: "EL MS 07 08 2026" is a date, read as a phone number.
+
+    The generic output scan is written for model prose. Applied to the host's
+    own descriptor it blanked the entire release -- the envelope came back
+    empty with "output minimized by deterministic leak policy" for a payload
+    the model never wrote.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    assert runtime._safe_release_title("EL MS 07 08 2026") == "EL MS 07 08 2026"
+    assert runtime._safe_release_title("Engagement Letter 2026") == (
+        "Engagement Letter 2026"
+    )
+    # The old scan would have refused this outright.
+    assert runtime._leak_reason("EL MS 07 08 2026", output=True) != ""
+
+
+def test_a_title_carrying_something_unshippable_is_replaced_not_denied(tmp_path):
+    """Protection is kept, but it can never block the document itself."""
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    runtime.secret_values = {"super-secret-token-value"}
+
+    for hostile in (
+        "invoice for adviser@example.com",
+        "creds api_key=abcdef123456",
+        "notes super-secret-token-value",
+        "",
+    ):
+        assert runtime._safe_release_title(hostile) == "Requested document", hostile
+
+
+def test_attachment_download_gets_its_own_timeout(tmp_path):
+    """The live pipeline died mid-download on the shared 15s source timeout.
+
+    One attachment command makes two API round-trips and pulls the document,
+    where a text answer makes one and returns a few KB.
+    """
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        PrivateReadService,
+        _ATTACHMENT_COMMAND_TIMEOUT_SECONDS,
+    )
+
+    seen: list = []
+
+    def runner(argv, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        return _NS(returncode=0, stdout=json.dumps({
+            "filename": "d.pdf", "mime_type": "application/pdf",
+            "size_bytes": 3, "text": "", "artifact_base64": "AAAA",
+        }), stderr="")
+
+    root = tmp_path / "family"
+    root.mkdir()
+    executable = tmp_path / "reader"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o700)
+    reads = dict(_config(tmp_path, root, mode="kite")["juno_kite_trusted_principal"]["private_reads"])
+    reads["gmail"] = {
+        "executable": str(executable),
+        "account_aliases": {"personal": "personal", "kite": "kite"},
+    }
+    service = PrivateReadService(
+        reads, backends=None, command_runner=runner, url_opener=None,
+        secret_values=set(),
+    )
+
+    service._source_or_google_command(
+        "gmail", "attachment_extract",
+        {"account": "personal", "message_id": "abc", "attachment_id": "xyz"},
+    )
+    assert seen == [_ATTACHMENT_COMMAND_TIMEOUT_SECONDS]
+    assert _ATTACHMENT_COMMAND_TIMEOUT_SECONDS > service.timeout
+
+    # An ordinary answer keeps the short timeout.
+    seen.clear()
+    service._source_or_google_command(
+        "gmail", "get", {"account": "personal", "message_id": "abc"}
+    )
+    assert seen == [service.timeout]

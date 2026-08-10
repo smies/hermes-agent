@@ -60,6 +60,11 @@ _ATTACHMENT_ID_MAX_CHARS = 1024
 # release ceiling is 8MB of decoded bytes, which is ~10.7MB encoded; this caps
 # the pipe, not the policy, which is enforced on the decoded size.
 _ATTACHMENT_COMMAND_OUTPUT_BYTES = 12 * 1024 * 1024
+# The attachment command makes two API round-trips and downloads the document,
+# where an ordinary text answer makes one and returns a few KB. The shared 15s
+# source timeout killed it mid-download. Bounded well inside the A2A call
+# envelope so a slow document cannot strand the whole consultation.
+_ATTACHMENT_COMMAND_TIMEOUT_SECONDS = 60
 _ATTACHMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}\Z" % _ATTACHMENT_ID_MAX_CHARS)
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
@@ -1031,7 +1036,9 @@ class PrivateReadService:
             # limit is enforced separately, on the decoded bytes, and still
             # decides what may be extracted or released.
             return self._run_json(
-                argv, max_output_bytes=_ATTACHMENT_COMMAND_OUTPUT_BYTES
+                argv,
+                max_output_bytes=_ATTACHMENT_COMMAND_OUTPUT_BYTES,
+                max_seconds=_ATTACHMENT_COMMAND_TIMEOUT_SECONDS,
             )
         return self._run_json(argv)
 
@@ -1041,6 +1048,7 @@ class PrivateReadService:
         *,
         env: Optional[dict[str, str]] = None,
         max_output_bytes: Optional[int] = None,
+        max_seconds: Optional[int] = None,
     ) -> Any:
         completed = self.command_runner(
             argv,
@@ -1049,7 +1057,7 @@ class PrivateReadService:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=self.timeout,
+            timeout=max_seconds or self.timeout,
             env=env,
         )
         if completed.returncode != 0:
