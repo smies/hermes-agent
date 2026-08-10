@@ -2159,7 +2159,12 @@ class TrustedPrincipalRuntime:
                 )
             )
             _ACTIVE_PRIVATE_READS.set(None)
-            logger.warning("Kite policy binding denied: %s", type(exc).__name__)
+            # The message is an internal policy string, not user content, and
+            # without it a binding failure is undiagnosable after the fact.
+            logger.warning(
+                "Kite policy binding denied: %s: %s",
+                type(exc).__name__, str(exc)[:200],
+            )
             return {
                 "context": (
                     "JUNO--KITE POLICY: DENIED. "
@@ -3179,7 +3184,10 @@ class TrustedPrincipalRuntime:
                 raise ValueError("response envelope exceeds byte limit")
             return envelope
         except Exception as exc:
-            logger.warning("Kite output release denied: %s", type(exc).__name__)
+            logger.warning(
+                "Kite output release denied: %s: %s",
+                type(exc).__name__, str(exc)[:200],
+            )
             if binding and binding.request:
                 try:
                     self.store.abort_request(binding.request.request_id)

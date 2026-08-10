@@ -2624,7 +2624,8 @@ def test_session_recall_rejects_an_unbounded_or_odd_query(tmp_path):
     service = _session_service(tmp_path, [
         ("agent:main:mattermost:channel:x", "assistant", "passport filed", 1.0),
     ])
-    for bad in ("a", "x" * 200, 'match "*"', "text; --", "a\u0000b"):
+    # Still refused: nothing to search, or past the bound.
+    for bad in ("a", "x" * 200, "£ $ %", "  "):
         raised = False
         try:
             service._sessions({"query": bad, "max_results": 3})
@@ -2683,3 +2684,45 @@ def test_recall_ranks_by_match_quality_not_recency(tmp_path):
     found = service._sessions({"query": "passports filed", "max_results": 2})
     # The older, better match leads.
     assert "Family/Passports" in found[0]["excerpt"]
+
+
+def test_recall_matches_on_any_word_not_every_word(tmp_path):
+    """The live Mauritius failure: 11 words, strict AND, zero results.
+
+    The model asked "Mauritius trip confirmed dates travelers accommodation
+    flights transport unresolved decisions" and got nothing back, so it told
+    James the planning context was unavailable. bm25 puts the best match
+    first; requiring every word just meant no match at all.
+    """
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant",
+         "Mauritius trip: flights confirmed for the family in August", 1786300000.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "unrelated note about the garden fence", 1786200000.0),
+    ])
+    found = service._sessions({
+        "query": "Mauritius trip confirmed dates travelers accommodation flights",
+        "max_results": 5,
+    })
+    assert found and "Mauritius" in found[0]["excerpt"]
+
+
+def test_recall_reduces_an_awkward_query_rather_than_refusing_it(tmp_path):
+    """"One&Only Mauritius dates" was refused as "not plain words"."""
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant",
+         "One&Only accepted the Mercedes V-Class for the airport transfer",
+         1786300000.0),
+    ])
+    found = service._sessions({"query": "One&Only Mauritius dates", "max_results": 3})
+    assert found and "One&Only" in found[0]["excerpt"]
+    # Punctuation is reduced away, so FTS operators can never reach the match.
+    for hostile in ('NEAR("a" "b")', "a AND b OR c", 'x" OR "y'):
+        service._sessions({"query": hostile, "max_results": 3})
+    # A query with no usable word is still refused rather than run empty.
+    raised = False
+    try:
+        service._sessions({"query": "£ $ %", "max_results": 3})
+    except Exception as exc:
+        raised = getattr(exc, "code", "") == "invalid_arguments"
+    assert raised

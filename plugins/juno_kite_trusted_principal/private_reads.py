@@ -2146,10 +2146,21 @@ class PrivateReadService:
             )
         query = self._bounded_text(args["query"], "query", 120)
         maximum = self._bounded_int(args.get("max_results", 5), "max_results", 10)
-        if re.fullmatch(r"[A-Za-z0-9 ._'\-]{2,120}", query) is None:
-            raise SourceFailure("invalid_arguments", "query must be plain words")
-
-        terms = " ".join(f'"{word}"' for word in query.split())
+        # Reduce rather than reject. A real query says "One&Only Mauritius
+        # dates"; refusing it taught the model only that recall was broken.
+        # Everything outside the safe set becomes a space, which also strips
+        # every FTS operator, so the match expression stays ours.
+        words = [
+            word for word in re.sub(r"[^A-Za-z0-9']+", " ", query).split()
+            if len(word) > 1
+        ]
+        if not words:
+            raise SourceFailure("invalid_arguments", "query needs a word to search")
+        # OR, not AND. Requiring every word meant a natural request --
+        # "Mauritius trip confirmed dates travellers accommodation flights" --
+        # matched nothing at all, and the model reported the context missing.
+        # bm25 then ranks the messages that match most of them first.
+        terms = " OR ".join(f'"{word}"' for word in words[:12])
         found: list[dict[str, Any]] = []
         try:
             connection = sqlite3.connect(
