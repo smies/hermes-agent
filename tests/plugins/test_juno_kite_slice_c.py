@@ -1910,3 +1910,50 @@ def test_attachment_transport_cap_does_not_reject_a_real_document(tmp_path):
     except Exception as exc:  # SourceFailure is frozen; inspect it directly
         capped = getattr(exc, "code", "") == "cap_exceeded"
     assert capped
+
+
+@pytest.mark.asyncio
+async def test_a_preview_titled_after_its_source_file_is_not_a_leak(tmp_path):
+    """The 07:09 failure: the host's own descriptor tripped the leak policy.
+
+    A document's title comes from the artifact's filename, and the reader that
+    found it records filenames as provenance. At the document tier any overlap
+    denies, so the approval preview collided with itself and the envelope came
+    back empty with "output minimized by deterministic leak policy" -- for a
+    payload the model never wrote.
+    """
+    artifact = _png_bytes()
+    root = tmp_path / "family"
+    root.mkdir()
+    # The searchable name and the delivered title are necessarily the same.
+    (root / "engagement-letter.png").write_bytes(artifact)
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    _juno, _gateway, preview = await _propose(
+        tmp_path,
+        root,
+        clock,
+        roster,
+        adapter,
+        question="Show me the engagement letter",
+        relative_path="engagement-letter.png",
+        capability_id="juno.private.james",
+        purpose="personal administration",
+        search_query="engagement",
+    )
+
+    assert preview["outcome"] == "approval_required"
+    assert "engagement" in preview["document"]["title"].casefold()
+
+
+def test_only_a_document_turn_skips_the_overlap_check():
+    """The exemption is for host-authored payloads, not a general relaxation."""
+    source = (
+        Path("plugins/juno_kite_trusted_principal/runtime.py").read_text()
+    )
+    assert "and not host_authored" in source
+    # It is set in exactly one place: right after the host replaces the answer.
+    assert source.count("host_authored = True") == 1
+    assert source.count("host_authored = False") == 1

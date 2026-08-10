@@ -2954,6 +2954,7 @@ class TrustedPrincipalRuntime:
             answer = str(response_text or "")
             property_mode = False
             property_provenance = False
+            host_authored = False
             if self.private_reads.enabled:
                 if binding.output_tier == "bulk_raw_export":
                     answer = canonical_json({
@@ -2964,6 +2965,9 @@ class TrustedPrincipalRuntime:
                     if self.document_releases.enabled:
                         state = self._private_read_state()
                         answer = self._document_release_answer(binding, answer, state)
+                        # The model's text was discarded above; what remains is
+                        # the host's own closed descriptor.
+                        host_authored = True
                     else:
                         answer = canonical_json({
                             "outcome": "unavailable_next_gate",
@@ -2989,7 +2993,12 @@ class TrustedPrincipalRuntime:
                 leak_reason = self._property_output_leak_reason(answer)
             else:
                 leak_reason = self._leak_reason(answer, output=True)
-            if not leak_reason and self.private_reads.enabled:
+            # The overlap check exists to stop the model echoing raw source
+            # text. On a document turn the answer is the host's own descriptor,
+            # so running it there checks the host against itself -- and it must
+            # fail: the document's title is derived from the artifact's
+            # filename, which the reader that found it recorded as provenance.
+            if not leak_reason and self.private_reads.enabled and not host_authored:
                 if not property_mode:
                     leak_reason = self._private_source_overlap_leak_reason(
                         answer,
