@@ -1389,6 +1389,46 @@ class TestMultiAgentRouting:
         assert card["supportedInterfaces"][0]["tenant"] == "research"
         assert {s["name"] for s in card["skills"]} == {"research", "web"}
 
+    def test_configured_capabilities_survive_a_partially_populated_registry(self, monkeypatch):
+        """Configured capabilities must not depend on global import order.
+
+        ``tools.registry.registry`` is a process-wide singleton populated as a
+        side effect of importing tool modules, so which toolsets it knows about
+        depends on what else ran in this process. The Agent Card must advertise
+        the configured capabilities either way: intersecting them with the live
+        registry silently dropped any capability whose module happened not to be
+        imported yet.
+        """
+        from tools.registry import registry
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        # A registry that knows "web" but has never heard of "research".
+        monkeypatch.setattr(registry, "get_registered_toolset_names", lambda: ["web"])
+        monkeypatch.setattr(
+            registry, "get_tool_names_for_toolset",
+            lambda ts: ["web_search"] if ts == "web" else [],
+        )
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {
+                "research": {
+                    "profile": "research",
+                    "capabilities": ["web", "research"],
+                }
+            }
+        }))
+        card = adapter._build_card("http://agents.example.com/", agent=adapter._agents["research"])
+        by_name = {s["name"]: s for s in card["skills"]}
+        assert set(by_name) == {"research", "web"}
+        # The registry still enriches the toolset it does know about.
+        assert "web_search" in by_name["web"]["tags"]
+
+        # ...and the same holds when the registry knows nothing at all.
+        monkeypatch.setattr(registry, "get_registered_toolset_names", lambda: [])
+        card = adapter._build_card("http://agents.example.com/", agent=adapter._agents["research"])
+        assert {s["name"] for s in card["skills"]} == {"research", "web"}
+
     def test_tenant_routing_selects_agent_without_path_prefix(self):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig

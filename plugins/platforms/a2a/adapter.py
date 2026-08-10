@@ -618,27 +618,30 @@ class A2AAdapter(BasePlatformAdapter):
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
         """Dynamic Agent Card skills from the live tool registry.
 
-        The card reflects what the agent can actually do right now. An
-        explicit ``advertised_toolsets`` config (or A2A_ADVERTISED_TOOLSETS)
-        restricts what we advertise; without a registry we fall back to that
-        static list.
+        With no explicit config the card reflects what the agent can actually
+        do right now, straight from the live registry. An explicit
+        ``advertised_toolsets`` config (or A2A_ADVERTISED_TOOLSETS) is
+        authoritative instead: we advertise exactly what was configured, and
+        the registry only enriches those entries with live tool names. A
+        configured capability is never dropped just because this process
+        happens not to have imported the module that registers it — otherwise
+        the card would depend on global import order rather than on config.
         """
+        configured = list(
+            ((agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets) or []
+        )
+        live: dict[str, list[str]] = {}
         try:
             from tools.registry import registry as tool_registry
-            names = tool_registry.get_registered_toolset_names()
-            configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-            allowed = set(configured or []) or None
-            mapping = {
-                n: tool_registry.get_tool_names_for_toolset(n)
-                for n in names
-                if allowed is None or n in allowed
+            live = {
+                name: list(tool_registry.get_tool_names_for_toolset(name) or [])
+                for name in tool_registry.get_registered_toolset_names()
             }
-            if mapping:
-                return protocol.skills_from_toolsets(mapping)
         except Exception:
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
-        configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-        return protocol.skills_from_toolsets(configured or [])
+        if configured:
+            return protocol.skills_from_toolsets({n: live.get(n, []) for n in configured})
+        return protocol.skills_from_toolsets(live or [])
 
     # ── Pending reply plumbing ────────────────────────────────────────────
 
