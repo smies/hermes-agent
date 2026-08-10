@@ -1303,6 +1303,45 @@ async def test_auto_release_delivers_without_an_approval_message(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_the_same_document_is_not_sent_twice_in_one_turn(tmp_path):
+    """Asked for the family's passports, Albert's arrived twice.
+
+    Juno consulted Kite once per person and asked for Albert twice. Each
+    consultation is separately authorized and neither is wrong on its own,
+    so no single gate could refuse it -- the repeat only exists in the
+    relationship between them, which is where it is caught.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+
+    first = json.loads(await juno._auto_release(json.dumps(preview), audience))
+    assert first["outcome"] == "delivered"
+    assert len(adapter.document_calls) == 1
+
+    repeat = json.loads(await juno._auto_release(json.dumps(preview), audience))
+    assert repeat["outcome"] == "already_delivered"
+    assert repeat["document"] == preview["document"]
+    assert len(adapter.document_calls) == 1, "the document was sent twice"
+
+    # A new inbound message is a new turn, and may ask for it again.
+    juno._delivered_documents.clear()
+    _juno, _gateway2, again = await _propose(tmp_path, root, clock, roster, adapter)
+    assert json.loads(
+        await juno._auto_release(json.dumps(again), _ACTIVE_AUDIENCE.get())
+    )["outcome"] == "delivered"
+    assert len(adapter.document_calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_auto_release_still_fails_closed_on_a_changed_roster(tmp_path):
     """Removing the owner prompt must not remove any gate behind it."""
     from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE

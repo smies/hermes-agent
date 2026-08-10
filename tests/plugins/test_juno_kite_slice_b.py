@@ -1489,10 +1489,39 @@ def test_named_document_requests_select_the_document_tier(question):
         "show me what nacho said",
         "show me a summary of the letter",
         "tell me about the passport",
+        # A field printed on a document is not the document. This asked for
+        # four numbers and was answered with four passport scans, which is
+        # both wrong and irreversible -- and it needs no question word, so
+        # nothing above catches it.
+        "give me the whole family's passport numbers and expiries",
+        "give me the passport numbers",
+        "i need the passport expiry dates",
+        "give me the expiry dates on the family's passports",
+        "when do the kids' passports expire",
     ],
 )
 def test_informational_requests_stay_minimized(question):
     assert classify_output_tier(question) == MINIMIZED
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Plurals count. "Send me the passports" classified as a minimized
+        # answer because the word boundary would not close after "passport",
+        # so asking for several documents quietly asked for none.
+        "send me the passports",
+        "send me the whole family's passports",
+        "send me the documents",
+        "forward the scans",
+        # A details *page* is the document itself, not a field printed on it.
+        "give me the passport details page",
+        "send me the passport photo page",
+        "send me a copy of the passport",
+    ],
+)
+def test_asking_for_several_documents_still_asks_for_documents(question):
+    assert classify_output_tier(question) == DOCUMENT_DESCRIPTOR
 
 
 def test_james_may_release_his_own_private_documents():

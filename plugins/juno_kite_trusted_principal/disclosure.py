@@ -63,7 +63,12 @@ _DOCUMENT_DELIVERY = (
     r"retrieve|give\s+me|email\s+me|whatsapp\s+me|text\s+me|i\s+need|"
     r"show\s+me|let\s+me\s+see|pull\s+up)"
 )
-_DOCUMENT_ARTIFACT = r"(?:document|scan|passport|pdf|file|attachment|copy)"
+# Plurals count. "Send me the passports" classified as a minimized answer
+# because \b would not close after "passport", so asking for more than one
+# document quietly asked for none.
+_DOCUMENT_ARTIFACT = (
+    r"(?:document|scan|passport|pdf|file|attachment|copy|copies)(?:e?s)?"
+)
 # Real-world document names people actually use.  A request rarely says "PDF";
 # it says "the engagement letter" or "Albie's boarding pass".
 _DOCUMENT_NOUN = (
@@ -73,13 +78,30 @@ _DOCUMENT_NOUN = (
 )
 # Informational intent, which must never escalate into a file release even when
 # it sits next to a delivery verb ("send me a summary of the engagement letter").
+# A field printed on a document is not the document. "Give me the whole
+# family's passport numbers and expiries" asks for four numbers, and answering
+# it by sending four passports is both wrong and irreversible. Read as a
+# question this needs no question word, so nothing else here catches it.
+_DOCUMENT_ATTRIBUTE = (
+    # "reference" is deliberately absent: "return a releasable file reference"
+    # means a handle to the document, not a field printed on it.
+    r"(?:numbers?|no\.|expir(?:y|ies|ation|es|ing)|issue\s+dates?|"
+    r"serial|details)"
+)
 _DOCUMENT_INFORMATIONAL = re.compile(
     r"(?i)(?:\b(?:summary|summarise|summarize|update|note|gist|overview|"
     r"tell\s+me|remind|what|when|who|how|why|which|where)\b"
     # A leading auxiliary makes it a question about a document, not a request
     # for one ("did nacho send the agreement").
     r"|^\s*(?:did|do|does|has|have|had|is|are|was|were|will|can|could|should)\b"
-    r"(?!\s+you\s+" + _DOCUMENT_DELIVERY + r"\b))"
+    r"(?!\s+you\s+" + _DOCUMENT_DELIVERY + r"\b)"
+    # "the passport number", either order. A details *page* is the document
+    # itself, so it keeps its release tier.
+    r"|\b" + _DOCUMENT_ARTIFACT + r"\b[^.?!]{0,24}?\b" + _DOCUMENT_ATTRIBUTE
+    + r"\b(?!\s+(?:page|scan|copy))"
+    r"|\b" + _DOCUMENT_ATTRIBUTE + r"\b[^.?!]{0,24}?\b(?:of|on|in|for|from)\b"
+    r"[^.?!]{0,24}?\b" + _DOCUMENT_ARTIFACT + r"\b"
+    r")"
 )
 _DOCUMENT_PATTERNS = (
     re.compile(

@@ -522,6 +522,9 @@ class TrustedPrincipalRuntime:
         # redundant confirmation can be dropped. Bounded: each entry is
         # consumed by the transform for that same turn.
         self._auto_delivered: set[str] = set()
+        # Documents already sent during the inbound turn being served, so a
+        # model that loops over a family cannot send the same passport twice.
+        self._delivered_documents: set[str] = set()
         # Conversations whose last request was a document request, so a bare
         # "send it again" can be resolved. Keyed by the opaque conversation
         # binding, never a raw chat id, and short-lived.
@@ -1328,6 +1331,7 @@ class TrustedPrincipalRuntime:
         _ACTIVE_INGRESS_TOKEN.set(None)
         _ACTIVE_DELIVERY.set(None)
         _ACTIVE_INBOUND_TEXT.set(str(getattr(event, "text", "") or ""))
+        self._delivered_documents.clear()
         try:
             _ACTIVE_LOOP.set(asyncio.get_running_loop())
         except RuntimeError:
@@ -1870,6 +1874,21 @@ class TrustedPrincipalRuntime:
             return answer
 
         descriptor = document if isinstance(document, dict) else {}
+        # Asked for the family's passports, Juno consulted Kite once per
+        # person and asked for Albert twice, so Albert's passport arrived
+        # twice. Each consultation is separately authorized and neither one
+        # is wrong on its own, which is why this is caught here rather than
+        # by any single gate: the same document is not sent twice in answer
+        # to one message.
+        identity = canonical_json({
+            "title": descriptor.get("title"),
+            "mime_type": descriptor.get("mime_type"),
+            "size_bytes": descriptor.get("size_bytes"),
+        })
+        if identity in self._delivered_documents:
+            return canonical_json(
+                {"outcome": "already_delivered", "document": document}
+            )
         outcome = await self._on_gateway_loop(
             self._consume_and_deliver(
                 code, audience=audience, adapter=adapter, chat_id=chat_id,
@@ -1885,6 +1904,9 @@ class TrustedPrincipalRuntime:
             if len(self._auto_delivered) > 16:
                 self._auto_delivered.clear()
             self._auto_delivered |= turn_keys
+            if len(self._delivered_documents) > 32:
+                self._delivered_documents.clear()
+            self._delivered_documents.add(identity)
             return canonical_json({"outcome": "delivered", "document": document})
         return canonical_json({
             "outcome": "delivery_" + outcome,
