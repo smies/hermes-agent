@@ -1360,6 +1360,61 @@ async def test_the_same_document_is_not_sent_twice_in_one_turn(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_an_approval_typed_in_a_dm_delivers_where_the_request_came_from(tmp_path):
+    """The document must reach the conversation that asked, not the DM.
+
+    A document found outside a release root needs James to say so, and he
+    says so in a DM -- a different chat from the one that asked for it. The
+    approval therefore has to carry two facts that used to be one: who
+    approved, and where it goes. Delivering into the DM would be a quiet
+    redirection of a private document to a different conversation than the
+    one whose audience was authorised for it.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+    from dataclasses import replace
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    origin_audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+    dm_chat = "james-dm@s.whatsapp.net"
+
+    juno._remember_pending_release(
+        code, chat_id=GROUP, audience=origin_audience,
+        expires_at=int(clock()) + 600,
+    )
+
+    # James approves from the DM. The DM is his own, so it is an audience
+    # entitled to approve -- but it is not where the document belongs.
+    dm_audience = replace(origin_audience, conversation_kind="dm")
+    result = await juno._handle_document_approval(
+        event=_event("APPROVE " + code, chat_id=dm_chat),
+        adapter=adapter,
+        audience=dm_audience,
+    )
+    assert result["action"] == "skip"
+
+    assert len(adapter.document_calls) == 1
+    assert adapter.document_calls[0]["chat_id"] == GROUP, (
+        "the document went to the DM instead of the conversation that asked"
+    )
+
+    # One use only: the same code cannot be replayed from the DM.
+    await juno._handle_document_approval(
+        event=_event("APPROVE " + code, chat_id=dm_chat),
+        adapter=adapter,
+        audience=dm_audience,
+    )
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_who_approves_and_where_it_lands_are_asked_separately(tmp_path):
     """One audience used to answer both questions, because it always could.
 

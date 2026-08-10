@@ -422,6 +422,8 @@ _RELEASE_SOURCE_CLASSES = frozenset({"personal files", "personal Gmail attachmen
 # Readers whose source has no capability of its own, bound to named principals.
 # Locate reports the names and whereabouts of documents across everywhere the
 # principal keeps them, which is his own filing system and nobody else's.
+# Outstanding approvals awaiting a reply elsewhere. Small on purpose.
+_MAX_PENDING_RELEASES = 16
 _PRINCIPAL_BOUND_READS = {
     "kite_session_search": frozenset({"james"}),
     "kite_personal_files_locate": frozenset({"james"}),
@@ -543,6 +545,15 @@ class TrustedPrincipalRuntime:
         # Documents already sent during the inbound turn being served, so a
         # model that loops over a family cannot send the same passport twice.
         self._delivered_documents: set[str] = set()
+        # Where an outstanding approval should deliver, held only in memory
+        # and only while the code lives. The mapping store keeps a one-way
+        # digest of a conversation and never the conversation itself, which
+        # is a property worth keeping: an approval that must reach a chat it
+        # did not arrive in needs that chat, and writing it down to get it
+        # would trade a durable secret for a transient convenience. Losing
+        # these on restart is the right failure -- the approval simply is not
+        # found, and nothing is released.
+        self._pending_releases: dict[str, tuple[str, AudienceBinding, int]] = {}
         # The inbound turn currently being served in each conversation. Bumped
         # once per ingress; a consultation carrying an older number belongs to a
         # question James has already moved on from and may neither dispatch nor
@@ -1136,6 +1147,31 @@ class TrustedPrincipalRuntime:
         except Exception:
             logger.warning("Juno document receipt transport failed closed")
 
+    def _remember_pending_release(
+        self, code: str, *, chat_id: str, audience: AudienceBinding, expires_at: int
+    ) -> None:
+        """Remember where an outstanding approval is meant to deliver."""
+        now = int(self.clock())
+        for stale in [
+            key for key, value in self._pending_releases.items() if value[2] <= now
+        ]:
+            self._pending_releases.pop(stale, None)
+        while len(self._pending_releases) >= _MAX_PENDING_RELEASES:
+            self._pending_releases.pop(next(iter(self._pending_releases)), None)
+        self._pending_releases[str(code)] = (str(chat_id), audience, int(expires_at))
+
+    def _pending_release(
+        self, code: str
+    ) -> Optional[tuple[str, AudienceBinding]]:
+        entry = self._pending_releases.get(str(code))
+        if entry is None:
+            return None
+        chat_id, audience, expires_at = entry
+        if expires_at <= int(self.clock()):
+            self._pending_releases.pop(str(code), None)
+            return None
+        return chat_id, audience
+
     async def _handle_document_approval(
         self,
         *,
@@ -1151,8 +1187,29 @@ class TrustedPrincipalRuntime:
         if match is None:
             await self._send_document_receipt(adapter, chat_id, denied)
             return self._ingress_skip("document-release-handled")
+        code = match.group(1)
+        # An approval typed where the document was asked for keeps its exact
+        # existing meaning: origin and approver are the one audience. An
+        # approval typed somewhere else -- a DM, because the document was
+        # found outside a release root and needed James to say so -- delivers
+        # to the conversation the request came from, never to the chat the
+        # approval arrived in. The code alone decides which, and a code that
+        # is not outstanding is simply not found.
+        origin = self._pending_release(code)
+        if origin is not None and origin[0] != chat_id:
+            origin_chat, origin_audience = origin
+            self._pending_releases.pop(code, None)
+            await self._consume_and_deliver(
+                code,
+                audience=origin_audience,
+                adapter=adapter,
+                chat_id=origin_chat,
+                approver=audience,
+            )
+            return self._ingress_skip("document-release-handled")
+        self._pending_releases.pop(code, None)
         await self._consume_and_deliver(
-            match.group(1), audience=audience, adapter=adapter, chat_id=chat_id
+            code, audience=audience, adapter=adapter, chat_id=chat_id
         )
         return self._ingress_skip("document-release-handled")
 
