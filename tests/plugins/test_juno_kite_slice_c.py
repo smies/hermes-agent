@@ -2289,7 +2289,7 @@ def test_a_scanned_pdf_with_no_text_layer_is_still_read(monkeypatch):
 
     calls: list = []
 
-    def fake_reader(argv):
+    def fake_reader(argv, limit=600):
         calls.append(argv)
         if argv[0].endswith("pdftotext"):
             return ""          # no text layer
@@ -2309,7 +2309,7 @@ def test_a_pdf_with_a_text_layer_does_not_pay_for_ocr(monkeypatch):
 
     calls: list = []
 
-    def fake_reader(argv):
+    def fake_reader(argv, limit=600):
         calls.append(argv)
         return "PRIVATE AND CONFIDENTIAL Palma de Mallorca"
 
@@ -3119,7 +3119,7 @@ def test_a_document_can_be_read_without_being_sent(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         pr, "_run_preview_reader",
-        lambda argv: "PASSPORT UNITED KINGDOM No 123456789 Expiry 04 MAR 2031",
+        lambda argv, limit=600: "PASSPORT UNITED KINGDOM No 123456789 Expiry 04 MAR 2031",
     )
     root = tmp_path / "family"
     root.mkdir()

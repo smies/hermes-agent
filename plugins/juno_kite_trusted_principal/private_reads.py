@@ -515,8 +515,15 @@ def _office_preview(data: bytes) -> str:
         return ""
 
 
-def _run_preview_reader(argv: list[str]) -> str:
-    """Run one local reader and return its bounded, collapsed text."""
+def _run_preview_reader(argv: list[str], limit: int = _PREVIEW_MAX_CHARS) -> str:
+    """Run one local reader and return its bounded, collapsed text.
+
+    The bound is the caller's. This used to impose the preview length on every
+    reader, so a read asking for the whole document still got 600 characters:
+    enough of a passport to show the number and stop short of the expiry date,
+    which reads as a document that cannot be verified rather than one that was
+    cut off.
+    """
     try:
         completed = subprocess.run(
             argv,
@@ -532,9 +539,7 @@ def _run_preview_reader(argv: list[str]) -> str:
         return ""
     if completed.returncode != 0:
         return ""
-    return re.sub(r"\s+", " ", str(completed.stdout or "")).strip()[
-        :_PREVIEW_MAX_CHARS
-    ]
+    return re.sub(r"\s+", " ", str(completed.stdout or "")).strip()[:limit]
 
 
 def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_CHARS) -> str:
@@ -570,7 +575,7 @@ def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_
             extracted = ""
             if executable:
                 extracted = _run_preview_reader(
-                    [executable, "-l", "2", "-q", path, "-"]
+                    [executable, "-l", "2", "-q", path, "-"], limit
                 )
             if extracted:
                 return extracted
@@ -598,7 +603,7 @@ def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_
             argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path]
         else:
             return ""
-        return _run_preview_reader(argv)
+        return _run_preview_reader(argv, limit)
     except (OSError, ValueError, subprocess.SubprocessError):
         return ""
     finally:

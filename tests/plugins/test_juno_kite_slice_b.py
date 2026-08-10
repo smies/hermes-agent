@@ -1193,6 +1193,41 @@ def test_personal_file_containment_and_bounds(tmp_path):
     assert allowed["status"] != "error", allowed
 
 
+def test_a_read_of_a_scan_is_bounded_by_the_read_not_by_the_preview(monkeypatch):
+    """The number was returned and the expiry was cut off.
+
+    Every local reader imposed the 600-character preview length, whatever the
+    caller asked for, so a read of a passport stopped mid-page: enough to show
+    the number, not enough to reach the expiry date. The model reported that
+    it could not verify the passport -- which is what a truncated document
+    looks like from the inside -- and declined to give either.
+    """
+    import plugins.juno_kite_trusted_principal.private_reads as pr
+
+    page = "Passport No 900000001 " + ("official observations " * 200) + "Expiry 14 MAR 2031"
+    assert len(page) > 4000
+
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(pr.Path, "exists", lambda self: True)
+    monkeypatch.setattr(
+        pr.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=page),
+    )
+
+    preview = pr._document_preview(b"synthetic", "image/jpeg")
+    assert len(preview) == 600
+    assert "14 MAR 2031" not in preview  # a preview only has to tell them apart
+
+    read = pr._document_preview(b"synthetic", "image/jpeg", limit=6000)
+    assert "900000001" in read
+    assert "14 MAR 2031" in read, "a read must reach the end of the page"
+
+    # And the same for a PDF with a text layer, which uses the other reader.
+    pdf = pr._document_preview(b"%PDF-1.4", "application/pdf", limit=6000)
+    assert "14 MAR 2031" in pdf
+
+
 def test_preview_converts_what_a_phone_produces_before_trying_to_read_it(monkeypatch):
     """A HEIC photo of a document read as blank, not as unreadable.
 
@@ -1212,7 +1247,9 @@ def test_preview_converts_what_a_phone_produces_before_trying_to_read_it(monkeyp
         return data, mime_type
 
     monkeypatch.setattr(pr, "_normalise_artifact", _fake_normalise)
-    monkeypatch.setattr(pr, "_run_preview_reader", lambda argv: "PASSPORT 533812947")
+    monkeypatch.setattr(
+        pr, "_run_preview_reader", lambda argv, limit=600: "PASSPORT 533812947"
+    )
     monkeypatch.setattr(pr.Path, "exists", lambda self: True)
 
     for mime in ("image/heic", "image/tiff", "image/jpeg"):
