@@ -2264,8 +2264,13 @@ def test_a_title_carrying_something_unshippable_is_replaced_not_denied(tmp_path)
     runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
     runtime.secret_values = {"super-secret-token-value"}
 
+    # An address in a title is fine now; the document itself is about to be
+    # sent, and naming who it came from tells the recipient nothing the file
+    # does not. A credential in a title is still suppressed.
+    assert runtime._safe_release_title("invoice for adviser@example.com") == (
+        "invoice for adviser@example.com"
+    )
     for hostile in (
-        "invoice for adviser@example.com",
         "creds api_key=abcdef123456",
         "notes super-secret-token-value",
         "",

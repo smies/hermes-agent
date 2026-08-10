@@ -118,55 +118,15 @@ _CREDENTIAL_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 )
-_EMAIL_PATTERN = re.compile(
-    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I
-)
-_ISO_DATE_PATTERN = re.compile(
-    r"(?<!\d)\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?(?!\d)"
-)
-_PHONE_CANDIDATE = re.compile(r"(?<!\w)\+?\d[\d .()\-]{5,}\d(?!\w)")
-
-
-def _is_phone_shaped(token: str) -> bool:
-    """Whether a run of digits looks like someone's phone number.
-
-    Length alone does not say. Four family passport numbers written as a
-    plain list -- "Alex Morgan Reed - 900000001 - 4 March 2032" -- were
-    each read as a phone number and the whole answer was withheld, because
-    the only carve-out was for a value written directly after the words
-    "passport number", which a list does not do. Nothing in that answer even
-    said "passport", so no rule about surrounding words could have saved it.
-
-    What actually distinguishes a phone number is its shape: a country code,
-    a trunk zero, grouping, or enough digits to be dialled. A bare nine-digit
-    run with none of those is a reference of some kind, and this filter is
-    the backstop for contact details leaking in by accident -- what may be
-    disclosed on purpose is decided by the tier and the capability.
-    """
-    digits = re.sub(r"\D", "", token)
-    if not 9 <= len(digits) <= 15:
-        return False
-    if token.lstrip().startswith("+") or digits.startswith("0"):
-        return True
-    groups = [part for part in re.split(r"[ .()\-]+", token.strip()) if part]
-    if len(groups) > 1:
-        # A number is dialled in short groups. A nine-digit run standing next
-        # to something else -- "900000002 - 31 January" -- is a reference and
-        # a date, which the separators alone cannot tell from a dialled
-        # number.
-        return all(len(part) <= 6 for part in groups)
-    return len(digits) >= 10
-# Emphasis is formatting, and formatting must not decide a security verdict.
-# A model writes "Passport number: **900000001**", the bold broke the passport
-# carve-out below, and the number underneath was read as a phone number -- the
-# answer was refused for containing the thing it had been asked for. The same
-# gap runs the other way: cred**ential** would slip a pattern that the flat
-# text catches, so the scan sees both forms and either one is enough.
-_EMPHASIS_PATTERN = re.compile(r"[*_`~]+")
-_PASSPORT_CONTEXT_PATTERN = re.compile(
-    r"(?i)\bpassport\s+(?:number|no\.?|identifier)\s*[:#-]?\s*"
-    r"[A-Z0-9][A-Z0-9 -]{4,18}[A-Z0-9]\b"
-)
+# Emphasis is formatting, and formatting must not decide a security verdict:
+# cred**ential** would slip a pattern that the flat text catches, so the scan
+# sees both forms and a match on either is enough.
+_EMPHASIS_PATTERN = re.compile(r"[*`~]+")
+# An underscore is emphasis at the edge of a word and a separator inside one.
+# Removing it everywhere joined the parts of a filename into digits that were
+# never there. Markdown italics still flatten, because there the underscore
+# borders whitespace rather than a word character.
+_EDGE_UNDERSCORE_PATTERN = re.compile(r"(?<!\w)_+|_+(?!\w)")
 _PRIVATE_ID_PATTERN = re.compile(
     r"(?i)\b(?:account|chat|conversation|customer|principal|subject|user)[_-]?id\s*[:=]"
 )
@@ -1731,7 +1691,9 @@ class TrustedPrincipalRuntime:
 
     def _leak_reason(self, text: str, *, output: bool) -> str:
         value = str(text or "")
-        flattened = _EMPHASIS_PATTERN.sub("", value)
+        flattened = _EDGE_UNDERSCORE_PATTERN.sub(
+            "", _EMPHASIS_PATTERN.sub("", value)
+        )
         for pattern in _CREDENTIAL_PATTERNS:
             if pattern.search(value) or pattern.search(flattened):
                 return "credential-shaped content"
@@ -1739,8 +1701,6 @@ class TrustedPrincipalRuntime:
             secret and secret in value for secret in getattr(self, "secret_values", ())
         ):
             return "configured credential value"
-        if _EMAIL_PATTERN.search(value) or _EMAIL_PATTERN.search(flattened):
-            return "email-shaped private identifier"
         identifier_scan = flattened
         if output:
             for origin in getattr(
@@ -1755,15 +1715,15 @@ class TrustedPrincipalRuntime:
             return "labelled private identifier"
         if _UUID_PATTERN.search(identifier_scan):
             return "UUID-shaped private identifier"
-        # A date is not a contact detail, and "2026-08-10 15:37" is otherwise
-        # ten digits in short groups -- indistinguishable from a number.
-        phone_scan = _ISO_DATE_PATTERN.sub(" ", identifier_scan)
-        phone_scan = _PASSPORT_CONTEXT_PATTERN.sub("", phone_scan)
-        if any(
-            _is_phone_shaped(match.group(0))
-            for match in _PHONE_CANDIDATE.finditer(phone_scan)
-        ):
-            return "phone-shaped private identifier"
+        # No phone or email check here, by James's decision: contact details
+        # are his to share and he does not count them as a leak. Between them
+        # they refused, in one day, a dated document title, four of the
+        # household's own passport numbers and a filename he typed himself --
+        # each reported back to him as an authorization problem for a document
+        # he was entitled to, and none of them ever a real disclosure. Digits
+        # and strings that carry authority are still caught above:
+        # credentials, configured secret values, labelled identifiers and
+        # UUIDs, and the raw-dump markers below.
         if any(
             identifier and identifier in value
             for identifier in self.private_identifiers
@@ -3338,9 +3298,10 @@ class TrustedPrincipalRuntime:
             for identifier in self.private_identifiers
         ):
             return "Requested document"
-        if _EMAIL_PATTERN.search(value) or any(
-            pattern.search(value) for pattern in _CREDENTIAL_PATTERNS
-        ):
+        # A credential in a filename is still worth suppressing; an address is
+        # not. The document itself is about to be sent, so a title naming who
+        # it came from tells the recipient nothing the file does not.
+        if any(pattern.search(value) for pattern in _CREDENTIAL_PATTERNS):
             return "Requested document"
         return value
 

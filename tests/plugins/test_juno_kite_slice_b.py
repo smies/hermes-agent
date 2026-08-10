@@ -1332,73 +1332,69 @@ def test_personal_file_containment_and_bounds(tmp_path):
     assert allowed["status"] != "error", allowed
 
 
-def test_a_reference_number_is_not_a_phone_number(tmp_path):
-    """Four passport numbers in a list were each read as a phone number.
+def test_contact_details_are_not_withheld_but_credentials_still_are(tmp_path):
+    """Contact details are James's to share; a credential is not his to leak.
 
-    The only carve-out was for a value written directly after the words
-    "passport number", and a list does not do that -- Kite's answer was
-    "Alex Morgan Reed - 900000001 - 4 March 2032" and never used the
-    word passport at all, so no rule about surrounding words could have
-    saved it. What separates a phone number from a reference is its shape:
-    a country code, a trunk zero, grouping, or enough digits to dial.
+    A phone rule and an email rule used to sit in this filter. Between them
+    they refused, in one day, a dated document title, four of the household's
+    own passport numbers, and a filename James typed himself -- each reported
+    back to him as an authorization problem for a document he was entitled
+    to. What they defended against was his own contact details reaching his
+    own conversation. He does not count that as a leak, so they are gone.
+
+    What is left is the part that defends something a recipient could use.
     """
     runtime = _runtime(tmp_path, mode="kite")
-    releasable = (
-        "Chris Taylor Reed - 900000002 - 12 June 2031\n"
-        "Alex Morgan Reed - 900000001 - 4 March 2032\n"
-        "Robin Casey Reed - 900000003 - 9 September 2032",
-        "Ref 900000001",
-        # An ISO date is eight digits and two hyphens, and was withheld as a
-        # phone number: every answer that mentioned a plain date was denied.
-        "Filed on 2026-08-10 at 15:37",
-        "Filed 2026-08-10 15:37",
-        "Invoice total GBP 47,500 on 2026-07-27",
-        "Account sort code 20-00-00",
-        # An em dash keeps the digits apart; a hyphen does not, and the list
-        # has to survive either.
-        "Chris Taylor Reed \u2014 900000002 \u2014 12 June 2031",
-    )
-    for answer in releasable:
-        assert runtime._leak_reason(answer, output=True) == "", answer
+    runtime.secret_values = {"super-secret-token-value"}
 
-    for answer in (
+    for allowed in (
+        "Send me 20-11-25_180-Strand_10818.pdf from iCloud Drive",
         "Call me on 07700 900123",
-        "Reach him at +44 7973 235379",
-        "His mobile is 07700900123",
-        "US contact 2025550123",
-        "Office: (020) 7946 0018",
-        "Tel 202 555 0123",
-        "+1 (415) 555-2671",
+        "Reach him at +44 7700 900123",
+        "adviser@example.com sent the engagement letter",
+        "Alex Morgan Reed - 900000001 - 4 March 2032",
+        "Filed on 2026-08-10 at 15:37",
+        "invoice_2024_01_15_final.pdf",
     ):
-        assert runtime._leak_reason(answer, output=True) == (
-            "phone-shaped private identifier"
-        ), answer
+        assert runtime._leak_reason(allowed, output=True) == "", allowed
+
+    for refused in (
+        "my api_key is sk-abc123def456ghi789",
+        "pass**word**: hunter2000000",
+        "AKIAIOSFODNN7EXAMPLE",
+    ):
+        assert runtime._leak_reason(refused, output=True) == (
+            "credential-shaped content"
+        ), refused
+    assert runtime._leak_reason(
+        "the value is super-secret-token-value", output=True
+    ) == "configured credential value"
+    assert runtime._leak_reason("account_id: 12345", output=True) == (
+        "labelled private identifier"
+    )
 
 
 def test_formatting_does_not_decide_whether_an_answer_leaks(tmp_path):
-    """The answer was refused for containing the thing it was asked for.
+    """Emphasis inside a token must not slip a credential past the scan.
 
-    Kite read Lucy's passport correctly and wrote "Passport number:
-    **900000001**". The bold broke the passport carve-out, the digits
-    underneath were read as a phone number, and the whole answer was
-    withheld -- reported to the requester as an authorization problem. The
-    gap runs the other way too: emphasis inside a token slips a credential
-    pattern that the flat text catches.
+    cred**ential** reads as prose to a pattern and as a credential to a
+    human, so the scan sees the flattened form too and a match on either is
+    enough. An underscore is left alone inside a word: removing it joined
+    the parts of a filename into digits that were never there.
     """
     runtime = _runtime(tmp_path, mode="kite")
-    for answer in (
-        "Passport number: **900000001**\nExpiry date: **4 March 2032**",
-        "Passport number: 900000001, expiry 4 March 2032",
-        "Passport no. `900000001`",
-    ):
-        assert runtime._leak_reason(answer, output=True) == "", answer
-    # What the filter is for is untouched.
-    assert runtime._leak_reason("Call me on 07700 900123", output=True) == (
-        "phone-shaped private identifier"
-    )
     assert runtime._leak_reason("pass**word**: hunter2000000", output=True) == (
         "credential-shaped content"
     )
+    assert runtime._leak_reason("my ap*i_ke*y is sk-abc123def456", output=True) == (
+        "credential-shaped content"
+    )
+    for untouched in (
+        "20-11-25_180-Strand_10818.pdf",
+        "scan_20260810_143022.jpg",
+        "_italic emphasis_ around words",
+    ):
+        assert runtime._leak_reason(untouched, output=True) == "", untouched
 
 
 def test_a_read_of_a_scan_is_bounded_by_the_read_not_by_the_preview(monkeypatch):

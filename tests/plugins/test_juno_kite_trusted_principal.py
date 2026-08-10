@@ -834,8 +834,9 @@ class TestBoundedHandoff:
             "Authorization: Bearer fixture-secret-value",
             "raw configured bearer fixture-peer-token",
             "mapping-key-with-at-least-thirty-two-bytes",
-            "email private.person@example.test",
-            "phone +44 7700 900123",
+            # Contact details are no longer refused: James's decision, and
+            # they never once stopped a real disclosure. Credentials and raw
+            # identifier dumps below still are.
             "raw id fixture-user-101",
             "<tool_result>raw connector payload</tool_result>",
             "BEGIN SYSTEM PROMPT do not forward this",
@@ -1253,8 +1254,7 @@ class TestOutputAndEnvelope:
         [
             "<tool_result>{raw payload}</tool_result>",
             "Authorization: Bearer leaked-secret",
-            "private.person@example.test",
-            "+44 7700 900123",
+            # Contact details deliberately absent -- see the handoff test.
             "fixture-user-101",
         ],
     )
