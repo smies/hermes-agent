@@ -51,6 +51,9 @@ ALLOWED_MIME_EXTENSIONS = {
     "application/json": ".json",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    # An unrecognised document keeps the name it already had, so the extension
+    # comes from the file rather than from a table that would have to grow.
+    "application/octet-stream": "",
 }
 # Text formats carry no structure to hide anything in: they are decoded whole
 # and scanned as text.
@@ -73,6 +76,27 @@ _OFFICE_ACTIVE_PARTS = ("vbaproject.bin", "vbadata.xml", ".bin")
 _OFFICE_MAX_ENTRIES = 512
 _OFFICE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 _XML_TEXT = re.compile(r"<[^>]+>")
+
+# Things that run, install, or load code. This is the list that matters: a
+# document does not become dangerous by being a format nobody anticipated, and
+# an allow-list of understood types refuses a new one every time -- HEIC, MPO
+# and office files each cost a real failure before anyone noticed. Refuse what
+# executes; carry everything else.
+_EXECUTABLE_MAGIC = (
+    b"MZ",                      # Windows PE
+    b"\x7fELF",                 # ELF
+    b"\xca\xfe\xba\xbe",       # Mach-O fat / Java class
+    b"\xcf\xfa\xed\xfe",       # Mach-O 64
+    b"\xce\xfa\xed\xfe",       # Mach-O 32
+    b"#!",                      # any interpreter shebang
+)
+_EXECUTABLE_SUFFIXES = frozenset({
+    ".exe", ".dll", ".com", ".bat", ".cmd", ".msi", ".scr", ".ps1", ".vbs",
+    ".app", ".pkg", ".dmg", ".kext", ".dylib", ".so", ".jar", ".apk",
+    ".deb", ".rpm", ".sh", ".bash", ".zsh", ".command", ".scpt", ".applescript",
+    ".workflow", ".action", ".osax", ".bin", ".run",
+})
+_OPAQUE_MIME = "application/octet-stream"
 
 _APPROVAL_CODE = re.compile(r"C7-[A-Z2-9]{16}\Z")
 # Constructs that can run code, reach the network or filesystem, or carry a
@@ -500,6 +524,20 @@ class DocumentReleaseService:
             raise DocumentReleaseDenied("document image is malformed") from exc
         return 1, metadata + "\n" + cls._printable_text(data)
 
+    @classmethod
+    def _inspect_opaque(cls, data: bytes) -> tuple[str, int, str]:
+        """Carry an unrecognised document, having refused anything executable.
+
+        Deep inspection is only possible for formats this understands, and
+        those keep it. For the rest the honest position is that this cannot
+        vouch for the structure, so it checks the one property that actually
+        matters -- that the file is not a program -- and scans whatever text
+        can be recovered, exactly as it would for a PDF it could not decode.
+        """
+        if any(data.startswith(magic) for magic in _EXECUTABLE_MAGIC):
+            raise DocumentReleaseDenied("executable documents are unsupported")
+        return _OPAQUE_MIME, 1, cls._printable_text(data)
+
     @staticmethod
     def _decoded_text(data: bytes) -> Optional[str]:
         """Whole-file UTF-8 with no control bytes, or not a text document."""
@@ -507,9 +545,12 @@ class DocumentReleaseService:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             return None
+        # Valid UTF-8 is not the same as text: a run of 0x11 bytes decodes
+        # cleanly and is plainly not a document. Allow only the control
+        # characters that genuinely occur in text.
         if any(
-            character in text
-            for character in ("\x00", "\x1b", "\x07", "\x08", "\x0c")
+            ord(character) < 0x20 and character not in "\t\n\r"
+            for character in text
         ):
             return None
         return text
@@ -582,6 +623,11 @@ class DocumentReleaseService:
     def inspect_bytes(self, data: bytes) -> ArtifactInspection:
         if not isinstance(data, bytes) or not 0 < len(data) <= MAX_DOCUMENT_BYTES:
             raise DocumentReleaseDenied("document size is out of bounds")
+        # Before anything else, and for every type: a script is executable and
+        # also perfectly decodable as text, so checking this only in the
+        # unrecognised branch would let "#!/bin/sh" through as text/plain.
+        if any(data.startswith(magic) for magic in _EXECUTABLE_MAGIC):
+            raise DocumentReleaseDenied("executable documents are unsupported")
         if data.startswith(b"%PDF-"):
             mime = "application/pdf"
             pages, scanned_text = self._inspect_pdf(data)
@@ -596,7 +642,10 @@ class DocumentReleaseService:
         elif (text := self._decoded_text(data)) is not None:
             mime, pages, scanned_text = self._text_mime(text), 1, text
         else:
-            raise DocumentReleaseDenied("document type is unsupported")
+            # Understood formats get their deep checks above. Anything else is
+            # carried as opaque data rather than refused for being unfamiliar,
+            # having been refused what it plainly is: executable code.
+            mime, pages, scanned_text = self._inspect_opaque(data)
         if self._text_is_denied(scanned_text):
             raise DocumentReleaseDenied("document contains prohibited material")
         return ArtifactInspection(
@@ -607,8 +656,9 @@ class DocumentReleaseService:
         )
 
     @staticmethod
-    def _safe_title(value: str) -> str:
-        stem = Path(str(value or "")).stem
+    def _safe_title(value: str, *, keep_suffix: bool = False) -> str:
+        raw = Path(str(value or ""))
+        stem = raw.name if keep_suffix else raw.stem
         title = re.sub(r"[^A-Za-z0-9 ()_.-]+", " ", stem).strip(" ._-")
         title = re.sub(r"\s+", " ", title)[:96]
         if not title or DocumentReleaseService._text_is_denied(title):
@@ -721,6 +771,8 @@ class DocumentReleaseService:
         ):
             raise DocumentReleaseDenied("document contains prohibited material")
         inspection = self.inspect_bytes(bytes(data))
+        if Path(str(display_name or "")).suffix.casefold() in _EXECUTABLE_SUFFIXES:
+            raise DocumentReleaseDenied("executable documents are unsupported")
         proposal_id = "doc-" + secrets.token_urlsafe(18)
         stage_leaf = proposal_id + ".stage"
         assert self.staging_path is not None
@@ -754,7 +806,9 @@ class DocumentReleaseService:
         return StagedCandidate(
             proposal_id=proposal_id,
             stage_leaf=stage_leaf,
-            title=self._safe_title(display_name),
+            title=self._safe_title(
+                display_name, keep_suffix=inspection.mime_type == _OPAQUE_MIME
+            ),
             source_class=source_class,
             mime_type=inspection.mime_type,
             size_bytes=inspection.size_bytes,

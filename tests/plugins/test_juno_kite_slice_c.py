@@ -652,7 +652,10 @@ def test_typed_resolver_has_one_closed_candidate_and_no_arbitrary_selectors(tmp_
     "name,payload",
     [
         ("oversize.png", b"\x89PNG\r\n\x1a\n" + b"x" * (8 * 1024 * 1024)),
-        ("wrong.png", b"\x00\x01not an image\xff"),
+        # NB: unrecognised bytes are deliberately carried now, not refused --
+        # a name that disagrees with its content is caught by the resolver
+        # instead (test_a_text_file_wearing_an_image_name_is_still_caught).
+        ("executable.png", b"MZ" + b"\x00" * 200),
         ("encrypted.pdf", b"%PDF-1.7\n1 0 obj<</Encrypt 2 0 R>>endobj\n%%EOF"),
         ("active.pdf", b"%PDF-1.7\n1 0 obj<</JavaScript 2 0 R>>endobj\n%%EOF"),
         ("escaped-active.pdf", b"%PDF-1.7\n1 0 obj<</Java#53cript 2 0 R>>endobj\n%%EOF"),
@@ -662,7 +665,7 @@ def test_typed_resolver_has_one_closed_candidate_and_no_arbitrary_selectors(tmp_
     ],
     ids=[
         "oversize",
-        "wrong-mime",
+        "executable-bytes",
         "encrypted-pdf",
         "active-pdf",
         "escaped-active-pdf",
@@ -2431,9 +2434,16 @@ def test_a_text_document_with_a_credential_is_still_refused(tmp_path):
     runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
     with pytest.raises(DocumentReleaseDenied, match="prohibited"):
         runtime.document_releases.inspect_bytes(b"api_key=abcdef1234567890\n")
-    # Binary masquerading as text is not text.
-    with pytest.raises(DocumentReleaseDenied, match="unsupported"):
-        runtime.document_releases.inspect_bytes(b"\x00\x01binary\xff")
+    # Binary is no longer refused for being unrecognised -- it is carried as
+    # opaque data -- but the credential scan still applies to what can be read
+    # out of it, which is the property that actually protects anything.
+    assert runtime.document_releases.inspect_bytes(
+        b"\x00\x01binary\xff" + b"\x99" * 64
+    ).mime_type == "application/octet-stream"
+    with pytest.raises(DocumentReleaseDenied, match="prohibited"):
+        runtime.document_releases.inspect_bytes(
+            b"\x00\x01" + b"api_key=abcdef1234567890" + b"\xff" * 32
+        )
 
 
 def test_a_phone_photo_is_converted_rather_than_refused(monkeypatch):
@@ -2950,3 +2960,77 @@ def test_a_phone_photo_is_a_still_not_an_animation(tmp_path):
     except DocumentReleaseDenied as exc:
         raised = str(exc)
     assert raised, "a broken JPEG must still be refused"
+
+
+def test_an_unfamiliar_document_type_is_carried_not_refused():
+    """An allow-list refuses a new format every time one appears.
+
+    HEIC, MPO and office files each cost a real failure before anyone
+    noticed. A document does not become dangerous by being a format nobody
+    anticipated, so the rule is now the one that matters: refuse what runs.
+    """
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseService, DocumentReleaseDenied, ALLOWED_MIME_EXTENSIONS,
+    )
+    svc = DocumentReleaseService(None, store=None, mapping_key=b"0" * 32,
+                                 clock=lambda: 0.0)
+
+    # Formats nobody enumerated: a Numbers/Keynote blob, a RAW photo header.
+    for blob in (b"\x0e\x0eNUMBERS" + b"\x11" * 400, b"II*\x00" + b"\x99" * 400):
+        assert svc.inspect_bytes(blob).mime_type == "application/octet-stream"
+    # And it can actually be delivered: the extension comes from the file.
+    assert ALLOWED_MIME_EXTENSIONS["application/octet-stream"] == ""
+    assert DocumentReleaseService._safe_title(
+        "Family budget.numbers", keep_suffix=True) == "Family budget.numbers"
+
+
+@pytest.mark.parametrize(
+    "payload,label",
+    [
+        (b"#!/bin/sh\necho hi", "shell script"),
+        (b"#!/usr/bin/env python3\nprint(1)", "python script"),
+        (b"MZ" + b"\x00" * 200, "windows executable"),
+        (b"\x7fELF" + b"\x00" * 200, "elf binary"),
+        (b"\xcf\xfa\xed\xfe" + b"\x00" * 200, "mach-o binary"),
+    ],
+)
+def test_things_that_run_are_still_refused(payload, label):
+    """A script is executable and also decodes cleanly as text.
+
+    Checking this only in the unrecognised branch would have let every
+    shebang through as text/plain.
+    """
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseService, DocumentReleaseDenied,
+    )
+    svc = DocumentReleaseService(None, store=None, mapping_key=b"0" * 32,
+                                 clock=lambda: 0.0)
+    raised = ""
+    try:
+        svc.inspect_bytes(payload)
+    except DocumentReleaseDenied as exc:
+        raised = str(exc)
+    assert "executable" in raised, label
+
+
+def test_an_executable_name_is_refused_even_with_harmless_bytes(tmp_path):
+    """Bytes are not the only signal; the name matters at staging."""
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseService, DocumentReleaseDenied, _EXECUTABLE_SUFFIXES,
+    )
+    staging = tmp_path / "stage"
+    from plugins.juno_kite_trusted_principal.mapping_store import MappingStore
+    svc = DocumentReleaseService(
+        {"enabled": True, "staging_path": str(staging)},
+        store=MappingStore(tmp_path / "m.sqlite3", b"0" * 32),
+        mapping_key=b"0" * 32, clock=lambda: 0.0,
+    )
+    assert ".command" in _EXECUTABLE_SUFFIXES and ".app" in _EXECUTABLE_SUFFIXES
+    raised = ""
+    try:
+        svc.stage_bytes(b"just some text\n", source_class="personal files",
+                        display_name="totally-safe.command")
+    except DocumentReleaseDenied as exc:
+        raised = str(exc)
+    assert "executable" in raised
+    assert not list(staging.glob("*.stage")), "nothing may be staged"
