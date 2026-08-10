@@ -345,6 +345,57 @@ def test_deferred_broker_gates_are_exact_and_same_turn_bound(tmp_path):
     _bound_turn(tmp_path, {}, check)
 
 
+def test_an_unrelated_deferred_tool_is_not_this_plugins_business(tmp_path):
+    """James could not reach his own Granola connector on his own profile.
+
+    The broker fronts every deferred tool. This hook treated any
+    tool_describe/tool_call in kite mode as a possible private read and
+    demanded a Juno binding before looking at what was being brokered, so an
+    ordinary Mattermost turn -- no A2A, no delegation, nothing to do with
+    Juno -- came back as "Juno--Kite policy blocked tool call: internal or
+    missing policy binding": a policy decision about a tool this plugin does
+    not own, in the name of a lane that was not involved.
+    """
+    kite = _runtime(tmp_path, mode="kite", backends={})
+    unrelated = "mcp__granola__list_meetings"
+
+    def ordinary_turn():
+        assert kite.pre_tool_call(
+            "tool_describe", {"name": unrelated},
+            session_id="mm-session", turn_id="mm-turn",
+        ) is None
+        assert kite.pre_tool_call(
+            "tool_call", {"name": unrelated, "arguments": {"limit": 5}},
+            session_id="mm-session", turn_id="mm-turn",
+        ) is None
+        # The final-dispatch gate is the parallel path and must agree.
+        assert kite.pre_tool_dispatch(
+            "tool_call", {"name": unrelated, "arguments": {"limit": 5}},
+            session_id="mm-session", turn_id="mm-turn",
+        ) is None
+        # A broker request this plugin cannot read as naming one of its own
+        # readers is equally not its business; the registry validates it.
+        for shape in ({}, {"name": 123}, {"arguments": {}}, None, "not-a-dict"):
+            assert kite.pre_tool_call(
+                "tool_describe", shape,
+                session_id="mm-session", turn_id="mm-turn",
+            ) is None, shape
+        # ...but naming a protected reader off the lane still fails closed,
+        # which is the whole point of reading the target rather than the mode.
+        assert kite.pre_tool_call(
+            "tool_describe", {"name": "kite_calendar_read"},
+            session_id="mm-session", turn_id="mm-turn",
+        )["action"] == "block"
+
+    _run_in_session(
+        ordinary_turn,
+        platform="mattermost",
+        user_id="james-mattermost",
+        session_key="ordinary-conversation",
+        profile="kite",
+    )
+
+
 def test_deferred_brokers_are_blocked_outside_authenticated_a2a_turn(tmp_path):
     kite = _runtime(tmp_path, mode="kite", backends={})
 

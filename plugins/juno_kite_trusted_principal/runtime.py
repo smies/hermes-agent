@@ -2689,8 +2689,23 @@ class TrustedPrincipalRuntime:
             self.mode == "kite"
             and tool_name in {"tool_describe", "tool_call"}
         )
-        if platform != "a2a" and not brokered_private_read:
-            return None
+        if platform != "a2a":
+            if not brokered_private_read:
+                return None
+            # The broker fronts every deferred tool, not just this plugin's
+            # readers, and off the lane the rest are none of its business:
+            # requiring a Juno binding for them blocked James from reaching
+            # his own MCP connectors on his own profile, and reported it as a
+            # policy decision about a tool this plugin does not own. The
+            # target is read from the arguments rather than assumed, so an
+            # attempt to broker a protected reader from outside the lane
+            # still falls through to the gate below and still fails closed.
+            target = args.get("name") if isinstance(args, dict) else None
+            if (
+                not isinstance(target, str)
+                or target not in self.private_read_tool_names
+            ):
+                return None
         try:
             binding = self._current_valid_binding(
                 session_id=str(session_id or ""), turn_id=str(turn_id or "")
