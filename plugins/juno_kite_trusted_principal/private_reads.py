@@ -640,7 +640,16 @@ def _document_preview(
     text = _cached_preview(key)
     if text is None:
         text = _extract_document_text(data, mime_type, pages, _READ_EXTRACT_CHARS)
-        _remember_preview(key, text)
+        # Nothing read is not remembered. "" means both "this document has no
+        # text in it" and "the recogniser timed out, failed to start, or died
+        # under memory pressure" -- the readers cannot tell those apart and
+        # return the same empty string for each. Caching it would turn one
+        # transient failure into a document that stays unidentifiable for the
+        # life of the gateway, reported to whoever asked as an inability to
+        # tell what the file is. A genuinely blank page pays the recogniser
+        # again next turn, which is much the cheaper of the two mistakes.
+        if text:
+            _remember_preview(key, text)
     return text[:limit]
 
 

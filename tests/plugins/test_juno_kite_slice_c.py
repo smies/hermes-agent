@@ -2414,6 +2414,40 @@ def test_a_second_look_at_one_document_does_not_pay_the_recogniser_again(monkeyp
     assert len(calls) == 2
 
 
+def test_a_recogniser_that_failed_is_asked_again_next_time(monkeypatch):
+    """A timeout must not become a permanently unidentifiable document.
+
+    The readers return "" for a page with no text and for a recogniser that
+    timed out, failed to start, or died under memory pressure -- they cannot
+    tell those apart. Remembering "" would turn one transient failure into a
+    document this gateway can never identify again, surfacing to whoever
+    asked as an inability to say what the file is, with nothing in the logs
+    to connect it to the moment it actually failed.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    attempts: list[int] = []
+
+    def _reader(argv, limit=600):
+        attempts.append(1)
+        # Fails the first time, as a timeout or a cold start would, then works.
+        return "" if len(attempts) == 1 else "ENGAGEMENT LETTER page 1"
+
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(pr.Path, "exists", lambda self: True)
+    monkeypatch.setattr(pr, "_run_preview_reader", _reader)
+
+    # An image goes to the recogniser once; a PDF would try pdftotext first.
+    document = b"\xff\xd8\xff transient scan"
+    assert pr._document_preview(document, "image/jpeg") == ""
+    # Asked again rather than answered from a remembered failure.
+    assert pr._document_preview(document, "image/jpeg") == "ENGAGEMENT LETTER page 1"
+    assert len(attempts) == 2
+    # And the successful read IS remembered.
+    assert pr._document_preview(document, "image/jpeg") == "ENGAGEMENT LETTER page 1"
+    assert len(attempts) == 2
+
+
 def test_a_changed_document_is_read_again_rather_than_remembered(monkeypatch):
     """The cache must never answer for a file whose contents have moved on.
 
