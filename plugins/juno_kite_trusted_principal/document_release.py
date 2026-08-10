@@ -11,10 +11,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import secrets
 import stat
+import zipfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +41,34 @@ ALLOWED_MIME_EXTENSIONS = {
     "application/pdf": ".pdf",
     "image/jpeg": ".jpg",
     "image/png": ".png",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "text/markdown": ".md",
+    "application/json": ".json",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
 }
+# Text formats carry no structure to hide anything in: they are decoded whole
+# and scanned as text.
+_TEXT_MIME_EXTENSIONS = {
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "text/markdown": ".md",
+    "application/json": ".json",
+}
+# Office formats are zip containers. They cannot be inspected the way a PDF or
+# an image can -- there is no equivalent of the stream walk -- so the checks
+# here are narrower by nature: reject macros and anything that reaches outside
+# the document, and scan the text that can be recovered. Anyone reading this
+# should know that is a weaker guarantee than the other formats get.
+_OFFICE_MIME_EXTENSIONS = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+}
+_OFFICE_ACTIVE_PARTS = ("vbaproject.bin", "vbadata.xml", ".bin")
+_OFFICE_MAX_ENTRIES = 512
+_OFFICE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+_XML_TEXT = re.compile(r"<[^>]+>")
 
 _APPROVAL_CODE = re.compile(r"C7-[A-Z2-9]{16}\Z")
 # Constructs that can run code, reach the network or filesystem, or carry a
@@ -450,6 +479,85 @@ class DocumentReleaseService:
             raise DocumentReleaseDenied("document image is malformed") from exc
         return 1, metadata + "\n" + cls._printable_text(data)
 
+    @staticmethod
+    def _decoded_text(data: bytes) -> Optional[str]:
+        """Whole-file UTF-8 with no control bytes, or not a text document."""
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if any(
+            character in text
+            for character in ("\x00", "\x1b", "\x07", "\x08", "\x0c")
+        ):
+            return None
+        return text
+
+    @staticmethod
+    def _text_mime(text: str) -> str:
+        stripped = text.lstrip()
+        if stripped[:1] in "{[":
+            try:
+                json.loads(text)
+                return "application/json"
+            except ValueError:
+                pass
+        return "text/plain"
+
+    @classmethod
+    def _inspect_office(cls, data: bytes) -> tuple[str, int, str]:
+        """Refuse macros and outside references; scan what text is recoverable."""
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                names = archive.namelist()
+                if len(names) > _OFFICE_MAX_ENTRIES:
+                    raise DocumentReleaseDenied("document part count is out of bounds")
+                total = sum(item.file_size for item in archive.infolist())
+                if total > _OFFICE_MAX_TOTAL_BYTES:
+                    raise DocumentReleaseDenied("document is too large to inspect")
+                lowered = [name.casefold() for name in names]
+                if any(
+                    name.endswith(part)
+                    for name in lowered
+                    for part in _OFFICE_ACTIVE_PARTS
+                ):
+                    raise DocumentReleaseDenied(
+                        "macro-enabled documents are unsupported"
+                    )
+                if any(name.startswith("/") or ".." in name for name in lowered):
+                    raise DocumentReleaseDenied("document part path is unsafe")
+                if "word/document.xml" in lowered:
+                    mime = (
+                        "application/vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
+                    )
+                elif "xl/workbook.xml" in lowered:
+                    mime = (
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    )
+                else:
+                    raise DocumentReleaseDenied("document type is unsupported")
+                recovered: list[str] = []
+                budget = MAX_PDF_TOTAL_DECOMPRESSED_BYTES
+                for name in names:
+                    if not name.casefold().endswith(".xml"):
+                        continue
+                    info = archive.getinfo(name)
+                    if info.file_size > budget:
+                        break
+                    budget -= info.file_size
+                    with archive.open(name) as handle:
+                        chunk = handle.read(info.file_size)
+                    recovered.append(
+                        _XML_TEXT.sub(" ", chunk.decode("utf-8", errors="replace"))
+                    )
+                return mime, 1, "\n".join(recovered)
+        except DocumentReleaseDenied:
+            raise
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            raise DocumentReleaseDenied("document is malformed") from exc
+
     def inspect_bytes(self, data: bytes) -> ArtifactInspection:
         if not isinstance(data, bytes) or not 0 < len(data) <= MAX_DOCUMENT_BYTES:
             raise DocumentReleaseDenied("document size is out of bounds")
@@ -462,6 +570,10 @@ class DocumentReleaseService:
         elif data.startswith(b"\x89PNG\r\n\x1a\n"):
             mime = "image/png"
             pages, scanned_text = self._inspect_image(data, mime)
+        elif data.startswith(b"PK\x03\x04"):
+            mime, pages, scanned_text = self._inspect_office(data)
+        elif (text := self._decoded_text(data)) is not None:
+            mime, pages, scanned_text = self._text_mime(text), 1, text
         else:
             raise DocumentReleaseDenied("document type is unsupported")
         if self._text_is_denied(scanned_text):

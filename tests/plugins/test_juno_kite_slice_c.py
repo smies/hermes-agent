@@ -649,7 +649,7 @@ def test_typed_resolver_has_one_closed_candidate_and_no_arbitrary_selectors(tmp_
     "name,payload",
     [
         ("oversize.png", b"\x89PNG\r\n\x1a\n" + b"x" * (8 * 1024 * 1024)),
-        ("wrong.png", b"not an image"),
+        ("wrong.png", b"\x00\x01not an image\xff"),
         ("encrypted.pdf", b"%PDF-1.7\n1 0 obj<</Encrypt 2 0 R>>endobj\n%%EOF"),
         ("active.pdf", b"%PDF-1.7\n1 0 obj<</JavaScript 2 0 R>>endobj\n%%EOF"),
         ("escaped-active.pdf", b"%PDF-1.7\n1 0 obj<</Java#53cript 2 0 R>>endobj\n%%EOF"),
@@ -2362,3 +2362,126 @@ def test_the_same_rule_no_longer_blocks_staging_a_document(tmp_path):
         "require exact source verification that the document is his"
     ) is False
     assert DocumentReleaseService._text_is_denied("verification code 8f3k2a") is True
+
+
+def _docx_bytes(*, macro: bool = False, sheet: bool = False) -> bytes:
+    import io as _io, zipfile as _zip
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        if sheet:
+            archive.writestr("xl/workbook.xml", "<workbook/>")
+            archive.writestr("xl/sharedStrings.xml", "<sst><si><t>Fees 2026</t></si></sst>")
+        else:
+            archive.writestr(
+                "word/document.xml",
+                "<w:document><w:t>Terms of engagement for James Smith</w:t></w:document>",
+            )
+        if macro:
+            archive.writestr("word/vbaProject.bin", b"\x00macro")
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        (b"Engagement letter for James Smith\n", "text/plain"),
+        (b'{"holder": "James", "passport": "British"}', "application/json"),
+        (b"a,b,c\n1,2,3\n", "text/plain"),
+    ],
+    ids=["txt", "json", "csv"],
+)
+def test_text_documents_are_releasable(tmp_path, payload, expected):
+    from plugins.juno_kite_trusted_principal.document_release import (
+        ALLOWED_MIME_EXTENSIONS,
+    )
+
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    info = runtime.document_releases.inspect_bytes(payload)
+    assert info.mime_type == expected
+    assert info.mime_type in ALLOWED_MIME_EXTENSIONS
+
+
+def test_office_documents_are_releasable_but_macros_are_not(tmp_path):
+    """James accepted weaker checks for office formats; macros are still out."""
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    word = runtime.document_releases.inspect_bytes(_docx_bytes())
+    assert word.mime_type.endswith("wordprocessingml.document")
+    sheet = runtime.document_releases.inspect_bytes(_docx_bytes(sheet=True))
+    assert sheet.mime_type.endswith("spreadsheetml.sheet")
+
+    with pytest.raises(DocumentReleaseDenied, match="macro"):
+        runtime.document_releases.inspect_bytes(_docx_bytes(macro=True))
+
+
+def test_a_text_document_with_a_credential_is_still_refused(tmp_path):
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    with pytest.raises(DocumentReleaseDenied, match="prohibited"):
+        runtime.document_releases.inspect_bytes(b"api_key=abcdef1234567890\n")
+    # Binary masquerading as text is not text.
+    with pytest.raises(DocumentReleaseDenied, match="unsupported"):
+        runtime.document_releases.inspect_bytes(b"\x00\x01binary\xff")
+
+
+def test_a_phone_photo_is_converted_rather_than_refused(monkeypatch):
+    """HEIC is what an iPhone produces; it was refused outright."""
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    jpeg = b"\xff\xd8\xff" + b"body"
+
+    def fake_run(argv, **kwargs):
+        assert argv[0] == pr._SIPS and "jpeg" in argv
+        Path(argv[-1]).write_bytes(jpeg)
+        return _NS(returncode=0)
+
+    monkeypatch.setattr(pr.subprocess, "run", fake_run)
+    for mime in ("image/heic", "image/heif", "image/tiff"):
+        data, new_mime = pr._normalise_artifact(b"original-bytes", mime)
+        assert (data, new_mime) == (jpeg, "image/jpeg"), mime
+    # Already-releasable formats are passed through untouched.
+    assert pr._normalise_artifact(b"%PDF-1.4", "application/pdf") == (
+        b"%PDF-1.4", "application/pdf"
+    )
+
+
+def test_office_preview_reads_the_document_text():
+    from plugins.juno_kite_trusted_principal.private_reads import _document_preview
+
+    word = _document_preview(
+        _docx_bytes(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    assert "Terms of engagement for James Smith" in word
+    assert "<w:" not in word
+
+
+def test_a_text_file_wearing_an_image_name_is_still_caught(tmp_path):
+    """Allowing text must not let a mislabelled file through the real path.
+
+    inspect_bytes now reads "not an image" in a .png as text, correctly. The
+    protection that matters lives one level up: the resolver states the mime it
+    expects from the name, and staging discards anything that disagrees.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "wrong.png").write_bytes(b"not an image, just text\n")
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    encoded, internal = runtime.private_reads.resolve_document_candidate(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "family", "relative_path": "wrong.png"},
+    )
+    assert internal is not None
+    # The name claims PNG; the bytes are text. Staging compares the two.
+    assert internal["expected_mime"] == "image/png"
+    assert runtime.document_releases.inspect_bytes(
+        internal["path"].read_bytes()
+    ).mime_type == "text/plain"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import io
 import json
 import math
 import mimetypes
@@ -370,6 +371,82 @@ _SYSTEM_PYTHON = "/usr/bin/python3"
 _MACOS_OCR_SCRIPT = str(Path(__file__).resolve().parent / "macos_ocr.py")
 
 
+_CONVERTIBLE_IMAGE_MIME = {
+    "image/heic": "heic",
+    "image/heif": "heif",
+    "image/tiff": "tiff",
+}
+_SIPS = "/usr/bin/sips"
+
+
+def _normalise_artifact(data: bytes, mime_type: str) -> tuple[bytes, str]:
+    """Turn what a phone or scanner produces into something releasable.
+
+    A photo taken on an iPhone is HEIC and a scan is often TIFF, and neither
+    can be released: the inspector only understands PDF, JPEG and PNG. Rather
+    than widen what may leave the machine, convert on the way in, locally, so
+    the artifact that is inspected, staged and delivered is still a JPEG.
+    """
+    kind = _CONVERTIBLE_IMAGE_MIME.get(str(mime_type or "").lower())
+    if kind is None or not Path(_SIPS).exists():
+        return data, mime_type
+    source = destination = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix="." + kind, delete=False) as handle:
+            handle.write(data)
+            source = handle.name
+        os.chmod(source, 0o600)
+        destination = source + ".jpg"
+        completed = subprocess.run(
+            [_SIPS, "-s", "format", "jpeg", source, "--out", destination],
+            shell=False, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=_PREVIEW_TIMEOUT_SECONDS, env={"PATH": "/usr/bin:/bin"},
+        )
+        if completed.returncode != 0:
+            return data, mime_type
+        converted = Path(destination).read_bytes()
+        if not converted.startswith(b"\xff\xd8\xff"):
+            return data, mime_type
+        return converted, "image/jpeg"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return data, mime_type
+    finally:
+        for path in (source, destination):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+def _office_preview(data: bytes) -> str:
+    """Recover readable text from a Word or Excel container, bounded."""
+    import zipfile
+
+    wanted = ("word/document.xml", "xl/sharedStrings.xml", "xl/workbook.xml")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = set(archive.namelist())
+            recovered: list[str] = []
+            for name in wanted:
+                if name not in names:
+                    continue
+                info = archive.getinfo(name)
+                if info.file_size > 4 * 1024 * 1024:
+                    continue
+                with archive.open(name) as handle:
+                    chunk = handle.read(info.file_size)
+                recovered.append(
+                    re.sub(r"<[^>]+>", " ", chunk.decode("utf-8", errors="replace"))
+                )
+            return re.sub(r"\s+", " ", " ".join(recovered)).strip()[
+                :_PREVIEW_MAX_CHARS
+            ]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return ""
+
+
 def _run_preview_reader(argv: list[str]) -> str:
     """Run one local reader and return its bounded, collapsed text."""
     try:
@@ -430,6 +507,20 @@ def _document_preview(data: bytes, mime_type: str) -> str:
             argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path]
             if not (Path(_SYSTEM_PYTHON).exists() and Path(_MACOS_OCR_SCRIPT).exists()):
                 return ""
+        elif mime_type in {
+            "text/plain", "text/csv", "text/markdown", "application/json",
+        }:
+            try:
+                return re.sub(r"\s+", " ", data.decode("utf-8")).strip()[
+                    :_PREVIEW_MAX_CHARS
+                ]
+            except UnicodeDecodeError:
+                return ""
+        elif mime_type in {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }:
+            return _office_preview(data)
         elif mime_type in {"image/jpeg", "image/png"}:
             if not Path(_SYSTEM_PYTHON).exists() or not Path(_MACOS_OCR_SCRIPT).exists():
                 return ""
@@ -1021,6 +1112,11 @@ class PrivateReadService:
                 filename = self._bounded_text(
                     payload.get("filename"), "filename", 255
                 )
+                if isinstance(source_value, bytes):
+                    source_value, payload = (
+                        lambda pair: (pair[0], {**payload, "mime_type": pair[1],
+                                                "size_bytes": len(pair[0])})
+                    )(_normalise_artifact(source_value, str(payload.get("mime_type") or "")))
                 descriptor = {
                     "outcome": "release_candidate",
                     "source_class": "personal Gmail attachment",
