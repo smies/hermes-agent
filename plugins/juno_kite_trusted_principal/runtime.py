@@ -1151,6 +1151,53 @@ class TrustedPrincipalRuntime:
         except Exception:
             logger.warning("Juno document receipt transport failed closed")
 
+    def _owner_dm_target(self) -> str:
+        """Where to reach James directly, from authority the host already has.
+
+        Taken from principal_bindings rather than a new setting: the identity
+        that decides he is James is the identity worth asking. A phone JID is
+        preferred because a linked-device id is not addressable as a chat.
+        """
+        candidates = [
+            user_id
+            for platform, user_id, principal in self.principal_bindings
+            if platform == "whatsapp" and principal.casefold() == "james"
+        ]
+        direct = [item for item in candidates if item.endswith("@s.whatsapp.net")]
+        return (direct or candidates or [""])[0]
+
+    async def _ask_owner_to_release(
+        self, *, adapter: Any, requester_chat_id: str, code: str, document: dict
+    ) -> None:
+        """Tell whoever asked that it was found, and ask James to release it.
+
+        Two messages carrying different things on purpose. The requester is
+        told the document exists and is waiting -- silence reads as failure,
+        and a refusal would be untrue. The code goes only to James, because it
+        is the authority to release, and it goes to him directly rather than
+        into the conversation that asked, which is the whole reason this path
+        exists.
+        """
+        title = str(document.get("title") or "the document")[:96]
+        await self._send_document_receipt(
+            adapter,
+            requester_chat_id,
+            f"Found {title}. It is outside the folders I can send from, so I "
+            f"have asked James to approve releasing it.",
+        )
+        target = self._owner_dm_target()
+        if not target or target == requester_chat_id:
+            # Nowhere separate to ask, so the proposal stands where it is and
+            # the code is still only usable by James.
+            return
+        await self._send_document_receipt(
+            adapter,
+            target,
+            f"{title} was found outside the folders I release from, and "
+            f"someone has asked for it. Reply APPROVE {code} to send it to "
+            f"them, or ignore this and nothing happens.",
+        )
+
     def _remember_pending_release(
         self, code: str, *, chat_id: str, audience: AudienceBinding, expires_at: int
     ) -> None:
@@ -2094,6 +2141,12 @@ class TrustedPrincipalRuntime:
                 return answer
             adapter, chat_id = delivery
             if isinstance(document, dict) and document.get("requires_owner_approval"):
+                await self._ask_owner_to_release(
+                    adapter=adapter,
+                    requester_chat_id=chat_id,
+                    code=code,
+                    document=document,
+                )
                 # Auto-release exists because James asking for his own document
                 # from his own folder should not have to be re-typed back. This
                 # document was not in one of those folders -- it was found by

@@ -93,6 +93,7 @@ class RecordingWhatsAppAdapter:
         self.authenticated_group_roster = roster
         self.document_calls: list[dict] = []
         self.receipts: list[str] = []
+        self.messages: list[dict] = []
         self.result = SendResult(success=True, message_id="provider-message-1")
         self.raise_on_send: Exception | None = None
         self.before_send = None
@@ -111,8 +112,13 @@ class RecordingWhatsAppAdapter:
         return self.result
 
     async def send(self, *, chat_id, content, **_kwargs):
-        assert chat_id == GROUP
-        self.receipts.append(content)
+        self.messages.append({"chat_id": chat_id, "content": content})
+        # `receipts` stays group-only, so every existing assertion about it
+        # still means "this reached the conversation" and still fails if a
+        # receipt goes astray. Approval now legitimately writes to James
+        # directly, which `messages` records with its destination.
+        if chat_id == GROUP:
+            self.receipts.append(content)
         return SendResult(success=True, message_id="receipt-message")
 
 
@@ -1357,6 +1363,51 @@ async def test_the_same_document_is_not_sent_twice_in_one_turn(tmp_path):
         await juno._auto_release(json.dumps(again), _ACTIVE_AUDIENCE.get())
     )["outcome"] == "delivered"
     assert len(adapter.document_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_requester_is_told_it_is_waiting_and_only_james_gets_the_code(
+    tmp_path,
+):
+    """Silence would read as failure, and a refusal would be untrue.
+
+    The document was found; it just cannot be sent yet. Whoever asked is
+    told exactly that. The code is the authority to release, so it goes to
+    James directly and never into the conversation that asked -- which is
+    the reason this path exists at all.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+    outside = {
+        **preview,
+        "document": {**preview["document"], "requires_owner_approval": True},
+    }
+
+    await juno._auto_release(json.dumps(outside), audience)
+
+    assert adapter.document_calls == []
+    sent = {call["chat_id"]: call["content"] for call in adapter.messages}
+
+    # The requester learns it exists and is waiting, and learns no code.
+    holding = sent[GROUP]
+    assert "asked James to approve" in holding
+    assert code not in holding, "the release code went to the conversation"
+
+    # James is asked directly, and his message is the one that carries it.
+    owner = juno._owner_dm_target()
+    assert owner and owner != GROUP
+    assert code in sent[owner]
+    assert "APPROVE " + code in sent[owner]
 
 
 @pytest.mark.asyncio
