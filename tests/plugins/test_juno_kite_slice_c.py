@@ -178,7 +178,10 @@ def _config(tmp_path: Path, personal_root: Path, *, mode: str) -> dict:
         {"platform": "whatsapp", "chat_id": GROUP}
     ]
     section["private_reads"]["files"] = {
-        "roots": [{"name": "family", "path": str(personal_root)}]
+        "roots": [{"name": "family", "path": str(personal_root)}],
+        # Tests live under the OS temp area, which is deliberately not one of
+        # the production document areas.
+        "allowed_bases": [str(tmp_path), str(personal_root.parent)],
     }
     section["document_release"] = {
         "enabled": True,
@@ -2485,3 +2488,55 @@ def test_a_text_file_wearing_an_image_name_is_still_caught(tmp_path):
     assert runtime.document_releases.inspect_bytes(
         internal["path"].read_bytes()
     ).mime_type == "text/plain"
+
+
+@pytest.mark.parametrize(
+    "path,allowed",
+    [
+        ("/Users/james", False),
+        ("/Users/james/Documents", False),
+        ("/Users/james/Library", False),
+        ("/Users/james/Library/Keychains", False),
+        ("/Users/james/.ssh", False),
+        ("/Users/james/.hermes/cache", False),
+        ("/Users/james/Documents/work/payroll", False),
+        ("/Users/james/Documents/Family/Passports", True),
+        ("/Users/james/Desktop/Scans", True),
+    ],
+)
+def test_root_areas_are_an_allow_list_not_a_deny_list(path, allowed):
+    """The old rule blocked what it had thought of and permitted the rest.
+
+    It refused home and Documents, but ~/Library was a legal root -- and that
+    holds Keychains and the Messages database. A root now has to sit beneath a
+    nominated documents area, so an oversight fails closed.
+    """
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+
+    try:
+        PrivateReadService._roots({"roots": [{"name": "t", "path": path}]})
+        got = True
+    except ValueError:
+        got = False
+    assert got is allowed, path
+
+
+def test_naming_a_whole_area_is_not_a_root():
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        PrivateReadService, _PERSONAL_ROOT_BASES,
+    )
+
+    for base in _PERSONAL_ROOT_BASES:
+        with pytest.raises(ValueError, match="folder, not a whole area"):
+            PrivateReadService._roots({"roots": [{"name": "t", "path": base}]})
+
+
+def test_allowed_bases_must_be_deliberate():
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+
+    for bases in ([], "/", ["/"], [""]):
+        with pytest.raises(ValueError):
+            PrivateReadService._roots(
+                {"roots": [{"name": "t", "path": "/Users/james/Documents/X"}],
+                 "allowed_bases": bases}
+            )

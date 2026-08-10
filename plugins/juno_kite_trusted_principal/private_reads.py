@@ -364,6 +364,15 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+# Areas a personal-file root may live beneath. Naming the area is not enough --
+# a root has to be a folder inside one, so that widening reach is always a
+# deliberate, visible act rather than an oversight.
+_PERSONAL_ROOT_BASES = (
+    "/users/james/documents",
+    "/users/james/desktop",
+    "/users/james/downloads",
+)
+
 _PREVIEW_MAX_CHARS = 600
 _PREVIEW_TIMEOUT_SECONDS = 45
 _PDFTOTEXT_CANDIDATES = ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
@@ -1953,10 +1962,17 @@ class PrivateReadService:
     def _roots(config: Any) -> dict[str, Path]:
         if (
             not isinstance(config, dict)
-            or set(config) != {"roots"}
+            or not set(config) <= {"roots", "allowed_bases"}
+            or "roots" not in config
             or not isinstance(config["roots"], list)
         ):
             raise ValueError("files private-read config requires only a roots list")
+        bases = config.get("allowed_bases", _PERSONAL_ROOT_BASES)
+        if not isinstance(bases, (list, tuple)) or not bases:
+            raise ValueError("allowed_bases must be a non-empty list when given")
+        bases = tuple(str(base).casefold().rstrip("/") for base in bases)
+        if any(base in {"", "/"} for base in bases):
+            raise ValueError("an allowed base must name a directory, not the root")
         roots: dict[str, Path] = {}
         for item in config["roots"]:
             if not isinstance(item, dict) or set(item) != {"name", "path"}:
@@ -1970,27 +1986,30 @@ class PrivateReadService:
                 raise ValueError(
                     "personal file roots require bounded names and absolute paths"
                 )
-            lowered = str(path).casefold()
-            forbidden_prefixes = (
-                "/etc",
-                "/var",
-                "/system",
-                "/library",
-                "/applications",
-                "/usr",
-                "/bin",
-                "/sbin",
-                "/opt",
-            )
-            if (
-                lowered in {"/", "/users/james", "/users/james/documents"}
-                or lowered.startswith(forbidden_prefixes)
-                or any(
-                    part in lowered
-                    for part in ("/.hermes", "/projects/", "/work/", "/workspace/")
+            lowered = str(path).casefold().rstrip("/")
+            # An allow-list, not a deny-list. The previous rule blocked the
+            # obvious roots -- home, Documents, Hermes' own directories -- but
+            # permitted anything it had not thought of, including ~/Library,
+            # which holds Keychains and the Messages database. A root now has
+            # to sit beneath somewhere explicitly nominated for documents.
+            if not any(
+                lowered == base or lowered.startswith(base + "/")
+                for base in bases
+            ):
+                raise ValueError(
+                    "personal file roots must sit beneath an approved documents area"
                 )
+            # Still refused inside those areas: Hermes' own state, and anything
+            # filed as project or work material.
+            if any(
+                part in lowered
+                for part in ("/.hermes", "/projects/", "/work/", "/workspace/")
             ):
                 raise ValueError("Hermes, project, and work roots are forbidden")
+            if lowered in bases:
+                raise ValueError(
+                    "a personal file root must name a folder, not a whole area"
+                )
             if name in roots:
                 raise ValueError("personal file root names must be unique")
             roots[name] = path

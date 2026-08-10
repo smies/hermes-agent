@@ -1125,7 +1125,8 @@ def test_personal_file_containment_and_bounds(tmp_path):
     service = PrivateReadService({
         "enabled": True,
         "output_bytes": 4096,
-        "files": {"roots": [{"name": "obsidian", "path": str(root)}]},
+        "files": {"roots": [{"name": "obsidian", "path": str(root)}],
+                  "allowed_bases": [str(tmp_path)]},
     })
     found = json.loads(
         service.execute(
