@@ -370,6 +370,28 @@ _SYSTEM_PYTHON = "/usr/bin/python3"
 _MACOS_OCR_SCRIPT = str(Path(__file__).resolve().parent / "macos_ocr.py")
 
 
+def _run_preview_reader(argv: list[str]) -> str:
+    """Run one local reader and return its bounded, collapsed text."""
+    try:
+        completed = subprocess.run(
+            argv,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_PREVIEW_TIMEOUT_SECONDS,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return re.sub(r"\s+", " ", str(completed.stdout or "")).strip()[
+        :_PREVIEW_MAX_CHARS
+    ]
+
+
 def _document_preview(data: bytes, mime_type: str) -> str:
     """A bounded look at what this document actually says.
 
@@ -395,30 +417,26 @@ def _document_preview(data: bytes, mime_type: str) -> str:
             executable = next(
                 (item for item in _PDFTOTEXT_CANDIDATES if Path(item).exists()), ""
             )
-            if not executable:
+            extracted = ""
+            if executable:
+                extracted = _run_preview_reader(
+                    [executable, "-l", "2", "-q", path, "-"]
+                )
+            if extracted:
+                return extracted
+            # No text layer: a scanned document. Fall through to reading the
+            # rendered page, or it stays unidentifiable -- which is the case
+            # the preview exists for.
+            argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path]
+            if not (Path(_SYSTEM_PYTHON).exists() and Path(_MACOS_OCR_SCRIPT).exists()):
                 return ""
-            argv = [executable, "-l", "2", "-q", path, "-"]
         elif mime_type in {"image/jpeg", "image/png"}:
             if not Path(_SYSTEM_PYTHON).exists() or not Path(_MACOS_OCR_SCRIPT).exists():
                 return ""
             argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path]
         else:
             return ""
-        completed = subprocess.run(
-            argv,
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=_PREVIEW_TIMEOUT_SECONDS,
-            env={"PATH": "/usr/bin:/bin"},
-        )
-        if completed.returncode != 0:
-            return ""
-        return re.sub(r"\s+", " ", str(completed.stdout or "")).strip()[
-            :_PREVIEW_MAX_CHARS
-        ]
+        return _run_preview_reader(argv)
     except (OSError, ValueError, subprocess.SubprocessError):
         return ""
     finally:

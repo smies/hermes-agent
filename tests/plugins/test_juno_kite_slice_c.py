@@ -2259,3 +2259,106 @@ def test_document_guidance_requires_matching_the_contents_not_the_topic():
     assert "document_preview" in rule
     assert "read the next candidate" in rule
     assert "empty preview" in rule.lower()
+
+
+def test_a_rejected_question_says_what_matched(tmp_path):
+    """A question refused here is never persisted, so it must name itself."""
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    source = Path("plugins/juno_kite_trusted_principal/runtime.py").read_text()
+    assert 'f"({handoff_reason})"' in source
+
+
+def test_a_scanned_pdf_with_no_text_layer_is_still_read(monkeypatch):
+    """TB.pdf: 290KB of scanned terms, and pdftotext returns nothing for it.
+
+    Without the rendered-page fallback the candidate stays unidentifiable,
+    which is precisely the case the preview exists to solve.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    def fake_reader(argv):
+        calls.append(argv)
+        if argv[0].endswith("pdftotext"):
+            return ""          # no text layer
+        return "Terms of Business - the attached professional engagement"
+
+    monkeypatch.setattr(pr, "_run_preview_reader", fake_reader)
+    out = pr._document_preview(b"%PDF-1.4 scanned", "application/pdf")
+    assert out.startswith("Terms of Business")
+    # It tried the text layer first, then the local renderer.
+    assert calls[0][0].endswith("pdftotext")
+    assert calls[1][0] == pr._SYSTEM_PYTHON
+    assert calls[1][1].endswith("macos_ocr.py")
+
+
+def test_a_pdf_with_a_text_layer_does_not_pay_for_ocr(monkeypatch):
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    def fake_reader(argv):
+        calls.append(argv)
+        return "PRIVATE AND CONFIDENTIAL Palma de Mallorca"
+
+    monkeypatch.setattr(pr, "_run_preview_reader", fake_reader)
+    assert pr._document_preview(b"%PDF-1.4", "application/pdf").startswith("PRIVATE")
+    assert len(calls) == 1
+
+
+def test_a_sentence_about_verification_is_not_a_verification_code(tmp_path):
+    """The 08:45 block: "Send me my British passport" never reached Kite.
+
+    The composed question said "require exact source verification that the
+    document is both a British passport and belongs to the authenticated
+    principal". The credential rule for one-time codes matched "verification
+    that" -- the qualifier was optional, so any of these words followed by the
+    next English word read as a secret.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    # The exact live question, recovered from the session store.
+    live = (
+        "Locate and securely deliver the authenticated principal's own British "
+        "passport biodata page to this exact bound WhatsApp conversation. Because "
+        "two prior candidates were wrong, require exact source verification that "
+        "the document is both a British passport and belongs to the authenticated "
+        "principal before release."
+    )
+    assert runtime._leak_reason(live, output=False) == ""
+    for ordinary in (
+        "verification that the document is his",
+        "authentication of ownership is required",
+        "recovery of the original letter",
+        "if exact verification succeeds, deliver it",
+    ):
+        assert runtime._leak_reason(ordinary, output=False) == "", ordinary
+
+    # Real one-time secrets are still caught, with or without the qualifier.
+    for secret in (
+        "verification code 8f3k2a",
+        "your otp is 402913",
+        "one-time password 55télé" .replace("télé", "1234"),
+        "verification code: abc123",
+        "pairing code = 99887766",
+    ):
+        assert runtime._leak_reason(secret, output=False) == (
+            "credential-shaped content"
+        ), secret
+
+
+def test_the_same_rule_no_longer_blocks_staging_a_document(tmp_path):
+    """document_release carries its own copy of the rule, used when staging."""
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseService,
+    )
+
+    assert DocumentReleaseService._text_is_denied(
+        "require exact source verification that the document is his"
+    ) is False
+    assert DocumentReleaseService._text_is_denied("verification code 8f3k2a") is True

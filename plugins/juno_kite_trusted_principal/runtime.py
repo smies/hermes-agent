@@ -83,9 +83,17 @@ _CREDENTIAL_PATTERNS = (
         r"(?i)\b(?:otp|one[- ]time|verification|authentication|signup|recovery|pairing)"
         r"(?:\s+(?:password|code))?\s*[:=]\s*[A-Za-z0-9-]{4,64}\b"
     ),
+    # "verification code 8f3k2a" is a secret; "verification that the document
+    # is his" is a sentence. Without a qualifier, require the token to look
+    # like a code rather than the next English word -- this rule refused
+    # "Send me my British passport" before it ever left Juno.
     re.compile(
         r"(?i)\b(?:otp|one[- ]time|login|verification|authentication|signup|recovery|pairing)"
-        r"(?:\s+(?:password|code))?\s+(?:is\s+)?[A-Za-z0-9-]{4,64}\b"
+        r"\s+(?:password|code)\s+(?:is\s+)?[A-Za-z0-9-]{4,64}\b"
+    ),
+    re.compile(
+        r"(?i)\b(?:otp|one[- ]time|login|verification|authentication|signup|recovery|pairing)"
+        r"\s+(?:is\s+)?(?=[A-Za-z0-9-]{4,64}\b)[A-Za-z-]*\d[A-Za-z0-9-]*\b"
     ),
     re.compile(
         r"(?i)\b(?:cvv|cvc|card pin|banking pin|online banking passcode)\s*[:=]\s*\d{3,12}\b"
@@ -1545,8 +1553,15 @@ class TrustedPrincipalRuntime:
         question = str((args or {}).get("question_or_goal") or "").strip()
         if not question or len(question) > self.limits.question_chars:
             raise ValueError("question_or_goal is empty or over its configured limit")
-        if self._leak_reason(question, output=False):
-            raise ValueError("question contains private or credential-shaped data")
+        handoff_reason = self._leak_reason(question, output=False)
+        if handoff_reason:
+            # Name what matched. A generic rejection here is undiagnosable: the
+            # payload is only persisted once it is sent, so a question refused
+            # at this line leaves no record of itself anywhere.
+            raise ValueError(
+                "question contains private or credential-shaped data "
+                f"({handoff_reason})"
+            )
         session_private_values = {
             str(get_session_env(name) or "").strip()
             for name in (
