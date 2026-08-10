@@ -424,6 +424,8 @@ _RELEASE_SOURCE_CLASSES = frozenset({"personal files", "personal Gmail attachmen
 # principal keeps them, which is his own filing system and nobody else's.
 # Outstanding approvals awaiting a reply elsewhere. Small on purpose.
 _MAX_PENDING_RELEASES = 16
+# Matches document_release.APPROVAL_TTL_SECONDS; the code dies with it.
+_PENDING_RELEASE_TTL_SECONDS = 600
 _PRINCIPAL_BOUND_READS = {
     "kite_session_search": frozenset({"james"}),
     "kite_personal_files_locate": frozenset({"james"}),
@@ -554,6 +556,8 @@ class TrustedPrincipalRuntime:
         # these on restart is the right failure -- the approval simply is not
         # found, and nothing is released.
         self._pending_releases: dict[str, tuple[str, AudienceBinding, int]] = {}
+        # Proposals whose document was found outside every configured root.
+        self._owner_approval_proposals: set[str] = set()
         # The inbound turn currently being served in each conversation. Bumped
         # once per ingress; a consultation carrying an older number belongs to a
         # question James has already moved on from and may neither dispatch nor
@@ -2089,6 +2093,20 @@ class TrustedPrincipalRuntime:
             if not code or delivery is None:
                 return answer
             adapter, chat_id = delivery
+            if isinstance(document, dict) and document.get("requires_owner_approval"):
+                # Auto-release exists because James asking for his own document
+                # from his own folder should not have to be re-typed back. This
+                # document was not in one of those folders -- it was found by
+                # searching more widely -- and the whole point of finding it
+                # that way is that he decides whether it goes out. Remember
+                # where it would go and leave the answer as the proposal it is.
+                self._remember_pending_release(
+                    code,
+                    chat_id=chat_id,
+                    audience=audience,
+                    expires_at=int(self.clock()) + _PENDING_RELEASE_TTL_SECONDS,
+                )
+                return answer
         except (TypeError, ValueError):
             return answer
 
@@ -2629,10 +2647,11 @@ class TrustedPrincipalRuntime:
                 and tool_name
                 in {
                     "kite_personal_files_read",
+                    "kite_personal_files_release_located",
                     "kite_gmail_attachment_extract",
                 }
                 and (
-                    tool_name == "kite_gmail_attachment_extract"
+                    tool_name != "kite_personal_files_read"
                     or args.get("operation") == "read"
                 )
             ):
@@ -2678,6 +2697,15 @@ class TrustedPrincipalRuntime:
                                     inspection_text=candidate_source.get(
                                         "inspection_text", ""
                                     ),
+                                )
+                            if candidate_source.get("requires_owner_approval"):
+                                # Found outside every configured root. Reading
+                                # it was fine; sending it to whoever asked is
+                                # what the principal has to allow, so this
+                                # proposal is marked here and never takes the
+                                # auto-release the in-root path takes.
+                                self._owner_approval_proposals.add(
+                                    candidate.proposal_id
                                 )
                             if (
                                 candidate.mime_type != candidate_source["expected_mime"]
@@ -3200,9 +3228,16 @@ class TrustedPrincipalRuntime:
         approval = parsed.get("approval")
         if (
             not isinstance(document, dict)
-            or set(document) != {
+            # requires_owner_approval is optional: absent means what every
+            # descriptor meant before it existed -- a document from a
+            # configured root, which auto-release may send. No other key is
+            # tolerated, so this stays a closed shape.
+            or set(document) - {"requires_owner_approval"} != {
                 "title", "source_class", "mime_type", "size_bytes", "page_count"
             }
+            or not isinstance(
+                document.get("requires_owner_approval", False), bool
+            )
             or not isinstance(document.get("title"), str)
             or len(document["title"]) > 96
             or document.get("source_class") not in _RELEASE_SOURCE_CLASSES
@@ -3333,6 +3368,15 @@ class TrustedPrincipalRuntime:
                     "mime_type": candidate.mime_type,
                     "size_bytes": candidate.size_bytes,
                     "page_count": candidate.page_count,
+                    # Present only when it is true. A document from a
+                    # configured root produces exactly the descriptor it
+                    # always did, so nothing downstream has to learn a new
+                    # shape to keep behaving the way it already does.
+                    **(
+                        {"requires_owner_approval": True}
+                        if candidate.proposal_id in self._owner_approval_proposals
+                        else {}
+                    ),
                 },
                 "audience": "James only in this WhatsApp conversation",
                 "purpose": purpose_by_capability[capability_id],

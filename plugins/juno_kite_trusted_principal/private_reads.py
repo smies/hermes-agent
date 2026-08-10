@@ -43,6 +43,7 @@ TOOL_NAMES = (
     "kite_whatsapp_archive_read",
     "kite_personal_files_read",
     "kite_personal_files_locate",
+    "kite_personal_files_release_located",
     "kite_session_search",
 )
 
@@ -382,6 +383,22 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             ("query",),
+        ),
+    },
+    "kite_personal_files_release_located": {
+        "description": (
+            "Propose a document that kite_personal_files_locate found outside "
+            "a configured root. Names the exact directory and file from one "
+            "locate match. This does not send anything: it prepares the "
+            "document and asks the principal to approve its release, and "
+            "only his approval delivers it to whoever asked."
+        ),
+        "parameters": _object_schema(
+            {
+                "directory": {"type": "string", "minLength": 1, "maxLength": 512},
+                "file_name": {"type": "string", "minLength": 1, "maxLength": 255},
+            },
+            ("directory", "file_name"),
         ),
     },
     "kite_personal_files_read": {
@@ -1018,6 +1035,7 @@ class PrivateReadService:
                 "kite_whatsapp_archive_read": self._whatsapp,
                 "kite_personal_files_read": self._files,
                 "kite_personal_files_locate": self._locate,
+                "kite_personal_files_release_located": self._release_located,
                 "kite_session_search": self._sessions,
             }[tool_name]
             result = _success(source, handler(dict(args)))
@@ -1245,11 +1263,47 @@ class PrivateReadService:
         try:
             if not self.enabled or tool_name not in {
                 "kite_personal_files_read",
+                "kite_personal_files_release_located",
                 "kite_gmail_attachment_extract",
             }:
                 raise SourceFailure(
                     "operation_denied", "source cannot produce a release candidate"
                 )
+            if tool_name == "kite_personal_files_release_located":
+                # A document found outside every configured root. Reading it
+                # here is fine -- what must not happen without the principal
+                # saying so is the release to whoever asked -- so it is staged
+                # and inspected exactly like any other candidate, and the
+                # descriptor is marked so the host asks him rather than
+                # delivering it the way an in-root document is delivered.
+                path = self._located_path(dict(args))
+                source_info = path.lstat()
+                guessed = (mimetypes.guess_type(path.name)[0] or "").lower()
+                descriptor = {
+                    "outcome": "release_candidate",
+                    "source_class": "personal files",
+                    "document_name": _release_display_name(path.name),
+                    "document_preview": _document_preview(path.read_bytes(), guessed),
+                    "mime_type": guessed,
+                    "size_bytes": source_info.st_size,
+                    "requires_owner_approval": True,
+                    "found_in": str(path.parent),
+                }
+                internal = {
+                    "path": path,
+                    "display_name": path.name,
+                    "source_class": "personal files",
+                    "expected_mime": guessed,
+                    "expected_size": source_info.st_size,
+                    "expected_identity": (
+                        source_info.st_dev,
+                        source_info.st_ino,
+                        source_info.st_size,
+                        source_info.st_mtime_ns,
+                    ),
+                    "requires_owner_approval": True,
+                }
+                return _success(source, descriptor), internal
             if tool_name == "kite_personal_files_read":
                 self._require_exact(
                     args,
@@ -2374,6 +2428,75 @@ class PrivateReadService:
             if len(found) >= maximum:
                 break
         return found
+
+    def _located_path(self, args: dict[str, Any]) -> Path:
+        """The one file a locate match named, re-checked from scratch.
+
+        Locate's output is a description, not a capability. Everything it
+        refused to show is refused again here, against the path as it is now
+        rather than as it was when the walk saw it, because the two calls are
+        separated by a model deciding what to do.
+        """
+        self._require_exact(args, {"directory", "file_name"}, {"directory", "file_name"})
+        directory = self._bounded_text(args["directory"], "directory", 512)
+        file_name = self._bounded_text(args["file_name"], "file_name", 255)
+        if "/" in file_name or file_name in {".", ".."} or file_name.startswith("."):
+            raise SourceFailure("path_denied", "file_name must be one plain name")
+        config = self.config.get("files")
+        bases = (
+            (config or {}).get("allowed_bases", _PERSONAL_ROOT_BASES)
+            if isinstance(config, dict)
+            else _PERSONAL_ROOT_BASES
+        )
+        candidate = Path(directory) / file_name
+        if not candidate.is_absolute():
+            raise SourceFailure("path_denied", "an absolute location is required")
+        try:
+            real = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise SourceFailure("path_denied", "the document is unavailable") from exc
+        lowered = str(real).casefold()
+        if not any(
+            lowered == str(base).casefold().rstrip("/")
+            or lowered.startswith(str(base).casefold().rstrip("/") + "/")
+            for base in bases
+        ):
+            raise SourceFailure(
+                "path_denied", "the document is outside the searchable bases"
+            )
+        if candidate.is_symlink() or real.is_symlink():
+            raise SourceFailure("path_denied", "symlinks are not permitted")
+        if real.suffix.casefold() in _REFUSED_EXTENSIONS or any(
+            _LOCATE_DENIED_PART.search(part) for part in real.parts
+        ):
+            raise SourceFailure(
+                "unsupported_content", "executable and credential files are not released"
+            )
+        info = real.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise SourceFailure("path_denied", "only regular files are releasable")
+        if info.st_size > _EXTRACT_MAX_INPUT_BYTES:
+            raise SourceFailure("cap_exceeded", "file exceeds the configured byte cap")
+        return real
+
+    def _release_located(self, args: dict[str, Any]) -> Any:
+        """What the model is told about a located document it wants released.
+
+        Content-free, like every candidate descriptor: enough to say which
+        document this is and that nothing has been sent, never the document.
+        """
+        path = self._located_path(dict(args))
+        info = path.lstat()
+        return {
+            "outcome": "approval_required",
+            "document_name": _release_display_name(path.name),
+            "directory": str(path.parent),
+            "size_bytes": info.st_size,
+            "note": (
+                "Nothing has been sent. The principal has been asked to approve "
+                "releasing this document to whoever requested it."
+            ),
+        }
 
     def _locate(self, args: dict[str, Any]) -> Any:
         """Say where a document is, without acquiring the right to open it.

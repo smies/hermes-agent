@@ -1360,6 +1360,54 @@ async def test_the_same_document_is_not_sent_twice_in_one_turn(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_document_found_outside_a_root_is_not_auto_released(tmp_path):
+    """Auto-release must not carry a document nobody granted standing access to.
+
+    A configured root is a standing grant, and auto-release exists so James
+    does not have to type a code back for his own document in his own folder.
+    A document found by searching more widely has no such grant behind it --
+    finding it is precisely why he has to decide -- so the proposal stays a
+    proposal, and the code is remembered against the conversation that asked
+    rather than spent on it.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import (
+        _ACTIVE_AUDIENCE, _ACTIVE_DELIVERY,
+    )
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    assert _ACTIVE_DELIVERY.get() is not None
+
+    outside = dict(preview)
+    outside["document"] = {**preview["document"], "requires_owner_approval": True}
+    answer = await juno._auto_release(json.dumps(outside), audience)
+
+    # Nothing was sent, and the proposal came back untouched to be shown.
+    assert adapter.document_calls == []
+    assert json.loads(answer)["outcome"] == "approval_required"
+
+    # The code is outstanding, pointed at the conversation that asked.
+    code = preview["approval"]["code"]
+    pending = juno._pending_release(code)
+    assert pending is not None and pending[0] == GROUP
+
+    # And the same document from a configured root still auto-releases.
+    juno2, _gateway2, in_root = await _propose(tmp_path, root, clock, roster, adapter)
+    assert "requires_owner_approval" not in in_root["document"]
+    assert json.loads(
+        await juno2._auto_release(json.dumps(in_root), _ACTIVE_AUDIENCE.get())
+    )["outcome"] == "delivered"
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_an_approval_typed_in_a_dm_delivers_where_the_request_came_from(tmp_path):
     """The document must reach the conversation that asked, not the DM.
 
