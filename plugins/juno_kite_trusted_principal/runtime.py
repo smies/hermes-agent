@@ -2113,6 +2113,39 @@ class TrustedPrincipalRuntime:
             raise ValueError("generated policy view exceeds its deterministic limit")
         return rendered
 
+    def _juno_turn_context(self) -> Optional[dict]:
+        """Put the document instruction in the turn, not in a tool description.
+
+        Twice now Juno has refused a document request outright -- "I can't
+        access or send another person's passport" for the principal's own
+        children -- with one API call and no consultation at all. The tool
+        description already forbade exactly that, and was not enough: a static
+        description is skimmed, while a line in the turn is read.
+
+        This says nothing about entitlement, which remains the host's to
+        decide. It says only that this particular turn is a document request
+        and must be asked, so that a refusal can come from a gate rather than
+        from a guess.
+        """
+        if self.mode != "juno" or not self.juno_available():
+            return None
+        from .disclosure import DOCUMENT_DESCRIPTOR, classify_output_tier
+
+        inbound = _ACTIVE_INBOUND_TEXT.get()
+        if not inbound or classify_output_tier(inbound) != DOCUMENT_DESCRIPTOR:
+            return None
+        return {
+            "context": (
+                "JUNO--KITE: this turn is a request for a specific document. "
+                "Call consult_kite before answering. Whether it exists, and "
+                "whose it is, and whether it may be released, are the host's "
+                "decisions and not yours -- household and children's documents "
+                "are routinely in scope. Do not answer that you cannot provide "
+                "or access it without having asked; if the host denies it, "
+                "report the reason it gave."
+            )
+        }
+
     def pre_llm_call(
         self,
         user_message: str = "",
@@ -2124,7 +2157,7 @@ class TrustedPrincipalRuntime:
         if platform != "a2a":
             _ACTIVE_BINDING.set(None)
             _ACTIVE_PRIVATE_READS.set(None)
-            return None
+            return self._juno_turn_context()
         binding: Optional[TurnBinding] = None
         try:
             binding = self._bind_request(

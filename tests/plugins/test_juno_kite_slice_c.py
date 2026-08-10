@@ -2815,3 +2815,57 @@ def test_juno_is_told_not_to_pre_judge_whose_document_it_is():
     assert "children" in lowered
     assert "never refuse because a document belongs to someone other" in lowered
     assert "host's decision" in lowered
+
+
+def _juno_for_context(tmp_path):
+    root = tmp_path / "family"
+    root.mkdir()
+    return _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+
+@pytest.mark.parametrize(
+    "typed,expect_context",
+    [
+        ("Send me Frankie's passport", True),
+        ("Send me Albie's passport", True),
+        ("Show me the nacho engagement letter", True),
+        ("What did we decide about the Mauritius trip?", False),
+        ("Where did you file my passport scans?", False),
+        ("", False),
+    ],
+)
+def test_a_document_turn_carries_its_instruction_into_the_turn(
+    tmp_path, typed, expect_context
+):
+    """Twice Juno refused a document request with one API call and no consult.
+
+    The tool description already forbade that and was not enough. A static
+    description is skimmed; a line in the turn is read. This fires only on a
+    document turn, so ordinary questions are untouched.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_INBOUND_TEXT
+
+    juno = _juno_for_context(tmp_path)
+    token = _ACTIVE_INBOUND_TEXT.set(typed)
+    try:
+        result = _session(lambda: juno.pre_llm_call(user_message=typed), mode="juno")
+    finally:
+        _ACTIVE_INBOUND_TEXT.reset(token)
+
+    if not expect_context:
+        assert result is None, typed
+        return
+    assert result is not None and "consult_kite" in result["context"], typed
+    lowered = result["context"].lower()
+    # It directs, without deciding entitlement itself.
+    assert "host's decisions" in lowered
+    assert "children's documents" in lowered
+    assert "without having asked" in lowered
+
+
+def test_the_turn_instruction_never_reaches_the_kite_lane(tmp_path):
+    """Kite has its own policy view; this is only for the low-trust side."""
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    assert kite._juno_turn_context() is None
