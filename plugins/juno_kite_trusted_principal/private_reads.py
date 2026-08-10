@@ -362,6 +362,20 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+def _release_display_name(value: Any) -> str:
+    """The candidate's own name, reduced the same way its title will be.
+
+    Without this the model chose a document and was never told which one it
+    had picked: the descriptor carried only a MIME type and a byte count. It
+    could not check its own choice, could not say what it was about to send,
+    and could not notice that "Epson_07082026151807" says nothing about
+    whether this is a British passport.
+    """
+    stem = Path(str(value or "")).stem
+    text = re.sub(r"[^A-Za-z0-9 ()_.-]+", " ", stem)
+    return re.sub(r"\s+", " ", text).strip(" ._-")[:96] or "untitled"
+
+
 def validate_tool_arguments(tool_name: str, args: Any) -> bool:
     """Fail-closed validation for brokered private-read arguments.
 
@@ -861,6 +875,7 @@ class PrivateReadService:
                 descriptor = {
                     "outcome": "release_candidate",
                     "source_class": "personal files",
+                    "document_name": _release_display_name(path.name),
                     "mime_type": guessed,
                     "size_bytes": source_info.st_size,
                 }
@@ -922,6 +937,7 @@ class PrivateReadService:
                 descriptor = {
                     "outcome": "release_candidate",
                     "source_class": "personal Gmail attachment",
+                    "document_name": _release_display_name(filename),
                     "mime_type": str(payload.get("mime_type") or "").lower(),
                     "size_bytes": int(payload.get("size_bytes") or 0),
                 }

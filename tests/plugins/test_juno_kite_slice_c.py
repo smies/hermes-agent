@@ -586,9 +586,13 @@ def test_typed_resolver_has_one_closed_candidate_and_no_arbitrary_selectors(tmp_
     assert set(candidate["data"]) == {
         "outcome",
         "source_class",
+        "document_name",
         "mime_type",
         "size_bytes",
     }
+    # The name is the artifact's own, reduced; still no selector, path or bytes.
+    assert candidate["data"]["document_name"]
+    assert "/" not in candidate["data"]["document_name"]
     assert internal["bytes"] == artifact
     assert "message-1" not in encoded and "attachment-1" not in encoded
 
@@ -2109,3 +2113,64 @@ def test_only_the_exact_host_shape_bypasses_the_prose_scan(tmp_path, mutate):
     assert juno._release_descriptor(
         '{"outcome":"denied","reason":"nope"}'
     ) is None
+
+
+def test_the_release_candidate_tells_the_model_which_document_it_picked(tmp_path):
+    """08:09 and 08:11: the model chose blind and sent the wrong passport.
+
+    The descriptor carried only a MIME type and a byte count, so the model
+    could not check its own choice or report it. It picked "Epson_07082026151807"
+    and then "photo" -- scanner defaults that identify nothing -- inferring from
+    the surrounding email that an image was a British passport when it was the
+    front cover of the Irish one.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    encoded, internal = runtime.private_reads.resolve_document_candidate(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "family",
+         "relative_path": "child-passport.png"},
+    )
+    assert internal is not None
+    descriptor = json.loads(encoded)["data"]
+    assert descriptor["document_name"] == "child-passport"
+    # Still closed: no path, no root, no bytes.
+    assert set(descriptor) == {
+        "outcome", "source_class", "document_name", "mime_type", "size_bytes"
+    }
+    assert str(tmp_path) not in encoded and "family" not in descriptor["document_name"]
+
+
+def test_a_candidate_name_is_reduced_before_the_model_sees_it():
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        _release_display_name,
+    )
+
+    assert _release_display_name("EL MS 07 08 2026.pdf") == "EL MS 07 08 2026"
+    assert _release_display_name("Epson_07082026151807.jpg") == "Epson_07082026151807"
+    # Percent-encoding is already decoded upstream; separators never survive.
+    for hostile in ("../../etc/passwd", "a/b\\c.pdf", "x\x00y.png"):
+        produced = _release_display_name(hostile)
+        assert "/" not in produced and "\\" not in produced and ".." not in produced
+        assert "\x00" not in produced
+    assert _release_display_name("") == "untitled"
+    assert len(_release_display_name("A" * 300 + ".pdf")) <= 96
+
+
+def test_document_guidance_requires_checking_the_name_before_releasing():
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        generated_semantic_guidance,
+    )
+
+    rule = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )["output_tier_rule"]
+    assert "document_name" in rule
+    assert "ask rather than" in rule
+    assert "cannot be recalled" in rule
