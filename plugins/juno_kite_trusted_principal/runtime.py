@@ -1163,6 +1163,7 @@ class TrustedPrincipalRuntime:
         audience: AudienceBinding,
         adapter: Any,
         chat_id: str,
+        approver: Optional[AudienceBinding] = None,
         send_receipt: bool = True,
         title: Any = "",
         caption: str = "",
@@ -1176,6 +1177,23 @@ class TrustedPrincipalRuntime:
         reaches transport.
         """
         denied = "Document release denied."
+        # Two questions, and until now one audience answered both because the
+        # approval could only ever arrive in the conversation it was for. Who
+        # may approve this release, and where may it land? An approval sent
+        # from a DM will make those different audiences, so they are asked
+        # separately here while the answer stays identical: `approver`
+        # defaults to the audience being delivered into, which is exactly the
+        # same-conversation flow this has always served.
+        approving = approver if approver is not None else audience
+        if (
+            approving.principal.casefold() != "james"
+            or approving.human_principals != ("james",)
+        ):
+            if send_receipt:
+                await self._send_document_receipt(adapter, chat_id, denied)
+            return "denied"
+        # The destination has to be entitled to hold the document, which is a
+        # fact about the conversation it lands in, not about who approved.
         if (
             audience.principal.casefold() != "james"
             or audience.human_principals != ("james",)

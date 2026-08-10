@@ -1360,6 +1360,58 @@ async def test_the_same_document_is_not_sent_twice_in_one_turn(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_who_approves_and_where_it_lands_are_asked_separately(tmp_path):
+    """One audience used to answer both questions, because it always could.
+
+    An approval could only arrive in the conversation it was for, so "may
+    this person approve" and "may this conversation hold the document" were
+    the same fact. A DM approval separates them, and the gates have to keep
+    meaning what they mean: an approver who is not James cannot release into
+    a conversation that would otherwise be entitled to it, and James cannot
+    approve a release into a conversation that is not.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+    from dataclasses import replace
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+
+    # Someone other than James, approving a release into James's own
+    # conversation. The destination is impeccable; the approver is not.
+    stranger = replace(audience, principal="family", human_principals=("family",))
+    assert await juno._consume_and_deliver(
+        code, audience=audience, adapter=adapter, chat_id=GROUP,
+        approver=stranger, send_receipt=False,
+    ) == "denied"
+    assert adapter.document_calls == []
+
+    # James approving a release into a conversation with no private
+    # capability. The approver is impeccable; the destination is not.
+    unentitled = replace(audience, effective_read_capability_ids=("juno.public",))
+    assert await juno._consume_and_deliver(
+        code, audience=unentitled, adapter=adapter, chat_id=GROUP,
+        approver=audience, send_receipt=False,
+    ) == "denied"
+    assert adapter.document_calls == []
+
+    # Both satisfied, which is the flow that exists today, and the one-use
+    # authority is still there to be claimed after two refusals.
+    assert await juno._consume_and_deliver(
+        code, audience=audience, adapter=adapter, chat_id=GROUP,
+        approver=audience, send_receipt=False,
+    ) == "delivered"
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_auto_release_still_fails_closed_on_a_changed_roster(tmp_path):
     """Removing the owner prompt must not remove any gate behind it."""
     from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
