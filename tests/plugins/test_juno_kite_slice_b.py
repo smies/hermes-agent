@@ -1193,6 +1193,32 @@ def test_personal_file_containment_and_bounds(tmp_path):
     assert allowed["status"] != "error", allowed
 
 
+def test_formatting_does_not_decide_whether_an_answer_leaks(tmp_path):
+    """The answer was refused for containing the thing it was asked for.
+
+    Kite read Lucy's passport correctly and wrote "Passport number:
+    **900000001**". The bold broke the passport carve-out, the digits
+    underneath were read as a phone number, and the whole answer was
+    withheld -- reported to the requester as an authorization problem. The
+    gap runs the other way too: emphasis inside a token slips a credential
+    pattern that the flat text catches.
+    """
+    runtime = _runtime(tmp_path, mode="kite")
+    for answer in (
+        "Passport number: **900000001**\nExpiry date: **4 March 2032**",
+        "Passport number: 900000001, expiry 4 March 2032",
+        "Passport no. `900000001`",
+    ):
+        assert runtime._leak_reason(answer, output=True) == "", answer
+    # What the filter is for is untouched.
+    assert runtime._leak_reason("Call me on 07700 900123", output=True) == (
+        "phone-shaped private identifier"
+    )
+    assert runtime._leak_reason("pass**word**: hunter2000000", output=True) == (
+        "credential-shaped content"
+    )
+
+
 def test_a_read_of_a_scan_is_bounded_by_the_read_not_by_the_preview(monkeypatch):
     """The number was returned and the expiry was cut off.
 
@@ -1277,7 +1303,7 @@ def test_read_caps_a_document_on_what_it_loads_not_on_what_a_text_file_returns(
 
     seen: list[int] = []
 
-    def _stub(data, mime_type, *, limit=600):
+    def _stub(data, mime_type, *, limit=600, pages=2):
         seen.append(len(data))
         return ("Synthetic passport. Number 000000000. Expiry 01 JAN 2030. " * 400)[
             :limit
@@ -1313,8 +1339,9 @@ def test_read_caps_a_document_on_what_it_loads_not_on_what_a_text_file_returns(
     # The extractor was handed the whole document, well past output_bytes...
     assert seen == [23_009]
     # ...and what came back is bounded by what a read returns, shortened to
-    # fit the configured cap rather than failing against it.
-    assert len(extracted["data"]["text"]) == 6_000
+    # fit the configured cap rather than failing against it: half of the
+    # 20_000-byte envelope here, well under the 40_000 a read may ask for.
+    assert len(extracted["data"]["text"]) == 10_000
 
     # A text file still answers for its own size: there the two are the same.
     assert read("notes.md")["status"] == "error"

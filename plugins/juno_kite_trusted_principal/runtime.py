@@ -121,6 +121,13 @@ _EMAIL_PATTERN = re.compile(
     r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I
 )
 _PHONE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\d .()\-]{7,}\d)(?!\w)")
+# Emphasis is formatting, and formatting must not decide a security verdict.
+# A model writes "Passport number: **900000001**", the bold broke the passport
+# carve-out below, and the number underneath was read as a phone number -- the
+# answer was refused for containing the thing it had been asked for. The same
+# gap runs the other way: cred**ential** would slip a pattern that the flat
+# text catches, so the scan sees both forms and either one is enough.
+_EMPHASIS_PATTERN = re.compile(r"[*_`~]+")
 _PASSPORT_CONTEXT_PATTERN = re.compile(
     r"(?i)\bpassport\s+(?:number|no\.?|identifier)\s*[:#-]?\s*"
     r"[A-Z0-9][A-Z0-9 -]{4,18}[A-Z0-9]\b"
@@ -1455,16 +1462,17 @@ class TrustedPrincipalRuntime:
 
     def _leak_reason(self, text: str, *, output: bool) -> str:
         value = str(text or "")
+        flattened = _EMPHASIS_PATTERN.sub("", value)
         for pattern in _CREDENTIAL_PATTERNS:
-            if pattern.search(value):
+            if pattern.search(value) or pattern.search(flattened):
                 return "credential-shaped content"
         if any(
             secret and secret in value for secret in getattr(self, "secret_values", ())
         ):
             return "configured credential value"
-        if _EMAIL_PATTERN.search(value):
+        if _EMAIL_PATTERN.search(value) or _EMAIL_PATTERN.search(flattened):
             return "email-shaped private identifier"
-        identifier_scan = value
+        identifier_scan = flattened
         if output:
             for origin in getattr(
                 getattr(self, "private_reads", None), "public_property_origins", ()
@@ -3234,7 +3242,9 @@ class TrustedPrincipalRuntime:
                 answer=answer,
                 denied=denied,
                 reason=(
-                    "output minimized by deterministic leak policy" if denied else ""
+                    f"output withheld by leak policy ({leak_reason})"
+                    if denied
+                    else ""
                 ),
             )
             if (
@@ -3361,7 +3371,17 @@ class TrustedPrincipalRuntime:
         ) == "Requested document" and json.loads(answer)["document"]["title"]:
             raise ValueError("Kite response contains leak-shaped data")
         if payload.get("denied") is not False:
-            raise ValueError("Kite denied release under current policy")
+            # Say which gate refused. A bare "denied under current policy"
+            # is indistinguishable from a missing file, an unreadable scan
+            # and a policy that genuinely does not cover the request, and
+            # every one of those has cost a round trip to tell apart. The
+            # reason names the category the host itself computed, never the
+            # content that tripped it.
+            detail = str(payload.get("reason") or "").strip()
+            raise ValueError(
+                "Kite denied release under current policy"
+                + (f": {detail[:160]}" if detail else "")
+            )
         return payload
 
     def _verify_response(

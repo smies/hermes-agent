@@ -419,8 +419,14 @@ _PERSONAL_ROOT_BASES = (
 )
 
 _PREVIEW_MAX_CHARS = 600
-# A read asks to understand the document, not merely to tell it apart.
-_READ_EXTRACT_CHARS = 6000
+_PREVIEW_MAX_PAGES = 2
+# A read asks to understand the document, not merely to tell it apart, so it
+# is bounded by what it costs rather than by what a preview needs. The result
+# envelope caps it at output_bytes regardless, and what may be disclosed from
+# it is capped separately at limits.output_chars -- reading more never
+# discloses more. 40k characters is roughly a 20-page contract.
+_READ_EXTRACT_CHARS = 40_000
+_READ_MAX_PAGES = 20
 # What an extractor is willing to load, which is not what it returns: a scan
 # is megabytes of image data behind a few hundred characters of text.
 _EXTRACT_MAX_INPUT_BYTES = 8 * 1024 * 1024
@@ -542,7 +548,13 @@ def _run_preview_reader(argv: list[str], limit: int = _PREVIEW_MAX_CHARS) -> str
     return re.sub(r"\s+", " ", str(completed.stdout or "")).strip()[:limit]
 
 
-def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_CHARS) -> str:
+def _document_preview(
+    data: bytes,
+    mime_type: str,
+    *,
+    limit: int = _PREVIEW_MAX_CHARS,
+    pages: int = _PREVIEW_MAX_PAGES,
+) -> str:
     """A bounded look at what this document actually says.
 
     The model has to decide whether a candidate is the document that was asked
@@ -575,14 +587,14 @@ def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_
             extracted = ""
             if executable:
                 extracted = _run_preview_reader(
-                    [executable, "-l", "2", "-q", path, "-"], limit
+                    [executable, "-l", str(pages), "-q", path, "-"], limit
                 )
             if extracted:
                 return extracted
             # No text layer: a scanned document. Fall through to reading the
             # rendered page, or it stays unidentifiable -- which is the case
             # the preview exists for.
-            argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path]
+            argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path, str(pages)]
             if not (Path(_SYSTEM_PYTHON).exists() and Path(_MACOS_OCR_SCRIPT).exists()):
                 return ""
         elif mime_type in {
@@ -600,7 +612,7 @@ def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_
         elif mime_type in {"image/jpeg", "image/png"}:
             if not Path(_SYSTEM_PYTHON).exists() or not Path(_MACOS_OCR_SCRIPT).exists():
                 return ""
-            argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path]
+            argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path, str(pages)]
         else:
             return ""
         return _run_preview_reader(argv, limit)
@@ -2294,6 +2306,7 @@ class PrivateReadService:
                     path.read_bytes(),
                     guessed,
                     limit=min(_READ_EXTRACT_CHARS, self.output_bytes // 2),
+                    pages=_READ_MAX_PAGES,
                 )
                 return {
                     "outcome": "extracted" if extracted else "unavailable_next_gate",
