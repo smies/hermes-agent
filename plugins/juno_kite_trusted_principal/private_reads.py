@@ -42,6 +42,7 @@ TOOL_NAMES = (
     "kite_property_read",
     "kite_whatsapp_archive_read",
     "kite_personal_files_read",
+    "kite_personal_files_locate",
     "kite_session_search",
 )
 
@@ -366,6 +367,23 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             ("query",),
         ),
     },
+    "kite_personal_files_locate": {
+        "description": (
+            "Find where a document is, anywhere the principal keeps documents, "
+            "when it is not under a configured root. Returns names and "
+            "locations only -- never contents, never a preview, and never a "
+            "releasable reference. A file found this way cannot be read or "
+            "sent by this tool or any other: say what was found and where, and "
+            "the principal decides whether it may be released."
+        ),
+        "parameters": _object_schema(
+            {
+                "query": {"type": "string", "minLength": 2, "maxLength": 200},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            ("query",),
+        ),
+    },
     "kite_personal_files_read": {
         "description": (
             "Search or read relative regular files beneath a configured personal "
@@ -419,6 +437,17 @@ _PERSONAL_ROOT_BASES = (
     "/users/james/documents",
     "/users/james/desktop",
     "/users/james/downloads",
+)
+
+# A locate walk is bounded by work done, not by what it finds: a query that
+# matches nothing must still terminate over a documents tree of any size.
+_LOCATE_MAX_SCANNED = 20_000
+# Credential-shaped path components stay invisible to locate for the same
+# reason they are unreadable: naming a file called id_rsa discloses that it
+# exists and where, which is most of what an attacker wanted.
+_LOCATE_DENIED_PART = re.compile(
+    r"(?i)(?:^|[._-])(?:credential|credentials|secret|secrets|token|tokens|"
+    r"password|passwords|private[-_]?key|keychain|wallet)(?:[._-]|$)"
 )
 
 _PREVIEW_MAX_CHARS = 600
@@ -988,6 +1017,7 @@ class PrivateReadService:
                 "kite_property_read": self._property,
                 "kite_whatsapp_archive_read": self._whatsapp,
                 "kite_personal_files_read": self._files,
+                "kite_personal_files_locate": self._locate,
                 "kite_session_search": self._sessions,
             }[tool_name]
             result = _success(source, handler(dict(args)))
@@ -2344,6 +2374,115 @@ class PrivateReadService:
             if len(found) >= maximum:
                 break
         return found
+
+    def _locate(self, args: dict[str, Any]) -> Any:
+        """Say where a document is, without acquiring the right to open it.
+
+        A configured root is a standing grant: everything beneath it may be
+        read and released. That is why there are only three of them, and why
+        a document kept anywhere else could not be found at all -- the honest
+        answer was "I cannot find it" for a file sitting in plain view.
+
+        Finding is not reading. This walks the same bases that bound where a
+        root may point, and returns names, locations and sizes only: no
+        contents, no preview, no relative_path that any reader here accepts.
+        Turning a location into a release needs the principal to say so, which
+        is the whole of the approval step and is deliberately not automatable
+        from in here.
+        """
+        self._require_exact(args, {"query", "max_results"}, {"query"})
+        query = self._bounded_text(args["query"], "query", 200).casefold()
+        maximum = self._bounded_int(args.get("max_results", 10), "max_results", 20)
+        config = self.config.get("files")
+        bases = [
+            Path(base)
+            for base in (
+                (config or {}).get("allowed_bases", _PERSONAL_ROOT_BASES)
+                if isinstance(config, dict)
+                else _PERSONAL_ROOT_BASES
+            )
+        ]
+        release_roots = {}
+        try:
+            release_roots = {
+                name: root.resolve(strict=True)
+                for name, root in self._roots(config).items()
+            }
+        except (ValueError, OSError, SourceFailure):
+            release_roots = {}
+
+        found: list[dict[str, Any]] = []
+        scanned = 0
+        for base in bases:
+            try:
+                base_real = base.expanduser().resolve(strict=True)
+            except OSError:
+                continue
+            for directory, names, files in os.walk(base_real, followlinks=False):
+                names[:] = sorted(
+                    item
+                    for item in names
+                    if not item.startswith(".")
+                    and not Path(directory, item).is_symlink()
+                )
+                for filename in sorted(files):
+                    scanned += 1
+                    if scanned > _LOCATE_MAX_SCANNED:
+                        return self._locate_result(found, truncated=True)
+                    if filename.startswith(".") or query not in filename.casefold():
+                        continue
+                    path = Path(directory, filename)
+                    if path.is_symlink() or path.suffix.casefold() in (
+                        _REFUSED_EXTENSIONS
+                    ):
+                        continue
+                    if any(
+                        pattern.search(part)
+                        for part in path.parts
+                        for pattern in (_LOCATE_DENIED_PART,)
+                    ):
+                        continue
+                    try:
+                        info = path.lstat()
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    root_name = next(
+                        (
+                            name
+                            for name, root in release_roots.items()
+                            if root in path.parents
+                        ),
+                        None,
+                    )
+                    found.append({
+                        "document_name": _release_display_name(filename),
+                        "file_name": filename,
+                        # A directory, not a path a reader would take. The
+                        # readers key off (root, relative_path); nothing here
+                        # can be handed to one.
+                        "directory": str(path.parent),
+                        "size_bytes": info.st_size,
+                        "modified": _session_when(info.st_mtime),
+                        "release_root": root_name,
+                        "releasable_now": root_name is not None,
+                    })
+                    if len(found) >= maximum:
+                        return self._locate_result(found, truncated=True)
+        return self._locate_result(found, truncated=False)
+
+    @staticmethod
+    def _locate_result(found: list[dict[str, Any]], *, truncated: bool) -> Any:
+        return {
+            "matches": found,
+            "truncated": truncated,
+            "note": (
+                "Locations only. A match with releasable_now false is outside "
+                "every configured root: it cannot be read or sent from here, "
+                "and releasing it requires the principal's approval."
+            ),
+        }
 
     def _files(self, args: dict[str, Any]) -> Any:
         self._require_exact(

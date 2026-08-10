@@ -1179,6 +1179,78 @@ def test_whatsapp_real_boundary_uses_argv_without_shell(tmp_path):
     assert not {"--send", "--reply", "--react", "--mark-read"}.intersection(argv)
 
 
+def test_locate_says_where_a_document_is_without_being_able_to_open_it(tmp_path):
+    """A document outside the three roots could not be found at all.
+
+    A configured root is a standing grant -- everything beneath it is
+    readable and releasable -- which is why there are only three. The cost
+    was that a file sitting in plain view somewhere else got the honest but
+    useless answer "I cannot find it". Locate separates the two: it reports
+    names and whereabouts, and grants nothing. What it returns cannot be
+    handed to a reader, because the readers key off (root, relative_path)
+    and locate deliberately returns neither.
+    """
+    base = tmp_path / "docs"
+    (base / "Hermes Documents").mkdir(parents=True)
+    (base / "Elsewhere" / "Scans").mkdir(parents=True)
+    (base / "Hermes Documents" / "alex passport.pdf").write_bytes(b"%PDF-1.4 in")
+    (base / "Elsewhere" / "Scans" / "robin passport.pdf").write_bytes(b"%PDF-1.4 out")
+    (base / "Elsewhere" / "id_rsa_private_key.pem").write_text("x", encoding="utf-8")
+    (base / "Elsewhere" / "passport_helper.sh").write_text("echo", encoding="utf-8")
+    (base / "Elsewhere" / ".hidden passport.pdf").write_bytes(b"%PDF-1.4 hidden")
+
+    service = PrivateReadService({
+        "enabled": True,
+        "output_bytes": 262_144,
+        "files": {
+            "roots": [{"name": "documents", "path": str(base / "Hermes Documents")}],
+            "allowed_bases": [str(base)],
+        },
+    })
+
+    def locate(query, **extra):
+        return json.loads(service.execute(
+            "kite_personal_files_locate", {"query": query, **extra}
+        ))
+
+    found = locate("passport", max_results=10)["data"]
+    by_name = {m["file_name"]: m for m in found["matches"]}
+    assert set(by_name) == {"alex passport.pdf", "robin passport.pdf"}
+
+    # The one inside a root is already releasable; the one outside is not,
+    # and saying which is the entire point.
+    assert by_name["alex passport.pdf"]["releasable_now"] is True
+    assert by_name["alex passport.pdf"]["release_root"] == "documents"
+    assert by_name["robin passport.pdf"]["releasable_now"] is False
+    assert by_name["robin passport.pdf"]["release_root"] is None
+
+    # Locations only: nothing here is content, and nothing here is a
+    # relative_path that a reader would accept.
+    for match in found["matches"]:
+        assert set(match) == {
+            "document_name", "file_name", "directory", "size_bytes",
+            "modified", "release_root", "releasable_now",
+        }
+        assert "relative_path" not in match
+
+    # A location is a disclosure too: key material stays invisible, as do
+    # executables and dotfiles.
+    assert locate("id_rsa", max_results=10)["data"]["matches"] == []
+    assert locate("passport_helper", max_results=10)["data"]["matches"] == []
+    assert all(
+        not m["file_name"].startswith(".") for m in locate("hidden")["data"]["matches"]
+    )
+
+    # Bounded: a result cap truncates rather than walking everything.
+    capped = locate("passport", max_results=1)["data"]
+    assert len(capped["matches"]) == 1 and capped["truncated"] is True
+
+    for malformed in ({}, {"query": "x" * 300}, {"query": "ok", "extra": 1}):
+        assert json.loads(
+            service.execute("kite_personal_files_locate", malformed)
+        )["status"] == "error", malformed
+
+
 def test_personal_file_containment_and_bounds(tmp_path):
     root = tmp_path / "personal"
     root.mkdir()

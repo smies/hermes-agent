@@ -420,7 +420,12 @@ _DOCUMENT_FOLLOWUP_TTL_SECONDS = 300
 # shape by these, so nothing outside them can wear it.
 _RELEASE_SOURCE_CLASSES = frozenset({"personal files", "personal Gmail attachment"})
 # Readers whose source has no capability of its own, bound to named principals.
-_PRINCIPAL_BOUND_READS = {"kite_session_search": frozenset({"james"})}
+# Locate reports the names and whereabouts of documents across everywhere the
+# principal keeps them, which is his own filing system and nobody else's.
+_PRINCIPAL_BOUND_READS = {
+    "kite_session_search": frozenset({"james"}),
+    "kite_personal_files_locate": frozenset({"james"}),
+}
 _RELEASE_PURPOSES = frozenset({
     "personal administration",
     "family administration",
