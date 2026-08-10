@@ -75,23 +75,26 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\Z"
 )
+from .document_release import _EXECUTABLE_SUFFIXES
+
 _DATE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?)?\Z"
 )
-_SAFE_EXTENSIONS = frozenset({
-    ".txt",
-    ".md",
-    ".markdown",
-    ".csv",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".pdf",
-    ".docx",
-    ".jpg",
-    ".jpeg",
-    ".png",
+# The release path already settled this argument -- refuse what executes and
+# carry everything else -- but reading kept its own allow-list of twelve
+# extensions, so a HEIC photo of a document could be released and never found.
+# A document does not become dangerous by being a format nobody anticipated,
+# and reading one is strictly weaker than sending it: the deny-list is shared
+# with release so the two cannot drift apart again.
+# Key material is not a document. The path patterns below catch names like
+# private_key and token, but not id_rsa.pem, and a documents folder is exactly
+# where a stray certificate ends up.
+_CREDENTIAL_EXTENSIONS = frozenset({
+    ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk",
+    ".crt", ".cer", ".der", ".asc", ".gpg", ".pgp", ".kdbx", ".keychain",
+    ".env", ".netrc", ".htpasswd",
 })
+_REFUSED_EXTENSIONS = _EXECUTABLE_SUFFIXES | _CREDENTIAL_EXTENSIONS
 _EXTRACTABLE_MIME = frozenset({
     "text/plain",
     "text/csv",
@@ -418,6 +421,18 @@ _PERSONAL_ROOT_BASES = (
 _PREVIEW_MAX_CHARS = 600
 # A read asks to understand the document, not merely to tell it apart.
 _READ_EXTRACT_CHARS = 6000
+# What an extractor is willing to load, which is not what it returns: a scan
+# is megabytes of image data behind a few hundred characters of text.
+_EXTRACT_MAX_INPUT_BYTES = 8 * 1024 * 1024
+_TEXT_SUFFIXES = frozenset({
+    ".txt",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+})
 _PREVIEW_TIMEOUT_SECONDS = 45
 _PDFTOTEXT_CANDIDATES = ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
 _SYSTEM_PYTHON = "/usr/bin/python3"
@@ -1057,7 +1072,7 @@ class PrivateReadService:
                 "unsupported_content",
                 "attachment type is not safe for private extraction",
             )
-        maximum = 8 * 1024 * 1024 if release else self.output_bytes
+        maximum = _EXTRACT_MAX_INPUT_BYTES if release else self.output_bytes
         if (
             isinstance(size, bool)
             or not isinstance(size, int)
@@ -1107,6 +1122,10 @@ class PrivateReadService:
                 )
                 path = self._safe_file(roots[root_name], relative)
                 source_info = path.lstat()
+                if source_info.st_size > _EXTRACT_MAX_INPUT_BYTES:
+                    raise SourceFailure(
+                        "cap_exceeded", "file exceeds the configured byte cap"
+                    )
                 guessed = (mimetypes.guess_type(path.name)[0] or "").lower()
                 descriptor = {
                     "outcome": "release_candidate",
@@ -2114,9 +2133,10 @@ class PrivateReadService:
         mode = real.stat().st_mode
         if not stat.S_ISREG(mode):
             raise SourceFailure("path_denied", "only regular files are readable")
-        if real.suffix.casefold() not in _SAFE_EXTENSIONS:
+        if real.suffix.casefold() in _REFUSED_EXTENSIONS:
             raise SourceFailure(
-                "unsupported_content", "file extension is not allowlisted"
+                "unsupported_content",
+                "executable and credential files are not readable",
             )
         return real
 
@@ -2235,19 +2255,19 @@ class PrivateReadService:
                 self._bounded_text(args["relative_path"], "relative_path", 512),
             )
             size = path.stat().st_size
-            if size > self.output_bytes:
+            textual = path.suffix.casefold() in _TEXT_SUFFIXES
+            # output_bytes caps what a tool returns. For a text file that is
+            # also its size on disk, so one gate served for both. An extracted
+            # document returns at most _READ_EXTRACT_CHARS however large the
+            # scan behind it is, and charging it for the size of its image
+            # data made every passport unreadable while the same file
+            # previewed and released fine. Bound what it will load instead,
+            # at the cap the release path already uses.
+            if size > (self.output_bytes if textual else _EXTRACT_MAX_INPUT_BYTES):
                 raise SourceFailure(
                     "cap_exceeded", "file exceeds the configured byte cap"
                 )
-            if path.suffix.casefold() not in {
-                ".txt",
-                ".md",
-                ".markdown",
-                ".csv",
-                ".json",
-                ".yaml",
-                ".yml",
-            }:
+            if not textual:
                 # A PDF or a scan is readable even though it is not text, and
                 # refusing to read it made an ordinary question unanswerable:
                 # "what is Lucy's passport number" could only be answered by
@@ -2257,8 +2277,13 @@ class PrivateReadService:
                 guessed = (
                     mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                 )
+                # Leave room for the descriptor around it: a configured cap
+                # smaller than the extract turns a readable document into an
+                # opaque cap error, and a shorter answer beats no answer.
                 extracted = _document_preview(
-                    path.read_bytes(), guessed, limit=_READ_EXTRACT_CHARS
+                    path.read_bytes(),
+                    guessed,
+                    limit=min(_READ_EXTRACT_CHARS, self.output_bytes // 2),
                 )
                 return {
                     "outcome": "extracted" if extracted else "unavailable_next_gate",
@@ -2314,8 +2339,7 @@ class PrivateReadService:
                 content_match = False
                 if (
                     path.stat().st_size <= self.output_bytes
-                    and path.suffix.casefold()
-                    in {".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml"}
+                    and path.suffix.casefold() in _TEXT_SUFFIXES
                 ):
                     try:
                         content_match = (

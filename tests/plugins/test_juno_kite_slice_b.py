@@ -1119,6 +1119,10 @@ def test_personal_file_containment_and_bounds(tmp_path):
     (root / ".hidden.md").write_text("hidden", encoding="utf-8")
     (root / "api_token.json").write_text("{}", encoding="utf-8")
     (root / "program.sh").write_text("echo no", encoding="utf-8")
+    (root / "id_rsa.pem").write_text("synthetic key material", encoding="utf-8")
+    # A format nobody anticipated is still a document: releasing a phone photo
+    # while being unable to read or list it is how the allow-list failed.
+    (root / "scan.heic").write_bytes(b"\x00\x00\x00\x18ftypheic")
     outside = tmp_path / "outside.md"
     outside.write_text("outside", encoding="utf-8")
     (root / "escape.md").symlink_to(outside)
@@ -1161,6 +1165,7 @@ def test_personal_file_containment_and_bounds(tmp_path):
         ".hidden.md",
         "api_token.json",
         "program.sh",
+        "id_rsa.pem",
     ):
         denied = json.loads(
             service.execute(
@@ -1174,6 +1179,84 @@ def test_personal_file_containment_and_bounds(tmp_path):
             )
         )
         assert denied["status"] == "error"
+    allowed = json.loads(
+        service.execute(
+            "kite_personal_files_read",
+            {
+                "operation": "read",
+                "root": "obsidian",
+                "relative_path": "scan.heic",
+                "max_lines": 10,
+            },
+        )
+    )
+    assert allowed["status"] != "error", allowed
+
+
+def test_read_caps_a_document_on_what_it_loads_not_on_what_a_text_file_returns(
+    tmp_path, monkeypatch
+):
+    """A scan is megabytes of image behind a few hundred characters of text.
+
+    output_bytes caps what a tool returns, and for a text file that is also
+    its size on disk, so one gate served for both. Charging an extracted
+    document for the size of its image data made every passport unreadable
+    -- "what is Lucy's passport number" could only be answered by sending
+    Lucy's passport -- while the same file previewed and released fine.
+    """
+    root = tmp_path / "personal"
+    root.mkdir()
+    filler = b"0" * 23_000
+    (root / "scan.pdf").write_bytes(b"%PDF-1.4\n" + filler)
+    (root / "notes.md").write_text("x" * 23_000, encoding="utf-8")
+    (root / "huge.pdf").write_bytes(b"%PDF-1.4\n" + b"0" * (8 * 1024 * 1024))
+
+    seen: list[int] = []
+
+    def _stub(data, mime_type, *, limit=600):
+        seen.append(len(data))
+        return ("Synthetic passport. Number 000000000. Expiry 01 JAN 2030. " * 400)[
+            :limit
+        ]
+
+    monkeypatch.setattr(
+        "plugins.juno_kite_trusted_principal.private_reads._document_preview", _stub
+    )
+    service = PrivateReadService({
+        "enabled": True,
+        "output_bytes": 20_000,
+        "files": {"roots": [{"name": "obsidian", "path": str(root)}],
+                  "allowed_bases": [str(tmp_path)]},
+    })
+
+    def read(relative):
+        return json.loads(
+            service.execute(
+                "kite_personal_files_read",
+                {
+                    "operation": "read",
+                    "root": "obsidian",
+                    "relative_path": relative,
+                    "max_lines": 10,
+                },
+            )
+        )
+
+    extracted = read("scan.pdf")
+    assert extracted["status"] != "error", extracted
+    assert extracted["data"]["outcome"] == "extracted"
+    assert "000000000" in extracted["data"]["text"]
+    # The extractor was handed the whole document, well past output_bytes...
+    assert seen == [23_009]
+    # ...and what came back is bounded by what a read returns, shortened to
+    # fit the configured cap rather than failing against it.
+    assert len(extracted["data"]["text"]) == 6_000
+
+    # A text file still answers for its own size: there the two are the same.
+    assert read("notes.md")["status"] == "error"
+    # And the new gate is a gate, not an opening.
+    assert read("huge.pdf")["status"] == "error"
+    assert seen == [23_009]
 
 
 @pytest.mark.parametrize(
