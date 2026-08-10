@@ -2163,7 +2163,11 @@ class PrivateReadService:
                     "join messages m on m.id = f.rowid "
                     "join sessions s on s.id = m.session_id "
                     "where f.messages_fts match ? and m.role in ('user','assistant') "
-                    "order by m.rowid desc limit ?",
+                    # Best match first, recent as the tie-break. Ordering by
+                    # recency alone returned messages that merely contained the
+                    # words -- "school term dates" matched a note about
+                    # architecture that happened to use all three.
+                    "order by bm25(messages_fts), m.rowid desc limit ?",
                     (terms, maximum * 12),
                 ).fetchall()
             finally:

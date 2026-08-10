@@ -374,7 +374,10 @@ def generated_semantic_guidance(
         "output_tier_rule": {
             MINIMIZED: (
                 "answer with necessary facts, status, synthesis, blockers, next "
-                "steps, and bounded provenance. No document staging or approval "
+                "steps, and bounded provenance. When the request refers to "
+                "something already discussed, decided or filed, kite_session_search "
+                "recalls it rather than re-deriving it from live sources. "
+                "No document staging or approval "
                 "gate runs on this tier, so never explain a document you did not "
                 "return by inventing one: if a binary was wanted and this turn "
                 "did not ask for one, say exactly that"
@@ -384,6 +387,9 @@ def generated_semantic_guidance(
                 "two mandatory steps in this same turn, not an output format. "
                 "Step one: actually call an approved typed reader and let it "
                 "succeed, because only a real successful read stages the artifact. "
+                "If this document has come up before -- where it was filed, what "
+                "it was called -- kite_session_search recalls that first and "
+                "saves guessing which of several candidates is the right one. "
                 "There are two independent document sources and a document lives "
                 "in only one of them, so search BOTH before concluding anything is "
                 "missing: (a) kite_personal_files_read search over each root the "

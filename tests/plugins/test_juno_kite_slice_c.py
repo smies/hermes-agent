@@ -2651,3 +2651,35 @@ def test_session_recall_is_bound_to_one_principal():
     from plugins.juno_kite_trusted_principal.runtime import _PRINCIPAL_BOUND_READS
 
     assert _PRINCIPAL_BOUND_READS["kite_session_search"] == frozenset({"james"})
+
+
+def test_recall_is_offered_where_the_model_will_need_it():
+    """The model has to choose the tool; today showed it needs telling."""
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED, generated_semantic_guidance,
+    )
+
+    def rule(tier):
+        return generated_semantic_guidance(
+            principal="james",
+            effective_capability_ids=["juno.private.james"],
+            configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+            output_tier=tier,
+        )["output_tier_rule"]
+
+    assert "kite_session_search" in rule(MINIMIZED)
+    assert "kite_session_search" in rule(DOCUMENT_DESCRIPTOR)
+
+
+def test_recall_ranks_by_match_quality_not_recency(tmp_path):
+    """Recency alone surfaced messages that merely contained the words."""
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant",
+         "an unrelated note that happens to mention passports once", 1786300000.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "passports passports filed: /Users/james/Documents/Family/Passports",
+         1786200000.0),
+    ])
+    found = service._sessions({"query": "passports filed", "max_results": 2})
+    # The older, better match leads.
+    assert "Family/Passports" in found[0]["excerpt"]
