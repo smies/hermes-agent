@@ -364,6 +364,8 @@ _DOCUMENT_FOLLOWUP_TTL_SECONDS = 300
 # The closed vocabulary of a host-built release descriptor. Juno recognises the
 # shape by these, so nothing outside them can wear it.
 _RELEASE_SOURCE_CLASSES = frozenset({"personal files", "personal Gmail attachment"})
+# Readers whose source has no capability of its own, bound to named principals.
+_PRINCIPAL_BOUND_READS = {"kite_session_search": frozenset({"james"})}
 _RELEASE_PURPOSES = frozenset({
     "personal administration",
     "family administration",
@@ -2473,6 +2475,19 @@ class TrustedPrincipalRuntime:
             return self._block(
                 "bulk/raw private-source requests cannot invoke connectors"
             )
+        # Past conversation is not a typed source with a capability of its own,
+        # so it is bound to the principal whose conversations they are, here,
+        # rather than left to the model to remember. Adding another principal
+        # is then an explicit decision instead of an inherited one.
+        if tool_name in _PRINCIPAL_BOUND_READS:
+            principal = (
+                binding.mapping.principal if binding.mapping is not None else ""
+            )
+            if str(principal).casefold() not in _PRINCIPAL_BOUND_READS[tool_name]:
+                return self._block(
+                    "session recall is bound to the principal whose "
+                    "conversations these are"
+                )
         from .private_reads import validate_tool_arguments
 
         if not validate_tool_arguments(tool_name, args):

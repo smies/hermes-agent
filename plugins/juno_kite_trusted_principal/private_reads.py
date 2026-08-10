@@ -16,6 +16,8 @@ import math
 import mimetypes
 import os
 import re
+import sqlite3
+from datetime import datetime
 import stat
 import subprocess
 import tempfile
@@ -37,6 +39,7 @@ TOOL_NAMES = (
     "kite_property_read",
     "kite_whatsapp_archive_read",
     "kite_personal_files_read",
+    "kite_session_search",
 )
 
 PERSONAL_GMAIL = "smith.js@gmail.com"
@@ -341,6 +344,22 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             ("operation", "max_results"),
         ),
     },
+    "kite_session_search": {
+        "description": (
+            "Search this assistant's own past conversations for what it already "
+            "learned or was told. Returns short dated excerpts, never a whole "
+            "transcript, and is for recalling facts and locations -- where a "
+            "document was filed, what was decided -- not for quoting past "
+            "conversation back to the requester."
+        ),
+        "parameters": _object_schema(
+            {
+                "query": {"type": "string", "minLength": 2, "maxLength": 120},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            ("query",),
+        ),
+    },
     "kite_personal_files_read": {
         "description": (
             "Search or read relative regular files beneath a configured personal "
@@ -367,6 +386,29 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 # Areas a personal-file root may live beneath. Naming the area is not enough --
 # a root has to be a folder inside one, so that widening reach is always a
 # deliberate, visible act rather than an oversight.
+def _session_when(stamp: Any) -> str:
+    """A date the model can reason about, from whatever the store holds."""
+    text = str(stamp or "").strip()
+    try:
+        return datetime.fromtimestamp(float(text)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return text[:16]
+
+
+_SESSION_EXCERPT_CHARS = 300
+
+
+def _session_denied_patterns():
+    """Anything secret-shaped is dropped from recall outright.
+
+    A transcript carries no capability of its own, so this does not rely on a
+    later check catching it -- it never enters the turn.
+    """
+    from .document_release import _CREDENTIAL_PATTERNS
+
+    return _CREDENTIAL_PATTERNS
+
+
 _PERSONAL_ROOT_BASES = (
     "/users/james/documents",
     "/users/james/desktop",
@@ -697,9 +739,18 @@ class PrivateReadService:
             "property_intel",
             "whatsapp",
             "files",
+            "sessions",
         }
         if set(self.config) - allowed:
             raise ValueError("private_reads contains unsupported configuration fields")
+        sessions = self.config.get("sessions")
+        if sessions is not None:
+            if (
+                not isinstance(sessions, dict)
+                or set(sessions) != {"database"}
+                or not Path(str(sessions.get("database") or "")).is_absolute()
+            ):
+                raise ValueError("session recall requires only an absolute database path")
         gmail = self.config.get("gmail")
         if gmail is not None:
             if (
@@ -805,6 +856,7 @@ class PrivateReadService:
                 "kite_property_read": self._property,
                 "kite_whatsapp_archive_read": self._whatsapp,
                 "kite_personal_files_read": self._files,
+                "kite_session_search": self._sessions,
             }[tool_name]
             result = _success(source, handler(dict(args)))
             encoded = canonical_json(result)
@@ -2067,6 +2119,79 @@ class PrivateReadService:
                 "unsupported_content", "file extension is not allowlisted"
             )
         return real
+
+    def _sessions(self, args: dict[str, Any]) -> Any:
+        """Recall what this assistant already learned, in bounded excerpts.
+
+        This reads past conversation, which is not a typed source with a
+        capability of its own: a transcript line has no domain the way personal
+        Gmail does. It is therefore deliberately narrow -- an excerpt, dated,
+        with the surface it came from -- so it can answer "where did I put the
+        passports" without becoming a way to replay a conversation.
+
+        Its results are returned through the same path as every other reader,
+        so the host records them as content fragments and the overlap check
+        still governs what may reach Juno.
+        """
+        self._require_exact(args, {"query", "max_results"}, {"query"})
+        config = self.config.get("sessions")
+        if not isinstance(config, dict):
+            raise SourceFailure(
+                "backend_unavailable", "session recall is not configured", True
+            )
+        database = Path(str(config.get("database") or ""))
+        if not database.is_absolute() or not database.exists():
+            raise SourceFailure(
+                "backend_unavailable", "session store is unavailable", True
+            )
+        query = self._bounded_text(args["query"], "query", 120)
+        maximum = self._bounded_int(args.get("max_results", 5), "max_results", 10)
+        if re.fullmatch(r"[A-Za-z0-9 ._'\-]{2,120}", query) is None:
+            raise SourceFailure("invalid_arguments", "query must be plain words")
+
+        terms = " ".join(f'"{word}"' for word in query.split())
+        found: list[dict[str, Any]] = []
+        try:
+            connection = sqlite3.connect(
+                f"file:{database}?mode=ro", uri=True, timeout=5
+            )
+            try:
+                connection.execute("pragma query_only = on")
+                rows = connection.execute(
+                    "select m.content, m.timestamp, s.session_key "
+                    "from messages_fts f "
+                    "join messages m on m.id = f.rowid "
+                    "join sessions s on s.id = m.session_id "
+                    "where f.messages_fts match ? and m.role in ('user','assistant') "
+                    "order by m.rowid desc limit ?",
+                    (terms, maximum * 12),
+                ).fetchall()
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            raise SourceFailure(
+                "source_failure", "session store could not be read", True
+            ) from exc
+
+        for content, stamp, key in rows:
+            text = re.sub(r"\s+", " ", str(content or "")).strip()
+            if len(text) < 24:
+                continue
+            # A transcript is not a typed source, so anything credential-shaped
+            # is dropped here rather than relied on being caught downstream.
+            if any(pattern.search(text) for pattern in _session_denied_patterns()):
+                continue
+            surface = (str(key or "").split(":") + ["", "", ""])[2] or "cli"
+            if surface == "a2a":
+                continue  # this lane's own traffic, not recall
+            found.append({
+                "when": _session_when(stamp),
+                "surface": surface,
+                "excerpt": text[:_SESSION_EXCERPT_CHARS],
+            })
+            if len(found) >= maximum:
+                break
+        return found
 
     def _files(self, args: dict[str, Any]) -> Any:
         self._require_exact(

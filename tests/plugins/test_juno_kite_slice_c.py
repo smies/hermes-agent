@@ -2540,3 +2540,114 @@ def test_allowed_bases_must_be_deliberate():
                 {"roots": [{"name": "t", "path": "/Users/james/Documents/X"}],
                  "allowed_bases": bases}
             )
+
+
+def _session_store(tmp_path, rows):
+    """A stand-in for Kite's own session store, same shape as the real one."""
+    import sqlite3 as _sql
+    path = tmp_path / "sessions.sqlite3"
+    db = _sql.connect(path)
+    db.executescript(
+        "create table sessions(id text primary key, session_key text);"
+        "create table messages(id integer primary key, session_id text, role text,"
+        " content text, timestamp real);"
+        "create virtual table messages_fts using fts5(content);"
+    )
+    for index, (key, role, content, stamp) in enumerate(rows, start=1):
+        db.execute("insert or ignore into sessions values (?,?)", (key, key))
+        db.execute("insert into messages values (?,?,?,?,?)",
+                   (index, key, role, content, stamp))
+        db.execute("insert into messages_fts(rowid, content) values (?,?)",
+                   (index, content))
+    db.commit()
+    db.close()
+    return path
+
+
+def _session_service(tmp_path, rows):
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+    return PrivateReadService(
+        {"enabled": True, "output_bytes": 262144,
+         "sessions": {"database": str(_session_store(tmp_path, rows))}},
+        backends=None, command_runner=None, url_opener=None, secret_values=set(),
+    )
+
+
+def test_session_recall_answers_where_a_document_was_filed(tmp_path):
+    """The case that started this: Kite knew, and could not say so.
+
+    It had told James "saved the passport scans in a durable family folder"
+    and the lane had no way to reach that.
+    """
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant",
+         "Saved the three current passport scans in a durable family folder: "
+         "/Users/james/Documents/Family/Passports", 1786307203.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "The weather tomorrow looks fine for the drive", 1786307100.0),
+    ])
+    found = service._sessions({"query": "passport scans", "max_results": 5})
+    assert len(found) == 1
+    assert "Family/Passports" in found[0]["excerpt"]
+    assert found[0]["when"].startswith("2026-")
+    assert found[0]["surface"] == "mattermost"
+
+
+def test_session_recall_drops_anything_secret_shaped(tmp_path):
+    """A transcript has no capability, so secrets never enter the turn."""
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant",
+         "the passport portal api_key=abcdef1234567890 is stored in the vault",
+         1786307203.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "passport scans are filed under the family folder", 1786307100.0),
+    ])
+    found = service._sessions({"query": "passport", "max_results": 5})
+    assert len(found) == 1
+    assert "api_key" not in found[0]["excerpt"]
+
+
+def test_session_recall_excludes_this_lane_and_bounds_its_output(tmp_path):
+    service = _session_service(tmp_path, [
+        ("agent:main:a2a:dm:jk-context", "assistant",
+         "passport request handled on the juno lane " + "x" * 400, 1786307203.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "passport " + "y" * 900, 1786307100.0),
+    ])
+    found = service._sessions({"query": "passport", "max_results": 5})
+    assert len(found) == 1                      # the a2a lane's own traffic is not recall
+    assert found[0]["surface"] == "mattermost"
+    assert len(found[0]["excerpt"]) <= 300      # an excerpt, never a transcript
+
+
+def test_session_recall_rejects_an_unbounded_or_odd_query(tmp_path):
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant", "passport filed", 1.0),
+    ])
+    for bad in ("a", "x" * 200, 'match "*"', "text; --", "a\u0000b"):
+        raised = False
+        try:
+            service._sessions({"query": bad, "max_results": 3})
+        except Exception as exc:
+            raised = getattr(exc, "code", "") in {"invalid_arguments", "cap_exceeded"}
+        assert raised, bad
+
+
+def test_session_recall_cannot_change_the_store(tmp_path):
+    """SQL-shaped words are just words: parameterised, read-only, no effect."""
+    import sqlite3 as _sql
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant", "passport filed here", 1.0),
+    ])
+    database = service.config["sessions"]["database"]
+    before = list(_sql.connect(database).execute("select count(*) from messages"))
+    service._sessions({"query": "drop table messages", "max_results": 3})
+    after = list(_sql.connect(database).execute("select count(*) from messages"))
+    assert before == after and before[0][0] == 1
+
+
+def test_session_recall_is_bound_to_one_principal():
+    """Lucy inherits nothing here; adding her has to be a deliberate change."""
+    from plugins.juno_kite_trusted_principal.runtime import _PRINCIPAL_BOUND_READS
+
+    assert _PRINCIPAL_BOUND_READS["kite_session_search"] == frozenset({"james"})
