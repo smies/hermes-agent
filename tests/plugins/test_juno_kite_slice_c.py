@@ -2044,3 +2044,68 @@ def test_attachment_download_gets_its_own_timeout(tmp_path):
         "gmail", "get", {"account": "personal", "message_id": "abc"}
     )
     assert seen == [service.timeout]
+
+
+def test_juno_accepts_the_host_descriptor_it_cannot_distinguish_by_signature(tmp_path):
+    """The 07:51 failure: Kite fully succeeded and Juno rejected the envelope.
+
+    Kite extracted the attachment, issued C7-T6REKJNX3DVQC2RN and returned
+    approval_required with denied=False. Juno then ran its own prose scan over
+    the answer, matched "07 08 2026" in the title as a phone number, and
+    blocked the consultation -- leaving the record staged and never claimed.
+    Fixing only the Kite side left the identical bug on the other side of the
+    wire.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    preview = canonical = json.dumps({
+        "outcome": "approval_required",
+        "document": {"title": "EL MS 07 08 2026",
+                     "source_class": "personal Gmail attachment",
+                     "mime_type": "application/pdf",
+                     "size_bytes": 254398, "page_count": 5},
+        "audience": "James only in this WhatsApp conversation",
+        "purpose": "property administration",
+        "approval": {"code": "C7-T6REKJNX3DVQC2RN",
+                     "instruction": "APPROVE C7-T6REKJNX3DVQC2RN",
+                     "expires_at": "2026-08-10T07:01:57+00:00"},
+    })
+    assert juno._release_descriptor(preview) is not None
+    # The prose scan alone would still refuse it, which is why the shape matters.
+    assert juno._leak_reason(preview, output=True) != ""
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        {"extra": "smuggled prose"},
+        {"audience": "everyone"},
+        {"purpose": "whatever administration"},
+    ],
+    ids=["extra-key", "wrong-audience", "unknown-purpose"],
+)
+def test_only_the_exact_host_shape_bypasses_the_prose_scan(tmp_path, mutate):
+    """Nothing may wear the descriptor's shape to skip the scan."""
+    root = tmp_path / "family"
+    root.mkdir()
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    payload = {
+        "outcome": "approval_required",
+        "document": {"title": "Letter", "source_class": "personal files",
+                     "mime_type": "application/pdf",
+                     "size_bytes": 10, "page_count": 1},
+        "audience": "James only in this WhatsApp conversation",
+        "purpose": "property administration",
+        "approval": {"code": "C7-AAAAAAAAAAAAAAAA",
+                     "instruction": "APPROVE C7-AAAAAAAAAAAAAAAA",
+                     "expires_at": "2026-01-01T00:00:00+00:00"},
+    }
+    assert juno._release_descriptor(json.dumps(payload)) is not None
+    payload.update(mutate)
+    assert juno._release_descriptor(json.dumps(payload)) is None
+    # Ordinary answers are still prose, and still scanned.
+    assert juno._release_descriptor("here is a summary of the letter") is None
+    assert juno._release_descriptor(
+        '{"outcome":"denied","reason":"nope"}'
+    ) is None

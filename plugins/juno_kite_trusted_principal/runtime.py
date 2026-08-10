@@ -353,6 +353,15 @@ _ACTIVE_LOOP: ContextVar[Optional[Any]] = ContextVar(
 CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
 # How long a document request stays resolvable by a bare follow-up.
 _DOCUMENT_FOLLOWUP_TTL_SECONDS = 300
+# The closed vocabulary of a host-built release descriptor. Juno recognises the
+# shape by these, so nothing outside them can wear it.
+_RELEASE_SOURCE_CLASSES = frozenset({"personal files", "personal Gmail attachment"})
+_RELEASE_PURPOSES = frozenset({
+    "personal administration",
+    "family administration",
+    "travel administration",
+    "property administration",
+})
 
 
 Transport = Callable[[str, dict, str, str], tuple[str, str, str]]
@@ -2755,6 +2764,59 @@ class TrustedPrincipalRuntime:
                 return "Property JSON/container dump"
         return ""
 
+    @staticmethod
+    def _release_descriptor(answer: str) -> Optional[dict]:
+        """Return the host's closed release descriptor, or None for prose.
+
+        Juno cannot tell a host-built descriptor from model text by signature
+        alone -- both are signed by Kite -- so it is recognised by exact shape.
+        Every field is constrained to a host-generated value except the title,
+        which the caller checks separately, so nothing can smuggle prose
+        through by wearing this shape.
+        """
+        from .document_release import ALLOWED_MIME_EXTENSIONS
+
+        try:
+            parsed = json.loads(str(answer or ""))
+        except (TypeError, ValueError):
+            return None
+        if (
+            not isinstance(parsed, dict)
+            or set(parsed) != {"outcome", "document", "audience", "purpose", "approval"}
+            or parsed.get("outcome") != "approval_required"
+            or parsed.get("audience") != "James only in this WhatsApp conversation"
+            or parsed.get("purpose") not in _RELEASE_PURPOSES
+        ):
+            return None
+        document = parsed.get("document")
+        approval = parsed.get("approval")
+        if (
+            not isinstance(document, dict)
+            or set(document) != {
+                "title", "source_class", "mime_type", "size_bytes", "page_count"
+            }
+            or not isinstance(document.get("title"), str)
+            or len(document["title"]) > 96
+            or document.get("source_class") not in _RELEASE_SOURCE_CLASSES
+            or document.get("mime_type") not in ALLOWED_MIME_EXTENSIONS
+            or not isinstance(document.get("size_bytes"), int)
+            or isinstance(document.get("size_bytes"), bool)
+            or not isinstance(document.get("page_count"), int)
+            or isinstance(document.get("page_count"), bool)
+        ):
+            return None
+        if (
+            not isinstance(approval, dict)
+            or set(approval) != {"code", "instruction", "expires_at"}
+            or not isinstance(approval.get("code"), str)
+            or re.fullmatch(r"C7-[A-Z2-9]{16}", approval["code"]) is None
+            or approval.get("instruction") != "APPROVE " + approval["code"]
+            or not isinstance(approval.get("expires_at"), str)
+            or len(approval["expires_at"]) > 40
+        ):
+            return None
+        return parsed
+
     def _safe_release_title(self, title: Any) -> str:
         """Keep a real document title unless it carries something that must not ship.
 
@@ -3179,7 +3241,12 @@ class TrustedPrincipalRuntime:
         answer = payload.get("answer")
         if not isinstance(answer, str) or len(answer) > self.limits.output_chars:
             raise ValueError("Kite response answer exceeds its minimized limit")
-        if self._leak_reason(answer, output=True):
+        if self._release_descriptor(answer) is None:
+            if self._leak_reason(answer, output=True):
+                raise ValueError("Kite response contains leak-shaped data")
+        elif self._safe_release_title(
+            json.loads(answer)["document"]["title"]
+        ) == "Requested document" and json.loads(answer)["document"]["title"]:
             raise ValueError("Kite response contains leak-shaped data")
         if payload.get("denied") is not False:
             raise ValueError("Kite denied release under current policy")
