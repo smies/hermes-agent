@@ -34,6 +34,10 @@ MAX_PDF_DECOMPRESSED_BYTES_PER_STREAM = 4 * 1024 * 1024
 MAX_PDF_TOTAL_DECOMPRESSED_BYTES = 16 * 1024 * 1024
 MAX_PDF_TRAILING_WHITESPACE_BYTES = 32
 MAX_IMAGE_PIXELS = 40_000_000
+# JPEG-framed stills. MPO is what an iPhone writes for an HDR or portrait
+# photo: the same JPEG container with an extra rendition after the main image.
+_JPEG_FORMATS = frozenset({"JPEG", "MPO"})
+_MPO_MAX_FRAMES = 3
 APPROVAL_TTL_SECONDS = 600
 UNCERTAIN_RETENTION_SECONDS = 3600
 
@@ -461,13 +465,30 @@ class DocumentReleaseService:
         try:
             with Image.open(io.BytesIO(data)) as image:
                 observed = str(image.format or "").upper()
-                required = "JPEG" if expected == "image/jpeg" else "PNG"
-                if observed != required:
-                    raise DocumentReleaseDenied("document MIME is mismatched")
+                accepted = (
+                    _JPEG_FORMATS if expected == "image/jpeg" else frozenset({"PNG"})
+                )
+                if observed not in accepted:
+                    # Name what was actually seen. "MIME is mismatched" alone
+                    # cost a round trip to learn only that something did not
+                    # match; a format name is not content and identifies the
+                    # gate exactly.
+                    raise DocumentReleaseDenied(
+                        "document MIME is mismatched: read as "
+                        + (observed.lower() or "unknown")
+                    )
                 width, height = image.size
                 if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
                     raise DocumentReleaseDenied("image dimensions are out of bounds")
-                if int(getattr(image, "n_frames", 1)) != 1:
+                # A phone photo is usually MPO: JPEG framing carrying a second
+                # rendition, typically an HDR gain map. It is a still image and
+                # the first frame is the picture, so the frame rule applies to
+                # what a viewer would animate, not to those extra renditions.
+                # Every family passport scan here is one, and the rule refused
+                # them all while a PNG of the same page released cleanly.
+                frames = int(getattr(image, "n_frames", 1))
+                limit = _MPO_MAX_FRAMES if observed == "MPO" else 1
+                if frames < 1 or frames > limit:
                     raise DocumentReleaseDenied("multi-frame images are unsupported")
                 metadata = "\n".join(
                     str(value) for value in image.info.values() if isinstance(value, str)

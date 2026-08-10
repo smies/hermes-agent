@@ -2915,3 +2915,38 @@ def test_the_release_gate_reasons_are_safe_to_surface():
             message = str(exc)
             # No paths, no names, no content -- just the rule that fired.
             assert "/" not in message and len(message) < 80, message
+
+
+def test_a_phone_photo_is_a_still_not_an_animation(tmp_path):
+    """Every family passport scan was refused; a PNG of the same page was not.
+
+    The gate read "document MIME is mismatched" for ~4.9MB JPEG-framed files.
+    An iPhone HDR or portrait photo is MPO: the same JPEG container carrying a
+    second rendition, usually a gain map. It is a still image, and the frame
+    rule exists to refuse things a viewer would animate.
+    """
+    from plugins.juno_kite_trusted_principal.document_release import (
+        _JPEG_FORMATS, _MPO_MAX_FRAMES, DocumentReleaseService,
+    )
+
+    assert "MPO" in _JPEG_FORMATS and "JPEG" in _JPEG_FORMATS
+    assert _MPO_MAX_FRAMES > 1
+
+    source = Path("plugins/juno_kite_trusted_principal/document_release.py").read_text()
+    # The frame allowance is scoped to MPO; a real animation is still refused.
+    assert 'limit = _MPO_MAX_FRAMES if observed == "MPO" else 1' in source
+    # A PNG is never widened by this.
+    assert 'frozenset({"PNG"})' in source
+
+    svc = DocumentReleaseService(None, store=None, mapping_key=b"0" * 32,
+                                 clock=lambda: 0.0)
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseDenied,
+    )
+    # A JPEG-framed file that is not a still names the format it was read as.
+    raised = ""
+    try:
+        svc.inspect_bytes(b"\xff\xd8\xff" + b"not really an image")
+    except DocumentReleaseDenied as exc:
+        raised = str(exc)
+    assert raised, "a broken JPEG must still be refused"
