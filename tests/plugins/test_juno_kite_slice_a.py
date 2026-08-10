@@ -462,7 +462,7 @@ def test_v2_envelope_exact_fields_and_cross_audience_binding_denial(tmp_path):
         "policy_generation", "expires_at", "question_or_goal", "relevant_context",
         "audience_digest", "conversation_binding", "effective_read_capability_ids",
         "effective_action_capability_ids", "roster_generation", "host_output_tier",
-        "signature",
+        "host_informational", "signature",
     }
     assert _PHONE_A not in json.dumps(payload)
     payload["audience_digest"] = "f" * 64

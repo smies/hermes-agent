@@ -53,6 +53,7 @@ _REQUEST_FIELDS = frozenset({
     "effective_action_capability_ids",
     "roster_generation",
     "host_output_tier",
+    "host_informational",
     "signature",
 })
 _RESPONSE_FIELDS = frozenset({
@@ -1592,7 +1593,7 @@ class TrustedPrincipalRuntime:
         # Auto-release consumes the authority issued against exactly this
         # revalidated audience, so publish it rather than the ingress copy.
         _ACTIVE_AUDIENCE.set(audience)
-        from .disclosure import classify_output_tier
+        from .disclosure import _DOCUMENT_INFORMATIONAL, classify_output_tier
 
         mapping = self.store.resolve(principal, conversation_key)
         request_id = "req-" + secrets.token_urlsafe(18)
@@ -1619,6 +1620,11 @@ class TrustedPrincipalRuntime:
             # never from the model-authored question_or_goal.
             "host_output_tier": self._host_output_tier(
                 _ACTIVE_INBOUND_TEXT.get(), audience.conversation_binding
+            ),
+            # Whether James asked *about* a document rather than *for* one,
+            # tested against his own words before any model rewrote them.
+            "host_informational": bool(
+                _DOCUMENT_INFORMATIONAL.search(_ACTIVE_INBOUND_TEXT.get() or "")
             ),
         }
         payload = {**unsigned, "signature": sign_payload(unsigned, self.request_key)}
@@ -1961,7 +1967,12 @@ class TrustedPrincipalRuntime:
         )
         if request is None:
             raise ValueError("request is unissued, replayed, stale, or cross-bound")
-        from .disclosure import classify_output_tier, strongest_output_tier
+        from .disclosure import (
+            BOUNDED_EXCERPT,
+            DOCUMENT_DESCRIPTOR,
+            classify_output_tier,
+            strongest_output_tier,
+        )
 
         # The peer's question_or_goal is model-authored and reworded every turn,
         # so it cannot be the sole source of the tier: one live paraphrase said
@@ -1970,15 +1981,20 @@ class TrustedPrincipalRuntime:
         # Take the most restrictive of the host-classified inbound message, the
         # paraphrase, and the quoted context, so an untrusted rewording can only
         # add gates, never remove them.
+        # Only what is being asked now: the host's reading of the authentic
+        # message, and the peer's paraphrase of it. Quoted history is context
+        # for understanding the request, not a statement of it -- counting it
+        # turned "what is Lucy's passport number" into a file release, because
+        # the previous turn had been "send me Frankie's passport".
         candidates = [
             str(payload.get("host_output_tier") or ""),
             classify_output_tier(str(payload["question_or_goal"])),
         ]
-        candidates.extend(
-            classify_output_tier(str(turn.get("text") or ""))
-            for turn in payload["relevant_context"]
-            if isinstance(turn, dict) and turn.get("role") == "user"
-        )
+        tier = strongest_output_tier(candidates)
+        # A question about a document is not a request for one. The host tested
+        # that against James's own words, so a paraphrase cannot promote it.
+        if payload.get("host_informational") is True and tier == DOCUMENT_DESCRIPTOR:
+            tier = BOUNDED_EXCERPT
         return TurnBinding(
             True,
             "",
@@ -1988,7 +2004,7 @@ class TrustedPrincipalRuntime:
             turn_id,
             read_caps,
             action_caps,
-            strongest_output_tier(candidates),
+            tier,
         )
 
     def _host_output_tier(self, inbound_text: str, conversation_binding: str) -> str:

@@ -3034,3 +3034,106 @@ def test_an_executable_name_is_refused_even_with_harmless_bytes(tmp_path):
         raised = str(exc)
     assert "executable" in raised
     assert not list(staging.glob("*.stage")), "nothing may be staged"
+
+
+@pytest.mark.asyncio
+async def test_a_question_about_a_document_is_not_a_request_for_one(tmp_path):
+    """James asked for Lucy's passport number and was sent Lucy's passport.
+
+    Both tiers were right -- minimized. The escalation came from
+    relevant_context: Juno quoted the previous turn, "Send me Frankie's
+    passport", and the strongest-tier rule counted quoted history as part of
+    the current request.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED, classify_output_tier,
+    )
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    adapter = RecordingWhatsAppAdapter(MutableRoster())
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+
+    asked = "What is Lucy's passport number and expiry?"
+    assert classify_output_tier(asked) == MINIMIZED
+
+    await juno.pre_gateway_dispatch(
+        event=_event(asked),
+        gateway=SimpleNamespace(adapters={Platform.WHATSAPP: adapter}),
+        critical_ingress_token=object(),
+    )
+    prepared = _session(
+        lambda: juno._prepare_request({
+            "question_or_goal": "Extract the passport number and expiry",
+            # The previous turn, quoted as context exactly as Juno quoted it.
+            "relevant_context": [
+                {"role": "user", "text": "Send me Frankie's passport"},
+                {"role": "user", "text": asked},
+            ],
+        }),
+        mode="juno",
+    )
+    payload = json.loads(prepared.message.split("JUNO_KITE_REQUEST_V2", 1)[1])
+    assert payload["host_output_tier"] == MINIMIZED
+    assert payload["host_informational"] is True
+
+    # And the binding no longer scores quoted history at all.
+    source = Path("plugins/juno_kite_trusted_principal/runtime.py").read_text()
+    assert 'for turn in payload["relevant_context"]' not in source
+    assert 'payload.get("host_informational") is True' in source
+
+
+@pytest.mark.asyncio
+async def test_asking_for_a_document_still_reaches_the_document_tier(tmp_path):
+    """The cap must not disarm an actual request."""
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    adapter = RecordingWhatsAppAdapter(MutableRoster())
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    await juno.pre_gateway_dispatch(
+        event=_event("Send me Frankie's passport"),
+        gateway=SimpleNamespace(adapters={Platform.WHATSAPP: adapter}),
+        critical_ingress_token=object(),
+    )
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": "Release the passport"}),
+        mode="juno",
+    )
+    payload = json.loads(prepared.message.split("JUNO_KITE_REQUEST_V2", 1)[1])
+    assert payload["host_output_tier"] == DOCUMENT_DESCRIPTOR
+    assert payload["host_informational"] is False
+
+
+def test_a_document_can_be_read_without_being_sent(tmp_path, monkeypatch):
+    """"What is Lucy's passport number" could only be answered by sending it.
+
+    A PDF or a scan is readable even though it is not text; refusing to read
+    it left the model no way to answer except release.
+    """
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    monkeypatch.setattr(
+        pr, "_run_preview_reader",
+        lambda argv: "PASSPORT UNITED KINGDOM No 123456789 Expiry 04 MAR 2031",
+    )
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "passport.pdf").write_bytes(b"%PDF-1.4 scanned")
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    result = json.loads(runtime.private_reads.execute(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "family", "relative_path": "passport.pdf"},
+    ))
+    assert result["status"] == "ok"
+    data = result["data"]
+    assert data["outcome"] == "extracted"
+    assert "123456789" in data["text"]
+    # Still a bounded read of a named file, not the bytes.
+    assert data["descriptor"]["mime_type"] == "application/pdf"
+    assert "artifact" not in json.dumps(data)

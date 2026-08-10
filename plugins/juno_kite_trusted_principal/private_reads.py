@@ -416,6 +416,8 @@ _PERSONAL_ROOT_BASES = (
 )
 
 _PREVIEW_MAX_CHARS = 600
+# A read asks to understand the document, not merely to tell it apart.
+_READ_EXTRACT_CHARS = 6000
 _PREVIEW_TIMEOUT_SECONDS = 45
 _PDFTOTEXT_CANDIDATES = ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
 _SYSTEM_PYTHON = "/usr/bin/python3"
@@ -520,7 +522,7 @@ def _run_preview_reader(argv: list[str]) -> str:
     ]
 
 
-def _document_preview(data: bytes, mime_type: str) -> str:
+def _document_preview(data: bytes, mime_type: str, *, limit: int = _PREVIEW_MAX_CHARS) -> str:
     """A bounded look at what this document actually says.
 
     The model has to decide whether a candidate is the document that was asked
@@ -562,16 +564,14 @@ def _document_preview(data: bytes, mime_type: str) -> str:
             "text/plain", "text/csv", "text/markdown", "application/json",
         }:
             try:
-                return re.sub(r"\s+", " ", data.decode("utf-8")).strip()[
-                    :_PREVIEW_MAX_CHARS
-                ]
+                return re.sub(r"\s+", " ", data.decode("utf-8")).strip()[:limit]
             except UnicodeDecodeError:
                 return ""
         elif mime_type in {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }:
-            return _office_preview(data)
+            return _office_preview(data)[:limit]
         elif mime_type in {"image/jpeg", "image/png"}:
             if not Path(_SYSTEM_PYTHON).exists() or not Path(_MACOS_OCR_SCRIPT).exists():
                 return ""
@@ -2248,15 +2248,27 @@ class PrivateReadService:
                 ".yaml",
                 ".yml",
             }:
+                # A PDF or a scan is readable even though it is not text, and
+                # refusing to read it made an ordinary question unanswerable:
+                # "what is Lucy's passport number" could only be answered by
+                # sending Lucy's passport. The text is extracted on this
+                # machine, and disclosure of what it says is governed by the
+                # capability for the turn exactly as any other read is.
+                guessed = (
+                    mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                )
+                extracted = _document_preview(
+                    path.read_bytes(), guessed, limit=_READ_EXTRACT_CHARS
+                )
                 return {
-                    "outcome": "unavailable_next_gate",
+                    "outcome": "extracted" if extracted else "unavailable_next_gate",
                     "descriptor": {
                         "root": name,
                         "relative_path": str(path.relative_to(roots[name].resolve())),
-                        "mime_type": mimetypes.guess_type(path.name)[0]
-                        or "application/octet-stream",
+                        "mime_type": guessed,
                         "size_bytes": size,
                     },
+                    "text": extracted,
                 }
             text = path.read_text(encoding="utf-8")
             lines = text.splitlines()
