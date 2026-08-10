@@ -1260,7 +1260,8 @@ def test_document_guidance_requires_searching_every_source_before_concluding():
     assert "BOTH" in rule
     assert "kite_personal_files_read" in rule
     assert "kite_gmail_attachment_extract" in rule
-    assert "never grounds to report the document missing" in rule
+    assert "before saying a document is missing" in rule
+    assert "never appears in an email search" in rule
 
 
 @pytest.mark.asyncio
@@ -2177,7 +2178,9 @@ def test_document_guidance_requires_checking_the_name_before_releasing():
         output_tier=DOCUMENT_DESCRIPTOR,
     )["output_tier_rule"]
     assert "document_preview" in rule
-    assert "ask rather than" in rule
+    assert "document_name" in rule
+    assert "identifies nothing" in rule          # a scanner default is not evidence
+    assert "not the topic" in rule               # British vs Irish are both passports
     assert "cannot be recalled" in rule
 
 
@@ -2726,3 +2729,54 @@ def test_recall_reduces_an_awkward_query_rather_than_refusing_it(tmp_path):
     except Exception as exc:
         raised = getattr(exc, "code", "") == "invalid_arguments"
     assert raised
+
+
+@pytest.mark.parametrize(
+    "tier",
+    ["minimized_answer", "bounded_excerpt", "specific_full_document_descriptor",
+     "bulk_raw_export"],
+)
+def test_the_policy_view_fits_its_limit_on_every_tier(tmp_path, tier):
+    """The guidance grew until the binding itself failed.
+
+    _policy_view raises when the rendered view passes policy_view_chars, and
+    _bind_request turns that into "Kite policy binding denied". The model then
+    runs with no lane instructions at all and refuses -- which reads exactly
+    like a policy refusal and is nothing of the kind. Every sentence added to
+    the guidance spends this budget, so it is asserted per tier, with the full
+    production capability set.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import TurnBinding
+
+    root = tmp_path / "family"
+    root.mkdir()
+    config = _config(tmp_path, root, mode="kite")
+    section = config["juno_kite_trusted_principal"]
+    # The production capability set, which is what the live view is rendered
+    # against -- a smaller fixture would pass while production failed.
+    live_caps = [
+        "juno.private.james", "juno.shared.family", "juno.shared.children",
+        "juno.shared.mauritius", "juno.shared.property_intel",
+        "juno.shared.villa_lena", "juno.public",
+    ]
+    principal = section["policy"]["principals"]["james"]
+    principal["read_capability_ids"] = list(live_caps)
+    principal["semantic_policy"] = {c: {"domain": c} for c in live_caps}
+    # The fixture is generous (20000); production allows 8000, and it is
+    # production that decides whether a turn binds at all.
+    section["limits"]["policy_view_chars"] = 8000
+    caps = tuple(live_caps)
+    runtime = TrustedPrincipalRuntime(config, active_profile="kite", clock=Clock())
+
+    binding = TurnBinding(
+        True, "",
+        SimpleNamespace(principal="james", correlation_id="corr-x",
+                        context_id="ctx-x"),
+        SimpleNamespace(request_id="req-x"),
+        "kite-session", "kite-turn", caps, (), tier,
+    )
+    rendered = runtime._policy_view(binding)
+    limit = runtime.limits.policy_view_chars
+    assert len(rendered) <= limit, (
+        f"{tier}: policy view is {len(rendered)} chars against a {limit} limit"
+    )
