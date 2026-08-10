@@ -1377,11 +1377,29 @@ class TrustedPrincipalRuntime:
 
     @property
     def _lane_wait_seconds(self) -> float:
-        """How long to wait for the lane: one peer timeout is its worst case."""
+        """How long a redirect waits for the lane the earlier turn still holds.
+
+        A request already on the wire cannot be recalled, so the new one waits
+        for the lane to drain rather than colliding in it. One peer timeout
+        reads like the worst case until you notice the live config sets no
+        timeout for that peer at all, which collapses this to its 1.0s floor
+        -- while a real consultation runs for tens of seconds and sometimes
+        minutes. A redirect would then almost always give up and report the
+        lane occupied, which is little better than being answered with the
+        wrong document.
+
+        Wait as long as the turn itself may live. Past its TTL the request has
+        expired and there is nothing left to wait for.
+        """
         try:
-            return max(1.0, float(self.peer.get("timeout") or 0) + 1.0)
+            peer = float(self.peer.get("timeout") or 0) + 1.0
         except (TypeError, ValueError):
-            return 1.0
+            peer = 1.0
+        try:
+            ttl = float(self.limits.turn_ttl_seconds)
+        except (TypeError, ValueError):
+            ttl = 0.0
+        return max(1.0, peer, ttl)
 
     async def pre_gateway_dispatch(
         self,

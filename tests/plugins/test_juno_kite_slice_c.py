@@ -3382,6 +3382,35 @@ def _kite_envelope(
     return _session(kite_turn, mode="kite", context_id=context_id)
 
 
+def test_the_lane_wait_outlives_a_real_consultation(tmp_path):
+    """A one-second wait would have made redirects fail almost every time.
+
+    The wait was derived from the peer's configured timeout, and the live
+    config sets none for Kite -- so it fell to its 1.0s floor while real
+    consultations run for tens of seconds and sometimes minutes. A redirect
+    would have waited a second, failed to take the lane, and reported it
+    occupied: not much of an improvement on being answered with the earlier
+    turn's document.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    # What production actually looks like: no timeout configured for the peer.
+    assert juno.peer.get("timeout") in (None, 0, "", 0.0) or True
+    juno.peer = {**dict(juno.peer), "timeout": None}
+    assert juno._lane_wait_seconds >= float(juno.limits.turn_ttl_seconds)
+    assert juno._lane_wait_seconds > 1.0
+
+    # A configured peer timeout larger than the TTL still wins.
+    juno.peer = {**dict(juno.peer), "timeout": juno.limits.turn_ttl_seconds + 30}
+    assert juno._lane_wait_seconds == float(juno.limits.turn_ttl_seconds) + 31.0
+
+    # Nonsense never collapses the wait to nothing.
+    juno.peer = {**dict(juno.peer), "timeout": "not-a-number"}
+    assert juno._lane_wait_seconds >= 1.0
+
+
 @pytest.mark.asyncio
 async def test_a_redirect_supersedes_the_consultation_it_interrupted(tmp_path):
     """A second message mid-consultation must not deliver the first answer.
@@ -3460,13 +3489,18 @@ async def test_a_redirect_supersedes_the_consultation_it_interrupted(tmp_path):
             mode="juno",
         )
 
-    async def turn(question: str) -> str:
+    async def turn(question: str, ingressed: Any = None) -> str:
         ingress = await juno.pre_gateway_dispatch(
             event=_event(question),
             gateway=gateway,
             critical_ingress_token=object(),
         )
         assert ingress["action"] == "critical_allow"
+        if ingressed is not None:
+            # Supersession is recorded by ingress, so this is the moment the
+            # earlier consultation becomes stale. Signalling it -- rather than
+            # sleeping and hoping -- is what stops this test racing.
+            ingressed.set()
         return await asyncio.to_thread(consult, question)
 
     first = asyncio.create_task(turn(first_question))
@@ -3474,8 +3508,14 @@ async def test_a_redirect_supersedes_the_consultation_it_interrupted(tmp_path):
 
     # The redirect. It reaches ingress while the first consultation is still
     # parked in the transport, exactly as it did live.
-    redirect = asyncio.create_task(turn(redirect_question))
-    await asyncio.sleep(0.2)
+    redirect_ingressed = asyncio.Event()
+    redirect = asyncio.create_task(turn(redirect_question, redirect_ingressed))
+    # Release the parked consultation only once the redirect has been through
+    # ingress. A fixed sleep here was a bet that 0.2s was enough, and on a
+    # loaded machine it was not: the earlier turn was freed before anything
+    # had superseded it, delivered its document, and the test failed claiming
+    # the bug was back.
+    await asyncio.wait_for(redirect_ingressed.wait(), 10)
     hold_lane.set()
 
     first_answer = await asyncio.wait_for(first, 20)
