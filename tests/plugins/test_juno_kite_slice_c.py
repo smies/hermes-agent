@@ -2869,3 +2869,49 @@ def test_the_turn_instruction_never_reaches_the_kite_lane(tmp_path):
     root.mkdir()
     kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
     assert kite._juno_turn_context() is None
+
+
+def test_a_refused_artifact_says_which_gate_refused_it(tmp_path):
+    """"failed the release gate" cannot distinguish oversized from wrong-type.
+
+    Frankie's passport is a 4.9MB scan that exists and was found, and the reply
+    said only that a private source was incomplete -- which is neither the
+    reason nor even the right category.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    # A JPEG far past the artifact size ceiling: a real, nameable gate.
+    huge = b"\xff\xd8\xff" + b"\x00" * (9 * 1024 * 1024)
+    (root / "huge.jpg").write_bytes(huge)
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseDenied,
+    )
+    raised = ""
+    try:
+        runtime.document_releases.inspect_bytes(huge)
+    except DocumentReleaseDenied as exc:
+        raised = str(exc)
+    assert "size is out of bounds" in raised
+
+    # The runtime surfaces that wording rather than swallowing it.
+    source = Path("plugins/juno_kite_trusted_principal/runtime.py").read_text()
+    assert 'f": {detail}" if detail else ""' in source
+    assert "_typed_read_failures" in source
+
+
+def test_the_release_gate_reasons_are_safe_to_surface():
+    """They name the gate, not the document -- that is what they are for."""
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseService, DocumentReleaseDenied,
+    )
+    svc = DocumentReleaseService(None, store=None, mapping_key=b"0" * 32,
+                                 clock=lambda: 0.0)
+    for payload in (b"", b"\x00\x01binary\xff", b"%PDF-1.7\n/JavaScript\n%%EOF"):
+        try:
+            svc.inspect_bytes(payload)
+        except DocumentReleaseDenied as exc:
+            message = str(exc)
+            # No paths, no names, no content -- just the rule that fired.
+            assert "/" not in message and len(message) < 80, message

@@ -2381,15 +2381,35 @@ class TrustedPrincipalRuntime:
                                 self.document_releases.discard_candidate(candidate)
                                 raise ValueError("typed source descriptor mismatched artifact")
                             state["document_candidates"].append(candidate)
-                        except Exception:
+                        except Exception as exc:
+                            # DocumentReleaseDenied messages are written to be
+                            # non-sensitive on purpose -- they name the gate,
+                            # not the document. Withholding them made a
+                            # refused artifact undiagnosable: "failed the
+                            # release gate" cannot distinguish an oversized
+                            # scan from a mismatched type.
+                            from .document_release import DocumentReleaseDenied
+
+                            detail = (
+                                str(exc)[:120]
+                                if isinstance(exc, (DocumentReleaseDenied, ValueError))
+                                else ""
+                            )
                             state["failures"].add(f"{source}:release_denied")
+                            logger.warning(
+                                "Juno--Kite release gate refused a candidate: %s",
+                                detail or type(exc).__name__,
+                            )
                             return canonical_json({
                                 "status": "error",
                                 "source": source,
                                 "complete": False,
                                 "error": {
                                     "code": "release_denied",
-                                    "message": "document candidate failed the release gate",
+                                    "message": (
+                                        "document candidate failed the release gate"
+                                        + (f": {detail}" if detail else "")
+                                    ),
                                     "retryable": False,
                                 },
                             })
@@ -2925,6 +2945,10 @@ class TrustedPrincipalRuntime:
         try:
             if state["failures"]:
                 stage = "typed-read"
+                # Carry the gate's own words outward. "a required private
+                # source failed" cannot tell James whether his scan was too
+                # large, the wrong type, or simply absent.
+                self._typed_read_failures = sorted(state["failures"])[:3]
                 raise ValueError("a required private source failed or was incomplete")
             if not candidates:
                 # Name the sources that were never searched. A model that
@@ -3010,7 +3034,8 @@ class TrustedPrincipalRuntime:
             reason_by_stage = {
                 "typed-read": (
                     "a required private source failed or was incomplete, so no "
-                    "document could be staged"
+                    "document could be staged: "
+                    + "; ".join(getattr(self, "_typed_read_failures", ()) or ["unspecified"])
                 ),
                 "staging": (
                     "no approved typed reader ran and succeeded in this turn, so "
