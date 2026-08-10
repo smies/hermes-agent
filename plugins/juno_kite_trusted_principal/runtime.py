@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.request
 from contextvars import ContextVar
@@ -399,6 +400,18 @@ _ACTIVE_DELIVERY: ContextVar[Optional[tuple[Any, str]]] = ContextVar(
 _ACTIVE_LOOP: ContextVar[Optional[Any]] = ContextVar(
     "juno_kite_active_loop", default=None
 )
+# Which inbound turn this work belongs to. Every inbound event is dispatched on
+# its own task, and a ContextVar set is task-local, so a later message cannot be
+# noticed through any of the ContextVars above -- the counter it is compared
+# against lives on the runtime instead. Captured at ingress and inherited by the
+# agent executor and its tool threads through copy_context(), so a consultation
+# can always tell whether the message that asked for it is still the current
+# one. None means the work never passed through ingress (a direct unit call, or
+# a surface with no inbound message) and is therefore never superseded.
+_ACTIVE_TURN_EPOCH: ContextVar[Optional[tuple[str, int]]] = ContextVar(
+    "juno_kite_active_turn_epoch", default=None
+)
+_SUPERSEDED_REASON = "a newer message superseded this consultation"
 
 CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
 # How long a document request stays resolvable by a bare follow-up.
@@ -525,6 +538,16 @@ class TrustedPrincipalRuntime:
         # Documents already sent during the inbound turn being served, so a
         # model that loops over a family cannot send the same passport twice.
         self._delivered_documents: set[str] = set()
+        # The inbound turn currently being served in each conversation. Bumped
+        # once per ingress; a consultation carrying an older number belongs to a
+        # question James has already moved on from and may neither dispatch nor
+        # deliver.
+        self._turn_epochs: dict[str, int] = {}
+        self._turn_epoch_lock = threading.Lock()
+        # Kite answers one conversation in one session, keyed by the durable
+        # context id, so that lane is a single-occupancy resource shared by
+        # every turn of the conversation. Held only across issue+transport.
+        self._lane_locks: dict[str, threading.Lock] = {}
         # Conversations whose last request was a document request, so a bare
         # "send it again" can be resolved. Keyed by the opaque conversation
         # binding, never a raw chat id, and short-lived.
@@ -1312,6 +1335,54 @@ class TrustedPrincipalRuntime:
         except Exception:
             logger.warning("Juno--Kite lane session reset failed; continuing")
 
+    def _begin_turn_epoch(
+        self, platform: str, chat_type: str, chat_id: str
+    ) -> tuple[str, int]:
+        """Claim this conversation for this message and supersede the last one.
+
+        Keyed by the same opaque conversation binding the signed request carries,
+        never a raw chat id, and per conversation rather than per runtime so a
+        message in one conversation cannot cancel a consultation running for
+        another. The key set is bounded by the configured eligible
+        conversations, which is why it is never pruned.
+        """
+        conversation = self._opaque_digest(
+            "conversation-v2",
+            {"platform": platform, "kind": chat_type, "chat": chat_id},
+        )
+        with self._turn_epoch_lock:
+            epoch = self._turn_epochs.get(conversation, 0) + 1
+            self._turn_epochs[conversation] = epoch
+            return conversation, epoch
+
+    def _turn_superseded(self) -> bool:
+        """Whether a newer inbound message has replaced the turn we are serving."""
+        active = _ACTIVE_TURN_EPOCH.get()
+        if active is None:
+            return False
+        conversation, epoch = active
+        with self._turn_epoch_lock:
+            return self._turn_epochs.get(conversation, epoch) != epoch
+
+    def _consultation_lane(self) -> threading.Lock:
+        """The single-occupancy Kite session this conversation consults through."""
+        active = _ACTIVE_TURN_EPOCH.get()
+        conversation = active[0] if active else ""
+        with self._turn_epoch_lock:
+            lane = self._lane_locks.get(conversation)
+            if lane is None:
+                lane = threading.Lock()
+                self._lane_locks[conversation] = lane
+            return lane
+
+    @property
+    def _lane_wait_seconds(self) -> float:
+        """How long to wait for the lane: one peer timeout is its worst case."""
+        try:
+            return max(1.0, float(self.peer.get("timeout") or 0) + 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+
     async def pre_gateway_dispatch(
         self,
         event: Any = None,
@@ -1331,6 +1402,7 @@ class TrustedPrincipalRuntime:
         _ACTIVE_INGRESS_TOKEN.set(None)
         _ACTIVE_DELIVERY.set(None)
         _ACTIVE_INBOUND_TEXT.set(str(getattr(event, "text", "") or ""))
+        _ACTIVE_TURN_EPOCH.set(None)
         self._delivered_documents.clear()
         try:
             _ACTIVE_LOOP.set(asyncio.get_running_loop())
@@ -1361,6 +1433,16 @@ class TrustedPrincipalRuntime:
             eligibility = self.conversation_eligibility[principal]
             if chat_type not in {"dm", "group"} or not eligibility[chat_type]:
                 return self._ingress_skip("conversation-ineligible")
+            # This message is now the turn for this conversation, and whatever
+            # is still running for the previous one is superseded from here.
+            # Claimed only once the sender is a protected principal in an
+            # eligible conversation, so nothing anyone else sends can cancel a
+            # consultation of James's, and only after the resets above, so no
+            # step of the superseded turn can read the state they clear and
+            # still believe it is current.
+            _ACTIVE_TURN_EPOCH.set(
+                self._begin_turn_epoch(platform, chat_type, chat_id)
+            )
             if chat_type == "dm":
                 audience = self._single_principal_audience(principal, platform, chat_id)
                 _ACTIVE_AUDIENCE.set(audience)
@@ -1713,13 +1795,44 @@ class TrustedPrincipalRuntime:
         """Tool handler: derive authority from ContextVars and call fixed Kite."""
         request_id = ""
         try:
-            prepared = self._prepare_request(args)
-            mapping = prepared.mapping
-            request_id = prepared.request_id
-            audience = prepared.audience
-            raw, returned_context, state = self.transport(
-                self.peer_name, dict(self.peer), prepared.message, mapping.context_id
-            )
+            if self._turn_superseded():
+                raise ValueError(_SUPERSEDED_REASON)
+            # One signed request at a time on this lane. Kite serves the whole
+            # conversation from a single session keyed by the durable context
+            # id, so a second request issued while the first is still in flight
+            # lands in that session as a mid-turn interrupt and Kite reads one
+            # user message carrying two signed requests -- which _extract_request
+            # is right to refuse as ambiguous. The lane is serialised so it never
+            # sees that, rather than the check being softened to tolerate it.
+            lane = self._consultation_lane()
+            if not lane.acquire(timeout=self._lane_wait_seconds):
+                raise ValueError(
+                    "the Kite lane is still occupied by an earlier consultation"
+                )
+            try:
+                # Re-checked under the lane: waiting for it is exactly the window
+                # in which a redirect arrives, and a superseded turn must not
+                # issue authority or occupy the lane the new one needs.
+                if self._turn_superseded():
+                    raise ValueError(_SUPERSEDED_REASON)
+                prepared = self._prepare_request(args)
+                mapping = prepared.mapping
+                request_id = prepared.request_id
+                audience = prepared.audience
+                raw, returned_context, state = self.transport(
+                    self.peer_name,
+                    dict(self.peer),
+                    prepared.message,
+                    mapping.context_id,
+                )
+            finally:
+                lane.release()
+            # The answer came back for a question James has moved on from. Stop
+            # before the one-use claim is consumed, so no release descriptor and
+            # no approval code from this consultation ever exists to be
+            # delivered.
+            if self._turn_superseded():
+                raise ValueError(_SUPERSEDED_REASON)
             if returned_context != mapping.context_id or state.lower() not in {
                 "completed",
                 "task-state-completed",
@@ -1762,6 +1875,14 @@ class TrustedPrincipalRuntime:
         audience = _ACTIVE_AUDIENCE.get()
         if audience is None:
             return answer
+        # Last gate before the host sends anything on its own initiative. A
+        # redirect that lands in the gap between the answer returning and the
+        # release being consumed would otherwise put the document James asked
+        # for first into the reply to the message he asked for instead -- which
+        # is the worst of the three possible outcomes, and the observed one.
+        if self._turn_superseded():
+            logger.info("Juno--Kite consultation superseded before delivery")
+            return f"BLOCKED: consult_kite denied ({_SUPERSEDED_REASON})."
         # A tool handler is not given the host's session/turn identifiers --
         # handler_kwargs is whatever the caller passed -- so keying the delivery
         # flag off kwargs produced an empty key that never matched the hook.

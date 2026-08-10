@@ -6,9 +6,11 @@ suite never contacts a provider and never uses the ordinary ``MEDIA:`` path.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import io
 import json
+import threading
 import zlib
 from contextvars import copy_context
 from pathlib import Path
@@ -3332,3 +3334,162 @@ def test_a_document_can_be_read_without_being_sent(tmp_path, monkeypatch):
     # Still a bounded read of a named file, not the bytes.
     assert data["descriptor"]["mime_type"] == "application/pdf"
     assert "artifact" not in json.dumps(data)
+
+
+def _kite_envelope(
+    kite: TrustedPrincipalRuntime,
+    message: str,
+    context_id: str,
+    *,
+    relative_path: str,
+    capability_id: str,
+    search_query: str,
+) -> str:
+    """Run one whole Kite lane turn over an already signed request."""
+
+    def kite_turn():
+        kite.pre_llm_call(
+            user_message=message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        _invoke(
+            kite,
+            "kite_personal_files_read",
+            {
+                "operation": "search",
+                "root": "family",
+                "query": search_query,
+                "max_results": 1,
+            },
+        )
+        _invoke(
+            kite,
+            "kite_personal_files_read",
+            {
+                "operation": "read",
+                "root": "family",
+                "relative_path": relative_path,
+                "max_lines": 1,
+            },
+        )
+        return kite.transform_llm_output(
+            response_text=json.dumps({"capability_id": capability_id}),
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    return _session(kite_turn, mode="kite", context_id=context_id)
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_supersedes_the_consultation_it_interrupted(tmp_path):
+    """A second message mid-consultation must not deliver the first answer.
+
+    Live on 2026-08-10: a redirect arrived while ``consult_kite`` was still
+    waiting on the lane, and the earlier turn's document was delivered in reply
+    to it. Two things are shared between overlapping turns and both are
+    exercised here -- the runtime instance that keeps delivering for a turn
+    nobody is waiting for any more, and the single Kite lane session keyed by
+    the durable context id, which sees two signed requests at once.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    superseded_bytes = _png_bytes(text="the passport nobody asked for any more")
+    redirect_bytes = _png_bytes(text="the letter he actually asked for")
+    (root / "child-passport.png").write_bytes(superseded_bytes)
+    (root / "engagement-letter.png").write_bytes(redirect_bytes)
+
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+    gateway = SimpleNamespace(adapters={Platform.WHATSAPP: adapter})
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+
+    first_question = "Send me the actual child passport scan"
+    redirect_question = "Show me the nacho engagement letter"
+
+    entered_lane = threading.Event()
+    hold_lane = threading.Event()
+    on_lane: list[str] = []
+    lane_peak = 0
+
+    def transport(_peer_name, _peer, message, context_id):
+        nonlocal lane_peak
+        on_lane.append(message)
+        lane_peak = max(lane_peak, len(on_lane))
+        try:
+            if first_question in message:
+                entered_lane.set()
+                assert hold_lane.wait(10)
+                return (
+                    _kite_envelope(
+                        kite,
+                        message,
+                        context_id,
+                        relative_path="child-passport.png",
+                        capability_id="juno.shared.children",
+                        search_query="passport",
+                    ),
+                    context_id,
+                    "completed",
+                )
+            return (
+                _kite_envelope(
+                    kite,
+                    message,
+                    context_id,
+                    relative_path="engagement-letter.png",
+                    capability_id="juno.private.james",
+                    search_query="engagement",
+                ),
+                context_id,
+                "completed",
+            )
+        finally:
+            on_lane.pop()
+
+    juno.transport = transport
+
+    def consult(question: str) -> str:
+        return _session(
+            lambda: asyncio.run(
+                juno.consult_kite_delivering({"question_or_goal": question})
+            ),
+            mode="juno",
+        )
+
+    async def turn(question: str) -> str:
+        ingress = await juno.pre_gateway_dispatch(
+            event=_event(question),
+            gateway=gateway,
+            critical_ingress_token=object(),
+        )
+        assert ingress["action"] == "critical_allow"
+        return await asyncio.to_thread(consult, question)
+
+    first = asyncio.create_task(turn(first_question))
+    assert await asyncio.to_thread(entered_lane.wait, 10)
+
+    # The redirect. It reaches ingress while the first consultation is still
+    # parked in the transport, exactly as it did live.
+    redirect = asyncio.create_task(turn(redirect_question))
+    await asyncio.sleep(0.2)
+    hold_lane.set()
+
+    first_answer = await asyncio.wait_for(first, 20)
+    redirect_answer = await asyncio.wait_for(redirect, 20)
+
+    # Nothing from the superseded consultation reached the chat.
+    delivered = [call["bytes"] for call in adapter.document_calls]
+    assert superseded_bytes not in delivered
+    assert first_answer.startswith("BLOCKED: consult_kite denied")
+
+    # The redirect is what got answered, and its document is what arrived.
+    assert json.loads(redirect_answer)["outcome"] == "delivered"
+    assert delivered == [redirect_bytes]
+
+    # Two signed requests never sat on the one Kite session together: that is
+    # what _extract_request refuses as ambiguous, and it must never see it.
+    assert lane_peak == 1
