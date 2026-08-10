@@ -121,6 +121,22 @@ def _keys(monkeypatch):
     monkeypatch.setenv("JK_RESPONSE_KEY", "response-key-with-at-least-thirty-two-bytes")
 
 
+@pytest.fixture(autouse=True)
+def _fresh_preview_cache():
+    """No test inherits another's extraction.
+
+    The document preview cache is process-global on purpose -- it exists so a
+    later turn does not pay the recogniser again -- which means a test that
+    stubs the reader would otherwise be answered by whatever an earlier test
+    stubbed for the same bytes.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    pr._reset_document_preview_cache()
+    yield
+    pr._reset_document_preview_cache()
+
+
 def _png_bytes(*, text: str = "family travel document") -> bytes:
     image = Image.new("RGB", (8, 8), color=(20, 40, 60))
     metadata = PngImagePlugin.PngInfo()
@@ -2267,11 +2283,12 @@ def test_preview_is_bounded_collapsed_and_never_guesses(monkeypatch):
     assert "\n" not in out and "\t" not in out
 
     # A reader that fails, or a format with no reader, yields nothing at all
-    # rather than a guess.
+    # rather than a guess. A different document, because the first one has now
+    # been read successfully and a second look at it is answered from memory.
     monkeypatch.setattr(
         pr.subprocess, "run", lambda *a, **k: _NS(returncode=1, stdout="secret")
     )
-    assert pr._document_preview(b"%PDF-1.4", "application/pdf") == ""
+    assert pr._document_preview(b"%PDF-1.4 unreadable", "application/pdf") == ""
     assert pr._document_preview(b"x", "application/zip") == ""
     assert pr._document_preview(b"x", "") == ""
 
@@ -2361,6 +2378,105 @@ def test_a_pdf_with_a_text_layer_does_not_pay_for_ocr(monkeypatch):
     monkeypatch.setattr(pr, "_run_preview_reader", fake_reader)
     assert pr._document_preview(b"%PDF-1.4", "application/pdf").startswith("PRIVATE")
     assert len(calls) == 1
+
+
+def test_a_second_look_at_one_document_does_not_pay_the_recogniser_again(monkeypatch):
+    """Weighing four candidates used to cost the recogniser four times a turn.
+
+    Nearly all of that is fixed cost -- a cold interpreter importing the Vision
+    bindings, then warming the OS text models -- and it was paid again next
+    turn over the same unchanged files. The extraction is a pure function of
+    the document's bytes, so the second look should be free.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(
+        pr,
+        "_run_preview_reader",
+        lambda argv, limit=600: calls.append(argv) or "SPECIMEN PASSPORT ZZ0000001",
+    )
+
+    first = pr._document_preview(b"scan-one", "image/jpeg")
+    second = pr._document_preview(b"scan-one", "image/jpeg")
+    assert first == second == "SPECIMEN PASSPORT ZZ0000001"
+    assert len(calls) == 1, "the recogniser ran a second time on unchanged bytes"
+
+    # A shorter bound is served from the same remembered extraction, truncated
+    # per call, so the bound is not baked into what is remembered.
+    assert pr._document_preview(b"scan-one", "image/jpeg", limit=8) == "SPECIMEN"
+    assert len(calls) == 1
+
+    # A different page bound is a different extraction, and so a different key.
+    pr._document_preview(b"scan-one", "image/jpeg", pages=pr._READ_MAX_PAGES)
+    assert len(calls) == 2
+
+
+def test_a_changed_document_is_read_again_rather_than_remembered(monkeypatch):
+    """The cache must never answer for a file whose contents have moved on.
+
+    Keyed on a digest of the bytes rather than on a stat tuple precisely so a
+    rewritten document cannot be served from the previous one's preview.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    def fake_reader(argv, limit=600):
+        calls.append(argv)
+        # The reader sees the staged temp file, so it answers from the bytes.
+        return Path(argv[-2]).read_text()
+
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(pr, "_run_preview_reader", fake_reader)
+
+    assert pr._document_preview(b"COUNCIL TAX BILL", "image/jpeg") == "COUNCIL TAX BILL"
+    assert len(calls) == 1
+
+    # Same document, rewritten. Different bytes, so a fresh extraction.
+    assert pr._document_preview(b"TENANCY AGREEMENT", "image/jpeg") == (
+        "TENANCY AGREEMENT"
+    )
+    assert len(calls) == 2
+
+    # And the first document is still remembered, not evicted by the second.
+    assert pr._document_preview(b"COUNCIL TAX BILL", "image/jpeg") == "COUNCIL TAX BILL"
+    assert len(calls) == 2
+
+
+def test_the_preview_cache_is_bounded_and_never_written_to_disk(monkeypatch):
+    """Someone's documents live in memory here, so both bounds must hold."""
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(
+        pr, "_run_preview_reader", lambda argv, limit=600: calls.append(argv) or "text"
+    )
+
+    for index in range(pr._PREVIEW_CACHE_MAX_ENTRIES + 10):
+        pr._document_preview(f"document-{index}".encode(), "image/jpeg")
+    assert len(pr._PREVIEW_CACHE) == pr._PREVIEW_CACHE_MAX_ENTRIES
+
+    # The character bound holds too, however few entries that leaves.
+    pr._reset_document_preview_cache()
+    monkeypatch.setattr(
+        pr,
+        "_run_preview_reader",
+        lambda argv, limit=600: "y" * pr._READ_EXTRACT_CHARS,
+    )
+    for index in range(40):
+        pr._document_preview(f"long-{index}".encode(), "image/jpeg")
+    assert sum(len(v) for v in pr._PREVIEW_CACHE.values()) <= pr._PREVIEW_CACHE_MAX_CHARS
+
+    # A caller asking beyond what the cache agrees to hold bypasses it entirely.
+    pr._reset_document_preview_cache()
+    pr._document_preview(
+        b"oversized", "image/jpeg", limit=pr._READ_EXTRACT_CHARS + 1
+    )
+    assert not pr._PREVIEW_CACHE
 
 
 def test_a_sentence_about_verification_is_not_a_verification_code(tmp_path):

@@ -54,6 +54,22 @@ def _keys(monkeypatch):
     monkeypatch.setenv("JK_RESPONSE_KEY", "response-key-with-at-least-thirty-two-bytes")
 
 
+@pytest.fixture(autouse=True)
+def _fresh_preview_cache():
+    """No test inherits another's extraction.
+
+    The document preview cache is process-global on purpose -- it exists so a
+    later turn does not pay the recogniser again -- which means a test that
+    stubs the reader would otherwise be answered by whatever an earlier test
+    stubbed for the same bytes.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    pr._reset_document_preview_cache()
+    yield
+    pr._reset_document_preview_cache()
+
+
 class RecordingBackend:
     def __init__(self, results=None, failure=None):
         self.results = dict(results or {})

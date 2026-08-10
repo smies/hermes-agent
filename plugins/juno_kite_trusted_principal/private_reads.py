@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import io
 import json
 import math
@@ -17,6 +18,8 @@ import mimetypes
 import os
 import re
 import sqlite3
+import threading
+from collections import OrderedDict
 from datetime import datetime
 import stat
 import subprocess
@@ -452,6 +455,64 @@ _CONVERTIBLE_IMAGE_MIME = {
 }
 _SIPS = "/usr/bin/sips"
 
+# Identifying one document costs five to nine seconds, nearly all of it fixed:
+# a fresh /usr/bin/python3 spends ~1.5s importing the Vision bindings before
+# the recogniser has looked at a single pixel, and the first recognition
+# request in a cold process pays several seconds more to warm the OS text
+# models. The same page recognised again inside an already-warm process takes
+# about 1.2s. That cost is paid per candidate, and paid again next turn for the
+# same unchanged files -- which is what made weighing four documents take
+# minutes.
+#
+# The extraction is a pure function of (bytes, mime, pages): `limit` only
+# truncates the result at the very end, so it is deliberately not part of the
+# key. Remembering the extracted text for the life of the process therefore
+# makes a second look free without changing one character of what any caller
+# sees.
+#
+# Keyed on a digest of the document's own bytes rather than on (st_dev, st_ino,
+# st_size, st_mtime_ns): these callers hand the preview bytes, not a path, so a
+# stat tuple would have to be threaded through every call site and would still
+# be the weaker key -- a file rewritten inside one mtime_ns tick keeps its stat
+# identity and would serve a stale preview of the wrong document. A digest
+# cannot. Hashing costs ~12ms at the 8 MiB input cap against a 5-9s extraction.
+_PREVIEW_CACHE_MAX_ENTRIES = 64
+# Bounds what document text lives in memory. Each entry is capped at
+# _READ_EXTRACT_CHARS (40k) and the total at 512k characters, so the cache
+# holds at most half a megabyte of extracted text -- a dozen or so full reads,
+# or every preview of a large candidate set. It is memory only: nothing here is
+# ever written to disk, and it dies with the process.
+_PREVIEW_CACHE_MAX_CHARS = 512_000
+_PREVIEW_CACHE: "OrderedDict[tuple[str, str, int], str]" = OrderedDict()
+_PREVIEW_CACHE_LOCK = threading.Lock()
+
+
+def _reset_document_preview_cache() -> None:
+    """Forget every remembered extraction. For tests, and for a fresh start."""
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_CACHE.clear()
+
+
+def _cached_preview(key: tuple[str, str, int]) -> Optional[str]:
+    with _PREVIEW_CACHE_LOCK:
+        text = _PREVIEW_CACHE.get(key)
+        if text is not None:
+            _PREVIEW_CACHE.move_to_end(key)
+        return text
+
+
+def _remember_preview(key: tuple[str, str, int], text: str) -> None:
+    """Keep the extraction, oldest first out, under both bounds."""
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_CACHE.pop(key, None)
+        _PREVIEW_CACHE[key] = text
+        while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_MAX_ENTRIES:
+            _PREVIEW_CACHE.popitem(last=False)
+        total = sum(len(value) for value in _PREVIEW_CACHE.values())
+        while total > _PREVIEW_CACHE_MAX_CHARS and len(_PREVIEW_CACHE) > 1:
+            _key, dropped = _PREVIEW_CACHE.popitem(last=False)
+            total -= len(dropped)
+
 
 def _normalise_artifact(data: bytes, mime_type: str) -> tuple[bytes, str]:
     """Turn what a phone or scanner produces into something releasable.
@@ -566,6 +627,31 @@ def _document_preview(
 
     Returns "" when nothing can be read, which is itself informative: it means
     the candidate cannot be identified from its contents.
+
+    Reading the same unchanged document twice returns the remembered
+    extraction rather than paying the recogniser again. See _PREVIEW_CACHE.
+    """
+    if limit > _READ_EXTRACT_CHARS:
+        # More than any caller asks for and more than the cache agrees to
+        # hold. Extract it fresh rather than remember an unbounded amount of
+        # someone's document.
+        return _extract_document_text(data, mime_type, pages, limit)
+    key = (hashlib.sha256(data).hexdigest(), str(mime_type or ""), int(pages))
+    text = _cached_preview(key)
+    if text is None:
+        text = _extract_document_text(data, mime_type, pages, _READ_EXTRACT_CHARS)
+        _remember_preview(key, text)
+    return text[:limit]
+
+
+def _extract_document_text(
+    data: bytes, mime_type: str, pages: int, limit: int
+) -> str:
+    """Run the local readers once and return what they say, bounded.
+
+    Split out of _document_preview so the expensive half can be memoised on
+    the document's identity while the cheap half -- truncating to the caller's
+    limit -- stays per call.
     """
     # A phone photo is HEIC and a scan is often TIFF. Release already converts
     # these locally; reading did not, so the formats a family actually
