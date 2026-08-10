@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -360,6 +361,71 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
     },
 }
+
+
+_PREVIEW_MAX_CHARS = 600
+_PREVIEW_TIMEOUT_SECONDS = 45
+_PDFTOTEXT_CANDIDATES = ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
+_SYSTEM_PYTHON = "/usr/bin/python3"
+_MACOS_OCR_SCRIPT = str(Path(__file__).resolve().parent / "macos_ocr.py")
+
+
+def _document_preview(data: bytes, mime_type: str) -> str:
+    """A bounded look at what this document actually says.
+
+    The model has to decide whether a candidate is the document that was asked
+    for, and a filename frequently cannot answer that: "Epson_07082026151807"
+    and "photo" identify nothing, and the surrounding email is not evidence of
+    what an image contains. Both readers here run on this machine -- pdftotext
+    for a text layer, the OS text recogniser for a scan -- so the artifact is
+    never sent anywhere to find out what it is.
+
+    Returns "" when nothing can be read, which is itself informative: it means
+    the candidate cannot be identified from its contents.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(data)
+            path = handle.name
+        os.chmod(path, 0o600)
+    except OSError:
+        return ""
+    try:
+        if mime_type == "application/pdf":
+            executable = next(
+                (item for item in _PDFTOTEXT_CANDIDATES if Path(item).exists()), ""
+            )
+            if not executable:
+                return ""
+            argv = [executable, "-l", "2", "-q", path, "-"]
+        elif mime_type in {"image/jpeg", "image/png"}:
+            if not Path(_SYSTEM_PYTHON).exists() or not Path(_MACOS_OCR_SCRIPT).exists():
+                return ""
+            argv = [_SYSTEM_PYTHON, _MACOS_OCR_SCRIPT, path]
+        else:
+            return ""
+        completed = subprocess.run(
+            argv,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_PREVIEW_TIMEOUT_SECONDS,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        if completed.returncode != 0:
+            return ""
+        return re.sub(r"\s+", " ", str(completed.stdout or "")).strip()[
+            :_PREVIEW_MAX_CHARS
+        ]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _release_display_name(value: Any) -> str:
@@ -876,6 +942,9 @@ class PrivateReadService:
                     "outcome": "release_candidate",
                     "source_class": "personal files",
                     "document_name": _release_display_name(path.name),
+                    "document_preview": _document_preview(
+                        path.read_bytes(), guessed
+                    ),
                     "mime_type": guessed,
                     "size_bytes": source_info.st_size,
                 }
@@ -938,6 +1007,11 @@ class PrivateReadService:
                     "outcome": "release_candidate",
                     "source_class": "personal Gmail attachment",
                     "document_name": _release_display_name(filename),
+                    "document_preview": _document_preview(
+                        source_value if isinstance(source_value, bytes)
+                        else source_value.read_bytes(),
+                        str(payload.get("mime_type") or "").lower(),
+                    ),
                     "mime_type": str(payload.get("mime_type") or "").lower(),
                     "size_bytes": int(payload.get("size_bytes") or 0),
                 }

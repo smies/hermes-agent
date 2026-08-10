@@ -587,6 +587,7 @@ def test_typed_resolver_has_one_closed_candidate_and_no_arbitrary_selectors(tmp_
         "outcome",
         "source_class",
         "document_name",
+        "document_preview",
         "mime_type",
         "size_bytes",
     }
@@ -2139,7 +2140,8 @@ def test_the_release_candidate_tells_the_model_which_document_it_picked(tmp_path
     assert descriptor["document_name"] == "child-passport"
     # Still closed: no path, no root, no bytes.
     assert set(descriptor) == {
-        "outcome", "source_class", "document_name", "mime_type", "size_bytes"
+        "outcome", "source_class", "document_name", "document_preview",
+        "mime_type", "size_bytes",
     }
     assert str(tmp_path) not in encoded and "family" not in descriptor["document_name"]
 
@@ -2171,6 +2173,89 @@ def test_document_guidance_requires_checking_the_name_before_releasing():
         configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
         output_tier=DOCUMENT_DESCRIPTOR,
     )["output_tier_rule"]
-    assert "document_name" in rule
+    assert "document_preview" in rule
     assert "ask rather than" in rule
     assert "cannot be recalled" in rule
+
+
+def test_the_candidate_carries_a_preview_of_what_the_document_says(tmp_path):
+    """A name cannot answer "is this the British one?"; the contents can."""
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    encoded, internal = runtime.private_reads.resolve_document_candidate(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "family", "relative_path": "child-passport.png"},
+    )
+    assert internal is not None
+    descriptor = json.loads(encoded)["data"]
+    assert set(descriptor) == {
+        "outcome", "source_class", "document_name", "document_preview",
+        "mime_type", "size_bytes",
+    }
+    # An 8x8 fixture has no legible text: empty, which says "unidentified".
+    assert isinstance(descriptor["document_preview"], str)
+
+
+def test_preview_is_bounded_collapsed_and_never_guesses(monkeypatch):
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    monkeypatch.setattr(
+        pr.subprocess, "run",
+        lambda *a, **k: _NS(returncode=0, stdout="a\n\n  b\t" + "x" * 5000),
+    )
+    out = pr._document_preview(b"%PDF-1.4", "application/pdf")
+    assert len(out) <= 600
+    assert out.startswith("a b x")
+    assert "\n" not in out and "\t" not in out
+
+    # A reader that fails, or a format with no reader, yields nothing at all
+    # rather than a guess.
+    monkeypatch.setattr(
+        pr.subprocess, "run", lambda *a, **k: _NS(returncode=1, stdout="secret")
+    )
+    assert pr._document_preview(b"%PDF-1.4", "application/pdf") == ""
+    assert pr._document_preview(b"x", "application/zip") == ""
+    assert pr._document_preview(b"x", "") == ""
+
+
+def test_preview_reader_runs_locally_and_cleans_up(monkeypatch, tmp_path):
+    """The artifact must not leave the machine to be identified."""
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
+        seen["path"] = next(a for a in argv if "/T/" in a or "tmp" in a)
+        seen["existed"] = Path(seen["path"]).exists()
+        return _NS(returncode=0, stdout="text")
+
+    monkeypatch.setattr(pr.subprocess, "run", fake_run)
+    assert pr._document_preview(b"%PDF-1.4 hello", "application/pdf") == "text"
+    # A local executable, a bounded environment, and the temp file removed after.
+    assert seen["argv"][0].endswith("pdftotext")
+    assert seen["env"] == {"PATH": "/usr/bin:/bin"}
+    assert seen["existed"] is True
+    assert not Path(seen["path"]).exists()
+
+
+def test_document_guidance_requires_matching_the_contents_not_the_topic():
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        generated_semantic_guidance,
+    )
+
+    rule = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )["output_tier_rule"]
+    assert "document_preview" in rule
+    assert "read the next candidate" in rule
+    assert "empty preview" in rule.lower()
