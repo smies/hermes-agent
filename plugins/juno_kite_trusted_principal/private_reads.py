@@ -1303,7 +1303,7 @@ class PrivateReadService:
                     ),
                     "requires_owner_approval": True,
                 }
-                return _success(source, descriptor), internal
+                return canonical_json(_success(source, descriptor)), internal
             if tool_name == "kite_personal_files_read":
                 self._require_exact(
                     args,

@@ -1179,6 +1179,54 @@ def test_whatsapp_real_boundary_uses_argv_without_shell(tmp_path):
     assert not {"--send", "--reply", "--react", "--mark-read"}.intersection(argv)
 
 
+def test_every_candidate_producer_returns_the_transport_contract(tmp_path):
+    """The new producer returned a dict and the tool layer refused it.
+
+    "Tool handler returned unsupported result type: dict" -- so a document
+    that locate had found, in a folder James named, came back to him as a
+    malformed lookup. Every other branch serialises before returning and
+    this one did not, which no test noticed because none of them checked
+    the type the transport actually requires.
+    """
+    base = tmp_path / "docs"
+    (base / "Elsewhere").mkdir(parents=True)
+    (base / "Hermes Documents").mkdir(parents=True)
+    (base / "Elsewhere" / "statement.pdf").write_bytes(b"%PDF-1.4 located")
+    (base / "Hermes Documents" / "in-root.pdf").write_bytes(b"%PDF-1.4 in root")
+
+    service = PrivateReadService({
+        "enabled": True,
+        "output_bytes": 262_144,
+        "files": {
+            "roots": [{"name": "documents", "path": str(base / "Hermes Documents")}],
+            "allowed_bases": [str(base)],
+        },
+    })
+
+    produced = service.resolve_document_candidate(
+        "kite_personal_files_release_located",
+        {"directory": str(base / "Elsewhere"), "file_name": "statement.pdf"},
+    )
+    result, internal = produced
+    assert isinstance(result, str), (
+        "the transport requires an encoded result, not a dict"
+    )
+    parsed = json.loads(result)
+    assert parsed["status"] == "ok"
+    assert parsed["data"]["outcome"] == "release_candidate"
+    assert parsed["data"]["requires_owner_approval"] is True
+    assert internal["requires_owner_approval"] is True
+    assert internal["path"].name == "statement.pdf"
+
+    # The in-root producer answers the same contract, which is the point.
+    in_root, _internal = service.resolve_document_candidate(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "documents", "relative_path": "in-root.pdf"},
+    )
+    assert isinstance(in_root, str)
+    assert json.loads(in_root)["status"] == "ok"
+
+
 def test_locate_says_where_a_document_is_without_being_able_to_open_it(tmp_path):
     """A document outside the three roots could not be found at all.
 
