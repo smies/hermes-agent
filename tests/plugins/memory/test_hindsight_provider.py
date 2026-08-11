@@ -17,6 +17,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+# hindsight-client is optional, and this machine deliberately refuses lazy
+# installs (security.allow_lazy_installs=false). The tests below that reach
+# the real client failed rather than skipped, so every full-suite run reported
+# failures that said nothing about the code being changed. Only those tests
+# are skipped -- the rest of this file runs on stubs and still runs.
+_needs_client = pytest.mark.skipif(
+    __import__("importlib.util", fromlist=["util"]).find_spec("hindsight_client")
+    is None,
+    reason="hindsight-client is optional and lazy installs are disabled here",
+)
+
 from hermes_cli.memory_setup import _CANCELLED
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
@@ -329,6 +340,7 @@ class TestConfig:
         assert env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "0"
 
 
+    @_needs_client
     def test_get_client_passes_idle_timeout_to_hindsight_embedded(self, monkeypatch):
         captured = {}
 
@@ -599,6 +611,7 @@ class TestPrefetchServerRetainVisibility:
         # retain_async=False → no server-side op to wait on.
         assert p._pending_retain_ops == set()
 
+    @_needs_client
     def test_prefetch_waits_for_server_completion_before_recall(self, provider):
         """Recall must not run until the tracked async op reports completed."""
         order = []
@@ -624,6 +637,7 @@ class TestPrefetchServerRetainVisibility:
         assert provider._client.operations.get_operation_status.await_count >= 3
         assert provider._pending_retain_ops == set()
 
+    @_needs_client
     def test_prefetch_proceeds_after_server_wait_timeout(self, provider_with_config):
         """A wedged/never-completing async op must not hang prefetch forever;
         it recalls anyway once the drain budget is exhausted."""
@@ -649,6 +663,7 @@ class TestPrefetchServerRetainVisibility:
         assert order == ["recall"], "prefetch should recall after the timeout"
         assert elapsed < 3.0, "prefetch must not block well past the drain budget"
 
+    @_needs_client
     def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config):
         """Ops unresolved at deadline must be EVICTED so a permanently failing
         status endpoint can't make every later prefetch re-burn the full
@@ -681,6 +696,7 @@ class TestPrefetchServerRetainVisibility:
             "second prefetch re-polled dropped ops — eviction regressed"
         )
 
+    @_needs_client
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
         from hindsight_client_api.exceptions import NotFoundException
@@ -694,6 +710,7 @@ class TestPrefetchServerRetainVisibility:
 
         assert provider._is_retain_op_complete("bank", "op-gone") is True
 
+    @_needs_client
     def test_transient_status_error_keeps_waiting(self, provider):
         """A transient status-check error means 'unknown', so keep waiting."""
         client = _make_mock_client()

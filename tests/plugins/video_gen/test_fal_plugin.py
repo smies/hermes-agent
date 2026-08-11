@@ -80,9 +80,27 @@ class TestFamilyRouting:
         fal_plugin._managed_fal_video_client_config = None
 
         monkeypatch.setenv("FAL_KEY", "test")
+        # The availability check reads the profile secret scope rather than the
+        # environment, so setting FAL_KEY above stopped being enough for it and
+        # every routing test failed on "No FAL backend available" without ever
+        # reaching the endpoint it was written to check. These tests are about
+        # which endpoint a family routes to; whether a backend exists is tested
+        # on its own below.
+        monkeypatch.setattr(fal_plugin, "_check_fal_video_available", lambda: True)
         # Force direct mode — no managed gateway
         monkeypatch.setattr(fal_plugin, "_resolve_managed_fal_video_gateway", lambda: None)
         return captured
+
+    def test_no_backend_is_reported_rather_than_attempted(self, monkeypatch):
+        """The check the routing fixture stubs still has to mean something."""
+        from plugins.video_gen import fal as fal_plugin
+        from plugins.video_gen.fal import FALVideoGenProvider
+
+        monkeypatch.setattr(fal_plugin, "_check_fal_video_available", lambda: False)
+        result = FALVideoGenProvider().generate("a dog")
+        assert result["success"] is False
+        assert result["error_type"] == "auth_required"
+        assert "FAL_KEY" in result["error"]
 
     def test_text_to_video_routes_to_text_endpoint(self, with_fake_fal):
         from plugins.video_gen.fal import FALVideoGenProvider
