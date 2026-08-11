@@ -1366,6 +1366,136 @@ async def test_the_same_document_is_not_sent_twice_in_one_turn(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_locate_and_approve_from_the_request_to_the_delivered_file(tmp_path):
+    """The whole path, in one test, because the parts were never the problem.
+
+    Three consecutive live failures came from seams between pieces that were
+    each correct on their own: a producer that returned a mapping where the
+    transport wanted an encoded string, an approval code handed to the model
+    that answers the room, and two messages awaited on the wrong event loop
+    so they silently went nowhere. Every one of them would have failed here.
+
+    James asks for a document that is not in any release root. It is found,
+    staged and held; he is told it is waiting; the code reaches him and only
+    him; he approves from a DM; the file arrives in the conversation that
+    asked for it, once.
+    """
+    from dataclasses import replace
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    artifact = _png_bytes()
+    (elsewhere / "downloaded-scan.png").write_bytes(artifact)
+
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+    question = "Send me the downloaded scan"
+
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    gateway = SimpleNamespace(adapters={Platform.WHATSAPP: adapter})
+    ingress = await juno.pre_gateway_dispatch(
+        event=_event(question), gateway=gateway, critical_ingress_token=object()
+    )
+    assert ingress["action"] == "critical_allow"
+    audience = _ACTIVE_AUDIENCE.get()
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": question}), mode="juno"
+    )
+
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+
+    def kite_turn():
+        policy = kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        assert "specific" in policy["context"]
+
+        # Nothing under a release root matches, which is the situation locate
+        # exists for.
+        in_root = _invoke(kite, "kite_personal_files_read", {
+            "operation": "search", "root": "family",
+            "query": "downloaded", "max_results": 5,
+        })
+        assert in_root["data"] == []
+
+        found = _invoke(kite, "kite_personal_files_locate", {
+            "query": "downloaded", "max_results": 5,
+        })
+        matches = found["data"]["matches"]
+        assert [m["file_name"] for m in matches] == ["downloaded-scan.png"]
+        assert matches[0]["releasable_now"] is False
+        assert matches[0]["release_root"] is None
+        # A location, and nothing a reader would accept.
+        assert "relative_path" not in matches[0]
+
+        proposed = _invoke(kite, "kite_personal_files_release_located", {
+            "directory": matches[0]["directory"],
+            "file_name": matches[0]["file_name"],
+        })
+        assert proposed["status"] == "ok"
+        assert proposed["data"]["requires_owner_approval"] is True
+
+        return kite.transform_llm_output(
+            response_text=json.dumps({"capability_id": "juno.shared.children"}),
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    envelope = _session(kite_turn, mode="kite", context_id=prepared.mapping.context_id)
+    answer = _session(
+        lambda: juno._verify_response(envelope, prepared.mapping, prepared.request_id),
+        mode="juno",
+    )
+    assert json.loads(answer)["document"]["requires_owner_approval"] is True
+    code = json.loads(answer)["approval"]["code"]
+
+    # The delivering half of the turn.
+    released = await juno._auto_release(answer, audience)
+
+    # Nothing sent, and the model is not given the authority to send it.
+    assert adapter.document_calls == []
+    assert code not in released
+    assert json.loads(released)["outcome"] == "owner_approval_requested"
+
+    by_chat = {call["chat_id"]: call["content"] for call in adapter.messages}
+    owner = juno._owner_dm_target()
+    assert owner and owner != GROUP
+    assert code not in by_chat[GROUP]
+    assert "asked James to approve" in by_chat[GROUP]
+    assert "APPROVE " + code in by_chat[owner]
+
+    # James approves from the DM, reading the code the way he actually would.
+    import re as _re
+    typed = _re.search(r"APPROVE (C7-[A-Z2-9]{16})", by_chat[owner]).group(0)
+    result = await juno._handle_document_approval(
+        event=_event(typed, chat_id=owner),
+        adapter=adapter,
+        audience=replace(audience, conversation_kind="dm"),
+    )
+    assert result["action"] == "skip"
+
+    # It arrives in the conversation that asked, once, and it is the file.
+    assert len(adapter.document_calls) == 1
+    delivered = adapter.document_calls[0]
+    assert delivered["chat_id"] == GROUP
+    assert delivered["bytes"] == artifact
+
+    # And the authority is spent.
+    await juno._handle_document_approval(
+        event=_event(typed, chat_id=owner),
+        adapter=adapter,
+        audience=replace(audience, conversation_kind="dm"),
+    )
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_the_requester_is_told_it_is_waiting_and_only_james_gets_the_code(
     tmp_path,
 ):

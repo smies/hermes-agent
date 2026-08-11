@@ -2535,12 +2535,22 @@ class PrivateReadService:
             release_roots = {}
 
         found: list[dict[str, Any]] = []
+        seen: set[str] = set()
         scanned = 0
         for base in bases:
             try:
                 base_real = base.expanduser().resolve(strict=True)
             except OSError:
                 continue
+            # Bases may overlap or nest -- one configured area sitting inside
+            # another is ordinary -- and a document listed twice reads as two
+            # documents to whoever has to choose between them.
+            if any(
+                base_real == other or other in base_real.parents
+                for other in (Path(item) for item in seen)
+            ):
+                continue
+            seen.add(str(base_real))
             for directory, names, files in os.walk(base_real, followlinks=False):
                 names[:] = sorted(
                     item
@@ -2579,6 +2589,9 @@ class PrivateReadService:
                         ),
                         None,
                     )
+                    if str(path.resolve()) in seen:
+                        continue
+                    seen.add(str(path.resolve()))
                     found.append({
                         "document_name": _release_display_name(filename),
                         "file_name": filename,
