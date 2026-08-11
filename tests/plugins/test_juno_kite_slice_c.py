@@ -3624,14 +3624,44 @@ def test_session_recall_cannot_change_the_store(tmp_path):
     assert before == after and before[0][0] == 1
 
 
-def test_session_recall_is_bound_to_one_principal():
-    """Lucy inherits nothing here; adding her has to be a deliberate change."""
+def test_recall_is_available_to_a_second_principal_and_judged_not_gated():
+    """James's decision: Kite may look, then judge what it found.
+
+    Binding recall to one name cost real answers -- a follow-up about a
+    passport she had just been told the number of -- and the protection it
+    bought was the wrong shape. Kite looks with its full power and then
+    reviews what came back against this turn's capabilities, returning only
+    what is both relevant and permitted.
+
+    What this does not do is separate his private threads from shared ones
+    mechanically: nothing in the store is tagged by owner. The judgment step
+    is the filter, and the guidance has to say so or it is not a filter at
+    all.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED, PRINCIPAL_BOUND_READS, generated_semantic_guidance,
+    )
     from plugins.juno_kite_trusted_principal.runtime import _PRINCIPAL_BOUND_READS
 
-    assert _PRINCIPAL_BOUND_READS["kite_session_search"] == frozenset({"james"})
+    assert "kite_session_search" not in PRINCIPAL_BOUND_READS
+    # Locate still is bound: it reports where his documents live.
+    assert PRINCIPAL_BOUND_READS["kite_personal_files_locate"] == frozenset({"james"})
+    assert _PRINCIPAL_BOUND_READS is PRINCIPAL_BOUND_READS
+
+    rule = generated_semantic_guidance(
+        principal="lucy",
+        effective_capability_ids=["juno.shared.children"],
+        configured_policy={"juno.shared.children": {"domain": "juno.shared.children"}},
+        output_tier=MINIMIZED,
+    )["output_tier_rule"]
+    assert "kite_session_search" in rule
+    # The judgment step is stated, because it is the only thing standing
+    # between raw recall and this audience.
+    assert "no capability of its own" in rule
+    assert "permit" in rule
 
 
-def test_a_refused_recall_says_what_to_do_instead(tmp_path):
+def test_a_refused_principal_bound_read_says_what_is_still_open(tmp_path):
     """A correct refusal that reads as a dead end still loses the answer.
 
     Lucy asked "when does it expire?" about a passport she had just been
@@ -3660,58 +3690,19 @@ def test_a_refused_recall_says_what_to_do_instead(tmp_path):
 
     def refuse():
         return kite.pre_tool_call(
-            "kite_session_search",
-            {"query": "passport expiry", "max_results": 3},
+            "kite_personal_files_locate",
+            {"query": "passport", "max_results": 3},
             session_id="kite-session", turn_id="kite-turn",
         )
 
     blocked = _session(refuse, mode="kite", context_id="x")
 
-    assert blocked is not None, "recall must still be refused for her"
+    assert blocked is not None, "a principal-bound reader must still refuse"
     message = blocked["message"]
     # Still says who it is bound to...
-    assert "bound to the principal" in message
+    assert "kite_personal_files_locate is bound to the principal" in message
     # ...and now says what remains open, which is what the turn needed.
-    assert "typed readers" in message and "re-reading" in message
-
-
-def test_recall_is_offered_only_to_the_principal_who_may_use_it():
-    """Lucy was told to use a tool she is not allowed to use.
-
-    She asked "when does it expire?" about a passport she had just been given
-    the number of. Juno resolved the referent correctly and passed the
-    conversation; Kite then reached for session recall because the guidance
-    recommends it, and was refused because those transcripts are James's. The
-    answer was a typed read away the whole time.
-
-    Guidance and gate now come from one definition, so a principal is never
-    pointed at a reader they cannot use.
-    """
-    from plugins.juno_kite_trusted_principal.disclosure import (
-        MINIMIZED, PRINCIPAL_BOUND_READS, generated_semantic_guidance,
-    )
-    from plugins.juno_kite_trusted_principal.runtime import (
-        _PRINCIPAL_BOUND_READS,
-    )
-
-    assert _PRINCIPAL_BOUND_READS is PRINCIPAL_BOUND_READS
-
-    def rule(tier, principal="james"):
-        return generated_semantic_guidance(
-            principal=principal,
-            effective_capability_ids=["juno.shared.children"],
-            configured_policy={
-                "juno.shared.children": {"domain": "juno.shared.children"}
-            },
-            output_tier=tier,
-        )["output_tier_rule"]
-
-    for tier in (MINIMIZED, DOCUMENT_DESCRIPTOR):
-        assert "kite_session_search" not in rule(tier, "lucy")
-        # And she is told what to do instead, rather than left with a gap.
-        assert "typed readers" in rule(tier, "lucy") or "typed reader" in rule(
-            tier, "lucy"
-        )
+    assert "typed readers" in message and "reading the document" in message
 
 
 def test_recall_is_offered_where_the_model_will_need_it():

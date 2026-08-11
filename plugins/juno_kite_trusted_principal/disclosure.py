@@ -298,13 +298,27 @@ def disclosure_decision(
 # this so the guidance and the gate cannot drift: recommending a tool the
 # caller may not use costs a turn and reads to them as a dead end.
 PRINCIPAL_BOUND_READS = {
-    "kite_session_search": frozenset({"james"}),
+    # Locate walks everywhere a principal keeps documents, including places no
+    # capability covers, and reports paths. That stays James's own.
     "kite_personal_files_locate": frozenset({"james"}),
+    # Recall is deliberately NOT here. James's decision, and the reasoning is
+    # his: Kite may look with its full power, and then judge what came back
+    # against the request and the capabilities this turn actually has, and
+    # return only what is both relevant and permitted. Binding recall by name
+    # instead cost a real answer -- a follow-up about a passport she had just
+    # been told the number of -- and would keep costing them.
+    #
+    # What this does not do, stated plainly: the store holds every
+    # conversation, and nothing in it is tagged by owner, so there is no
+    # mechanical filter separating a private thread from a shared one. The
+    # judgment step is the filter. When sessions carry a principal, that
+    # becomes a real boundary and should be added here.
 }
 
 
 def _may_recall(principal: str) -> bool:
-    return str(principal).casefold() in PRINCIPAL_BOUND_READS["kite_session_search"]
+    permitted = PRINCIPAL_BOUND_READS.get("kite_session_search")
+    return permitted is None or str(principal).casefold() in permitted
 
 
 def generated_semantic_guidance(
@@ -417,7 +431,13 @@ def generated_semantic_guidance(
                 + (
                     "When the request refers to something already discussed, "
                     "decided or filed, kite_session_search recalls it rather "
-                    "than re-deriving it from live sources. "
+                    "than re-deriving it from live sources. What it returns is "
+                    "raw recall from every stored conversation, not an answer: "
+                    "read it, keep only what actually bears on this request, "
+                    "and only what the effective semantic domains above permit "
+                    "for THIS audience. A transcript carries no capability of "
+                    "its own, so nothing found in one may be repeated here "
+                    "unless a capability in force this turn covers it. "
                     if _may_recall(principal)
                     else "Answer from the typed readers: this principal cannot "
                     "search stored conversations, so a question about "

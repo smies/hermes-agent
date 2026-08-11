@@ -2997,18 +2997,17 @@ class TrustedPrincipalRuntime:
                 binding.mapping.principal if binding.mapping is not None else ""
             )
             if str(principal).casefold() not in _PRINCIPAL_BOUND_READS[tool_name]:
-                # Naming the alternative, not just the refusal. Lucy asked
-                # "when does it expire?" about a passport she had just been
-                # told the number of; recall was refused, correctly, because
-                # those transcripts are James's -- and she was told only that,
-                # so the turn ended. The document is still readable by her:
-                # say so, or a correct refusal reads as a dead end.
+                # Name the alternative, not only the refusal. A reader
+                # withheld here reports on someone's own filing -- where their
+                # documents live, not what is in them -- and the documents
+                # themselves usually remain readable. Saying only what is shut
+                # ends the turn on a question that had an answer.
                 return self._block(
-                    "session recall is bound to the principal whose "
-                    "conversations these are, and this principal is not that "
-                    "one. Their own documents are still readable: answer from "
-                    "the typed readers instead, re-reading the document this "
-                    "question is about."
+                    f"{tool_name} is bound to the principal whose own material "
+                    "it reports on, and this principal is not that one. Their "
+                    "own documents are still readable: answer from the typed "
+                    "readers instead, reading the document this question is "
+                    "about."
                 )
         from .private_reads import validate_tool_arguments
 
