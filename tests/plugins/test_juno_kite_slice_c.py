@@ -1500,6 +1500,79 @@ async def test_a_family_document_reaches_a_room_lucy_is_in_and_his_own_does_not(
 
 
 @pytest.mark.asyncio
+async def test_approving_one_document_does_not_approve_the_next(tmp_path):
+    """One approval, one document. It must not quietly become a standing one.
+
+    The skill warns against both failure modes here: routing every routine
+    request through the owner, and letting a single yes turn into a blanket
+    permission. James approves a document found outside his release roots;
+    the next one found there has to ask him again, and until he answers it
+    stays where it is.
+    """
+    from dataclasses import replace
+    from plugins.juno_kite_trusted_principal.runtime import (
+        _ACTIVE_AUDIENCE, _ACTIVE_DELIVERY,
+    )
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, first = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    assert _ACTIVE_DELIVERY.get() is not None
+
+    outside = {**first, "document": {**first["document"], "requires_owner_approval": True}}
+    await juno._auto_release(json.dumps(outside), audience)
+    first_code = first["approval"]["code"]
+    owner = juno._owner_dm_target()
+
+    await juno._handle_document_approval(
+        event=_event("APPROVE " + first_code, chat_id=owner),
+        adapter=adapter,
+        audience=replace(audience, conversation_kind="dm"),
+    )
+    assert len(adapter.document_calls) == 1
+
+    # A second document, found the same way, in the same conversation, moments
+    # later. The yes he already gave says nothing about this one.
+    _juno2, _gateway2, second = await _propose(
+        tmp_path, root, clock, roster, adapter,
+        question="Send me the other scan",
+    )
+    outside_again = {
+        **second, "document": {**second["document"], "requires_owner_approval": True},
+    }
+    answer = await juno._auto_release(json.dumps(outside_again), _ACTIVE_AUDIENCE.get())
+
+    # Still one delivery: the second is proposed, not sent.
+    assert len(adapter.document_calls) == 1
+    assert json.loads(answer)["outcome"] == "owner_approval_requested"
+    second_code = second["approval"]["code"]
+    assert second_code != first_code
+    assert juno._pending_release(second_code) is not None
+
+    # And the first code cannot be reused to release the second.
+    await juno._handle_document_approval(
+        event=_event("APPROVE " + first_code, chat_id=owner),
+        adapter=adapter,
+        audience=replace(audience, conversation_kind="dm"),
+    )
+    assert len(adapter.document_calls) == 1
+
+    # Only its own approval moves it.
+    await juno._handle_document_approval(
+        event=_event("APPROVE " + second_code, chat_id=owner),
+        adapter=adapter,
+        audience=replace(audience, conversation_kind="dm"),
+    )
+    assert len(adapter.document_calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_a_room_without_james_receives_no_document(tmp_path):
     """His household's documents go to rooms he is in.
 
