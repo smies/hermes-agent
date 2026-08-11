@@ -3251,14 +3251,17 @@ class TrustedPrincipalRuntime:
             return False
         if binding.mapping is None or binding.request is None:
             return False
-        if binding.mapping.principal != "james":
-            return False
+        # The capability decides, not the name. Gating the fuller property
+        # answer on "james" meant his wife got the thin one for a purchase
+        # they are making together, while holding exactly the capability that
+        # authorises it.
+        principal = str(binding.mapping.principal or "")
         if _PROPERTY_CAPABILITY_ID not in binding.effective_read_capability_ids:
             return False
-        principal_policy = self.policy.get("principals", {}).get("james")
+        principal_policy = self.policy.get("principals", {}).get(principal)
         if not isinstance(principal_policy, dict):
             return False
-        configured_caps = self.principal_read_capabilities.get("james", frozenset())
+        configured_caps = self.principal_read_capabilities.get(principal, frozenset())
         semantic_policy = principal_policy.get("semantic_policy")
         if (
             _PROPERTY_CAPABILITY_ID not in configured_caps

@@ -298,9 +298,11 @@ def disclosure_decision(
 # this so the guidance and the gate cannot drift: recommending a tool the
 # caller may not use costs a turn and reads to them as a dead end.
 PRINCIPAL_BOUND_READS = {
-    # Locate walks everywhere a principal keeps documents, including places no
-    # capability covers, and reports paths. That stays James's own.
-    "kite_personal_files_locate": frozenset({"james"}),
+    # Empty on purpose. Every entry that was here cost a real answer to
+    # someone James trusts, and none of them ever stopped a disclosure: what
+    # may be said is decided by the capabilities in force for the room, and
+    # judged against them before anything is returned. A reader bound by name
+    # only decides who has to ask him instead.
     # Recall is deliberately NOT here. James's decision, and the reasoning is
     # his: Kite may look with its full power, and then judge what came back
     # against the request and the capabilities this turn actually has, and

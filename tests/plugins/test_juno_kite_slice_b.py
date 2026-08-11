@@ -1072,26 +1072,36 @@ def test_property_mode_denies_over_limit_mixed_source_and_non_james(tmp_path):
         mixed,
     )
 
-    def non_james(kite):
-        _invoke(
-            kite,
-            "kite_property_read",
-            {"operation": "property", "property_id": property_id},
-        )
-        envelope = json.loads(
-            kite.transform_llm_output(
-                response_text="The future heritage score is 97.",
-                session_id="kite-session",
-            ).split(RESPONSE_PREFIX, 1)[1]
-        )
-        assert envelope["denied"] is True
+    # A second principal holding the property capability gets the same
+    # property answer he does. Gating the fuller mode on his name meant his
+    # wife got the thin one for a purchase they are making together.
+    outcomes = {}
 
-    _bound_turn(
-        tmp_path,
-        {"property_intel": RecordingBackend({"property": {"futureField": 97}})},
-        non_james,
-        principal="lucy",
-    )
+    def record(principal):
+        def check(kite):
+            _invoke(
+                kite,
+                "kite_property_read",
+                {"operation": "property", "property_id": property_id},
+            )
+            envelope = json.loads(
+                kite.transform_llm_output(
+                    response_text="The future heritage score is 97.",
+                    session_id="kite-session",
+                ).split(RESPONSE_PREFIX, 1)[1]
+            )
+            outcomes[principal] = envelope["denied"]
+
+        return check
+
+    for principal in ("james", "lucy"):
+        _bound_turn(
+            tmp_path,
+            {"property_intel": RecordingBackend({"property": {"futureField": 97}})},
+            record(principal),
+            principal=principal,
+        )
+    assert outcomes["lucy"] == outcomes["james"], outcomes
 
 
 def test_property_mode_denies_wrong_final_turn_binding(tmp_path):

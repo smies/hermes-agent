@@ -3684,9 +3684,10 @@ def test_recall_is_available_to_a_second_principal_and_judged_not_gated():
     )
     from plugins.juno_kite_trusted_principal.runtime import _PRINCIPAL_BOUND_READS
 
-    assert "kite_session_search" not in PRINCIPAL_BOUND_READS
-    # Locate still is bound: it reports where his documents live.
-    assert PRINCIPAL_BOUND_READS["kite_personal_files_locate"] == frozenset({"james"})
+    # Nothing is bound by name any more. Each entry that lived here cost a
+    # real answer to someone James trusts and stopped no disclosure: what may
+    # be said is decided by the room's capabilities and judged against them.
+    assert PRINCIPAL_BOUND_READS == {}
     assert _PRINCIPAL_BOUND_READS is PRINCIPAL_BOUND_READS
 
     rule = generated_semantic_guidance(
@@ -3702,48 +3703,1946 @@ def test_recall_is_available_to_a_second_principal_and_judged_not_gated():
     assert "permit" in rule
 
 
-def test_a_refused_principal_bound_read_says_what_is_still_open(tmp_path):
-    """A correct refusal that reads as a dead end still loses the answer.
+@pytest.mark.asyncio
+async def test_a_room_without_james_receives_no_document(tmp_path):
+    """His household's documents go to rooms he is in.
 
-    Lucy asked "when does it expire?" about a passport she had just been
-    given the number of. Recall was refused because those transcripts are
-    James's, which is right and stays. She was told only that, so the turn
-    ended -- while the document itself was still hers to read, and the
-    number had come from exactly that reader a minute earlier.
+    The capability check upstream would already refuse most of this, and this
+    is the other half of the rule: whatever the room is entitled to, it is not
+    entitled to it while he is absent.
+    """
+    from dataclasses import replace
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+
+    assert await juno._consume_and_deliver(
+        code,
+        audience=replace(audience, human_principals=("lucy",)),
+        adapter=adapter,
+        chat_id=GROUP,
+        approver=audience,
+        send_receipt=False,
+    ) == "denied"
+    assert adapter.document_calls == []
+
+    # With him present it goes, which is what makes the refusal above mean
+    # something.
+    assert await juno._consume_and_deliver(
+        code, audience=audience, adapter=adapter, chat_id=GROUP,
+        approver=audience, send_receipt=False,
+    ) == "delivered"
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_locate_and_approve_from_the_request_to_the_delivered_file(tmp_path):
+    """The whole path, in one test, because the parts were never the problem.
+
+    Three consecutive live failures came from seams between pieces that were
+    each correct on their own: a producer that returned a mapping where the
+    transport wanted an encoded string, an approval code handed to the model
+    that answers the room, and two messages awaited on the wrong event loop
+    so they silently went nowhere. Every one of them would have failed here.
+
+    James asks for a document that is not in any release root. It is found,
+    staged and held; he is told it is waiting; the code reaches him and only
+    him; he approves from a DM; the file arrives in the conversation that
+    asked for it, once.
+    """
+    from dataclasses import replace
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    artifact = _png_bytes()
+    (elsewhere / "downloaded-scan.png").write_bytes(artifact)
+
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+    question = "Send me the downloaded scan"
+
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    gateway = SimpleNamespace(adapters={Platform.WHATSAPP: adapter})
+    ingress = await juno.pre_gateway_dispatch(
+        event=_event(question), gateway=gateway, critical_ingress_token=object()
+    )
+    assert ingress["action"] == "critical_allow"
+    audience = _ACTIVE_AUDIENCE.get()
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": question}), mode="juno"
+    )
+
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+
+    def kite_turn():
+        policy = kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        assert "specific" in policy["context"]
+
+        # Nothing under a release root matches, which is the situation locate
+        # exists for.
+        in_root = _invoke(kite, "kite_personal_files_read", {
+            "operation": "search", "root": "family",
+            "query": "downloaded", "max_results": 5,
+        })
+        assert in_root["data"] == []
+
+        found = _invoke(kite, "kite_personal_files_locate", {
+            "query": "downloaded", "max_results": 5,
+        })
+        matches = found["data"]["matches"]
+        assert [m["file_name"] for m in matches] == ["downloaded-scan.png"]
+        assert matches[0]["releasable_now"] is False
+        assert matches[0]["release_root"] is None
+        # A location, and nothing a reader would accept.
+        assert "relative_path" not in matches[0]
+
+        proposed = _invoke(kite, "kite_personal_files_release_located", {
+            "directory": matches[0]["directory"],
+            "file_name": matches[0]["file_name"],
+        })
+        assert proposed["status"] == "ok"
+        assert proposed["data"]["requires_owner_approval"] is True
+
+        return kite.transform_llm_output(
+            response_text=json.dumps({"capability_id": "juno.shared.children"}),
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    envelope = _session(kite_turn, mode="kite", context_id=prepared.mapping.context_id)
+    answer = _session(
+        lambda: juno._verify_response(envelope, prepared.mapping, prepared.request_id),
+        mode="juno",
+    )
+    assert json.loads(answer)["document"]["requires_owner_approval"] is True
+    code = json.loads(answer)["approval"]["code"]
+
+    # The delivering half of the turn.
+    released = await juno._auto_release(
+        answer, audience, frozenset({"whatsapp-session"})
+    )
+
+    # Nothing sent, and the model is not given the authority to send it.
+    assert adapter.document_calls == []
+    assert code not in released
+    assert json.loads(released)["outcome"] == "owner_approval_requested"
+
+    by_chat = {call["chat_id"]: call["content"] for call in adapter.messages}
+    owner = juno._owner_dm_target()
+    assert owner and owner != GROUP
+    assert code not in by_chat[GROUP]
+    assert "asked James to approve" in by_chat[GROUP]
+    assert "APPROVE " + code in by_chat[owner]
+
+    # One message to the room, not two: the model's follow-up is suppressed
+    # because the host has already said it, in the document's own name.
+    assert len([m for m in adapter.messages if m["chat_id"] == GROUP]) == 1
+    assert juno.transform_llm_output(
+        response_text="I found and staged it, awaiting your approval.",
+        session_id="whatsapp-session",
+    ) == " "
+
+    # A bare yes approves, because copying a sixteen-character code off a
+    # phone to release your own document is a chore and the DM is the
+    # boundary, not the code.
+    result = await juno._handle_document_approval(
+        event=_event("\u2705", chat_id=owner),
+        adapter=adapter,
+        audience=replace(audience, conversation_kind="dm"),
+    )
+    assert result["action"] == "skip"
+
+    # It arrives in the conversation that asked, once, and it is the file.
+    assert len(adapter.document_calls) == 1
+    delivered = adapter.document_calls[0]
+    assert delivered["chat_id"] == GROUP
+    assert delivered["bytes"] == artifact
+
+    # Named after the document, and captioned instead of announced. The room
+    # heard three names for one file before this.
+    assert delivered["file_name"].startswith("downloaded-scan")
+    assert "downloaded-scan" in delivered["caption"]
+    assert not any(
+        "Document delivered" in m["content"]
+        for m in adapter.messages
+        if m["chat_id"] == GROUP
+    )
+
+    # And the authority is spent: the exact code no longer works either.
+    await juno._handle_document_approval(
+        event=_event("APPROVE " + code, chat_id=owner),
+        adapter=adapter,
+        audience=replace(audience, conversation_kind="dm"),
+    )
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_requester_is_told_it_is_waiting_and_only_james_gets_the_code(
+    tmp_path,
+):
+    """Silence would read as failure, and a refusal would be untrue.
+
+    The document was found; it just cannot be sent yet. Whoever asked is
+    told exactly that. The code is the authority to release, so it goes to
+    James directly and never into the conversation that asked -- which is
+    the reason this path exists at all.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+    outside = {
+        **preview,
+        "document": {**preview["document"], "requires_owner_approval": True},
+    }
+
+    answer = await juno._auto_release(json.dumps(outside), audience)
+
+    # The model is not handed the code. It printed one into the group when it
+    # was, and a model cannot disclose what it never receives.
+    assert code not in answer, "the release code was handed to the model"
+    assert json.loads(answer)["outcome"] == "owner_approval_requested"
+    assert "approval" not in json.loads(answer)
+
+    assert adapter.document_calls == []
+    sent = {call["chat_id"]: call["content"] for call in adapter.messages}
+
+    # The requester learns it exists and is waiting, and learns no code.
+    holding = sent[GROUP]
+    assert "asked James to approve" in holding
+    assert code not in holding, "the release code went to the conversation"
+
+    # James is asked directly, and his message is the one that carries it.
+    owner = juno._owner_dm_target()
+    assert owner and owner != GROUP
+    assert code in sent[owner]
+    assert "APPROVE " + code in sent[owner]
+
+
+@pytest.mark.asyncio
+async def test_a_document_found_outside_a_root_is_not_auto_released(tmp_path):
+    """Auto-release must not carry a document nobody granted standing access to.
+
+    A configured root is a standing grant, and auto-release exists so James
+    does not have to type a code back for his own document in his own folder.
+    A document found by searching more widely has no such grant behind it --
+    finding it is precisely why he has to decide -- so the proposal stays a
+    proposal, and the code is remembered against the conversation that asked
+    rather than spent on it.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import (
+        _ACTIVE_AUDIENCE, _ACTIVE_DELIVERY,
+    )
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    assert _ACTIVE_DELIVERY.get() is not None
+
+    outside = dict(preview)
+    outside["document"] = {**preview["document"], "requires_owner_approval": True}
+    answer = await juno._auto_release(json.dumps(outside), audience)
+
+    # Nothing was sent, and what comes back says a proposal is outstanding
+    # without carrying the code that would authorise it.
+    assert adapter.document_calls == []
+    assert json.loads(answer)["outcome"] == "owner_approval_requested"
+    code = preview["approval"]["code"]
+    assert code not in answer
+
+    # The code is outstanding, pointed at the conversation that asked.
+    pending = juno._pending_release(code)
+    assert pending is not None and pending[0] == GROUP
+
+    # And the same document from a configured root still auto-releases.
+    juno2, _gateway2, in_root = await _propose(tmp_path, root, clock, roster, adapter)
+    assert "requires_owner_approval" not in in_root["document"]
+    assert json.loads(
+        await juno2._auto_release(json.dumps(in_root), _ACTIVE_AUDIENCE.get())
+    )["outcome"] == "delivered"
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_approval_typed_in_a_dm_delivers_where_the_request_came_from(tmp_path):
+    """The document must reach the conversation that asked, not the DM.
+
+    A document found outside a release root needs James to say so, and he
+    says so in a DM -- a different chat from the one that asked for it. The
+    approval therefore has to carry two facts that used to be one: who
+    approved, and where it goes. Delivering into the DM would be a quiet
+    redirection of a private document to a different conversation than the
+    one whose audience was authorised for it.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+    from dataclasses import replace
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    origin_audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+    dm_chat = "james-dm@s.whatsapp.net"
+
+    juno._remember_pending_release(
+        code, chat_id=GROUP, audience=origin_audience,
+        expires_at=int(clock()) + 600,
+    )
+
+    # James approves from the DM. The DM is his own, so it is an audience
+    # entitled to approve -- but it is not where the document belongs.
+    dm_audience = replace(origin_audience, conversation_kind="dm")
+    result = await juno._handle_document_approval(
+        event=_event("APPROVE " + code, chat_id=dm_chat),
+        adapter=adapter,
+        audience=dm_audience,
+    )
+    assert result["action"] == "skip"
+
+    assert len(adapter.document_calls) == 1
+    assert adapter.document_calls[0]["chat_id"] == GROUP, (
+        "the document went to the DM instead of the conversation that asked"
+    )
+
+    # One use only: the same code cannot be replayed from the DM.
+    await juno._handle_document_approval(
+        event=_event("APPROVE " + code, chat_id=dm_chat),
+        adapter=adapter,
+        audience=dm_audience,
+    )
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_who_approves_and_where_it_lands_are_asked_separately(tmp_path):
+    """One audience used to answer both questions, because it always could.
+
+    An approval could only arrive in the conversation it was for, so "may
+    this person approve" and "may this conversation hold the document" were
+    the same fact. A DM approval separates them, and the gates have to keep
+    meaning what they mean: an approver who is not James cannot release into
+    a conversation that would otherwise be entitled to it, and James cannot
+    approve a release into a conversation that is not.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+    from dataclasses import replace
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+
+    # Someone other than James, approving a release into James's own
+    # conversation. The destination is impeccable; the approver is not.
+    stranger = replace(audience, principal="family", human_principals=("family",))
+    assert await juno._consume_and_deliver(
+        code, audience=audience, adapter=adapter, chat_id=GROUP,
+        approver=stranger, send_receipt=False,
+    ) == "denied"
+    assert adapter.document_calls == []
+
+    # James approving a release into a conversation he is not in. The approver
+    # is impeccable; the destination is not. What that conversation is allowed
+    # to hold was settled upstream against the intersection of everyone in it,
+    # so the question left here is whether it is one of his rooms.
+    without_him = replace(audience, human_principals=("lucy",))
+    assert await juno._consume_and_deliver(
+        code, audience=without_him, adapter=adapter, chat_id=GROUP,
+        approver=audience, send_receipt=False,
+    ) == "denied"
+    assert adapter.document_calls == []
+
+    # Both satisfied, which is the flow that exists today, and the one-use
+    # authority is still there to be claimed after two refusals.
+    assert await juno._consume_and_deliver(
+        code, audience=audience, adapter=adapter, chat_id=GROUP,
+        approver=audience, send_receipt=False,
+    ) == "delivered"
+    assert len(adapter.document_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_release_still_fails_closed_on_a_changed_roster(tmp_path):
+    """Removing the owner prompt must not remove any gate behind it."""
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    # A stranger joins between the release decision and dispatch.
+    roster.change_on_call = roster.calls + 1
+
+    result = json.loads(await juno._auto_release(json.dumps(preview), audience))
+
+    assert result["outcome"].startswith("delivery_")
+    assert adapter.document_calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_release_leaves_a_non_release_answer_untouched(tmp_path):
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, _preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    for answer in ("an ordinary minimized answer", '{"outcome":"denied"}'):
+        assert await juno._auto_release(answer, audience) == answer
+    assert adapter.document_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_is_scheduled_onto_the_gateway_loop(tmp_path):
+    """Dispatch must run where the adapter's HTTP session lives.
+
+    An async tool handler is executed by _run_async on a fresh loop in a
+    disposable thread. The platform adapter's session is bound to the
+    gateway's loop and raises when touched from another one, which the
+    transport surfaces only as SendResult(success=False) -- the live 21:09
+    failure, recorded in the ledger as "failed" with no exception anywhere.
+    """
+    import asyncio as _asyncio
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_LOOP
+
+    seen: dict = {}
+
+    async def _work() -> str:
+        seen["loop"] = _asyncio.get_running_loop()
+        return "delivered"
+
+    gateway_loop = _asyncio.new_event_loop()
+    thread = __import__("threading").Thread(
+        target=gateway_loop.run_forever, daemon=True
+    )
+    thread.start()
+    token = _ACTIVE_LOOP.set(gateway_loop)
+    try:
+        result = await TrustedPrincipalRuntime._on_gateway_loop(_work())
+        assert result == "delivered"
+        assert seen["loop"] is gateway_loop
+        assert seen["loop"] is not _asyncio.get_running_loop()
+    finally:
+        _ACTIVE_LOOP.reset(token)
+        gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+        thread.join(timeout=5)
+        gateway_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_runs_inline_when_no_gateway_loop_is_recorded(tmp_path):
+    import asyncio as _asyncio
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_LOOP
+
+    async def _work() -> str:
+        return "delivered"
+
+    token = _ACTIVE_LOOP.set(None)
+    try:
+        assert await TrustedPrincipalRuntime._on_gateway_loop(_work()) == "delivered"
+    finally:
+        _ACTIVE_LOOP.reset(token)
+
+
+def test_delivered_file_is_named_after_the_document():
+    name = TrustedPrincipalRuntime._delivery_file_name(
+        "Juno Test Engagement Letter", ".pdf"
+    )
+    assert name == "Juno Test Engagement Letter.pdf"
+    # Anything unusable falls back rather than producing an odd or empty name.
+    assert TrustedPrincipalRuntime._delivery_file_name("", ".pdf") == (
+        "requested-document.pdf"
+    )
+    assert TrustedPrincipalRuntime._delivery_file_name(None, ".png") == (
+        "requested-document.png"
+    )
+    # A title crossing the boundary is re-reduced on this side: no separators,
+    # no traversal, no control characters, bounded length.
+    for hostile in ("../../etc/passwd", "a/b\\c", "x\x00y", "  ...  "):
+        produced = TrustedPrincipalRuntime._delivery_file_name(hostile, ".pdf")
+        assert "/" not in produced and "\\" not in produced
+        assert ".." not in produced
+        assert "\x00" not in produced
+        assert produced.endswith(".pdf") and len(produced) <= 84
+    assert TrustedPrincipalRuntime._delivery_file_name("A" * 300, ".pdf") == (
+        "A" * 80 + ".pdf"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_document_is_the_answer_so_the_follow_up_line_is_dropped(tmp_path):
+    """One message, not two: the file arrives and nothing narrates it."""
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    runtime._auto_delivered.add("juno-session")
+    suppressed = runtime.transform_llm_output(
+        response_text="The document has been delivered to this conversation.",
+        session_id="juno-session",
+        turn_id="turn-1",
+    )
+    # The gateway strips this to empty and then sends nothing; returning ""
+    # would instead mean "leave the model's sentence unchanged".
+    assert suppressed is not None and suppressed.strip() == ""
+    # Consumed once: the next reply in the same session is untouched.
+    assert runtime.transform_llm_output(
+        response_text="an ordinary answer",
+        session_id="juno-session",
+        turn_id="turn-2",
+    ) is None
+
+
+def test_delivery_flag_survives_a_handler_that_gets_no_session_id():
+    """The live 21:27 miss: tool handlers are not given session identifiers.
+
+    handler_kwargs is whatever the caller passed, so keying the flag off
+    kwargs produced an empty key and the hook never matched it.
+    """
+    keys = TrustedPrincipalRuntime._delivery_turn_keys({})
+    assert "" not in keys
+    keys_with_id = TrustedPrincipalRuntime._delivery_turn_keys(
+        {"session_id": "juno-session"}
+    )
+    assert "juno-session" in keys_with_id
+
+
+def test_delivery_caption_describes_the_artifact_safely():
+    caption = TrustedPrincipalRuntime._delivery_caption({
+        "title": "Juno Test Engagement Letter",
+        "mime_type": "application/pdf",
+        "page_count": 1,
+    })
+    assert caption == "Juno Test Engagement Letter · PDF"
+    multi = TrustedPrincipalRuntime._delivery_caption({
+        "title": "Deed of Sale",
+        "mime_type": "application/pdf",
+        "page_count": 12,
+    })
+    assert multi == "Deed of Sale · PDF · 12 pages"
+    # Nothing crosses into the chat unreduced, and an empty descriptor is fine.
+    hostile = TrustedPrincipalRuntime._delivery_caption({
+        "title": "../../etc/passwd\x00",
+        "mime_type": "application/pdf",
+    })
+    assert ".." not in hostile and "/" not in hostile and "\x00" not in hostile
+    assert TrustedPrincipalRuntime._delivery_caption({}) == ""
+
+
+@pytest.mark.asyncio
+async def test_typing_settles_once_the_document_is_the_whole_reply(tmp_path):
+    """No lingering "typing…" after a delivery that ends the turn silently.
+
+    The model's follow-up is dropped, so nothing else is sent and the refresh
+    loop would otherwise keep asserting the indicator until the turn ended.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+    paused: list = []
+    stopped: list = []
+    adapter.pause_typing_for_chat = paused.append
+
+    async def _stop_typing(chat_id):
+        stopped.append(chat_id)
+
+    adapter.stop_typing = _stop_typing
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    result = json.loads(await juno._auto_release(json.dumps(preview), audience))
+
+    assert result["outcome"] == "delivered"
+    assert paused == [GROUP]
+    assert stopped == [GROUP]
+
+
+@pytest.mark.asyncio
+async def test_typing_helper_never_breaks_a_delivery(tmp_path):
+    """An adapter without the typing API, or one that raises, is harmless."""
+    class Hostile:
+        def pause_typing_for_chat(self, _chat_id):
+            raise RuntimeError("no typing API here")
+
+    await TrustedPrincipalRuntime._quiet_typing(Hostile(), GROUP)
+    await TrustedPrincipalRuntime._quiet_typing(object(), GROUP)
+
+
+def test_a_bare_follow_up_is_only_a_document_request_in_context():
+    """"retrieve and send it again" is James's real 21:36 and 21:43 phrasing.
+
+    It names no document, so on its own it is an ordinary turn. It worked once
+    and failed once purely because Juno happened to quote the earlier request
+    in relevant_context the first time.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED,
+        classify_output_tier,
+        is_document_followup,
+    )
+
+    followup = "retrieve and send it again"
+    assert classify_output_tier(followup) == MINIMIZED
+    assert is_document_followup(followup) is True
+    # A turn that carries its own subject is never treated as a follow-up.
+    for standalone in (
+        "what did nacho say about the amended terms",
+        "send me an update about the villa instead",
+        "remind me when the survey is due",
+    ):
+        assert is_document_followup(standalone) is False, standalone
+    # Nor is anything that already classifies on its own.
+    assert is_document_followup("Show me the juno test engagement letter") is False
+
+
+def test_resend_and_retrieve_classify_without_any_history():
+    from plugins.juno_kite_trusted_principal.disclosure import classify_output_tier
+
+    for phrase in (
+        "resend the engagement letter",
+        "re-send the engagement letter",
+        "retrieve the child passport scan",
+    ):
+        assert classify_output_tier(phrase) == DOCUMENT_DESCRIPTOR, phrase
+
+
+@pytest.mark.asyncio
+async def test_follow_up_inherits_only_a_recent_same_conversation_document_turn(
+    tmp_path,
+):
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    binding = "conversation-binding-digest"
+    other = "a-different-conversation"
+    followup = "retrieve and send it again"
+
+    # With no prior document turn the follow-up stays an ordinary turn.
+    assert juno._host_output_tier(followup, binding) == "minimized_answer"
+    # After a real document request in that conversation it resolves.
+    assert juno._host_output_tier(
+        "Show me the juno test engagement letter", binding
+    ) == DOCUMENT_DESCRIPTOR
+    assert juno._host_output_tier(followup, binding) == DOCUMENT_DESCRIPTOR
+    # Never across conversations.
+    assert juno._host_output_tier(followup, other) == "minimized_answer"
+    # And never after it goes stale.
+    clock.value += 301
+    assert juno._host_output_tier(followup, binding) == "minimized_answer"
+
+
+def test_minimized_guidance_forbids_inventing_a_release_gate():
+    """Kite told James release was "blocked at the next host approval gate".
+
+    No gate runs on a minimized turn; there was nothing to block.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED,
+        generated_semantic_guidance,
+    )
+
+    rule = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=MINIMIZED,
+    )["output_tier_rule"]
+    assert "never explain a document you did not return by inventing one" in rule
+
+
+@pytest.mark.parametrize(
+    "token", [b"/URI", b"/AA", b"/OpenAction", b"/AcroForm", b"/ObjStm"]
+)
+def test_ordinary_document_structure_is_not_treated_as_active_content(
+    tmp_path, token
+):
+    """A hyperlink is not an executable.
+
+    The real engagement letter carried /URI six times and /AA eighteen times --
+    a website, a LinkedIn profile, an email address in a signature block -- and
+    was refused as "active-content". That rejected essentially every document a
+    professional actually sends.
     """
     root = tmp_path / "family"
     root.mkdir()
-    config = _with_lucy(_config(tmp_path, root, mode="kite"))
-    kite = TrustedPrincipalRuntime(config, active_profile="kite", clock=Clock())
+    source = root / "ordinary.pdf"
+    source.write_bytes(_pdf_with_stream(b"BT " + token + b" ET"))
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
 
-    from plugins.juno_kite_trusted_principal.runtime import TurnBinding
+    inspected = runtime.document_releases.inspect_source_for_test(source)
+    assert inspected is not None, token
+    assert inspected.mime_type == "application/pdf"
 
-    binding = TurnBinding(
-        True, "",
-        _NS(principal="lucy", correlation_id="c", context_id="x"),
-        _NS(request_id="r"),
-        "kite-session", "kite-turn",
-        ("juno.shared.children",), (), "minimized_answer",
+
+def test_executable_and_payload_carrying_constructs_stay_refused():
+    """The loosening is bounded: code, external fetch, and embedding still fail."""
+    from plugins.juno_kite_trusted_principal.document_release import (
+        _PDF_ACTIVE_TOKENS,
+        _PDF_INERT_TOKENS,
     )
-    # The binding is supplied directly so this test is about the
-    # principal-bound gate and not about re-deriving a valid turn.
-    kite._current_valid_binding = lambda **_kwargs: binding
 
-    def refuse():
-        return kite.pre_tool_call(
-            "kite_personal_files_locate",
-            {"query": "passport", "max_results": 3},
-            session_id="kite-session", turn_id="kite-turn",
+    for token in (
+        b"/JavaScript", b"/JS", b"/XFA", b"/Launch", b"/GoToR", b"/SubmitForm",
+        b"/ImportData", b"/EmbeddedFile", b"/FileAttachment", b"/RichMedia",
+        b"/Movie", b"/Sound",
+    ):
+        assert token in _PDF_ACTIVE_TOKENS, token
+    # Nothing may be in both lists.
+    assert not set(_PDF_ACTIVE_TOKENS) & set(_PDF_INERT_TOKENS)
+
+
+def test_script_hidden_inside_an_object_stream_is_still_caught(tmp_path):
+    """Allowing /ObjStm must not create a place to hide /JS.
+
+    Decoded streams are scanned for the refused tokens, so a compressed object
+    stream is inspected rather than trusted.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "hidden.pdf"
+    source.write_bytes(_pdf_with_stream(b"<</Type/ObjStm>> /JavaScript (evil)"))
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is None
+
+
+@pytest.mark.parametrize(
+    "filter_name", [b"DCTDecode", b"CCITTFaxDecode", b"LZWDecode", b"JBIG2Decode"]
+)
+def test_an_image_codec_does_not_make_a_document_unreleasable(tmp_path, filter_name):
+    """A scanned page is not a reason to refuse a letter.
+
+    The real engagement letter failed here after clearing the active-content
+    gate: the scanner refused any stream it could not inflate, and a printed or
+    scanned document is full of them.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "scanned.pdf"
+    source.write_bytes(_pdf_with_stream(b"\xff\xd8\xff image samples", filter_name=filter_name))
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is not None
+
+
+@pytest.mark.parametrize("filter_name", [b"DCTDecode", b"LZWDecode"])
+def test_an_opaque_stream_is_scanned_as_stored(tmp_path, filter_name):
+    """Not inflating a stream must not mean not looking at it.
+
+    The bytes are scanned exactly as they sit in the file. This cannot see
+    through an encoding it cannot decode -- a token buried inside real JPEG
+    entropy data would not be visible -- but a viewer does not execute image
+    samples either; actions have to reach the object graph, which is scanned.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "smuggled.pdf"
+    source.write_bytes(
+        _pdf_with_stream(
+            b"unused",
+            filter_name=filter_name,
+            encoded_payload=b"cover /JavaScript (evil) cover",
+        )
+    )
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is None
+
+
+def test_a_stream_claiming_flate_that_will_not_inflate_is_still_refused(tmp_path):
+    """Opaque is for codecs this cannot read, not for a broken Flate claim."""
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "lying.pdf"
+    source.write_bytes(
+        _pdf_with_stream(
+            b"unused", filter_name=b"FlateDecode", encoded_payload=b"not-zlib"
+        )
+    )
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    assert runtime.document_releases.inspect_source_for_test(source) is None
+
+
+def test_a_real_gmail_attachment_id_fits_the_extractor_schema():
+    """The live 22:25 block: the id was longer than its own schema allowed.
+
+    Gmail attachment handles are hundreds of characters -- the engagement
+    letter's is 319 -- and are regenerated per response, so they cannot be
+    shortened or substituted. A 256 cap rejected the argument before the
+    reader ever ran, making every real attachment unreachable.
+    """
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        TOOL_SCHEMAS,
+        validate_tool_arguments,
+    )
+
+    schema = TOOL_SCHEMAS["kite_gmail_attachment_extract"]["parameters"]
+    assert schema["properties"]["attachment_id"]["maxLength"] >= 512
+    # Message ids stay tightly bounded; only the attachment handle is long.
+    assert schema["properties"]["message_id"]["maxLength"] == 256
+
+    realistic = "ANGjdJ" + "aB9_-x" * 52  # 318 chars, Gmail's alphabet
+    assert len(realistic) > 256
+    assert validate_tool_arguments(
+        "kite_gmail_attachment_extract",
+        {"account": "personal", "message_id": "19fdc822d5bea6a9",
+         "attachment_id": realistic},
+    ) is True
+    # Still bounded, and still only the URL-safe alphabet.
+    assert validate_tool_arguments(
+        "kite_gmail_attachment_extract",
+        {"account": "personal", "message_id": "19fdc822d5bea6a9",
+         "attachment_id": "a" * 4096},
+    ) is False
+    # The alphabet is enforced a layer down, at execution, not by the schema.
+    from plugins.juno_kite_trusted_principal.private_reads import _ATTACHMENT_ID_RE
+
+    assert _ATTACHMENT_ID_RE.fullmatch(realistic) is not None
+    for rejected in ("../../etc/passwd", "a b", "a/b", "x" * 2048, ""):
+        assert _ATTACHMENT_ID_RE.fullmatch(rejected) is None, rejected
+
+
+class _RecordingSessionStore:
+    def __init__(self, keys):
+        self._keys = list(keys)
+        self.reset_keys: list[str] = []
+
+    def list_sessions(self, active_minutes=None):
+        return [SimpleNamespace(session_key=key) for key in self._keys]
+
+    def reset_session(self, session_key, display_name=None):
+        self.reset_keys.append(session_key)
+        return SimpleNamespace(session_key=session_key)
+
+
+def _a2a_event(text, *, chat_id="jk-context", user_id="juno"):
+    """The A2A lane carries a plain "a2a" platform string, not a Platform member."""
+    return SimpleNamespace(
+        text=text,
+        source=SimpleNamespace(
+            platform="a2a", user_id=user_id, chat_id=chat_id, chat_type="dm"
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_juno_request_starts_from_a_clean_kite_session(tmp_path):
+    """Kite must not reason from a previous turn's stale failure.
+
+    Live 22:40: on a build where the attachment id limit had already been
+    raised, the model reported it as "still" overlength and never called the
+    reader -- quoting its own earlier failure from the same session. That
+    confounded five separate tests today.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import REQUEST_PREFIX
+
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    store = _RecordingSessionStore([
+        "agent:main:a2a:dm:jk-context",
+        "agent:main:whatsapp:group:unrelated",
+        "agent:main:a2a:dm:some-other-context",
+    ])
+
+    await kite.pre_gateway_dispatch(
+        event=_a2a_event("guard\n" + REQUEST_PREFIX + "{}"),
+        gateway=None,
+        session_store=store,
+    )
+    assert store.reset_keys == ["agent:main:a2a:dm:jk-context"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,user_id",
+    [
+        ("an ordinary peer message", "juno"),
+        ("guard\nJUNO_KITE_REQUEST_V2 {}", "someone-else"),
+    ],
+    ids=["not-a-signed-request", "not-the-juno-peer"],
+)
+async def test_unrelated_a2a_traffic_never_resets_a_session(tmp_path, text, user_id):
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    store = _RecordingSessionStore(["agent:main:a2a:dm:jk-context"])
+
+    await kite.pre_gateway_dispatch(
+        event=_a2a_event(text, user_id=user_id), gateway=None, session_store=store
+    )
+    assert store.reset_keys == []
+
+
+@pytest.mark.asyncio
+async def test_lane_reset_never_breaks_dispatch(tmp_path):
+    """A store without the API, or one that raises, must not block a turn."""
+    from plugins.juno_kite_trusted_principal.runtime import REQUEST_PREFIX
+
+    class Hostile:
+        def list_sessions(self, active_minutes=None):
+            raise RuntimeError("no listing here")
+
+        def reset_session(self, session_key, display_name=None):
+            raise RuntimeError("no reset here")
+
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    event = _a2a_event("guard\n" + REQUEST_PREFIX + "{}")
+    assert await kite.pre_gateway_dispatch(
+        event=event, gateway=None, session_store=Hostile()
+    ) is None
+    assert await kite.pre_gateway_dispatch(
+        event=event, gateway=None, session_store=object()
+    ) is None
+
+
+def test_attachment_transport_cap_does_not_reject_a_real_document(tmp_path):
+    """The live 22:53 and 22:55 failures: cap_exceeded on the pipe, not the file.
+
+    The engagement letter is 254398 bytes, ~339KB once base64-encoded, against
+    a 256KB text-answer cap. Every real attachment failed to extract while the
+    artifact policy itself would have allowed it.
+    """
+    import base64 as _base64
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        _ATTACHMENT_COMMAND_OUTPUT_BYTES,
+    )
+
+    artifact = b"%PDF-1.4 " + b"x" * 300_000
+    payload = json.dumps({
+        "filename": "engagement letter.pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": len(artifact),
+        "text": "",
+        "artifact_base64": _base64.b64encode(artifact).decode("ascii"),
+    })
+    assert len(payload.encode()) > 262144  # over the ordinary answer cap
+
+    calls: list = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return _NS(returncode=0, stdout=payload, stderr="")
+
+    root = tmp_path / "family"
+    root.mkdir()
+    executable = tmp_path / "reader"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o700)
+    config = _config(tmp_path, root, mode="kite")["juno_kite_trusted_principal"]
+    reads = dict(config["private_reads"])
+    reads["gmail"] = {
+        "executable": str(executable),
+        "account_aliases": {"personal": "personal", "kite": "kite"},
+    }
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+
+    service = PrivateReadService(
+        reads, backends=None, command_runner=runner,
+        url_opener=None, secret_values=set(),
+    )
+    assert service.output_bytes < _ATTACHMENT_COMMAND_OUTPUT_BYTES
+
+    result = service._source_or_google_command(
+        "gmail", "attachment_extract",
+        {"account": "personal", "message_id": "abc", "attachment_id": "xyz"},
+    )
+    assert result["size_bytes"] == len(artifact)
+    assert calls and calls[0][-3:] == ["attachment", "abc", "xyz"]
+
+    # An ordinary Gmail answer keeps the tight cap.
+    capped = False
+    try:
+        service._source_or_google_command(
+            "gmail", "get", {"account": "personal", "message_id": "abc"}
+        )
+    except Exception as exc:  # SourceFailure is frozen; inspect it directly
+        capped = getattr(exc, "code", "") == "cap_exceeded"
+    assert capped
+
+
+@pytest.mark.asyncio
+async def test_a_preview_titled_after_its_source_file_is_not_a_leak(tmp_path):
+    """The 07:09 failure: the host's own descriptor tripped the leak policy.
+
+    A document's title comes from the artifact's filename, and the reader that
+    found it records filenames as provenance. At the document tier any overlap
+    denies, so the approval preview collided with itself and the envelope came
+    back empty with "output minimized by deterministic leak policy" -- for a
+    payload the model never wrote.
+    """
+    artifact = _png_bytes()
+    root = tmp_path / "family"
+    root.mkdir()
+    # The searchable name and the delivered title are necessarily the same.
+    (root / "engagement-letter.png").write_bytes(artifact)
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    _juno, _gateway, preview = await _propose(
+        tmp_path,
+        root,
+        clock,
+        roster,
+        adapter,
+        question="Show me the engagement letter",
+        relative_path="engagement-letter.png",
+        capability_id="juno.private.james",
+        purpose="personal administration",
+        search_query="engagement",
+    )
+
+    assert preview["outcome"] == "approval_required"
+    assert "engagement" in preview["document"]["title"].casefold()
+
+
+def test_only_a_document_turn_skips_the_overlap_check():
+    """The exemption is for host-authored payloads, not a general relaxation."""
+    source = (
+        Path("plugins/juno_kite_trusted_principal/runtime.py").read_text()
+    )
+    assert "and not host_authored" in source
+    # It is set in exactly one place: right after the host replaces the answer.
+    assert source.count("host_authored = True") == 1
+    assert source.count("host_authored = False") == 1
+
+
+def test_a_dated_document_title_is_not_mistaken_for_a_phone_number(tmp_path):
+    """The 07:35 failure: "EL MS 07 08 2026" is a date, read as a phone number.
+
+    The generic output scan is written for model prose. Applied to the host's
+    own descriptor it blanked the entire release -- the envelope came back
+    empty with "output minimized by deterministic leak policy" for a payload
+    the model never wrote.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    assert runtime._safe_release_title("EL MS 07 08 2026") == "EL MS 07 08 2026"
+    assert runtime._safe_release_title("Engagement Letter 2026") == (
+        "Engagement Letter 2026"
+    )
+    # This once tripped the phone-shaped scan, which is why the title is
+    # sanitised rather than scanned. The scan no longer confuses a date with
+    # a dialled number, so the title now survives both checks -- the
+    # sanitiser above is still what guarantees it.
+    assert runtime._leak_reason("EL MS 07 08 2026", output=True) == ""
+
+
+def test_a_title_carrying_something_unshippable_is_replaced_not_denied(tmp_path):
+    """Protection is kept, but it can never block the document itself."""
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    runtime.secret_values = {"super-secret-token-value"}
+
+    # An address in a title is fine now; the document itself is about to be
+    # sent, and naming who it came from tells the recipient nothing the file
+    # does not. A credential in a title is still suppressed.
+    assert runtime._safe_release_title("invoice for adviser@example.com") == (
+        "invoice for adviser@example.com"
+    )
+    for hostile in (
+        "creds api_key=abcdef123456",
+        "notes super-secret-token-value",
+        "",
+    ):
+        assert runtime._safe_release_title(hostile) == "Requested document", hostile
+
+
+def test_attachment_download_gets_its_own_timeout(tmp_path):
+    """The live pipeline died mid-download on the shared 15s source timeout.
+
+    One attachment command makes two API round-trips and pulls the document,
+    where a text answer makes one and returns a few KB.
+    """
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        PrivateReadService,
+        _ATTACHMENT_COMMAND_TIMEOUT_SECONDS,
+    )
+
+    seen: list = []
+
+    def runner(argv, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        return _NS(returncode=0, stdout=json.dumps({
+            "filename": "d.pdf", "mime_type": "application/pdf",
+            "size_bytes": 3, "text": "", "artifact_base64": "AAAA",
+        }), stderr="")
+
+    root = tmp_path / "family"
+    root.mkdir()
+    executable = tmp_path / "reader"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o700)
+    reads = dict(_config(tmp_path, root, mode="kite")["juno_kite_trusted_principal"]["private_reads"])
+    reads["gmail"] = {
+        "executable": str(executable),
+        "account_aliases": {"personal": "personal", "kite": "kite"},
+    }
+    service = PrivateReadService(
+        reads, backends=None, command_runner=runner, url_opener=None,
+        secret_values=set(),
+    )
+
+    service._source_or_google_command(
+        "gmail", "attachment_extract",
+        {"account": "personal", "message_id": "abc", "attachment_id": "xyz"},
+    )
+    assert seen == [_ATTACHMENT_COMMAND_TIMEOUT_SECONDS]
+    assert _ATTACHMENT_COMMAND_TIMEOUT_SECONDS > service.timeout
+
+    # An ordinary answer keeps the short timeout.
+    seen.clear()
+    service._source_or_google_command(
+        "gmail", "get", {"account": "personal", "message_id": "abc"}
+    )
+    assert seen == [service.timeout]
+
+
+def test_juno_accepts_the_host_descriptor_it_cannot_distinguish_by_signature(tmp_path):
+    """The 07:51 failure: Kite fully succeeded and Juno rejected the envelope.
+
+    Kite extracted the attachment, issued C7-T6REKJNX3DVQC2RN and returned
+    approval_required with denied=False. Juno then ran its own prose scan over
+    the answer, matched "07 08 2026" in the title as a phone number, and
+    blocked the consultation -- leaving the record staged and never claimed.
+    Fixing only the Kite side left the identical bug on the other side of the
+    wire.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    preview = canonical = json.dumps({
+        "outcome": "approval_required",
+        "document": {"title": "EL MS 07 08 2026",
+                     "source_class": "personal Gmail attachment",
+                     "mime_type": "application/pdf",
+                     "size_bytes": 254398, "page_count": 5},
+        "audience": "James only in this WhatsApp conversation",
+        "purpose": "property administration",
+        "approval": {"code": "C7-T6REKJNX3DVQC2RN",
+                     "instruction": "APPROVE C7-T6REKJNX3DVQC2RN",
+                     "expires_at": "2026-08-10T07:01:57+00:00"},
+    })
+    assert juno._release_descriptor(preview) is not None
+    # The prose scan once refused this descriptor over "07 08 2026" in the
+    # title, which is why recognising the shape is what admits it. The scan
+    # itself no longer objects; the descriptor check above is still the
+    # guarantee, and it is what holds if the scan tightens again.
+    assert juno._leak_reason(preview, output=True) == ""
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        {"extra": "smuggled prose"},
+        {"audience": "everyone"},
+        {"purpose": "whatever administration"},
+    ],
+    ids=["extra-key", "wrong-audience", "unknown-purpose"],
+)
+def test_only_the_exact_host_shape_bypasses_the_prose_scan(tmp_path, mutate):
+    """Nothing may wear the descriptor's shape to skip the scan."""
+    root = tmp_path / "family"
+    root.mkdir()
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    payload = {
+        "outcome": "approval_required",
+        "document": {"title": "Letter", "source_class": "personal files",
+                     "mime_type": "application/pdf",
+                     "size_bytes": 10, "page_count": 1},
+        "audience": "James only in this WhatsApp conversation",
+        "purpose": "property administration",
+        "approval": {"code": "C7-AAAAAAAAAAAAAAAA",
+                     "instruction": "APPROVE C7-AAAAAAAAAAAAAAAA",
+                     "expires_at": "2026-01-01T00:00:00+00:00"},
+    }
+    assert juno._release_descriptor(json.dumps(payload)) is not None
+    payload.update(mutate)
+    assert juno._release_descriptor(json.dumps(payload)) is None
+    # Ordinary answers are still prose, and still scanned.
+    assert juno._release_descriptor("here is a summary of the letter") is None
+    assert juno._release_descriptor(
+        '{"outcome":"denied","reason":"nope"}'
+    ) is None
+
+
+def test_the_release_candidate_tells_the_model_which_document_it_picked(tmp_path):
+    """08:09 and 08:11: the model chose blind and sent the wrong passport.
+
+    The descriptor carried only a MIME type and a byte count, so the model
+    could not check its own choice or report it. It picked "Epson_07082026151807"
+    and then "photo" -- scanner defaults that identify nothing -- inferring from
+    the surrounding email that an image was a British passport when it was the
+    front cover of the Irish one.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    encoded, internal = runtime.private_reads.resolve_document_candidate(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "family",
+         "relative_path": "child-passport.png"},
+    )
+    assert internal is not None
+    descriptor = json.loads(encoded)["data"]
+    assert descriptor["document_name"] == "child-passport"
+    # Still closed: no path, no root, no bytes.
+    assert set(descriptor) == {
+        "outcome", "source_class", "document_name", "document_preview",
+        "mime_type", "size_bytes",
+    }
+    assert str(tmp_path) not in encoded and "family" not in descriptor["document_name"]
+
+
+def test_a_candidate_name_is_reduced_before_the_model_sees_it():
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        _release_display_name,
+    )
+
+    assert _release_display_name("EL MS 07 08 2026.pdf") == "EL MS 07 08 2026"
+    assert _release_display_name("Epson_07082026151807.jpg") == "Epson_07082026151807"
+    # Percent-encoding is already decoded upstream; separators never survive.
+    for hostile in ("../../etc/passwd", "a/b\\c.pdf", "x\x00y.png"):
+        produced = _release_display_name(hostile)
+        assert "/" not in produced and "\\" not in produced and ".." not in produced
+        assert "\x00" not in produced
+    assert _release_display_name("") == "untitled"
+    assert len(_release_display_name("A" * 300 + ".pdf")) <= 96
+
+
+def test_document_guidance_requires_checking_the_name_before_releasing():
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        generated_semantic_guidance,
+    )
+
+    rule = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )["output_tier_rule"]
+    assert "document_preview" in rule
+    assert "document_name" in rule
+    assert "identifies nothing" in rule          # a scanner default is not evidence
+    assert "not the topic" in rule               # British vs Irish are both passports
+    assert "cannot be recalled" in rule
+
+
+def test_the_candidate_carries_a_preview_of_what_the_document_says(tmp_path):
+    """A name cannot answer "is this the British one?"; the contents can."""
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    encoded, internal = runtime.private_reads.resolve_document_candidate(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "family", "relative_path": "child-passport.png"},
+    )
+    assert internal is not None
+    descriptor = json.loads(encoded)["data"]
+    assert set(descriptor) == {
+        "outcome", "source_class", "document_name", "document_preview",
+        "mime_type", "size_bytes",
+    }
+    # An 8x8 fixture has no legible text: empty, which says "unidentified".
+    assert isinstance(descriptor["document_preview"], str)
+
+
+def test_preview_is_bounded_collapsed_and_never_guesses(monkeypatch):
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    monkeypatch.setattr(
+        pr.subprocess, "run",
+        lambda *a, **k: _NS(returncode=0, stdout="a\n\n  b\t" + "x" * 5000),
+    )
+    out = pr._document_preview(b"%PDF-1.4", "application/pdf")
+    assert len(out) <= 600
+    assert out.startswith("a b x")
+    assert "\n" not in out and "\t" not in out
+
+    # A reader that fails, or a format with no reader, yields nothing at all
+    # rather than a guess. A different document, because the first one has now
+    # been read successfully and a second look at it is answered from memory.
+    monkeypatch.setattr(
+        pr.subprocess, "run", lambda *a, **k: _NS(returncode=1, stdout="secret")
+    )
+    assert pr._document_preview(b"%PDF-1.4 unreadable", "application/pdf") == ""
+    assert pr._document_preview(b"x", "application/zip") == ""
+    assert pr._document_preview(b"x", "") == ""
+
+
+def test_preview_reader_runs_locally_and_cleans_up(monkeypatch, tmp_path):
+    """The artifact must not leave the machine to be identified."""
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
+        seen["path"] = next(a for a in argv if "/T/" in a or "tmp" in a)
+        seen["existed"] = Path(seen["path"]).exists()
+        return _NS(returncode=0, stdout="text")
+
+    monkeypatch.setattr(pr.subprocess, "run", fake_run)
+    assert pr._document_preview(b"%PDF-1.4 hello", "application/pdf") == "text"
+    # A local executable, a bounded environment, and the temp file removed after.
+    assert seen["argv"][0].endswith("pdftotext")
+    assert seen["env"] == {"PATH": "/usr/bin:/bin"}
+    assert seen["existed"] is True
+    assert not Path(seen["path"]).exists()
+
+
+def test_document_guidance_requires_matching_the_contents_not_the_topic():
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        generated_semantic_guidance,
+    )
+
+    rule = generated_semantic_guidance(
+        principal="james",
+        effective_capability_ids=["juno.private.james"],
+        configured_policy={"juno.private.james": {"domain": "juno.private.james"}},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )["output_tier_rule"]
+    assert "document_preview" in rule
+    assert "read the next candidate" in rule
+    assert "empty preview" in rule.lower()
+
+
+def test_a_rejected_question_says_what_matched(tmp_path):
+    """A question refused here is never persisted, so it must name itself."""
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    source = Path("plugins/juno_kite_trusted_principal/runtime.py").read_text()
+    assert 'f"({handoff_reason})"' in source
+
+
+def test_a_scanned_pdf_with_no_text_layer_is_still_read(monkeypatch):
+    """TB.pdf: 290KB of scanned terms, and pdftotext returns nothing for it.
+
+    Without the rendered-page fallback the candidate stays unidentifiable,
+    which is precisely the case the preview exists to solve.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    def fake_reader(argv, limit=600):
+        calls.append(argv)
+        if argv[0].endswith("pdftotext"):
+            return ""          # no text layer
+        return "Terms of Business - the attached professional engagement"
+
+    monkeypatch.setattr(pr, "_run_preview_reader", fake_reader)
+    out = pr._document_preview(b"%PDF-1.4 scanned", "application/pdf")
+    assert out.startswith("Terms of Business")
+    # It tried the text layer first, then the local renderer.
+    assert calls[0][0].endswith("pdftotext")
+    assert calls[1][0] == pr._SYSTEM_PYTHON
+    assert calls[1][1].endswith("macos_ocr.py")
+
+
+def test_a_pdf_with_a_text_layer_does_not_pay_for_ocr(monkeypatch):
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    def fake_reader(argv, limit=600):
+        calls.append(argv)
+        return "PRIVATE AND CONFIDENTIAL Palma de Mallorca"
+
+    monkeypatch.setattr(pr, "_run_preview_reader", fake_reader)
+    assert pr._document_preview(b"%PDF-1.4", "application/pdf").startswith("PRIVATE")
+    assert len(calls) == 1
+
+
+def test_a_second_look_at_one_document_does_not_pay_the_recogniser_again(monkeypatch):
+    """Weighing four candidates used to cost the recogniser four times a turn.
+
+    Nearly all of that is fixed cost -- a cold interpreter importing the Vision
+    bindings, then warming the OS text models -- and it was paid again next
+    turn over the same unchanged files. The extraction is a pure function of
+    the document's bytes, so the second look should be free.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(
+        pr,
+        "_run_preview_reader",
+        lambda argv, limit=600: calls.append(argv) or "SPECIMEN PASSPORT ZZ0000001",
+    )
+
+    first = pr._document_preview(b"scan-one", "image/jpeg")
+    second = pr._document_preview(b"scan-one", "image/jpeg")
+    assert first == second == "SPECIMEN PASSPORT ZZ0000001"
+    assert len(calls) == 1, "the recogniser ran a second time on unchanged bytes"
+
+    # A shorter bound is served from the same remembered extraction, truncated
+    # per call, so the bound is not baked into what is remembered.
+    assert pr._document_preview(b"scan-one", "image/jpeg", limit=8) == "SPECIMEN"
+    assert len(calls) == 1
+
+    # A different page bound is a different extraction, and so a different key.
+    pr._document_preview(b"scan-one", "image/jpeg", pages=pr._READ_MAX_PAGES)
+    assert len(calls) == 2
+
+
+def test_a_recogniser_that_failed_is_asked_again_next_time(monkeypatch):
+    """A timeout must not become a permanently unidentifiable document.
+
+    The readers return "" for a page with no text and for a recogniser that
+    timed out, failed to start, or died under memory pressure -- they cannot
+    tell those apart. Remembering "" would turn one transient failure into a
+    document this gateway can never identify again, surfacing to whoever
+    asked as an inability to say what the file is, with nothing in the logs
+    to connect it to the moment it actually failed.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    attempts: list[int] = []
+
+    def _reader(argv, limit=600):
+        attempts.append(1)
+        # Fails the first time, as a timeout or a cold start would, then works.
+        return "" if len(attempts) == 1 else "ENGAGEMENT LETTER page 1"
+
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(pr.Path, "exists", lambda self: True)
+    monkeypatch.setattr(pr, "_run_preview_reader", _reader)
+
+    # An image goes to the recogniser once; a PDF would try pdftotext first.
+    document = b"\xff\xd8\xff transient scan"
+    assert pr._document_preview(document, "image/jpeg") == ""
+    # Asked again rather than answered from a remembered failure.
+    assert pr._document_preview(document, "image/jpeg") == "ENGAGEMENT LETTER page 1"
+    assert len(attempts) == 2
+    # And the successful read IS remembered.
+    assert pr._document_preview(document, "image/jpeg") == "ENGAGEMENT LETTER page 1"
+    assert len(attempts) == 2
+
+
+def test_a_changed_document_is_read_again_rather_than_remembered(monkeypatch):
+    """The cache must never answer for a file whose contents have moved on.
+
+    Keyed on a digest of the bytes rather than on a stat tuple precisely so a
+    rewritten document cannot be served from the previous one's preview.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+
+    def fake_reader(argv, limit=600):
+        calls.append(argv)
+        # The reader sees the staged temp file, so it answers from the bytes.
+        return Path(argv[-2]).read_text()
+
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(pr, "_run_preview_reader", fake_reader)
+
+    assert pr._document_preview(b"COUNCIL TAX BILL", "image/jpeg") == "COUNCIL TAX BILL"
+    assert len(calls) == 1
+
+    # Same document, rewritten. Different bytes, so a fresh extraction.
+    assert pr._document_preview(b"TENANCY AGREEMENT", "image/jpeg") == (
+        "TENANCY AGREEMENT"
+    )
+    assert len(calls) == 2
+
+    # And the first document is still remembered, not evicted by the second.
+    assert pr._document_preview(b"COUNCIL TAX BILL", "image/jpeg") == "COUNCIL TAX BILL"
+    assert len(calls) == 2
+
+
+def test_the_preview_cache_is_bounded_and_never_written_to_disk(monkeypatch):
+    """Someone's documents live in memory here, so both bounds must hold."""
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    calls: list = []
+    monkeypatch.setattr(pr, "_normalise_artifact", lambda data, mime: (data, mime))
+    monkeypatch.setattr(
+        pr, "_run_preview_reader", lambda argv, limit=600: calls.append(argv) or "text"
+    )
+
+    for index in range(pr._PREVIEW_CACHE_MAX_ENTRIES + 10):
+        pr._document_preview(f"document-{index}".encode(), "image/jpeg")
+    assert len(pr._PREVIEW_CACHE) == pr._PREVIEW_CACHE_MAX_ENTRIES
+
+    # The character bound holds too, however few entries that leaves.
+    pr._reset_document_preview_cache()
+    monkeypatch.setattr(
+        pr,
+        "_run_preview_reader",
+        lambda argv, limit=600: "y" * pr._READ_EXTRACT_CHARS,
+    )
+    for index in range(40):
+        pr._document_preview(f"long-{index}".encode(), "image/jpeg")
+    assert sum(len(v) for v in pr._PREVIEW_CACHE.values()) <= pr._PREVIEW_CACHE_MAX_CHARS
+
+    # A caller asking beyond what the cache agrees to hold bypasses it entirely.
+    pr._reset_document_preview_cache()
+    pr._document_preview(
+        b"oversized", "image/jpeg", limit=pr._READ_EXTRACT_CHARS + 1
+    )
+    assert not pr._PREVIEW_CACHE
+
+
+def test_a_sentence_about_verification_is_not_a_verification_code(tmp_path):
+    """The 08:45 block: "Send me my British passport" never reached Kite.
+
+    The composed question said "require exact source verification that the
+    document is both a British passport and belongs to the authenticated
+    principal". The credential rule for one-time codes matched "verification
+    that" -- the qualifier was optional, so any of these words followed by the
+    next English word read as a secret.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="juno", clock=Clock())
+
+    # The exact live question, recovered from the session store.
+    live = (
+        "Locate and securely deliver the authenticated principal's own British "
+        "passport biodata page to this exact bound WhatsApp conversation. Because "
+        "two prior candidates were wrong, require exact source verification that "
+        "the document is both a British passport and belongs to the authenticated "
+        "principal before release."
+    )
+    assert runtime._leak_reason(live, output=False) == ""
+    for ordinary in (
+        "verification that the document is his",
+        "authentication of ownership is required",
+        "recovery of the original letter",
+        "if exact verification succeeds, deliver it",
+    ):
+        assert runtime._leak_reason(ordinary, output=False) == "", ordinary
+
+    # Real one-time secrets are still caught, with or without the qualifier.
+    for secret in (
+        "verification code 8f3k2a",
+        "your otp is 402913",
+        "one-time password 55télé" .replace("télé", "1234"),
+        "verification code: abc123",
+        "pairing code = 99887766",
+    ):
+        assert runtime._leak_reason(secret, output=False) == (
+            "credential-shaped content"
+        ), secret
+
+
+def test_the_same_rule_no_longer_blocks_staging_a_document(tmp_path):
+    """document_release carries its own copy of the rule, used when staging."""
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseService,
+    )
+
+    assert DocumentReleaseService._text_is_denied(
+        "require exact source verification that the document is his"
+    ) is False
+    assert DocumentReleaseService._text_is_denied("verification code 8f3k2a") is True
+
+
+def _docx_bytes(*, macro: bool = False, sheet: bool = False) -> bytes:
+    import io as _io, zipfile as _zip
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        if sheet:
+            archive.writestr("xl/workbook.xml", "<workbook/>")
+            archive.writestr("xl/sharedStrings.xml", "<sst><si><t>Fees 2026</t></si></sst>")
+        else:
+            archive.writestr(
+                "word/document.xml",
+                "<w:document><w:t>Terms of engagement for James Smith</w:t></w:document>",
+            )
+        if macro:
+            archive.writestr("word/vbaProject.bin", b"\x00macro")
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        (b"Engagement letter for James Smith\n", "text/plain"),
+        (b'{"holder": "James", "passport": "British"}', "application/json"),
+        (b"a,b,c\n1,2,3\n", "text/plain"),
+    ],
+    ids=["txt", "json", "csv"],
+)
+def test_text_documents_are_releasable(tmp_path, payload, expected):
+    from plugins.juno_kite_trusted_principal.document_release import (
+        ALLOWED_MIME_EXTENSIONS,
+    )
+
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    info = runtime.document_releases.inspect_bytes(payload)
+    assert info.mime_type == expected
+    assert info.mime_type in ALLOWED_MIME_EXTENSIONS
+
+
+def test_office_documents_are_releasable_but_macros_are_not(tmp_path):
+    """James accepted weaker checks for office formats; macros are still out."""
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    word = runtime.document_releases.inspect_bytes(_docx_bytes())
+    assert word.mime_type.endswith("wordprocessingml.document")
+    sheet = runtime.document_releases.inspect_bytes(_docx_bytes(sheet=True))
+    assert sheet.mime_type.endswith("spreadsheetml.sheet")
+
+    with pytest.raises(DocumentReleaseDenied, match="macro"):
+        runtime.document_releases.inspect_bytes(_docx_bytes(macro=True))
+
+
+def test_a_text_document_with_a_credential_is_still_refused(tmp_path):
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    with pytest.raises(DocumentReleaseDenied, match="prohibited"):
+        runtime.document_releases.inspect_bytes(b"api_key=abcdef1234567890\n")
+    # Binary is no longer refused for being unrecognised -- it is carried as
+    # opaque data -- but the credential scan still applies to what can be read
+    # out of it, which is the property that actually protects anything.
+    assert runtime.document_releases.inspect_bytes(
+        b"\x00\x01binary\xff" + b"\x99" * 64
+    ).mime_type == "application/octet-stream"
+    with pytest.raises(DocumentReleaseDenied, match="prohibited"):
+        runtime.document_releases.inspect_bytes(
+            b"\x00\x01" + b"api_key=abcdef1234567890" + b"\xff" * 32
         )
 
-    blocked = _session(refuse, mode="kite", context_id="x")
 
-    assert blocked is not None, "a principal-bound reader must still refuse"
-    message = blocked["message"]
-    # Still says who it is bound to...
-    assert "kite_personal_files_locate is bound to the principal" in message
-    # ...and now says what remains open, which is what the turn needed.
-    assert "typed readers" in message and "reading the document" in message
+def test_a_phone_photo_is_converted_rather_than_refused(monkeypatch):
+    """HEIC is what an iPhone produces; it was refused outright."""
+    from types import SimpleNamespace as _NS
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    jpeg = b"\xff\xd8\xff" + b"body"
+
+    def fake_run(argv, **kwargs):
+        assert argv[0] == pr._SIPS and "jpeg" in argv
+        Path(argv[-1]).write_bytes(jpeg)
+        return _NS(returncode=0)
+
+    monkeypatch.setattr(pr.subprocess, "run", fake_run)
+    for mime in ("image/heic", "image/heif", "image/tiff"):
+        data, new_mime = pr._normalise_artifact(b"original-bytes", mime)
+        assert (data, new_mime) == (jpeg, "image/jpeg"), mime
+    # Already-releasable formats are passed through untouched.
+    assert pr._normalise_artifact(b"%PDF-1.4", "application/pdf") == (
+        b"%PDF-1.4", "application/pdf"
+    )
+
+
+def test_office_preview_reads_the_document_text():
+    from plugins.juno_kite_trusted_principal.private_reads import _document_preview
+
+    word = _document_preview(
+        _docx_bytes(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    assert "Terms of engagement for James Smith" in word
+    assert "<w:" not in word
+
+
+def test_a_text_file_wearing_an_image_name_is_still_caught(tmp_path):
+    """Allowing text must not let a mislabelled file through the real path.
+
+    inspect_bytes now reads "not an image" in a .png as text, correctly. The
+    protection that matters lives one level up: the resolver states the mime it
+    expects from the name, and staging discards anything that disagrees.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "wrong.png").write_bytes(b"not an image, just text\n")
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    encoded, internal = runtime.private_reads.resolve_document_candidate(
+        "kite_personal_files_read",
+        {"operation": "read", "root": "family", "relative_path": "wrong.png"},
+    )
+    assert internal is not None
+    # The name claims PNG; the bytes are text. Staging compares the two.
+    assert internal["expected_mime"] == "image/png"
+    assert runtime.document_releases.inspect_bytes(
+        internal["path"].read_bytes()
+    ).mime_type == "text/plain"
+
+
+@pytest.mark.parametrize(
+    "path,allowed",
+    [
+        ("/Users/james", False),
+        ("/Users/james/Documents", False),
+        ("/Users/james/Library", False),
+        ("/Users/james/Library/Keychains", False),
+        ("/Users/james/.ssh", False),
+        ("/Users/james/.hermes/cache", False),
+        ("/Users/james/Documents/work/payroll", False),
+        ("/Users/james/Documents/Family/Passports", True),
+        ("/Users/james/Desktop/Scans", True),
+    ],
+)
+def test_root_areas_are_an_allow_list_not_a_deny_list(path, allowed):
+    """The old rule blocked what it had thought of and permitted the rest.
+
+    It refused home and Documents, but ~/Library was a legal root -- and that
+    holds Keychains and the Messages database. A root now has to sit beneath a
+    nominated documents area, so an oversight fails closed.
+    """
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+
+    try:
+        PrivateReadService._roots({"roots": [{"name": "t", "path": path}]})
+        got = True
+    except ValueError:
+        got = False
+    assert got is allowed, path
+
+
+def test_naming_a_whole_area_is_not_a_root():
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        PrivateReadService, _PERSONAL_ROOT_BASES,
+    )
+
+    for base in _PERSONAL_ROOT_BASES:
+        with pytest.raises(ValueError, match="folder, not a whole area"):
+            PrivateReadService._roots({"roots": [{"name": "t", "path": base}]})
+
+
+def test_allowed_bases_must_be_deliberate():
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+
+    for bases in ([], "/", ["/"], [""]):
+        with pytest.raises(ValueError):
+            PrivateReadService._roots(
+                {"roots": [{"name": "t", "path": "/Users/james/Documents/X"}],
+                 "allowed_bases": bases}
+            )
+
+
+def _session_store(tmp_path, rows):
+    """A stand-in for Kite's own session store, same shape as the real one."""
+    import sqlite3 as _sql
+    path = tmp_path / "sessions.sqlite3"
+    db = _sql.connect(path)
+    db.executescript(
+        "create table sessions(id text primary key, session_key text);"
+        "create table messages(id integer primary key, session_id text, role text,"
+        " content text, timestamp real);"
+        "create virtual table messages_fts using fts5(content);"
+    )
+    for index, (key, role, content, stamp) in enumerate(rows, start=1):
+        db.execute("insert or ignore into sessions values (?,?)", (key, key))
+        db.execute("insert into messages values (?,?,?,?,?)",
+                   (index, key, role, content, stamp))
+        db.execute("insert into messages_fts(rowid, content) values (?,?)",
+                   (index, content))
+    db.commit()
+    db.close()
+    return path
+
+
+def _session_service(tmp_path, rows):
+    from plugins.juno_kite_trusted_principal.private_reads import PrivateReadService
+    return PrivateReadService(
+        {"enabled": True, "output_bytes": 262144,
+         "sessions": {"database": str(_session_store(tmp_path, rows))}},
+        backends=None, command_runner=None, url_opener=None, secret_values=set(),
+    )
+
+
+def test_session_recall_answers_where_a_document_was_filed(tmp_path):
+    """The case that started this: Kite knew, and could not say so.
+
+    It had told James "saved the passport scans in a durable family folder"
+    and the lane had no way to reach that.
+    """
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant",
+         "Saved the three current passport scans in a durable family folder: "
+         "/Users/james/Documents/Family/Passports", 1786307203.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "The weather tomorrow looks fine for the drive", 1786307100.0),
+    ])
+    found = service._sessions({"query": "passport scans", "max_results": 5})
+    assert len(found) == 1
+    assert "Family/Passports" in found[0]["excerpt"]
+    assert found[0]["when"].startswith("2026-")
+    assert found[0]["surface"] == "mattermost"
+
+
+def test_session_recall_drops_anything_secret_shaped(tmp_path):
+    """A transcript has no capability, so secrets never enter the turn."""
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant",
+         "the passport portal api_key=abcdef1234567890 is stored in the vault",
+         1786307203.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "passport scans are filed under the family folder", 1786307100.0),
+    ])
+    found = service._sessions({"query": "passport", "max_results": 5})
+    assert len(found) == 1
+    assert "api_key" not in found[0]["excerpt"]
+
+
+def test_session_recall_excludes_this_lane_and_bounds_its_output(tmp_path):
+    service = _session_service(tmp_path, [
+        ("agent:main:a2a:dm:jk-context", "assistant",
+         "passport request handled on the juno lane " + "x" * 400, 1786307203.0),
+        ("agent:main:mattermost:channel:x", "assistant",
+         "passport " + "y" * 900, 1786307100.0),
+    ])
+    found = service._sessions({"query": "passport", "max_results": 5})
+    assert len(found) == 1                      # the a2a lane's own traffic is not recall
+    assert found[0]["surface"] == "mattermost"
+    assert len(found[0]["excerpt"]) <= 300      # an excerpt, never a transcript
+
+
+def test_session_recall_rejects_an_unbounded_or_odd_query(tmp_path):
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant", "passport filed", 1.0),
+    ])
+    # Still refused: nothing to search, or past the bound.
+    for bad in ("a", "x" * 200, "£ $ %", "  "):
+        raised = False
+        try:
+            service._sessions({"query": bad, "max_results": 3})
+        except Exception as exc:
+            raised = getattr(exc, "code", "") in {"invalid_arguments", "cap_exceeded"}
+        assert raised, bad
+
+
+def test_session_recall_cannot_change_the_store(tmp_path):
+    """SQL-shaped words are just words: parameterised, read-only, no effect."""
+    import sqlite3 as _sql
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant", "passport filed here", 1.0),
+    ])
+    database = service.config["sessions"]["database"]
+    before = list(_sql.connect(database).execute("select count(*) from messages"))
+    service._sessions({"query": "drop table messages", "max_results": 3})
+    after = list(_sql.connect(database).execute("select count(*) from messages"))
+    assert before == after and before[0][0] == 1
+
+
+def test_recall_is_available_to_a_second_principal_and_judged_not_gated():
+    """James's decision: Kite may look, then judge what it found.
+
+    Binding recall to one name cost real answers -- a follow-up about a
+    passport she had just been told the number of -- and the protection it
+    bought was the wrong shape. Kite looks with its full power and then
+    reviews what came back against this turn's capabilities, returning only
+    what is both relevant and permitted.
+
+    What this does not do is separate his private threads from shared ones
+    mechanically: nothing in the store is tagged by owner. The judgment step
+    is the filter, and the guidance has to say so or it is not a filter at
+    all.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED, PRINCIPAL_BOUND_READS, generated_semantic_guidance,
+    )
+    from plugins.juno_kite_trusted_principal.runtime import _PRINCIPAL_BOUND_READS
+
+    # Nothing is bound by name any more. Each entry that lived here cost a
+    # real answer to someone James trusts and stopped no disclosure: what may
+    # be said is decided by the room's capabilities and judged against them.
+    assert PRINCIPAL_BOUND_READS == {}
+    assert _PRINCIPAL_BOUND_READS is PRINCIPAL_BOUND_READS
+
+    rule = generated_semantic_guidance(
+        principal="lucy",
+        effective_capability_ids=["juno.shared.children"],
+        configured_policy={"juno.shared.children": {"domain": "juno.shared.children"}},
+        output_tier=MINIMIZED,
+    )["output_tier_rule"]
+    assert "kite_session_search" in rule
+    # The judgment step is stated, because it is the only thing standing
+    # between raw recall and this audience.
+    assert "no capability of its own" in rule
+    assert "permit" in rule
 
 
 def test_recall_is_offered_where_the_model_will_need_it():
