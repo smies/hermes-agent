@@ -1720,6 +1720,47 @@ def test_release_authority_follows_the_policy_not_a_name(tmp_path):
     assert public_only.document_releases.release_principals == frozenset({"james"})
 
 
+def test_an_unavailable_tool_is_told_what_this_lane_does_have(tmp_path):
+    """Kite spent a turn's whole budget guessing at tools.
+
+    Asked for the family holiday and for the property purchase, it tried
+    skill_view, then kite_property_read with the wrong arguments, then the
+    WhatsApp archive, each refused with only "not explicitly classified".
+    It kept guessing, ran past the authority its request was issued under,
+    and both answers were discarded as stale bindings -- surfacing to the
+    people asking as an internal error.
+
+    A refusal that lists what is actually here ends that in one call.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    from plugins.juno_kite_trusted_principal.runtime import TurnBinding
+
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+    binding = TurnBinding(
+        True, "", _NS(principal="james", correlation_id="c", context_id="x"),
+        _NS(request_id="r"), "kite-session", "kite-turn",
+        ("juno.private.james",), (), "minimized_answer",
+    )
+    kite._current_valid_binding = lambda **_kwargs: binding
+
+    blocked = _session(
+        lambda: kite.pre_tool_call(
+            "skill_view", {"name": "travel-booking-logistics"},
+            session_id="kite-session", turn_id="kite-turn",
+        ),
+        mode="kite", context_id="x",
+    )
+    assert blocked is not None
+    message = blocked["message"]
+    assert "skill_view is not available on this lane" in message
+    # The readers that are here, so the next call is not another guess.
+    assert "kite_personal_files_read" in message
+    assert "kite_gmail_search" in message
+    # And permission to stop, which is the other way this loop ends.
+    assert "nothing here can answer" in message
+
+
 @pytest.mark.asyncio
 async def test_a_room_without_james_receives_no_document(tmp_path):
     """His household's documents go to rooms he is in.

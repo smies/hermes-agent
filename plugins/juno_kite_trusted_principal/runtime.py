@@ -3120,7 +3120,18 @@ class TrustedPrincipalRuntime:
             if tool_name in self.read_tools:
                 return None
             if tool_name not in self.mutating_tools:
-                return self._block("tool is not explicitly classified")
+                # Name what this lane does have. Kite spent most of a turn's
+                # budget on skill_view, kite_property_read with the wrong
+                # arguments, and the WhatsApp archive, each refused with only
+                # "not classified" -- so it kept guessing, ran past its own
+                # authority, and the answer died as a stale binding. A refusal
+                # that lists the alternatives ends that loop in one call.
+                available = ", ".join(sorted(self.private_read_tool_names))
+                return self._block(
+                    f"{tool_name} is not available on this lane. The readers "
+                    f"here are: {available}. Use one of those, or say that "
+                    "nothing here can answer the question."
+                )
             if not binding.effective_action_capability_ids:
                 return self._block("effective audience has no action capability")
             assert binding.mapping is not None and binding.request is not None
@@ -3745,6 +3756,15 @@ class TrustedPrincipalRuntime:
                 "Kite output release denied: %s: %s",
                 type(exc).__name__, str(exc)[:200],
             )
+            if "stale" in str(exc):
+                # "internal fail-closed error" told James nothing and sent the
+                # investigation to policy, when the turn had simply run longer
+                # than the authority it was issued.
+                logger.warning(
+                    "Kite turn outlived its %ss authority; the answer was "
+                    "discarded rather than released late",
+                    self.limits.turn_ttl_seconds,
+                )
             if binding and binding.request:
                 try:
                     self.store.abort_request(binding.request.request_id)
