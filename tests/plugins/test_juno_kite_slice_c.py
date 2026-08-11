@@ -1573,6 +1573,107 @@ async def test_approving_one_document_does_not_approve_the_next(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_shared_document_is_delivered_into_a_room_with_lucy_in_it(tmp_path):
+    """The two-person case all the way to the file arriving.
+
+    The capability layer and the destination gate were each tested on their
+    own, which is how the seams in this feature have gone wrong before. This
+    walks one document from James's request in a room Lucy is also in, through
+    Kite's selection of a class they both hold, to the bytes landing in that
+    room.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    artifact = _png_bytes()
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(artifact)
+    clock = Clock()
+    roster = MutableRoster()
+    roster.participants = [[JAMES_PHONE, JAMES_LID], [LUCY_PHONE, LUCY_LID]]
+    adapter = RecordingWhatsAppAdapter(roster)
+    config = _with_lucy(_config(tmp_path, root, mode="juno"))
+
+    juno = TrustedPrincipalRuntime(
+        copy.deepcopy(config), active_profile="juno", clock=clock
+    )
+    gateway = SimpleNamespace(adapters={Platform.WHATSAPP: adapter})
+    question = "Send me the actual child passport scan"
+    ingress = await juno.pre_gateway_dispatch(
+        event=_event(question), gateway=gateway, critical_ingress_token=object()
+    )
+    assert ingress["action"] == "critical_allow"
+    audience = _ACTIVE_AUDIENCE.get()
+    assert set(audience.human_principals) == {"james", "lucy"}
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": question}), mode="juno"
+    )
+
+    kite_config = copy.deepcopy(config)
+    kite_config["juno_kite_trusted_principal"]["mode"] = "kite"
+    kite_config["juno_kite_trusted_principal"]["profile"] = "kite"
+    kite = TrustedPrincipalRuntime(kite_config, active_profile="kite", clock=clock)
+
+    def kite_turn():
+        policy = kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        # Kite is told what this room may receive, and his private class is
+        # not in it -- it left when she joined.
+        assert "juno.private.james" not in policy["context"]
+        found = _invoke(kite, "kite_personal_files_read", {
+            "operation": "search", "root": "family",
+            "query": "passport", "max_results": 1,
+        })
+        assert len(found["data"]) == 1
+        assert _invoke(kite, "kite_personal_files_read", {
+            "operation": "read", "root": "family",
+            "relative_path": "child-passport.png", "max_lines": 1,
+        })["status"] == "ok"
+        return kite.transform_llm_output(
+            response_text=json.dumps({"capability_id": "juno.shared.children"}),
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    envelope = _session(kite_turn, mode="kite", context_id=prepared.mapping.context_id)
+    answer = _session(
+        lambda: juno._verify_response(envelope, prepared.mapping, prepared.request_id),
+        mode="juno",
+    )
+    preview = json.loads(answer)
+    assert preview["outcome"] == "approval_required"
+
+    released = await juno._auto_release(answer, audience)
+    assert json.loads(released)["outcome"] == "delivered"
+
+    # It reached the room both of them are in.
+    assert len(adapter.document_calls) == 1
+    assert adapter.document_calls[0]["chat_id"] == GROUP
+    assert adapter.document_calls[0]["bytes"] == artifact
+
+    # And when she is the one asking. This is the request the old name check
+    # refused outright, and the reason it was the wrong check: the document is
+    # hers to see, and it is the room's capability that says so.
+    lucy_ingress = await juno.pre_gateway_dispatch(
+        event=_event(question, sender=LUCY_PHONE),
+        gateway=gateway,
+        critical_ingress_token=object(),
+    )
+    assert lucy_ingress["action"] == "critical_allow"
+    lucy_audience = _ACTIVE_AUDIENCE.get()
+    assert lucy_audience.principal == "lucy"
+    assert disclosure_decision(
+        principal=lucy_audience.principal,
+        effective_capability_ids=set(lucy_audience.effective_read_capability_ids),
+        capability_id="juno.shared.children",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed
+
+
+@pytest.mark.asyncio
 async def test_a_room_without_james_receives_no_document(tmp_path):
     """His household's documents go to rooms he is in.
 
