@@ -3675,6 +3675,45 @@ def test_a_refused_recall_says_what_to_do_instead(tmp_path):
     assert "typed readers" in message and "re-reading" in message
 
 
+def test_recall_is_offered_only_to_the_principal_who_may_use_it():
+    """Lucy was told to use a tool she is not allowed to use.
+
+    She asked "when does it expire?" about a passport she had just been given
+    the number of. Juno resolved the referent correctly and passed the
+    conversation; Kite then reached for session recall because the guidance
+    recommends it, and was refused because those transcripts are James's. The
+    answer was a typed read away the whole time.
+
+    Guidance and gate now come from one definition, so a principal is never
+    pointed at a reader they cannot use.
+    """
+    from plugins.juno_kite_trusted_principal.disclosure import (
+        MINIMIZED, PRINCIPAL_BOUND_READS, generated_semantic_guidance,
+    )
+    from plugins.juno_kite_trusted_principal.runtime import (
+        _PRINCIPAL_BOUND_READS,
+    )
+
+    assert _PRINCIPAL_BOUND_READS is PRINCIPAL_BOUND_READS
+
+    def rule(tier, principal="james"):
+        return generated_semantic_guidance(
+            principal=principal,
+            effective_capability_ids=["juno.shared.children"],
+            configured_policy={
+                "juno.shared.children": {"domain": "juno.shared.children"}
+            },
+            output_tier=tier,
+        )["output_tier_rule"]
+
+    for tier in (MINIMIZED, DOCUMENT_DESCRIPTOR):
+        assert "kite_session_search" not in rule(tier, "lucy")
+        # And she is told what to do instead, rather than left with a gap.
+        assert "typed readers" in rule(tier, "lucy") or "typed reader" in rule(
+            tier, "lucy"
+        )
+
+
 def test_recall_is_offered_where_the_model_will_need_it():
     """The model has to choose the tool; today showed it needs telling."""
     from plugins.juno_kite_trusted_principal.disclosure import (

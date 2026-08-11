@@ -394,10 +394,10 @@ _CONFIRMATION_PATTERN = re.compile(
 _MAX_PENDING_RELEASES = 16
 # Matches document_release.APPROVAL_TTL_SECONDS; the code dies with it.
 _PENDING_RELEASE_TTL_SECONDS = 600
-_PRINCIPAL_BOUND_READS = {
-    "kite_session_search": frozenset({"james"}),
-    "kite_personal_files_locate": frozenset({"james"}),
-}
+# Defined in disclosure, so the guidance the model is given and the gate that
+# enforces it cannot disagree about who may use these readers. Recommending a
+# tool the caller may not use costs a turn and reads to them as a dead end.
+from .disclosure import PRINCIPAL_BOUND_READS as _PRINCIPAL_BOUND_READS
 _RELEASE_PURPOSES = frozenset({
     "personal administration",
     "family administration",

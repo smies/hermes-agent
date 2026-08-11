@@ -292,6 +292,21 @@ def disclosure_decision(
     )
 
 
+# Readers bound to one principal because of whose data they read, not whose
+# question it is. Session recall searches a principal's own conversation
+# transcripts; locate walks where they keep documents. The runtime imports
+# this so the guidance and the gate cannot drift: recommending a tool the
+# caller may not use costs a turn and reads to them as a dead end.
+PRINCIPAL_BOUND_READS = {
+    "kite_session_search": frozenset({"james"}),
+    "kite_personal_files_locate": frozenset({"james"}),
+}
+
+
+def _may_recall(principal: str) -> bool:
+    return str(principal).casefold() in PRINCIPAL_BOUND_READS["kite_session_search"]
+
+
 def generated_semantic_guidance(
     *,
     principal: str,
@@ -398,10 +413,18 @@ def generated_semantic_guidance(
         "output_tier_rule": {
             MINIMIZED: (
                 "answer with necessary facts, status, synthesis, blockers, next "
-                "steps, and bounded provenance. When the request refers to "
-                "something already discussed, decided or filed, kite_session_search "
-                "recalls it rather than re-deriving it from live sources. "
-                "No document staging or approval "
+                "steps, and bounded provenance. "
+                + (
+                    "When the request refers to something already discussed, "
+                    "decided or filed, kite_session_search recalls it rather "
+                    "than re-deriving it from live sources. "
+                    if _may_recall(principal)
+                    else "Answer from the typed readers: this principal cannot "
+                    "search stored conversations, so a question about "
+                    "something already discussed is answered by reading the "
+                    "source again. "
+                )
+                + "No document staging or approval "
                 "gate runs on this tier, so never explain a document you did not "
                 "return by inventing one: if a binary was wanted and this turn "
                 "did not ask for one, say exactly that"
@@ -409,8 +432,14 @@ def generated_semantic_guidance(
             BOUNDED_EXCERPT: "quote only a short necessary excerpt when the effective semantic domain permits it",
             DOCUMENT_DESCRIPTOR: (
                 "Two acts in this turn, not an output format.\n"
-                "1. Find it. If it has come up before, kite_session_search "
-                "recalls where it was filed. Then read it with a typed reader "
+                "1. Find it. "
+                + (
+                    "If it has come up before, kite_session_search "
+                    "recalls where it was filed. Then read it with a typed reader "
+                    if _may_recall(principal)
+                    else "Read it with a typed reader "
+                )
+                + 
                 "-- kite_personal_files_read (bounded search, then the exact "
                 "read) or the exact Gmail message read then "
                 "kite_gmail_attachment_extract. Only a real successful read "
