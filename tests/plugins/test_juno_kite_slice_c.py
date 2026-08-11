@@ -15,6 +15,7 @@ import zlib
 from contextvars import copy_context
 from pathlib import Path
 from types import SimpleNamespace
+from types import SimpleNamespace as _NS
 
 import pytest
 from PIL import Image, PngImagePlugin
@@ -1599,14 +1600,21 @@ async def test_a_shared_document_is_delivered_into_a_room_with_lucy_in_it(tmp_pa
     )
     gateway = SimpleNamespace(adapters={Platform.WHATSAPP: adapter})
     question = "Send me the actual child passport scan"
+    # She is the one asking. In production this cleared every capability check
+    # and then failed at approval-issue, because the release service tested a
+    # name after the capability layer had already decided.
     ingress = await juno.pre_gateway_dispatch(
-        event=_event(question), gateway=gateway, critical_ingress_token=object()
+        event=_event(question, sender=LUCY_PHONE),
+        gateway=gateway,
+        critical_ingress_token=object(),
     )
     assert ingress["action"] == "critical_allow"
     audience = _ACTIVE_AUDIENCE.get()
     assert set(audience.human_principals) == {"james", "lucy"}
+    assert audience.principal == "lucy"
     prepared = _session(
-        lambda: juno._prepare_request({"question_or_goal": question}), mode="juno"
+        lambda: juno._prepare_request({"question_or_goal": question}),
+        mode="juno", sender=LUCY_PHONE,
     )
 
     kite_config = copy.deepcopy(config)
@@ -1671,6 +1679,45 @@ async def test_a_shared_document_is_delivered_into_a_room_with_lucy_in_it(tmp_pa
         capability_id="juno.shared.children",
         output_tier=DOCUMENT_DESCRIPTOR,
     ).allowed
+
+
+def test_release_authority_follows_the_policy_not_a_name(tmp_path):
+    """A fifth James-only gate, found by Lucy hitting it in production.
+
+    She cleared every capability check and then failed at approval-issue --
+    "the staged passport document could not be bound to a one-use approval" --
+    because the release service tested the literal name after the capability
+    layer had already decided. Two places deciding the same thing, and the
+    stricter one silently outranking the one that knew about capabilities.
+
+    It now follows the policy: whoever may release something may hold the
+    authority to release it.
+    """
+    from plugins.juno_kite_trusted_principal.document_release import (
+        DocumentReleaseDenied,
+    )
+
+    root = tmp_path / "family"
+    root.mkdir()
+    config = _with_lucy(_config(tmp_path, root, mode="juno"))
+    runtime = TrustedPrincipalRuntime(config, active_profile="juno", clock=Clock())
+    assert runtime.document_releases.release_principals == frozenset({"james", "lucy"})
+
+    # The gate is exercised end to end by the Lucy-as-requester test below;
+    # here we pin the list it consults, and that an unknown principal is still
+    # refused by it.
+    assert "someone_else" not in runtime.document_releases.release_principals
+
+    # Holding capabilities is not the same as holding releasable ones: a
+    # principal with nothing releasable cannot hold the authority either.
+    narrowed = _with_lucy(_config(tmp_path, root, mode="juno"))
+    lucy = narrowed["juno_kite_trusted_principal"]["policy"]["principals"]["lucy"]
+    lucy["read_capability_ids"] = ["juno.public"]
+    lucy["semantic_policy"] = {"juno.public": {"domain": "juno.public"}}
+    public_only = TrustedPrincipalRuntime(
+        narrowed, active_profile="juno", clock=Clock()
+    )
+    assert public_only.document_releases.release_principals == frozenset({"james"})
 
 
 @pytest.mark.asyncio

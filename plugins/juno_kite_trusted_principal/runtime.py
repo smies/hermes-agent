@@ -544,11 +544,21 @@ class TrustedPrincipalRuntime:
         self._recent_document_turns: dict[str, int] = {}
         from .document_release import DocumentReleaseService
 
+        from .disclosure import _releasable_document_capabilities
+
         self.document_releases = DocumentReleaseService(
             section.get("document_release"),
             store=self.store,
             mapping_key=self.mapping_key,
             clock=self.clock,
+            # Everyone the policy says may release something. Derived rather
+            # than listed, so adding a principal to the policy cannot leave
+            # this behind.
+            release_principals=[
+                name
+                for name, capabilities in self.principal_read_capabilities.items()
+                if _releasable_document_capabilities(name, capabilities)
+            ],
         )
         if self.document_releases.enabled:
             # Only the staging side needs typed readers: it is the read that
@@ -1317,7 +1327,18 @@ class TrustedPrincipalRuntime:
         # the approver to be alone conflated the two and would refuse every
         # release into a conversation that has a second person in it --
         # including the ones the second person is entitled to.
-        if approving.principal.casefold() != "james":
+        #
+        # And who may approve is who may release, which the policy already
+        # says. Naming James here made Lucy's own request for a document her
+        # room is entitled to fail at delivery, and would have meant routing
+        # every routine thing she asks for through him -- the standing-grant
+        # trap from the other direction. What she may ask for is already
+        # bounded by the intersection; this is not the place to bound it
+        # again.
+        if (
+            approving.principal.casefold()
+            not in self.document_releases.release_principals
+        ):
             if send_receipt:
                 await self._send_document_receipt(adapter, chat_id, denied)
             return "denied"

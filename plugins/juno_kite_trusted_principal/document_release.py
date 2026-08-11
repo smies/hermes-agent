@@ -20,7 +20,7 @@ import zipfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Iterable
 
 from PIL import Image, UnidentifiedImageError
 
@@ -225,7 +225,6 @@ class StagedCandidate:
 class DocumentReleaseService:
     """Validate, stage, bind, revalidate, and clean one exact artifact."""
 
-    phase_one_principal = "james"
 
     def __init__(
         self,
@@ -234,7 +233,18 @@ class DocumentReleaseService:
         store: MappingStore,
         mapping_key: bytes,
         clock: Callable[[], float],
+        release_principals: Iterable[str] = ("james",),
     ) -> None:
+        # Who may hold a one-use release authority. This was the literal
+        # "james", which is the same policy decision the capability layer
+        # already makes and which quietly outranked it: a second principal
+        # cleared every capability check and then failed here, at
+        # approval-issue, with a staged document and nothing to bind it to.
+        # The runtime derives this from the policy so the two cannot disagree;
+        # the default keeps a bare service James-only.
+        self.release_principals = frozenset(
+            str(name).casefold() for name in release_principals if str(name)
+        ) or frozenset({"james"})
         self.store = store
         self._mapping_key = bytes(mapping_key)
         self.clock = clock
@@ -832,8 +842,10 @@ class DocumentReleaseService:
         request: Any,
         principal: str,
     ) -> tuple[str, int]:
-        if str(principal).casefold() != "james":
-            raise DocumentReleaseDenied("document release is James-only")
+        if str(principal).casefold() not in self.release_principals:
+            raise DocumentReleaseDenied(
+                "this principal may not hold a document release authority"
+            )
         code = "C7-" + "".join(
             secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(16)
         )
