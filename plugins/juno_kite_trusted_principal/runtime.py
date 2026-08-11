@@ -383,6 +383,14 @@ _RELEASE_SOURCE_CLASSES = frozenset({"personal files", "personal Gmail attachmen
 # Locate reports the names and whereabouts of documents across everywhere the
 # principal keeps them, which is his own filing system and nobody else's.
 # Outstanding approvals awaiting a reply elsewhere. Small on purpose.
+# Copying a sixteen-character code off a phone to approve your own document
+# is a chore, and the code was never the security boundary -- the DM is. A
+# plain yes, from the one person who can approve, when exactly one release is
+# outstanding, says the same thing unambiguously.
+_CONFIRMATION_PATTERN = re.compile(
+    r"(?i)\s*(?:\u2705|\U0001F44D|yes|yep|yeah|ok|okay|approve|approved|"
+    r"send it|go ahead|do it)\s*[.!]?\s*"
+)
 _MAX_PENDING_RELEASES = 16
 # Matches document_release.APPROVAL_TTL_SECONDS; the code dies with it.
 _PENDING_RELEASE_TTL_SECONDS = 600
@@ -515,7 +523,9 @@ class TrustedPrincipalRuntime:
         # would trade a durable secret for a transient convenience. Losing
         # these on restart is the right failure -- the approval simply is not
         # found, and nothing is released.
-        self._pending_releases: dict[str, tuple[str, AudienceBinding, int]] = {}
+        self._pending_releases: dict[
+            str, tuple[str, AudienceBinding, int, dict]
+        ] = {}
         # Proposals whose document was found outside every configured root.
         self._owner_approval_proposals: set[str] = set()
         # The inbound turn currently being served in each conversation. Bumped
@@ -1099,7 +1109,9 @@ class TrustedPrincipalRuntime:
     @staticmethod
     def _is_document_approval_text(value: Any) -> bool:
         text = str(value or "").strip()
-        return text == "APPROVE" or text.startswith("APPROVE ")
+        if text == "APPROVE" or text.startswith("APPROVE "):
+            return True
+        return _CONFIRMATION_PATTERN.fullmatch(text) is not None
 
     @staticmethod
     async def _send_document_receipt(adapter: Any, chat_id: str, text: str) -> None:
@@ -1153,7 +1165,9 @@ class TrustedPrincipalRuntime:
         into the conversation that asked, which is the whole reason this path
         exists.
         """
-        title = str(document.get("title") or "the document")[:96]
+        # The same name the delivered file will carry, so the conversation
+        # hears about one document rather than three.
+        title = self._safe_delivery_text(document.get("title")) or "the document"
         await self._send_document_receipt(
             adapter,
             requester_chat_id,
@@ -1174,7 +1188,13 @@ class TrustedPrincipalRuntime:
         )
 
     def _remember_pending_release(
-        self, code: str, *, chat_id: str, audience: AudienceBinding, expires_at: int
+        self,
+        code: str,
+        *,
+        chat_id: str,
+        audience: AudienceBinding,
+        expires_at: int,
+        document: Optional[dict] = None,
     ) -> None:
         """Remember where an outstanding approval is meant to deliver."""
         now = int(self.clock())
@@ -1184,19 +1204,21 @@ class TrustedPrincipalRuntime:
             self._pending_releases.pop(stale, None)
         while len(self._pending_releases) >= _MAX_PENDING_RELEASES:
             self._pending_releases.pop(next(iter(self._pending_releases)), None)
-        self._pending_releases[str(code)] = (str(chat_id), audience, int(expires_at))
+        self._pending_releases[str(code)] = (
+            str(chat_id), audience, int(expires_at), dict(document or {})
+        )
 
     def _pending_release(
         self, code: str
-    ) -> Optional[tuple[str, AudienceBinding]]:
+    ) -> Optional[tuple[str, AudienceBinding, dict]]:
         entry = self._pending_releases.get(str(code))
         if entry is None:
             return None
-        chat_id, audience, expires_at = entry
+        chat_id, audience, expires_at, document = entry
         if expires_at <= int(self.clock()):
             self._pending_releases.pop(str(code), None)
             return None
-        return chat_id, audience
+        return chat_id, audience, document
 
     async def _handle_document_approval(
         self,
@@ -1210,10 +1232,27 @@ class TrustedPrincipalRuntime:
         denied = "Document release denied."
         text = str(getattr(event, "text", "") or "").strip()
         match = re.fullmatch(r"APPROVE (C7-[A-Z2-9]{16})", text)
-        if match is None:
+        code = match.group(1) if match else ""
+        if not code and _CONFIRMATION_PATTERN.fullmatch(text):
+            # A bare yes resolves only when it cannot mean two things.
+            outstanding = [
+                pending
+                for pending in self._pending_releases
+                if self._pending_release(pending) is not None
+            ]
+            if len(outstanding) == 1:
+                code = outstanding[0]
+            elif outstanding:
+                await self._send_document_receipt(
+                    adapter,
+                    chat_id,
+                    "More than one document is waiting. Reply with the exact "
+                    "APPROVE code for the one you mean.",
+                )
+                return self._ingress_skip("document-release-handled")
+        if not code:
             await self._send_document_receipt(adapter, chat_id, denied)
             return self._ingress_skip("document-release-handled")
-        code = match.group(1)
         # An approval typed where the document was asked for keeps its exact
         # existing meaning: origin and approver are the one audience. An
         # approval typed somewhere else -- a DM, because the document was
@@ -1223,7 +1262,7 @@ class TrustedPrincipalRuntime:
         # is not outstanding is simply not found.
         origin = self._pending_release(code)
         if origin is not None and origin[0] != chat_id:
-            origin_chat, origin_audience = origin
+            origin_chat, origin_audience, document = origin
             self._pending_releases.pop(code, None)
             await self._consume_and_deliver(
                 code,
@@ -1231,6 +1270,12 @@ class TrustedPrincipalRuntime:
                 adapter=adapter,
                 chat_id=origin_chat,
                 approver=audience,
+                # The file carries its own name and says what it is, so the
+                # conversation gets the document instead of a receipt telling
+                # it that a document happened.
+                title=document.get("title"),
+                caption=self._delivery_caption(document),
+                send_receipt=False,
             )
             return self._ingress_skip("document-release-handled")
         self._pending_releases.pop(code, None)
@@ -2133,7 +2178,16 @@ class TrustedPrincipalRuntime:
                     chat_id=chat_id,
                     audience=audience,
                     expires_at=int(self.clock()) + _PENDING_RELEASE_TTL_SECONDS,
+                    document=document,
                 )
+                # The host has already told the conversation what happened, in
+                # the document's own name. Letting the model add its own
+                # sentence gave the room the same news twice, under a second
+                # name for the same file, and phrased at the approver rather
+                # than at whoever asked.
+                if len(self._auto_delivered) > 16:
+                    self._auto_delivered.clear()
+                self._auto_delivered |= turn_keys
                 # Without this the model is handed the code and prints it,
                 # which is exactly what happened: the approval arrived in the
                 # group it was meant to be kept out of. It cannot disclose

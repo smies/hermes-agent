@@ -1456,7 +1456,9 @@ async def test_locate_and_approve_from_the_request_to_the_delivered_file(tmp_pat
     code = json.loads(answer)["approval"]["code"]
 
     # The delivering half of the turn.
-    released = await juno._auto_release(answer, audience)
+    released = await juno._auto_release(
+        answer, audience, frozenset({"whatsapp-session"})
+    )
 
     # Nothing sent, and the model is not given the authority to send it.
     assert adapter.document_calls == []
@@ -1470,11 +1472,19 @@ async def test_locate_and_approve_from_the_request_to_the_delivered_file(tmp_pat
     assert "asked James to approve" in by_chat[GROUP]
     assert "APPROVE " + code in by_chat[owner]
 
-    # James approves from the DM, reading the code the way he actually would.
-    import re as _re
-    typed = _re.search(r"APPROVE (C7-[A-Z2-9]{16})", by_chat[owner]).group(0)
+    # One message to the room, not two: the model's follow-up is suppressed
+    # because the host has already said it, in the document's own name.
+    assert len([m for m in adapter.messages if m["chat_id"] == GROUP]) == 1
+    assert juno.transform_llm_output(
+        response_text="I found and staged it, awaiting your approval.",
+        session_id="whatsapp-session",
+    ) == " "
+
+    # A bare yes approves, because copying a sixteen-character code off a
+    # phone to release your own document is a chore and the DM is the
+    # boundary, not the code.
     result = await juno._handle_document_approval(
-        event=_event(typed, chat_id=owner),
+        event=_event("\u2705", chat_id=owner),
         adapter=adapter,
         audience=replace(audience, conversation_kind="dm"),
     )
@@ -1486,9 +1496,19 @@ async def test_locate_and_approve_from_the_request_to_the_delivered_file(tmp_pat
     assert delivered["chat_id"] == GROUP
     assert delivered["bytes"] == artifact
 
-    # And the authority is spent.
+    # Named after the document, and captioned instead of announced. The room
+    # heard three names for one file before this.
+    assert delivered["file_name"].startswith("downloaded-scan")
+    assert "downloaded-scan" in delivered["caption"]
+    assert not any(
+        "Document delivered" in m["content"]
+        for m in adapter.messages
+        if m["chat_id"] == GROUP
+    )
+
+    # And the authority is spent: the exact code no longer works either.
     await juno._handle_document_approval(
-        event=_event(typed, chat_id=owner),
+        event=_event("APPROVE " + code, chat_id=owner),
         adapter=adapter,
         audience=replace(audience, conversation_kind="dm"),
     )
