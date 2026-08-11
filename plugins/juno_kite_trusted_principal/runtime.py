@@ -3756,13 +3756,29 @@ class TrustedPrincipalRuntime:
                 "Kite output release denied: %s: %s",
                 type(exc).__name__, str(exc)[:200],
             )
-            if "stale" in str(exc):
-                # "internal fail-closed error" told James nothing and sent the
-                # investigation to policy, when the turn had simply run longer
-                # than the authority it was issued.
+            # "stale, replayed, or mismatched" is one message for three
+            # different causes, so asking whether the request had actually
+            # expired is the only way to say which. Guessing produced a log
+            # line claiming a 300s timeout for a turn that ran 147 seconds,
+            # which is worse than the generic message it replaced.
+            expired = False
+            try:
+                request = binding.request if binding is not None else None
+                expired = bool(request) and int(self.clock()) > int(
+                    request.expires_at
+                )
+            except Exception:
+                expired = False
+            if expired:
                 logger.warning(
                     "Kite turn outlived its %ss authority; the answer was "
                     "discarded rather than released late",
+                    self.limits.turn_ttl_seconds,
+                )
+            elif "stale" in str(exc):
+                logger.warning(
+                    "Kite binding was refused while still inside its %ss "
+                    "authority: replayed or mismatched, not expired",
                     self.limits.turn_ttl_seconds,
                 )
             if binding and binding.request:
