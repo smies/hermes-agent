@@ -219,10 +219,12 @@ def _releasable_document_capabilities(
 ) -> list[str]:
     """Document classes this principal may release, in stable order.
 
-    Phase one is James-only: no other principal releases any document.
+    Capability, not name. A principal releases what their audience actually
+    holds, and in a group that is the intersection of everyone present -- so
+    juno.private.james leaves the set the moment anyone else is in the room,
+    without a rule here having to say so. A shared class survives, which is
+    what lets a family document reach a family conversation.
     """
-    if str(principal).lower() != "james":
-        return []
     return sorted(
         set(map(str, capabilities)) & _DOCUMENT_RELEASABLE_CAPABILITIES
     )

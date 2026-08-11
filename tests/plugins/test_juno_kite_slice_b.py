@@ -1730,19 +1730,30 @@ def test_lucy_may_not_release_james_private_documents():
 
 
 @pytest.mark.parametrize("principal", ["lucy", "someone_else"])
-def test_non_james_never_releases_documents(principal):
-    for capability_id in (
-        "juno.private.james",
-        "juno.shared.family",
-        "juno.shared.children",
-    ):
-        decision = disclosure_decision(
+def test_a_second_principal_releases_shared_classes_but_never_his_own(principal):
+    """Name decided this; the capability decides it now.
+
+    A shared class is shared -- refusing a family document to family was the
+    old rule doing the wrong thing for the right reason. His private class
+    stays his, and not because of a check on names: it is only ever in an
+    effective set that belongs to him alone, because a group's set is the
+    intersection of everyone in it.
+    """
+    for capability_id in ("juno.shared.family", "juno.shared.children"):
+        assert disclosure_decision(
             principal=principal,
             effective_capability_ids=[capability_id],
             capability_id=capability_id,
             output_tier=DOCUMENT_DESCRIPTOR,
-        )
-        assert decision.allowed is False
+        ).allowed is True
+
+    # Asked for outside what the audience holds, it is refused for anyone.
+    assert disclosure_decision(
+        principal=principal,
+        effective_capability_ids=["juno.shared.family"],
+        capability_id="juno.private.james",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed is False
 
 
 def test_guidance_names_releasable_document_classes_for_james():
@@ -1773,15 +1784,28 @@ def test_guidance_names_releasable_document_classes_for_james():
     assert "refuse" in release["self_refusal"].lower()
 
 
-def test_guidance_document_release_unavailable_for_lucy():
+def test_guidance_offers_a_second_principal_the_classes_they_hold():
+    """The model has to be told what it may release, for whoever is asking."""
     guidance = generated_semantic_guidance(
         principal="lucy",
         effective_capability_ids=["juno.shared.family"],
         configured_policy={"juno.shared.family": "family"},
         output_tier=DOCUMENT_DESCRIPTOR,
     )
-    assert guidance["document_release_mode"]["available"] is False
-    assert guidance["document_release_mode"]["releasable_capability_ids"] == []
+    assert guidance["document_release_mode"]["available"] is True
+    assert guidance["document_release_mode"]["releasable_capability_ids"] == [
+        "juno.shared.family"
+    ]
+
+    # Nothing releasable in the set, nothing offered.
+    public_only = generated_semantic_guidance(
+        principal="lucy",
+        effective_capability_ids=["juno.public"],
+        configured_policy={"juno.public": "public"},
+        output_tier=DOCUMENT_DESCRIPTOR,
+    )
+    assert public_only["document_release_mode"]["available"] is False
+    assert public_only["document_release_mode"]["releasable_capability_ids"] == []
 
 
 def test_semantic_james_lucy_domain_matrix():

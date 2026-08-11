@@ -1313,20 +1313,24 @@ class TrustedPrincipalRuntime:
         # defaults to the audience being delivered into, which is exactly the
         # same-conversation flow this has always served.
         approving = approver if approver is not None else audience
-        if (
-            approving.principal.casefold() != "james"
-            or approving.human_principals != ("james",)
-        ):
+        # Who is approving, and nothing about who else is present. Requiring
+        # the approver to be alone conflated the two and would refuse every
+        # release into a conversation that has a second person in it --
+        # including the ones the second person is entitled to.
+        if approving.principal.casefold() != "james":
             if send_receipt:
                 await self._send_document_receipt(adapter, chat_id, denied)
             return "denied"
         # The destination has to be entitled to hold the document, which is a
         # fact about the conversation it lands in, not about who approved.
-        if (
-            audience.principal.casefold() != "james"
-            or audience.human_principals != ("james",)
-            or "juno.private.james" not in audience.effective_read_capability_ids
-        ):
+        # James has to be in the conversation the document lands in. What may
+        # land there was already decided upstream against the intersection of
+        # everyone present, so a class nobody in the room holds could not have
+        # been proposed; this is the standing rule that his household's
+        # documents go to rooms he is in, not the capability check again.
+        if "james" not in {
+            name.casefold() for name in audience.human_principals
+        }:
             if send_receipt:
                 await self._send_document_receipt(adapter, chat_id, denied)
             return "denied"
@@ -3421,15 +3425,17 @@ class TrustedPrincipalRuntime:
             if len(candidates) != 1:
                 stage = "staging"
                 raise ValueError("exactly one staged document is required")
+            from .disclosure import _releasable_document_capabilities
+
             if (
                 binding.mapping is None
                 or binding.request is None
-                or binding.mapping.principal.casefold() != "james"
-                or "juno.private.james"
-                not in binding.effective_read_capability_ids
+                or not _releasable_document_capabilities(
+                    binding.mapping.principal, binding.effective_read_capability_ids
+                )
             ):
                 stage = "binding"
-                raise ValueError("the phase-one James-only binding is unavailable")
+                raise ValueError("this audience may release no document class")
             stage = "selection"
             selection = json.loads(str(model_text or ""))
             if not isinstance(selection, dict) or set(selection) != {"capability_id"}:

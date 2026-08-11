@@ -38,6 +38,13 @@ from tests.plugins.test_juno_kite_slice_b import _slice_b_config
 JAMES_PHONE = "14444444444@s.whatsapp.net"
 JAMES_LID = "24444444444@lid"
 UNKNOWN_PHONE = "15555555555@s.whatsapp.net"
+# These bound failure, not speed: the test asserts the order two overlapping
+# turns resolve in, and nothing about how long that takes. At 20s they expired
+# on a loaded machine and reported the ordering bug as back, which is a worse
+# lie than being slow.
+_OVERLAP_DEADLINE = 120
+LUCY_PHONE = "15555555555@s.whatsapp.net"
+LUCY_LID = "25555555555@lid"
 BOT_PHONE = "19999999999@s.whatsapp.net"
 BOT_LID = "29999999999@lid"
 GROUP = "300000000000999@g.us"
@@ -893,27 +900,68 @@ def test_source_identity_change_between_resolution_and_staging_denies(tmp_path):
         )
 
 
-def test_document_release_is_phase_one_exact_james_only(tmp_path):
+def test_a_second_principal_releases_what_the_room_actually_holds(tmp_path):
+    """Release is decided by capability, not by name.
+
+    It used to be James or nobody. That refused a family document in a family
+    conversation, which is the case Lucy exists for -- and it did the refusing
+    on the wrong grounds, because what a conversation may receive is already
+    the intersection of what everyone in it holds. juno.private.james leaves
+    that set the moment a second person is present, so his own papers stay his
+    without a rule about names, while a shared class survives and reaches the
+    people it is shared with.
+    """
     root = tmp_path / "family"
     root.mkdir()
     (root / "child-passport.png").write_bytes(_png_bytes())
     config = _config(tmp_path, root, mode="juno")
-    config["juno_kite_trusted_principal"]["policy"]["principals"]["lucy"]["conversation_eligibility"]["group"] = True
+    config["juno_kite_trusted_principal"]["policy"]["principals"]["lucy"][
+        "conversation_eligibility"
+    ]["group"] = True
     runtime = TrustedPrincipalRuntime(config, active_profile="juno", clock=Clock())
-    assert runtime.document_releases.phase_one_principal == "james"
-    capabilities = {"juno.shared.children"}
+
+    # James alone, with his own private class, is unchanged.
     assert disclosure_decision(
         principal="james",
-        effective_capability_ids=capabilities,
+        effective_capability_ids={"juno.private.james", "juno.shared.children"},
+        capability_id="juno.private.james",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed
+
+    # A shared class reaches a second principal.
+    assert disclosure_decision(
+        principal="lucy",
+        effective_capability_ids={"juno.shared.children"},
         capability_id="juno.shared.children",
         output_tier=DOCUMENT_DESCRIPTOR,
     ).allowed
+
+    # His private class does not, because it is not in what she holds -- the
+    # intersection removed it rather than a name check refusing it.
     assert not disclosure_decision(
         principal="lucy",
-        effective_capability_ids=capabilities,
-        capability_id="juno.shared.children",
+        effective_capability_ids={"juno.shared.children"},
+        capability_id="juno.private.james",
         output_tier=DOCUMENT_DESCRIPTOR,
     ).allowed
+
+    # And nothing but a releasable class is releasable, for anyone.
+    assert not disclosure_decision(
+        principal="james",
+        effective_capability_ids={"juno.public"},
+        capability_id="juno.public",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed
+
+    # The config guard still refuses to let anyone else hold his private class.
+    shared = _config(tmp_path, root, mode="juno")
+    principals = shared["juno_kite_trusted_principal"]["policy"]["principals"]
+    principals["lucy"]["read_capability_ids"] = ["juno.private.james"]
+    principals["lucy"]["semantic_policy"] = {
+        "juno.private.james": {"domain": "juno.private.james"}
+    }
+    with pytest.raises(ValueError, match="James-only"):
+        TrustedPrincipalRuntime(shared, active_profile="juno", clock=Clock())
 
 
 # The two document-tier phrasings below are the ones observed in live traffic on
@@ -1365,6 +1413,133 @@ async def test_the_same_document_is_not_sent_twice_in_one_turn(tmp_path):
     assert len(adapter.document_calls) == 2
 
 
+def _with_lucy(config: dict) -> dict:
+    """James's standing policy for Lucy, as configuration rather than code."""
+    section = config["juno_kite_trusted_principal"]
+    section["principal_bindings"] = list(section["principal_bindings"]) + [
+        {"platform": "whatsapp", "user_id": LUCY_PHONE, "principal": "lucy"},
+        {"platform": "whatsapp", "user_id": LUCY_LID, "principal": "lucy"},
+    ]
+    section["policy"]["principals"]["lucy"] = {
+        "conversation_eligibility": {"dm": False, "group": True},
+        "required_group_co_principals": ["james"],
+        "read_capability_ids": ["juno.shared.children"],
+        "action_capability_ids": [],
+        "semantic_policy": {
+            "juno.shared.children": {"domain": "juno.shared.children"}
+        },
+    }
+    return config
+
+
+@pytest.mark.asyncio
+async def test_a_family_document_reaches_a_room_lucy_is_in_and_his_own_does_not(
+    tmp_path,
+):
+    """The second principal, end to end, at the boundary that decides it.
+
+    Release used to be James or nobody, which refused a family document in a
+    family conversation. What a room may receive is the intersection of what
+    everyone in it holds, so adding Lucy removes juno.private.james from that
+    room automatically -- his own papers stay his without a rule about names,
+    and the shared classes she holds survive and reach her.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    roster.participants = [[JAMES_PHONE, JAMES_LID], [LUCY_PHONE, LUCY_LID]]
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno = TrustedPrincipalRuntime(
+        _with_lucy(_config(tmp_path, root, mode="juno")),
+        active_profile="juno",
+        clock=clock,
+    )
+    gateway = SimpleNamespace(adapters={Platform.WHATSAPP: adapter})
+    ingress = await juno.pre_gateway_dispatch(
+        event=_event("Send me the child passport scan"),
+        gateway=gateway,
+        critical_ingress_token=object(),
+    )
+    assert ingress["action"] == "critical_allow"
+
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    audience = _ACTIVE_AUDIENCE.get()
+    assert set(audience.human_principals) == {"james", "lucy"}
+
+    # The intersection did the work: his private class is simply not in what
+    # this room may be told, and the shared one is.
+    assert "juno.private.james" not in audience.effective_read_capability_ids
+    assert "juno.shared.children" in audience.effective_read_capability_ids
+
+    # So a family document may be proposed here, and his own may not.
+    assert disclosure_decision(
+        principal="james",
+        effective_capability_ids=set(audience.effective_read_capability_ids),
+        capability_id="juno.shared.children",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed
+    assert not disclosure_decision(
+        principal="james",
+        effective_capability_ids=set(audience.effective_read_capability_ids),
+        capability_id="juno.private.james",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed
+
+    # And when she is the one asking, which is the case the old name check
+    # refused outright.
+    assert disclosure_decision(
+        principal="lucy",
+        effective_capability_ids=set(audience.effective_read_capability_ids),
+        capability_id="juno.shared.children",
+        output_tier=DOCUMENT_DESCRIPTOR,
+    ).allowed
+
+
+@pytest.mark.asyncio
+async def test_a_room_without_james_receives_no_document(tmp_path):
+    """His household's documents go to rooms he is in.
+
+    The capability check upstream would already refuse most of this, and this
+    is the other half of the rule: whatever the room is entitled to, it is not
+    entitled to it while he is absent.
+    """
+    from dataclasses import replace
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    roster = MutableRoster()
+    adapter = RecordingWhatsAppAdapter(roster)
+
+    juno, _gateway, preview = await _propose(tmp_path, root, clock, roster, adapter)
+    audience = _ACTIVE_AUDIENCE.get()
+    code = preview["approval"]["code"]
+
+    assert await juno._consume_and_deliver(
+        code,
+        audience=replace(audience, human_principals=("lucy",)),
+        adapter=adapter,
+        chat_id=GROUP,
+        approver=audience,
+        send_receipt=False,
+    ) == "denied"
+    assert adapter.document_calls == []
+
+    # With him present it goes, which is what makes the refusal above mean
+    # something.
+    assert await juno._consume_and_deliver(
+        code, audience=audience, adapter=adapter, chat_id=GROUP,
+        approver=audience, send_receipt=False,
+    ) == "delivered"
+    assert len(adapter.document_calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_locate_and_approve_from_the_request_to_the_delivered_file(tmp_path):
     """The whole path, in one test, because the parts were never the problem.
@@ -1705,11 +1880,13 @@ async def test_who_approves_and_where_it_lands_are_asked_separately(tmp_path):
     ) == "denied"
     assert adapter.document_calls == []
 
-    # James approving a release into a conversation with no private
-    # capability. The approver is impeccable; the destination is not.
-    unentitled = replace(audience, effective_read_capability_ids=("juno.public",))
+    # James approving a release into a conversation he is not in. The approver
+    # is impeccable; the destination is not. What that conversation is allowed
+    # to hold was settled upstream against the intersection of everyone in it,
+    # so the question left here is whether it is one of his rooms.
+    without_him = replace(audience, human_principals=("lucy",))
     assert await juno._consume_and_deliver(
-        code, audience=unentitled, adapter=adapter, chat_id=GROUP,
+        code, audience=without_him, adapter=adapter, chat_id=GROUP,
         approver=audience, send_receipt=False,
     ) == "denied"
     assert adapter.document_calls == []
@@ -3820,7 +3997,7 @@ async def test_a_redirect_supersedes_the_consultation_it_interrupted(tmp_path):
         try:
             if first_question in message:
                 entered_lane.set()
-                assert hold_lane.wait(10)
+                assert hold_lane.wait(_OVERLAP_DEADLINE)
                 return (
                     _kite_envelope(
                         kite,
@@ -3873,7 +4050,7 @@ async def test_a_redirect_supersedes_the_consultation_it_interrupted(tmp_path):
         return await asyncio.to_thread(consult, question)
 
     first = asyncio.create_task(turn(first_question))
-    assert await asyncio.to_thread(entered_lane.wait, 10)
+    assert await asyncio.to_thread(entered_lane.wait, _OVERLAP_DEADLINE)
 
     # The redirect. It reaches ingress while the first consultation is still
     # parked in the transport, exactly as it did live.
@@ -3884,11 +4061,11 @@ async def test_a_redirect_supersedes_the_consultation_it_interrupted(tmp_path):
     # loaded machine it was not: the earlier turn was freed before anything
     # had superseded it, delivered its document, and the test failed claiming
     # the bug was back.
-    await asyncio.wait_for(redirect_ingressed.wait(), 10)
+    await asyncio.wait_for(redirect_ingressed.wait(), _OVERLAP_DEADLINE)
     hold_lane.set()
 
-    first_answer = await asyncio.wait_for(first, 20)
-    redirect_answer = await asyncio.wait_for(redirect, 20)
+    first_answer = await asyncio.wait_for(first, _OVERLAP_DEADLINE)
+    redirect_answer = await asyncio.wait_for(redirect, _OVERLAP_DEADLINE)
 
     # Nothing from the superseded consultation reached the chat.
     delivered = [call["bytes"] for call in adapter.document_calls]
