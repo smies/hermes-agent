@@ -3631,6 +3631,50 @@ def test_session_recall_is_bound_to_one_principal():
     assert _PRINCIPAL_BOUND_READS["kite_session_search"] == frozenset({"james"})
 
 
+def test_a_refused_recall_says_what_to_do_instead(tmp_path):
+    """A correct refusal that reads as a dead end still loses the answer.
+
+    Lucy asked "when does it expire?" about a passport she had just been
+    given the number of. Recall was refused because those transcripts are
+    James's, which is right and stays. She was told only that, so the turn
+    ended -- while the document itself was still hers to read, and the
+    number had come from exactly that reader a minute earlier.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    config = _with_lucy(_config(tmp_path, root, mode="kite"))
+    kite = TrustedPrincipalRuntime(config, active_profile="kite", clock=Clock())
+
+    from plugins.juno_kite_trusted_principal.runtime import TurnBinding
+
+    binding = TurnBinding(
+        True, "",
+        _NS(principal="lucy", correlation_id="c", context_id="x"),
+        _NS(request_id="r"),
+        "kite-session", "kite-turn",
+        ("juno.shared.children",), (), "minimized_answer",
+    )
+    # The binding is supplied directly so this test is about the
+    # principal-bound gate and not about re-deriving a valid turn.
+    kite._current_valid_binding = lambda **_kwargs: binding
+
+    def refuse():
+        return kite.pre_tool_call(
+            "kite_session_search",
+            {"query": "passport expiry", "max_results": 3},
+            session_id="kite-session", turn_id="kite-turn",
+        )
+
+    blocked = _session(refuse, mode="kite", context_id="x")
+
+    assert blocked is not None, "recall must still be refused for her"
+    message = blocked["message"]
+    # Still says who it is bound to...
+    assert "bound to the principal" in message
+    # ...and now says what remains open, which is what the turn needed.
+    assert "typed readers" in message and "re-reading" in message
+
+
 def test_recall_is_offered_where_the_model_will_need_it():
     """The model has to choose the tool; today showed it needs telling."""
     from plugins.juno_kite_trusted_principal.disclosure import (
