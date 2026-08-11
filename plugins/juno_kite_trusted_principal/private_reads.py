@@ -60,6 +60,18 @@ WHATSAPP_QUERY = (
 )
 OBSIDIAN_ROOT = "/Users/james/Documents/Obsidian Vault"
 
+# What a property list is for: telling thirty-nine properties apart and
+# finding the one that matters. The full record is 4KB of description,
+# amenities, legal text and geometry -- 170KB for the list, which crowds out
+# the question being asked and sits one growth spurt from the byte cap. Depth
+# is what the detail operations are for; this is the index.
+_PROPERTY_LIST_FIELDS = (
+    "id", "canonicalTitle", "displayArea", "market", "status",
+    "interestLevel", "viewingPriority", "propertyType", "transactionType",
+    "priceAmount", "priceCurrency", "pricePeriod", "priceQualifier",
+    "bedrooms", "bathrooms", "nextAction", "nextActionDueAt", "updatedAt",
+)
+
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
 # Gmail attachment handles are far longer than message ids -- the engagement
 # letter's is 319 characters -- and are regenerated per response, so they
@@ -2082,10 +2094,32 @@ class PrivateReadService:
                 data = [
                     item for item in data if query in canonical_json(item).casefold()
                 ]
-            if len(data) > canonical["max_results"]:
-                raise SourceFailure(
-                    "cap_exceeded", "Property Intel result exceeded the requested cap"
-                )
+            total = len(data)
+            if operation == "list":
+                data = [
+                    {
+                        key: item[key]
+                        for key in _PROPERTY_LIST_FIELDS
+                        if isinstance(item, dict) and item.get(key) is not None
+                    }
+                    for item in data
+                ]
+            # max_results asked for a number and was answered with a refusal:
+            # ask for five of thirty-nine and the whole call failed. It bounds
+            # the answer now and says when it did, because a silent cut reads
+            # as "that is all there is".
+            limit = canonical["max_results"]
+            if total > limit:
+                return {
+                    "matches": data[:limit],
+                    "total": total,
+                    "truncated": True,
+                    "note": (
+                        f"{total} matched; showing {limit}. Narrow with query, "
+                        "or ask for one property by id."
+                    ),
+                }
+            return {"matches": data, "total": total, "truncated": False}
         return data
 
     def _http_get(self, url: str, config: dict[str, Any]) -> Any:
@@ -2113,7 +2147,9 @@ class PrivateReadService:
             ) from exc
         if len(raw) > self.output_bytes:
             raise SourceFailure(
-                "cap_exceeded", "Property Intel response exceeded its cap"
+                "cap_exceeded",
+                "Property Intel returned more than this reader may hold. "
+                "Ask for one property by id, or narrow the list with query"
             )
         try:
             return json.loads(raw.decode("utf-8"))

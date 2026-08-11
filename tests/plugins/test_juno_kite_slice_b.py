@@ -1020,6 +1020,82 @@ def test_property_mode_denies_container_dumps_and_credentials(tmp_path, answer):
     _bound_turn(tmp_path, {"property_intel": prop}, check)
 
 
+def test_a_property_list_is_an_index_not_the_whole_file(tmp_path):
+    """"What's the latest on the property purchase?" could not be answered.
+
+    Every call failed: an empty result, then "result exceeded the requested
+    cap", then "response exceeded its cap". The list returned whole records --
+    description, amenities, legal text, geometry, 4KB each and 170KB for
+    thirty-nine of them -- and max_results, asked for five, refused the call
+    rather than returning five.
+
+    A list is for telling properties apart and finding the one that matters.
+    Depth is what the detail operations are for.
+    """
+    fat = [
+        {
+            "id": f"123e4567-e89b-12d3-a456-42661417400{n}",
+            "canonicalTitle": f"Villa {n}",
+            "status": "offer_candidate" if n == 0 else "watchlist",
+            "displayArea": "Cala Llenya",
+            "priceAmount": "3400000",
+            "priceCurrency": "EUR",
+            "nextAction": "Confirm the timetable",
+            "description": "x" * 4000,
+            "amenities": ["y"] * 200,
+            "legal": {"notes": "z" * 2000},
+            "geom": {"coordinates": [[1.0, 2.0]] * 200},
+        }
+        for n in range(3)
+    ]
+
+    def check(kite):
+        result = _invoke(
+            kite, "kite_property_read", {"operation": "list", "max_results": 2}
+        )
+        data = result["data"]
+
+        # Bounded, not refused, and honest about what it left out.
+        assert data["truncated"] is True
+        assert data["total"] == 3
+        assert len(data["matches"]) == 2
+        assert "3 matched; showing 2" in data["note"]
+
+        # An index: what identifies and triages a property, and nothing whose
+        # only job is to be long.
+        row = data["matches"][0]
+        assert row["canonicalTitle"] == "Villa 0"
+        assert row["status"] == "offer_candidate"
+        assert row["nextAction"] == "Confirm the timetable"
+        for fat_field in ("description", "amenities", "legal", "geom"):
+            assert fat_field not in row, fat_field
+        assert len(json.dumps(data)) < 2000
+
+        # A query still narrows, and the one that matters is findable.
+        found = _invoke(kite, "kite_property_read", {
+            "operation": "list", "query": "offer_candidate", "max_results": 10,
+        })["data"]
+        assert found["total"] == 1
+        assert found["truncated"] is False
+        assert found["matches"][0]["canonicalTitle"] == "Villa 0"
+
+        # Depth is still available, by id, in full.
+        detail = _invoke(kite, "kite_property_read", {
+            "operation": "property",
+            "property_id": "123e4567-e89b-12d3-a456-426614174000",
+        })["data"]
+        assert detail["description"] == "x" * 4000
+
+    _bound_turn(
+        tmp_path,
+        {"property_intel": RecordingBackend({
+            "list": fat,
+            "property": fat[0],
+        })},
+        check,
+    )
+
+
 def test_property_mode_denies_over_limit_mixed_source_and_non_james(tmp_path):
     property_id = "123e4567-e89b-12d3-a456-426614174000"
 
