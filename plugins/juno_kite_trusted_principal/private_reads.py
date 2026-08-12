@@ -1553,7 +1553,11 @@ class PrivateReadService:
                 "unsupported_content",
                 "attachment type is not safe for private extraction",
             )
-        maximum = _EXTRACT_MAX_INPUT_BYTES if release else self.output_bytes
+        # One bound for both paths: this is the input being loaded, and what
+        # returns from a read is the bounded extraction, not the bytes. The
+        # answer allowance as a size cap made a 300KB attachment releasable
+        # but unreadable -- the same asymmetry as the empty text field.
+        maximum = _EXTRACT_MAX_INPUT_BYTES
         if (
             isinstance(size, bool)
             or not isinstance(size, int)

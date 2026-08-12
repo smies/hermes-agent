@@ -864,6 +864,50 @@ def test_a_pdf_attachment_is_read_not_returned_empty(tmp_path):
     _bound_turn(tmp_path, {"gmail": gmail}, check)
 
 
+def test_an_attachment_larger_than_the_answer_is_still_readable(tmp_path):
+    """The answer allowance is not a file-size limit.
+
+    A read returns the bounded extraction, never the bytes -- but the read
+    path capped the attachment's size at output_bytes while the release path
+    allowed 8MB, so a large scan was releasable and unreadable at once.
+    """
+    import base64 as _b64
+
+    pdf = _pdf_with_text("Large but perfectly readable")
+    padded_size = 300_000  # past output_bytes, well under the extraction cap
+    gmail = RecordingBackend({
+        "search": [{"id": "message-1", "subject": "engagement letter"}],
+        "get": {
+            "id": "message-1",
+            "body": "attached",
+            "attachments": [
+                {"attachment_id": "attachment-1", "filename": "big-scan.pdf"}
+            ],
+        },
+        "attachment_extract": {
+            "filename": "big-scan.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": padded_size,
+            "text": "",
+            "artifact_base64": _b64.b64encode(pdf).decode("ascii"),
+        },
+    })
+
+    def check(kite):
+        _invoke(kite, "kite_gmail_search",
+                {"account": "personal", "query": "engagement", "max_results": 3})
+        _invoke(kite, "kite_gmail_get",
+                {"account": "personal", "message_id": "message-1"})
+        result = _invoke(kite, "kite_gmail_attachment_extract", {
+            "account": "personal", "message_id": "message-1",
+            "attachment_id": "attachment-1",
+        })
+        assert result["status"] == "ok", result
+        assert "perfectly readable" in result["data"]["text"]
+
+    _bound_turn(tmp_path, {"gmail": gmail}, check)
+
+
 def test_an_unextractable_attachment_still_reads_as_empty_not_an_error(tmp_path):
     """Failing to extract must not be worse than the old behaviour."""
     gmail = RecordingBackend({
