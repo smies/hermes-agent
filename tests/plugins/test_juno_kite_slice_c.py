@@ -15,6 +15,7 @@ import re
 import yaml
 from datetime import datetime
 import threading
+import time
 import zlib
 from contextvars import copy_context
 from pathlib import Path
@@ -7035,6 +7036,105 @@ async def test_a_consultation_that_ran_out_of_time_does_not_read_as_a_refusal(tm
     assert "did not refuse" in answer
     assert "Asking again" in answer
     assert "internal fail-closed error" not in answer
+
+
+@pytest.mark.asyncio
+async def test_two_consultations_never_share_the_lane(tmp_path):
+    """"missing or ambiguous signed request" -- the half never tested.
+
+    Observed 2026-08-10 and again on the 11th as the tail of a different
+    failure. Kite parses exactly one signed request per message and refuses
+    two, which is right; what was never pinned is that two can never arrive
+    together. The lane is what guarantees it, and its wait was once a second
+    while consultations run for minutes.
+
+    Both halves are asserted here: the lane serialises, so no message ever
+    carries two requests, and the parser refuses one that somehow does.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    await juno.pre_gateway_dispatch(
+        event=_event("What is the plan?"),
+        gateway=SimpleNamespace(
+            adapters={Platform.WHATSAPP: RecordingWhatsAppAdapter(MutableRoster())}
+        ),
+        critical_ingress_token=object(),
+    )
+
+    from plugins.juno_kite_trusted_principal.runtime import REQUEST_PREFIX
+
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    def _kite_envelope_text(message, context_id):
+        def turn():
+            kite.pre_llm_call(
+                user_message=message,
+                session_id=f"kite-{context_id}",
+                turn_id=f"turn-{len(seen)}",
+            )
+            return kite.transform_llm_output(
+                response_text="An ordinary bounded answer.",
+                session_id=f"kite-{context_id}",
+                turn_id=f"turn-{len(seen)}",
+            )
+
+        return _session(turn, mode="kite", context_id=context_id)
+
+    in_flight = 0
+    peak = 0
+    seen: list[str] = []
+    started = threading.Event()
+
+    def transport(_peer_name, _peer, message, context_id):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        seen.append(message)
+        started.set()
+        try:
+            time.sleep(0.3)
+            return (
+                _kite_envelope_text(message, context_id),
+                context_id,
+                "completed",
+            )
+        finally:
+            in_flight -= 1
+
+    juno.transport = transport
+
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    audience = _ACTIVE_AUDIENCE.get()
+
+    def ask(text):
+        # A ContextVar does not cross into a worker thread; the gateway's own
+        # threads inherit it from the dispatch that set it.
+        _ACTIVE_AUDIENCE.set(audience)
+        _session(
+            lambda: juno.consult_kite({"question_or_goal": text}),
+            mode="juno",
+        )
+
+    first = threading.Thread(target=ask, args=("the first question",))
+    second = threading.Thread(target=ask, args=("the second question",))
+    first.start()
+    assert started.wait(5)
+    second.start()
+    first.join(30)
+    second.join(30)
+
+    # Never two at once, and never two in one message.
+    assert peak == 1, f"{peak} consultations shared the lane"
+    assert len(seen) == 2
+    for message in seen:
+        assert message.count(REQUEST_PREFIX) == 1
+
+    # And the parser refuses a message that carries two, whatever produced it.
+    doubled = seen[0] + "\n" + seen[1]
+    with pytest.raises(ValueError, match="missing or ambiguous signed request"):
+        kite._extract_request(doubled)
 
 
 def test_the_lane_wait_outlives_a_real_consultation(tmp_path):
