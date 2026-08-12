@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import (
+    GatewayConfig, Platform, PlatformConfig, _resolve_juno_shared_policy,
+)
 from gateway.platforms.whatsapp_common import (
     ORDINARY_VERIFIED_LAUNCHER_SHA256,
     ORDINARY_VERIFIED_MANIFEST_SHA256,
@@ -126,6 +128,64 @@ def test_legacy_juno_self_chat_can_configure_sender_companion_fence(
     adapter.configure_private_read_sender_companion_fence("juno")
 
     assert adapter._private_read_fence_profile == "juno"
+
+
+def test_a_config_that_names_its_shared_policy_still_installs_the_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two-hour silence of 2026-08-12.
+
+    The gateway decides whether to install the WhatsApp sender fence by
+    reading this block straight out of its config snapshot. When the two
+    profiles were changed to take that block from one shared file instead of
+    inlining it, this path saw only a pointer, read it as unconfigured, and
+    installed no fence -- so the bridge attached no provenance to inbound
+    messages, so the plugin's ingress check failed closed and every message
+    was dropped in silence.
+
+    The plugin resolved the shared file correctly. That was never the
+    question: this path does not construct the plugin.
+    """
+    import yaml
+
+    from gateway.config import load_gateway_config
+
+    raw = _trusted_principal_activation()
+    local_only = {"mode", "profile", "private_reads"}
+    shared = {k: v for k, v in raw.items() if k not in local_only}
+    shared_file = tmp_path / "juno-kite-shared.yaml"
+    shared_file.write_text(yaml.safe_dump(shared), encoding="utf-8")
+    lean = {k: v for k, v in raw.items() if k in local_only}
+    lean["shared_from"] = str(shared_file)
+
+    resolved = _resolve_juno_shared_policy(lean)
+    # What the gateway now sees is the whole block, not the pointer.
+    assert resolved.get("policy") == raw.get("policy")
+    assert resolved.get("enabled") is True
+    assert "shared_from" not in resolved
+
+    # And it qualifies, which is what decides whether the fence is installed.
+    from plugins.juno_kite_trusted_principal.runtime import (
+        valid_juno_gateway_activation_config,
+    )
+
+    assert valid_juno_gateway_activation_config(lean, "juno") is False, (
+        "the unresolved pointer must not qualify -- that is the bug, not the fix"
+    )
+    assert valid_juno_gateway_activation_config(resolved, "juno") is True
+
+    # End to end: a runner built from the lean config installs the fence.
+    runner = _activation_runner(resolved)
+    adapter = _unconfigured_adapter(tmp_path)
+    runner._configure_juno_private_read_sender_fence(Platform.WHATSAPP, adapter)
+    assert adapter._private_read_fence_profile == "juno"
+
+    # Where the unresolved pointer would have installed nothing at all.
+    bare = _activation_runner(lean)
+    bare_adapter = _unconfigured_adapter(tmp_path / "second")
+    runner_fence = bare._configure_juno_private_read_sender_fence
+    runner_fence(Platform.WHATSAPP, bare_adapter)
+    assert bare_adapter._private_read_fence_profile is None
 
 
 def test_exact_trusted_principal_v2_configures_fence_without_legacy_service(

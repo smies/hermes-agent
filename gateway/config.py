@@ -458,6 +458,21 @@ def platform_binds_port(platform_value: str, extra: Optional[dict] = None) -> bo
     return True
 
 
+def _resolve_juno_shared_policy(section: Any) -> Any:
+    """Merge the Juno--Kite block from the file both profiles point at.
+
+    Delegates to the plugin, which owns the rule -- local keys win, and a named
+    file that cannot be read raises rather than yielding a half-formed policy.
+    A section that names no file is returned untouched, so this is inert until
+    one does.
+    """
+    if not isinstance(section, dict) or not section.get("shared_from"):
+        return section
+    from plugins.juno_kite_trusted_principal.runtime import TrustedPrincipalRuntime
+
+    return TrustedPrincipalRuntime._with_shared_policy(section)
+
+
 @dataclass
 class HomeChannel:
     """
@@ -1386,9 +1401,21 @@ def load_gateway_config() -> GatewayConfig:
             # pre-dispatch critical-scope check must not re-read mutable live
             # configuration after startup.
             if "juno_kite_trusted_principal" in yaml_cfg:
-                gw_data["juno_kite_trusted_principal"] = yaml_cfg[
-                    "juno_kite_trusted_principal"
-                ]
+                # Resolve the block both profiles share here, at the boundary,
+                # so every reader downstream sees a complete one. The gateway
+                # qualifies the plugin by reading this snapshot directly --
+                # that is how it decides to install the WhatsApp sender fence
+                # -- and on 2026-08-12 a config that named its shared file
+                # instead of inlining it read as unconfigured: no fence, so no
+                # provenance on inbound messages, so every message failed
+                # closed at ingress and was dropped in silence for two hours.
+                # Resolving in the plugin alone was not enough, because this
+                # path never constructs the plugin.
+                gw_data["juno_kite_trusted_principal"] = (
+                    _resolve_juno_shared_policy(
+                        yaml_cfg["juno_kite_trusted_principal"]
+                    )
+                )
             plugins_cfg = yaml_cfg.get("plugins")
             if isinstance(plugins_cfg, dict):
                 gw_data["enabled_plugins"] = plugins_cfg.get("enabled", [])
