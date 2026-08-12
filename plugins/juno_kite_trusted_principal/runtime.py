@@ -877,6 +877,25 @@ class TrustedPrincipalRuntime:
         timeout = int(entry.get("timeout", 120))
         if timeout <= 0:
             raise ValueError("Kite peer timeout must be positive")
+        # Two independent numbers where the short one wins silently. Giving up
+        # on the wire does not just lose the answer: it aborts the request, so
+        # Kite -- still working, still inside the authority it was granted --
+        # loses its binding mid-turn and cannot release the answer it goes on
+        # to finish. Live on 2026-08-12 at 06:39: 120.12s on the wire, Kite
+        # done at 141s, and the log then said "refused while still inside its
+        # 300s authority".
+        #
+        # Not overridden here. A short wire timeout is a legitimate thing to
+        # want -- the tests set five seconds so failures are fast -- and
+        # quietly raising a number someone chose is how the two got out of step
+        # in the first place. Said out loud instead, once, at startup.
+        if timeout < int(self.limits.turn_ttl_seconds):
+            logger.warning(
+                "Juno--Kite peer '%s' gives up after %ss while a turn is "
+                "authorized for %ss: a consultation still running at %ss is "
+                "aborted mid-turn and its answer cannot be released",
+                name, timeout, self.limits.turn_ttl_seconds, timeout,
+            )
         self.peer_name = name
         return {"url": actual_url, "auth": dict(auth), "timeout": timeout}
 
@@ -2301,6 +2320,15 @@ class TrustedPrincipalRuntime:
     def _public_reason(exc: Exception) -> str:
         if isinstance(exc, ValueError):
             return str(exc)
+        if isinstance(exc, TimeoutError):
+            # Not a refusal, and the difference matters to whoever is waiting:
+            # "internal fail-closed error" is what she was told when the truth
+            # was that it had taken too long.
+            return (
+                "Kite did not refuse this -- the consultation ran past the "
+                "time allowed for it, so the answer was dropped. Asking again "
+                "starts a fresh one"
+            )
         return "internal fail-closed error"
 
     def _extract_request(self, user_message: str) -> dict:

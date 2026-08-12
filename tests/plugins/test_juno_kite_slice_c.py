@@ -6671,6 +6671,61 @@ def test_a_closed_gate_says_why_in_the_log(tmp_path, caplog):
     assert "passport number" not in caplog.text
 
 
+def test_giving_up_early_on_the_wire_is_said_out_loud(tmp_path, caplog):
+    """Two numbers, independently set, and the short one wins in silence.
+
+    Live on 2026-08-12 at 06:39: the wire gave up at 120.12s while the turn was
+    authorized for 300s. That does not merely lose the answer -- giving up
+    aborts the request, so Kite lost its binding two seconds later while still
+    searching, and when it finished at 141s the log said its binding was
+    "refused while still inside its 300s authority". Lucy was told "internal
+    fail-closed error".
+
+    The number is not overridden: a short wire timeout is a legitimate thing to
+    want, and quietly raising one someone chose is how these got out of step.
+    It is said instead.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    with caplog.at_level(logging.WARNING):
+        juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    assert juno.peer["timeout"] < juno.limits.turn_ttl_seconds
+    assert "gives up after" in caplog.text
+    assert "cannot be released" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_consultation_that_ran_out_of_time_does_not_read_as_a_refusal(tmp_path):
+    """"internal fail-closed error" is what she was told when it timed out.
+
+    Every other exception on this path carries a sentence written for whoever
+    is waiting. A TimeoutError fell through to the catch-all, which says
+    nothing about what to do next -- and what to do next is ask again.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+
+    def times_out(*_args, **_kwargs):
+        raise TimeoutError("the read operation timed out")
+
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    juno.transport = times_out
+    await juno.pre_gateway_dispatch(
+        event=_event("What time is the transfer?"),
+        gateway=SimpleNamespace(
+            adapters={Platform.WHATSAPP: RecordingWhatsAppAdapter(MutableRoster())}
+        ),
+        critical_ingress_token=object(),
+    )
+    answer = _session(
+        lambda: juno.consult_kite({"question_or_goal": "What time is the transfer?"}),
+        mode="juno",
+    )
+    assert "did not refuse" in answer
+    assert "Asking again" in answer
+    assert "internal fail-closed error" not in answer
+
+
 def test_the_lane_wait_outlives_a_real_consultation(tmp_path):
     """A one-second wait would have made redirects fail almost every time.
 
