@@ -534,6 +534,41 @@ def _session_when(stamp: Any) -> str:
 
 _SESSION_EXCERPT_CHARS = 300
 
+
+def _session_excerpt(text: str, words: Iterable[str]) -> str:
+    """The part of the message that matched, not the part that came first.
+
+    Recall returned the opening of whatever it found, and the things it finds
+    are often long: the answer to "where did the passport scans go" arrived as
+    "[CONTEXT COMPACTION -- REFERENCE ONLY] Earlier turns were compacted into
+    the summary below", which is true of the message and useless about the
+    passports.
+    """
+    lowered = text.casefold()
+    positions = [
+        found
+        for found in (lowered.find(word.casefold()) for word in words)
+        if found >= 0
+    ]
+    if not positions or len(text) <= _SESSION_EXCERPT_CHARS:
+        return text[:_SESSION_EXCERPT_CHARS]
+    lead = _SESSION_EXCERPT_CHARS // 4
+
+    def covered(start: int) -> int:
+        window = lowered[start:start + _SESSION_EXCERPT_CHARS]
+        return sum(1 for word in words if word.casefold() in window)
+
+    starts = sorted({max(0, place - lead) for place in positions})
+    best = max(starts, key=lambda start: (covered(start), -start))
+    # The ellipses are part of the bound, not an addition to it: the cap on
+    # what recall returns is the whole point of returning an excerpt.
+    opening = "..." if best else ""
+    body = text[best:best + _SESSION_EXCERPT_CHARS - len(opening)]
+    if best + len(body) < len(text) and len(body) > 3:
+        body = body[:-3] + "..."
+    return opening + body
+
+
 # A file search used to be one literal substring of the path. That is not how
 # anyone names a document or asks for one: "holiday itinerary" matched nothing
 # in a folder holding Ibiza-Trip-Itinerary.pdf, and five searches in a row came
@@ -2564,6 +2599,10 @@ class PrivateReadService:
                 "source_failure", "session store could not be read", True
             ) from exc
 
+        found: list[dict[str, Any]] = []
+        # The same thing said twice is one thing recalled, and recall has five
+        # slots: a message repeated across sessions was spending two of them.
+        seen_excerpts: set[str] = set()
         for content, stamp, key in rows:
             text = re.sub(r"\s+", " ", str(content or "")).strip()
             if len(text) < 24:
@@ -2575,10 +2614,14 @@ class PrivateReadService:
             surface = (str(key or "").split(":") + ["", "", ""])[2] or "cli"
             if surface == "a2a":
                 continue  # this lane's own traffic, not recall
+            excerpt = _session_excerpt(text, words)
+            if excerpt in seen_excerpts:
+                continue
+            seen_excerpts.add(excerpt)
             found.append({
                 "when": _session_when(stamp),
                 "surface": surface,
-                "excerpt": text[:_SESSION_EXCERPT_CHARS],
+                "excerpt": excerpt,
             })
             if len(found) >= maximum:
                 break

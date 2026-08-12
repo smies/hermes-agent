@@ -5792,6 +5792,58 @@ def test_recall_is_offered_where_the_model_will_need_it():
     assert "kite_session_search" in rule(DOCUMENT_DESCRIPTOR)
 
 
+def test_recall_shows_the_part_that_matched(tmp_path):
+    """Recall returned the opening of what it found, and it finds long things.
+
+    Live, asking where the passport scans went returned "[CONTEXT COMPACTION
+    -- REFERENCE ONLY] Earlier turns were compacted into the summary below":
+    true of the message, useless about the passports. The sentence that
+    matched was four thousand characters further down and never shown.
+    """
+    buried = (
+        "[CONTEXT COMPACTION -- REFERENCE ONLY] Earlier turns were compacted "
+        "into the summary below. " + ("filler about unrelated work. " * 200)
+        + "Saved the passport scans in /Users/james/Documents/Family/Passports "
+        "and left the Irish one unchanged. " + ("more filler. " * 200)
+    )
+    service = _session_service(tmp_path, [
+        ("agent:main:mattermost:channel:x", "assistant", buried, 1786300000.0),
+    ])
+    found = service._sessions({"query": "passport scans", "max_results": 3})
+    excerpt = found[0]["excerpt"]
+    assert "Family/Passports" in excerpt
+    assert "CONTEXT COMPACTION" not in excerpt
+    # It is still an excerpt, and it says it is one.
+    assert len(excerpt) <= 300
+    assert excerpt.startswith("...")
+    assert excerpt.endswith("...")
+
+
+def test_recall_says_the_same_thing_once(tmp_path):
+    """A message stored twice spent two of the five slots recall has.
+
+    Live, "passport scans filed" and "property purchase latest" each came back
+    with a duplicated row -- the same text saved under two session keys -- so
+    three results were really two.
+    """
+    noise = 'Trip Hub trip trip trip planner trip roadmap trip.'
+    signal = (
+        'The September holiday trip is booked: flights on the 4th, the villa from the 5th, and the car collected at the'
+        ' airport. Everything else in this message is ordinary detail about the booking that makes it a longer piece of text than the note above it. Everything else in this message is ordinary detail about the booking that makes it a longer piece of text than the note above it. Everything else in this message is ordinary detail about the booking that makes it a longer piece of text than the note above it. '
+    )
+    service = _session_service(tmp_path, [
+        ("agent:main:cli:x:1", "assistant", noise, 1786300000.0),
+        ("agent:main:mattermost:channel:x", "assistant", signal, 1786200000.0),
+        ("agent:main:mattermost:channel:y", "assistant", noise, 1786100000.0),
+    ])
+    found = service._sessions(
+        {"query": "holiday trip september", "max_results": 5}
+    )
+    assert len(found) == 2
+    assert len({item["excerpt"] for item in found}) == 2
+    assert any("September holiday trip is booked" in item["excerpt"] for item in found)
+
+
 def test_recall_ranks_by_match_quality_not_recency(tmp_path):
     """Recency alone surfaced messages that merely contained the words."""
     service = _session_service(tmp_path, [
