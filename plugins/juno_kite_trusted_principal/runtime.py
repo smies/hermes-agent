@@ -372,6 +372,12 @@ _ACTIVE_TURN_EPOCH: ContextVar[Optional[tuple[str, int]]] = ContextVar(
     "juno_kite_active_turn_epoch", default=None
 )
 _SUPERSEDED_REASON = "a newer message superseded this consultation"
+# Kite's denial reason crosses the lane as free text. This marker is how the
+# two halves of the plugin agree that a particular denial was the machinery
+# running out of time rather than a policy declining the request -- the
+# difference between "ask again" and "this is not something I can get you",
+# which are opposite instructions to whoever is waiting.
+_NOT_A_REFUSAL = "not a refusal: "
 
 CRITICAL_INGRESS_SCOPE = "juno-trusted-principal-v2"
 # How long a document request stays resolvable by a bare follow-up.
@@ -3772,17 +3778,31 @@ class TrustedPrincipalRuntime:
                 )
             except Exception:
                 expired = False
+            # A turn that ran out of time is not a policy that refused. Sent
+            # back as one, it teaches the person asking that the topic is
+            # closed to them, when in fact asking again would have worked --
+            # the opposite of what they should do next. Kite says which it was.
+            reason = "missing, stale, mismatched, or internal policy binding"
             if expired:
                 logger.warning(
                     "Kite turn outlived its %ss authority; the answer was "
                     "discarded rather than released late",
                     self.limits.turn_ttl_seconds,
                 )
+                reason = _NOT_A_REFUSAL + (
+                    f"this ran past the {self.limits.turn_ttl_seconds}s a "
+                    "consultation is allowed, so the answer was dropped. "
+                    "Asking again starts a fresh one"
+                )
             elif "stale" in str(exc):
                 logger.warning(
                     "Kite binding was refused while still inside its %ss "
                     "authority: replayed or mismatched, not expired",
                     self.limits.turn_ttl_seconds,
+                )
+                reason = _NOT_A_REFUSAL + (
+                    "a later message overtook this consultation, so its answer "
+                    "was dropped. Asking again starts a fresh one"
                 )
             if binding and binding.request:
                 try:
@@ -3794,7 +3814,7 @@ class TrustedPrincipalRuntime:
                     binding if binding and binding.valid else None,
                     answer="",
                     denied=True,
-                    reason="missing, stale, mismatched, or internal policy binding",
+                    reason=reason,
                 )
             except Exception:
                 return DENIAL_PREFIX + "no releasable envelope"
@@ -3836,6 +3856,15 @@ class TrustedPrincipalRuntime:
             or payload["expires_at"] != request.expires_at
             or payload["expires_at"] <= now
         ):
+            # Juno reaches its own expiry check before it ever reads Kite's
+            # reason, so this is usually the sentence the waiting person gets.
+            # It has to carry the same instruction: ask again.
+            if request is not None and payload.get("expires_at") == request.expires_at:
+                raise ValueError(
+                    "Kite did not refuse this -- it ran past the "
+                    f"{self.limits.turn_ttl_seconds}s a consultation is allowed, "
+                    "so the answer was dropped. Asking again starts a fresh one"
+                )
             raise ValueError("Kite response is stale or expired")
         authority_expected = {
             "audience_digest": request.audience_digest,
@@ -3890,9 +3919,14 @@ class TrustedPrincipalRuntime:
             # reason names the category the host itself computed, never the
             # content that tripped it.
             detail = str(payload.get("reason") or "").strip()
+            if detail.startswith(_NOT_A_REFUSAL):
+                raise ValueError(
+                    "Kite did not refuse this -- "
+                    + detail[len(_NOT_A_REFUSAL):][:200]
+                )
             raise ValueError(
                 "Kite denied release under current policy"
-                + (f": {detail[:160]}" if detail else "")
+                + (f": {detail[:200]}" if detail else "")
             )
         return payload
 

@@ -6163,6 +6163,143 @@ def _kite_envelope(
     return _session(kite_turn, mode="kite", context_id=context_id)
 
 
+@pytest.mark.asyncio
+async def test_running_out_of_time_is_not_reported_as_a_refusal(tmp_path):
+    """A slow turn came back as "denied release under current policy".
+
+    Kite sent the same sentence for a turn that outlived its authority as for
+    a policy that genuinely declined -- and Juno relayed it. The person waiting
+    was told the topic was closed to them when asking again would have worked:
+    the opposite of what they should do next. Lucy's question about the trip
+    ended this way on 2026-08-11, after tool failures dragged the turn out.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    (root / "child-passport.png").write_bytes(_png_bytes())
+    clock = Clock()
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+
+    await juno.pre_gateway_dispatch(
+        event=_event("What's the plan for the trip?"),
+        gateway=SimpleNamespace(
+            adapters={Platform.WHATSAPP: RecordingWhatsAppAdapter(MutableRoster())}
+        ),
+        critical_ingress_token=object(),
+    )
+    prepared = _session(
+        lambda: juno._prepare_request({
+            "question_or_goal": "What is the plan for the trip?",
+            "relevant_context": [],
+        }),
+        mode="juno",
+    )
+
+    def kite_turn():
+        kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        # The turn does its work, and takes too long over it.
+        clock.value += kite.limits.turn_ttl_seconds + 1
+        return kite.transform_llm_output(
+            response_text="The trip is booked for September.",
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    envelope = _session(
+        kite_turn, mode="kite", context_id=prepared.mapping.context_id
+    )
+
+    with pytest.raises(ValueError) as refusal:
+        _session(
+            lambda: juno._validate_response(
+                envelope, prepared.mapping, prepared.request_id
+            ),
+            mode="juno",
+        )
+    said = str(refusal.value)
+    assert "did not refuse" in said
+    assert "Asking again" in said
+    assert "denied release under current policy" not in said
+    # And the marker the two halves agree on never reaches whoever is waiting.
+    assert "not a refusal:" not in said
+
+    # Kite said the same thing on its own side of the lane, marked so Juno can
+    # tell it apart from a policy that declined.
+    sent = json.loads(envelope.split("JUNO_KITE_RESPONSE_V2", 1)[1])
+    assert sent["denied"] is True
+    assert sent["reason"].startswith("not a refusal: ")
+    assert "Asking again" in sent["reason"]
+
+
+@pytest.mark.asyncio
+async def test_an_overtaken_consultation_says_so_rather_than_refusing(tmp_path):
+    """The other half of the same distinction, inside the time limit.
+
+    A consultation whose binding was already spent is refused by the same
+    gate as one that expired, and it must not read as a policy decision
+    either: the answer was dropped because a later message took the lane.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    clock = Clock()
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+
+    await juno.pre_gateway_dispatch(
+        event=_event("What's the plan for the trip?"),
+        gateway=SimpleNamespace(
+            adapters={Platform.WHATSAPP: RecordingWhatsAppAdapter(MutableRoster())}
+        ),
+        critical_ingress_token=object(),
+    )
+    prepared = _session(
+        lambda: juno._prepare_request({
+            "question_or_goal": "What is the plan for the trip?",
+            "relevant_context": [],
+        }),
+        mode="juno",
+    )
+
+    def kite_turn():
+        kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        # The turn is bound and under way when its claim stops being the live
+        # one -- what a later message taking the lane does to it. The clock has
+        # not moved: this is not an expiry.
+        kite.store.abort_request(prepared.request_id)
+        return kite.transform_llm_output(
+            response_text="The trip is booked for September.",
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    overtaken = _session(
+        kite_turn, mode="kite", context_id=prepared.mapping.context_id
+    )
+    sent = json.loads(overtaken.split("JUNO_KITE_RESPONSE_V2", 1)[1])
+    assert sent["denied"] is True
+    assert sent["reason"].startswith("not a refusal: ")
+
+    with pytest.raises(ValueError) as refusal:
+        _session(
+            lambda: juno._validate_response(
+                overtaken, prepared.mapping, prepared.request_id
+            ),
+            mode="juno",
+        )
+    said = str(refusal.value)
+    assert "did not refuse" in said
+    assert "overtook" in said
+    assert "not a refusal:" not in said
+
+
 def test_the_lane_wait_outlives_a_real_consultation(tmp_path):
     """A one-second wait would have made redirects fail almost every time.
 
