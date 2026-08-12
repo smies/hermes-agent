@@ -684,8 +684,31 @@ def test_a_date_argument_is_read_the_way_it_is_written(tmp_path):
             "account": "personal", "start": "30d", "end": "today", "max_results": 5,
         })
         window = calendar.calls[-1][1]
-        assert window["start"] == (today - timedelta(days=30)).isoformat()
-        assert window["end"] == today.isoformat()
+        assert window["start"].startswith(
+            (today - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
+        )
+        assert window["end"].startswith(today.strftime("%Y-%m-%dT23:59:59"))
+
+        # A day is a window. The backend wants a moment and answers Bad
+        # Request to a bare date -- which arrives as "source command failed"
+        # and reads as the calendar being down.
+        _invoke(kite, "kite_calendar_read", {
+            "account": "personal", "start": "2026-08-01", "end": "2026-08-31",
+            "max_results": 5,
+        })
+        window = calendar.calls[-1][1]
+        assert window["start"].startswith("2026-08-01T00:00:00")
+        assert window["end"].startswith("2026-08-31T23:59:59")
+
+        # And so one day at each end is one whole day -- what "what's on
+        # today" means, and what the window check used to reject as empty.
+        _invoke(kite, "kite_calendar_read", {
+            "account": "personal", "start": "today", "end": "today",
+            "max_results": 5,
+        })
+        window = calendar.calls[-1][1]
+        assert window["start"].startswith(today.strftime("%Y-%m-%dT00:00:00"))
+        assert window["end"].startswith(today.strftime("%Y-%m-%dT23:59:59"))
 
         # An hour is still an hour: a full timestamp is not rounded to the day.
         _invoke(kite, "kite_calendar_read", {

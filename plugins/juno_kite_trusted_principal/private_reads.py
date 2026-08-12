@@ -118,6 +118,20 @@ def _today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+# The calendar backend wants a moment, not a day: given 2026-08-01 it answers
+# Bad Request, which arrives as "source command failed" and looks like the
+# calendar being down. A day is a window -- opening at its first moment and
+# closing at its last -- so naming one day at each end asks for exactly that
+# day, which is what "what's on today" means and what it could not previously
+# express.
+def _day_bound(value: str, *, opening: bool) -> str:
+    if "T" in value:
+        return value
+    offset = datetime.now().astimezone().strftime("%z")
+    zone = "Z" if offset in {"+0000", ""} else f"{offset[:3]}:{offset[3:]}"
+    return value + ("T00:00:00" if opening else "T23:59:59") + zone
+
+
 def _normalise_date(value: str, key: str, *, allow_time: bool = False) -> str:
     """Return YYYY-MM-DD for anything that unambiguously names a day.
 
@@ -1778,11 +1792,19 @@ class PrivateReadService:
         account = args.get("account")
         if account not in {"personal", "work_free_busy"}:
             raise SourceFailure("account_denied", "calendar account is unavailable")
-        start = _normalise_date(
-            self._bounded_text(args["start"], "start", 40), "start", allow_time=True
+        start = _day_bound(
+            _normalise_date(
+                self._bounded_text(args["start"], "start", 40),
+                "start", allow_time=True,
+            ),
+            opening=True,
         )
-        end = _normalise_date(
-            self._bounded_text(args["end"], "end", 40), "end", allow_time=True
+        end = _day_bound(
+            _normalise_date(
+                self._bounded_text(args["end"], "end", 40),
+                "end", allow_time=True,
+            ),
+            opening=False,
         )
         if start >= end:
             raise SourceFailure(
