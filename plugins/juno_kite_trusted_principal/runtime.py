@@ -1888,6 +1888,64 @@ class TrustedPrincipalRuntime:
             raise ValueError("authenticated audience changed")
         return current
 
+    def _hard_leak_reason(self, text: str) -> str:
+        """Only what is evidence, not what is merely shaped like something.
+
+        James, after a week of the heuristics: this is his wife being enabled,
+        and he would rather have risked one real slip than the stream of bad
+        refusals they actually produced -- which never once caught a true
+        disclosure. So an answer is withheld outright only for hard evidence:
+        a configured secret value, or credential-shaped content. Everything
+        merely identifier-shaped is redacted in place instead, by
+        _redacted_answer, and the rest of the answer is delivered.
+        """
+        value = str(text or "")
+        flattened = _EDGE_UNDERSCORE_PATTERN.sub(
+            "", _EMPHASIS_PATTERN.sub("", value)
+        )
+        for pattern in _CREDENTIAL_PATTERNS:
+            if pattern.search(value) or pattern.search(flattened):
+                return "credential-shaped content"
+        if any(
+            secret and secret in value for secret in getattr(self, "secret_values", ())
+        ):
+            return "configured credential value"
+        return ""
+
+    def _redacted_answer(self, text: str) -> tuple[str, tuple[str, ...]]:
+        """The answer with identifier-shaped spans blanked, and what was hit.
+
+        The span costs itself; the answer survives. A UUID in a reply used to
+        cost the whole reply.
+        """
+        value = str(text or "")
+        hits: list[str] = []
+        approved = list(getattr(
+            getattr(self, "private_reads", None), "public_property_origins", ()
+        ))
+
+        def blank(pattern: re.Pattern, label: str, source: str) -> str:
+            def swap(match: re.Match) -> str:
+                # An approved public link is not an identifier leak.
+                span = match.group(0)
+                if any(origin in span for origin in approved):
+                    return span
+                hits.append(label)
+                return "[redacted]"
+            return pattern.sub(swap, source)
+
+        value = blank(_PRIVATE_ID_PATTERN, "labelled private identifier", value)
+        value = blank(_UUID_PATTERN, "UUID-shaped identifier", value)
+        for identifier in self.private_identifiers:
+            if identifier and identifier in value:
+                hits.append("configured private identifier")
+                value = value.replace(identifier, "[redacted]")
+        for pattern in _RAW_RESULT_PATTERNS:
+            value = blank(pattern, "raw tool-result marker", value)
+        for pattern in _OUTPUT_INTERNAL_PATTERNS:
+            value = blank(pattern, "internal identifier or path", value)
+        return value, tuple(dict.fromkeys(hits))
+
     def _leak_reason(self, text: str, *, output: bool) -> str:
         value = str(text or "")
         flattened = _EDGE_UNDERSCORE_PATTERN.sub(
@@ -3860,7 +3918,9 @@ class TrustedPrincipalRuntime:
                 # would not.
                 leak_reason = self._property_output_leak_reason(
                     answer
-                ) or self._leak_reason(answer, output=True)
+                ) or self._hard_leak_reason(answer)
+                if not leak_reason:
+                    answer, _redactions = self._redacted_answer(answer)
             elif property_mode:
                 leak_reason = self._property_output_leak_reason(answer)
             elif host_authored:
@@ -3869,7 +3929,14 @@ class TrustedPrincipalRuntime:
                 # _safe_release_title against what actually cannot ship.
                 leak_reason = ""
             else:
-                leak_reason = self._leak_reason(answer, output=True)
+                # Hard evidence withholds; anything merely identifier-shaped
+                # is redacted in place and the answer is delivered. The
+                # identifier heuristics produced dozens of refused answers and
+                # never caught one real disclosure; the redaction keeps their
+                # entire protective effect on the span itself.
+                leak_reason = self._hard_leak_reason(answer)
+                if not leak_reason:
+                    answer, _redactions = self._redacted_answer(answer)
             # The overlap check exists to stop the model echoing raw source
             # text. On a document turn the answer is the host's own descriptor,
             # so running it there checks the host against itself -- and it must

@@ -982,7 +982,16 @@ class TestKiteLaneAndPolicy:
                 turn_id="kite-turn",
                 platform="a2a",
             )
-            monkeypatch.setattr(kite, "_leak_reason", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
+            # The output path now runs the hard gate and then the redactor;
+            # an internal exception in either must still fail closed.
+            monkeypatch.setattr(
+                kite, "_hard_leak_reason",
+                lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+            )
+            monkeypatch.setattr(
+                kite, "_redacted_answer",
+                lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+            )
             return kite.transform_llm_output(
                 "raw content must not escape", session_id="kite-session", platform="a2a"
             )
@@ -1250,15 +1259,22 @@ class TestOutputAndEnvelope:
         assert _parse_prefixed(denied, RESPONSE_PREFIX)["denied"] is True
 
     @pytest.mark.parametrize(
-        "answer",
+        ("answer", "withheld"),
         [
-            "<tool_result>{raw payload}</tool_result>",
-            "Authorization: Bearer leaked-secret",
+            # Hard evidence still withholds the whole answer.
+            ("Authorization: Bearer leaked-secret", True),
+            # Identifier-shaped content is redacted in place and the rest is
+            # delivered: the span costs itself, not the answer. James's
+            # calibration, 2026-08-12 -- the heuristics refused dozens of
+            # answers and never caught one real disclosure.
+            ("<tool_result>{raw payload}</tool_result>", False),
             # Contact details deliberately absent -- see the handoff test.
-            "fixture-user-101",
+            ("fixture-user-101", False),
         ],
     )
-    def test_leak_shapes_return_signed_denial_not_raw_output(self, tmp_path, answer):
+    def test_leak_shapes_return_signed_denial_not_raw_output(
+        self, tmp_path, answer, withheld
+    ):
         juno = _runtime(tmp_path)
         call, _ = _issue_request(juno)
         kite = _runtime(tmp_path, mode="kite")
@@ -1283,10 +1299,12 @@ class TestOutputAndEnvelope:
             chat_id=call["context_id"],
         )
         envelope = _parse_prefixed(envelope_text, RESPONSE_PREFIX)
-        assert envelope["denied"] is True
+        assert envelope["denied"] is withheld
+        # Either way, the leak-shaped span itself never crosses the lane.
         assert answer not in envelope_text
         assert envelope["signature"]
-        assert answer not in envelope_text[:500]
+        if not withheld:
+            assert "[redacted]" in envelope["answer"]
 
     def test_output_is_capped_signed_and_returns_only_answer_to_juno(self, tmp_path):
         kite = _runtime(tmp_path, mode="kite")

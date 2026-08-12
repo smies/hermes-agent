@@ -1496,6 +1496,55 @@ def test_a_property_list_is_an_index_not_the_whole_file(tmp_path):
     )
 
 
+def test_a_heuristic_match_costs_the_span_not_the_answer(tmp_path):
+    """James's calibration: this is his wife, not an adversary.
+
+    The identifier heuristics refused dozens of answers in two days and never
+    caught one real disclosure; each refusal read as "you may not know this"
+    about something she was entitled to. So a heuristic match now costs
+    exactly the matched span -- [redacted] -- and the answer survives. Hard
+    evidence is different: a configured secret or credential-shaped content
+    still withholds the whole answer, because there is nothing partial about
+    a password.
+    """
+    gmail = RecordingBackend({"search": [{"id": "message-1", "subject": "trip"}]})
+
+    def answer_with(kite, text):
+        _invoke(kite, "kite_gmail_search",
+                {"account": "personal", "query": "trip", "max_results": 2})
+        return json.loads(
+            kite.transform_llm_output(
+                response_text=text, session_id="kite-session"
+            ).split(RESPONSE_PREFIX, 1)[1]
+        )
+
+    def run(text):
+        verdicts = {}
+        _bound_turn(tmp_path, {"gmail": gmail},
+                    lambda kite: verdicts.update(v=answer_with(kite, text)))
+        return verdicts["v"]
+
+    # A UUID-shaped span is blanked; everything she asked for still arrives.
+    mixed = run(
+        "The villa holding record is 123e4567-e89b-12d3-a456-426614174000 "
+        "and completion is set for 8 October."
+    )
+    assert mixed["denied"] is False
+    assert "completion is set for 8 October" in mixed["answer"]
+    assert "123e4567" not in mixed["answer"]
+    assert "[redacted]" in mixed["answer"]
+
+    # A labelled identifier likewise.
+    labelled = run("Booking reference: 987654321 confirmed for the family.")
+    assert labelled["denied"] is False
+    assert "confirmed for the family" in labelled["answer"]
+
+    # Hard evidence still withholds everything.
+    hard = run("The wifi admin password=synthetic-credential-value if you need it.")
+    assert hard["denied"] is True
+    assert hard["answer"] == ""
+
+
 def test_reading_something_alongside_property_does_not_withhold_the_answer(tmp_path):
     """Lucy asked what the house being bought was and the answer was withheld.
 
@@ -1544,8 +1593,11 @@ def test_reading_something_alongside_property_does_not_withhold_the_answer(tmp_p
     # An ordinary prose answer, from two sources, is released.
     assert verdicts["prose"]["denied"] is False, verdicts["prose"]
     assert "Villa Lena" in verdicts["prose"]["answer"]
-    # The ordinary gate still applies: an identifier is still refused.
-    assert verdicts["identifier"]["denied"] is True
+    # The ordinary gate still applies to the span: the identifier is redacted
+    # and the answer survives, rather than the whole turn being withheld.
+    assert verdicts["identifier"]["denied"] is False
+    assert "123e4567" not in verdicts["identifier"]["answer"]
+    assert "[redacted]" in verdicts["identifier"]["answer"]
     # And so does the Property form gate, which the ordinary one has no
     # opinion about: a table dump of its data is still refused.
     assert verdicts["table"]["denied"] is True
@@ -1592,7 +1644,10 @@ def test_property_mode_denies_over_limit_mixed_source_and_non_james(tmp_path):
                 session_id="kite-session",
             ).split(RESPONSE_PREFIX, 1)[1]
         )
-        assert envelope["denied"] is True
+        # The identifier is redacted rather than the answer withheld.
+        assert envelope["denied"] is False
+        assert property_id not in envelope["answer"]
+        assert "[redacted]" in envelope["answer"]
 
     _bound_turn(
         tmp_path,
@@ -2842,15 +2897,19 @@ def test_minimized_email_bulk_subject_harvest_exceeds_provenance_bounds(
 
 
 @pytest.mark.parametrize(
-    "subject,answer",
+    "subject,answer,withheld",
     [
         (
             "Security notice: password=synthetic-credential-value must never be exposed",
             "Security notice: password=synthetic-credential-value must never be exposed",
+            True,
         ),
+        # Identifier-shaped content is redacted, not withheld: the span costs
+        # itself, the answer survives. James's calibration, 2026-08-12.
         (
             "Synthetic private record 123e4567-e89b-12d3-a456-426614174000 is ready",
             "Synthetic private record 123e4567-e89b-12d3-a456-426614174000 is ready",
+            False,
         ),
         (
             "Synthetic household update with enough provenance text for overlap",
@@ -2859,13 +2918,14 @@ def test_minimized_email_bulk_subject_harvest_exceeds_provenance_bounds(
                     "Synthetic household update with enough provenance text for overlap"
                 )
             }),
+            True,
         ),
     ],
 )
 def test_minimized_provenance_does_not_relax_absolute_output_denials(
-    tmp_path, subject, answer
+    tmp_path, subject, answer, withheld
 ):
-    """B-FIX-4: credentials, identifiers, and JSON containers stay denied."""
+    """B-FIX-4: credentials and containers stay denied; identifiers redact."""
     gmail = RecordingBackend({
         "search": [{"id": "message-absolute-denial", "subject": subject}]
     })
@@ -2881,8 +2941,13 @@ def test_minimized_provenance_does_not_relax_absolute_output_denials(
                 response_text=answer, session_id="kite-session"
             ).split(RESPONSE_PREFIX, 1)[1]
         )
-        assert envelope["denied"] is True
-        assert envelope["answer"] == ""
+        assert envelope["denied"] is withheld
+        if withheld:
+            assert envelope["answer"] == ""
+        else:
+            assert "123e4567" not in envelope["answer"]
+            assert "[redacted]" in envelope["answer"]
+            assert "is ready" in envelope["answer"]
 
     _bound_turn(tmp_path, {"gmail": gmail}, check)
 
