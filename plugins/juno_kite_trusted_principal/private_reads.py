@@ -2977,7 +2977,12 @@ class PrivateReadService:
             # data made every passport unreadable while the same file
             # previewed and released fine. Bound what it will load instead,
             # at the cap the release path already uses.
-            if size > (self.output_bytes if textual else _EXTRACT_MAX_INPUT_BYTES):
+            # The same for text. This comment already argued the point for
+            # scans and then measured text files against the answer allowance
+            # anyway: a 300KB note was unreadable while a 300KB PDF was fine,
+            # though only max_lines of the note ever comes back. Both bound
+            # what is loaded; what is returned is bounded after.
+            if size > _EXTRACT_MAX_INPUT_BYTES:
                 raise SourceFailure(
                     "cap_exceeded", "file exceeds the configured byte cap"
                 )

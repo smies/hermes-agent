@@ -1749,6 +1749,22 @@ def test_a_long_note_is_partly_read_not_refused(tmp_path):
     assert read(max_lines=400)["data"]["line_count"] == 400
     assert "completion is 8 October" not in read(max_lines=400)["data"]["text"]
 
+    # A note larger than the answer allowance is still readable, because only
+    # max_lines of it ever comes back. The same file as a PDF was always fine;
+    # measuring text against the answer allowance was the leftover of the two
+    # kinds of cap being one number.
+    big = root / "long-research.md"
+    big.write_text("\n".join(f"para {n} " + "w" * 300 for n in range(400)),
+                   encoding="utf-8")
+    assert big.stat().st_size > 65536
+    spilled = json.loads(service.execute("kite_personal_files_read", {
+        "operation": "read", "root": "obsidian",
+        "relative_path": "long-research.md", "max_lines": 5,
+    }))
+    assert spilled["status"] == "ok", spilled
+    assert spilled["data"]["line_count"] == 5
+    assert spilled["data"]["truncated"] is True
+
     # A file that fits says so plainly.
     short = root / "short.md"
     short.write_text("one\ntwo\n", encoding="utf-8")
