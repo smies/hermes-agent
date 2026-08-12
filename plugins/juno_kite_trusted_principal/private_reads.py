@@ -613,6 +613,14 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "operation": {"type": "string", "enum": ["search", "read"]},
                 "root": {"type": "string", "minLength": 1, "maxLength": 64},
                 "relative_path": {"type": "string", "minLength": 1, "maxLength": 512},
+                "start_line": {
+                    "type": "integer", "minimum": 1, "maximum": 100000,
+                    "description": (
+                        "1-based line to start at, for reading on past the "
+                        "first max_lines of a long note. The result says "
+                        "line_count, start_line and whether more remains."
+                    ),
+                },
                 "query": {
                     "type": "string", "minLength": 1, "maxLength": 200,
                     "description": (
@@ -624,7 +632,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     ),
                 },
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 30},
-                "max_lines": {"type": "integer", "minimum": 1, "maximum": 400},
+                "max_lines": {
+                    "type": "integer", "minimum": 1, "maximum": 400,
+                    "description": (
+                        "Lines to return, default 400. A longer file is "
+                        "truncated, not refused; use start_line for the rest."
+                    ),
+                },
             },
             ("operation", "root"),
         ),
@@ -3006,7 +3020,8 @@ class PrivateReadService:
     def _files(self, args: dict[str, Any]) -> Any:
         self._require_exact(
             args,
-            {"operation", "root", "relative_path", "query", "max_results", "max_lines"},
+            {"operation", "root", "relative_path", "query", "max_results",
+             "max_lines", "start_line"},
             {"operation", "root"},
         )
         roots = self._roots(self.config.get("files"))
@@ -3017,7 +3032,7 @@ class PrivateReadService:
         if operation == "read":
             _require_args(
                 args,
-                {"operation", "root", "relative_path", "max_lines"},
+                {"operation", "root", "relative_path", "max_lines", "start_line"},
                 {"operation", "root", "relative_path"},
                 "a file read",
             )
@@ -3081,16 +3096,22 @@ class PrivateReadService:
             # better be. Refusing meant every note longer than the default
             # four hundred lines was unreadable rather than partly read --
             # and a long note is exactly where a long answer lives.
-            truncated = len(lines) > maximum_lines
-            if truncated:
-                lines = lines[:maximum_lines]
-                text = "\n".join(lines)
+            total_lines = len(lines)
+            start = self._bounded_int(args.get("start_line", 1), "start_line", 100000)
+            offset = max(0, start - 1)
+            window = lines[offset:offset + maximum_lines]
+            truncated = offset + len(window) < total_lines
             return {
                 "root": name,
                 "relative_path": str(path.relative_to(roots[name].resolve())),
+                "start_line": offset + 1,
+                "line_count": len(window),
+                "total_lines": total_lines,
                 "truncated": truncated,
-                "line_count": len(lines),
-                "text": text,
+                # The tail of a long note used to be unreachable: 400 lines was
+                # the ceiling and there was no way to ask for line 401.
+                "next_start_line": offset + len(window) + 1 if truncated else None,
+                "text": "\n".join(window),
             }
         if operation != "search":
             raise SourceFailure(

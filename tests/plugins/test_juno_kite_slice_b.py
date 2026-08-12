@@ -2006,12 +2006,25 @@ def test_a_long_note_is_partly_read_not_refused(tmp_path):
     assert fewer["data"]["line_count"] == 10
     assert fewer["data"]["truncated"] is True
 
-    # Known limit, asserted so it is a decision and not a surprise: 400 lines
-    # is the schema ceiling and there is no offset, so the tail of a very long
-    # note cannot be reached at all. Partly read beats not read; reaching the
-    # rest needs pagination this reader does not have.
-    assert read(max_lines=400)["data"]["line_count"] == 400
-    assert "completion is 8 October" not in read(max_lines=400)["data"]["text"]
+    # And the tail is now reachable, which it was not: 400 lines was the
+    # ceiling and there was no way to ask for line 401.
+    first = read(max_lines=400)["data"]
+    assert first["start_line"] == 1
+    assert first["total_lines"] == 601
+    assert first["truncated"] is True
+    assert first["next_start_line"] == 401
+    assert "completion is 8 October" not in first["text"]
+
+    rest = read(max_lines=400, start_line=first["next_start_line"])["data"]
+    assert rest["start_line"] == 401
+    assert rest["truncated"] is False
+    assert rest["next_start_line"] is None
+    assert "completion is 8 October" in rest["text"]
+
+    # A start past the end is an empty window, not an error.
+    beyond = read(start_line=5000)["data"]
+    assert beyond["line_count"] == 0
+    assert beyond["truncated"] is False
 
     # A note larger than the answer allowance is still readable, because only
     # max_lines of it ever comes back. The same file as a PDF was always fine;
