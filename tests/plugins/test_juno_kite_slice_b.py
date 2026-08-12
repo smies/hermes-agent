@@ -3038,3 +3038,128 @@ def test_contextvar_isolation_does_not_transfer_private_read_authority(tmp_path)
         assert backend.calls == []
 
     _bound_turn(tmp_path, {"gmail": backend}, check)
+
+
+# ---------------------------------------------------------------------------
+# The reader contract.
+#
+# Two days of defects fell into a handful of shapes that kept recurring in
+# whichever reader had not been touched yet: a caller's own cap refusing the
+# call instead of bounding it, a refusal that would not name what it objected
+# to, an oversized-but-legal payload turned away rather than trimmed. Each was
+# fixed where it was found, one bespoke test at a time.
+#
+# These run the same invariants over every reader that takes a bound, so the
+# next reader cannot reintroduce them quietly. A new reader with a max_results
+# belongs in READER_CONTRACT.
+# ---------------------------------------------------------------------------
+
+# (tool, arguments, backend operation, the key the bound arrives under)
+READER_CONTRACT = [
+    (
+        "kite_gmail_search",
+        {"account": "personal", "query": "anything", "max_results": 3},
+        "gmail", "search",
+        lambda n: [{"id": f"message-{i}", "subject": "s"} for i in range(n)],
+    ),
+    (
+        "kite_calendar_read",
+        {"account": "personal", "start": "2026-08-01", "end": "2026-08-31",
+         "max_results": 3},
+        "calendar", "list",
+        lambda n: [
+            {"summary": f"event-{i}", "start": "2026-08-02", "end": "2026-08-03"}
+            for i in range(n)
+        ],
+    ),
+    (
+        "kite_whatsapp_archive_read",
+        {"operation": "search", "query": "anything", "max_results": 3},
+        "whatsapp", "search",
+        lambda n: [{"message_id": f"m-{i}", "text": "t"} for i in range(n)],
+    ),
+    (
+        "kite_things_read",
+        {"operation": "search", "query": "anything", "max_results": 3},
+        "things", "search",
+        lambda n: [{"id": f"t-{i}", "title": "task"} for i in range(n)],
+    ),
+    (
+        "kite_property_read",
+        {"operation": "list", "max_results": 3},
+        "property_intel", "list",
+        lambda n: [
+            {"id": f"123e4567-e89b-12d3-a456-4266141740{i:02d}",
+             "canonicalTitle": f"Villa {i}", "status": "watchlist"}
+            for i in range(n)
+        ],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "tool,args,backend_name,operation,make",
+    READER_CONTRACT,
+    ids=[row[0] for row in READER_CONTRACT],
+)
+def test_reader_contract_a_requested_bound_trims_and_never_refuses(
+    tmp_path, tool, args, backend_name, operation, make
+):
+    """max_results says how many are wanted, not how many there had better be.
+
+    Gmail, the calendar, the WhatsApp archive and Property Intel each treated
+    a source that returned more than the cap as a malformed read and returned
+    nothing. The caller asked for three; three were available; the answer was
+    an error.
+    """
+    wanted = args["max_results"]
+
+    def check(kite):
+        result = _invoke(kite, tool, dict(args))
+        assert result["status"] == "ok", result
+        data = result["data"]
+        rows = data["matches"] if isinstance(data, dict) and "matches" in data else data
+        assert isinstance(rows, list), data
+        assert len(rows) == wanted, f"{tool} returned {len(rows)} for cap {wanted}"
+
+    _bound_turn(
+        tmp_path,
+        {backend_name: RecordingBackend({operation: make(wanted * 4)})},
+        check,
+    )
+
+
+@pytest.mark.parametrize(
+    "tool,args,backend_name,operation,make",
+    READER_CONTRACT,
+    ids=[row[0] for row in READER_CONTRACT],
+)
+def test_reader_contract_a_refusal_names_the_argument(
+    tmp_path, tool, args, backend_name, operation, make
+):
+    """"file search requires query and max_results", to a call passing both.
+
+    A refusal that does not name what it objected to costs a round trip to
+    guess at, and the guess is often wrong twice.
+    """
+    def check(kite):
+        stray = {**args, "not_an_argument": "x"}
+        blocked = kite.pre_tool_call(
+            tool, stray, session_id="kite-session", turn_id="kite-turn",
+        )
+        # Either the schema gate or the reader may refuse it, but whichever
+        # does has to say which argument it means.
+        if blocked is not None:
+            assert "not_an_argument" in blocked["message"] or "schema" in (
+                blocked["message"].lower()
+            ), blocked
+            return
+        result = _invoke(kite, tool, stray)
+        assert result["status"] == "error", result
+        assert "not_an_argument" in result["error"]["message"], result
+
+    _bound_turn(
+        tmp_path,
+        {backend_name: RecordingBackend({operation: make(1)})},
+        check,
+    )

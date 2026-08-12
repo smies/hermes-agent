@@ -85,6 +85,19 @@ _TRANSACTION_DROPPED_FIELDS = {
 }
 
 
+def _bounded_rows(data: Any, limit: Any) -> Any:
+    """Trim a returned list to the caller's own bound. Anything else passes.
+
+    The reader contract: a max_results is how many are wanted. A source that
+    returns more is trimmed, never refused, and a reader that ignores the
+    bound entirely -- as the Things search did -- lets an answer grow until
+    some later cap refuses the whole thing.
+    """
+    if not isinstance(data, list) or not isinstance(limit, int) or limit <= 0:
+        return data
+    return data[:limit]
+
+
 def _bounded_transaction(payload: Any, limit: int) -> Any:
     """Bound every collection in a transaction, and say what was left out."""
     if not isinstance(payload, dict):
@@ -2042,7 +2055,8 @@ class PrivateReadService:
         else:
             _require_args(args, {"operation"}, {"operation"}, "a Things snapshot")
         if "things" in self.backends:
-            return self._injected("things", str(operation), canonical)
+            data = self._injected("things", str(operation), canonical)
+            return _bounded_rows(data, canonical.get("max_results"))
         cfg = self.config.get("things")
         if not isinstance(cfg, dict):
             raise SourceFailure(
@@ -2087,6 +2101,9 @@ class PrivateReadService:
                 "--json",
             ]
         result = self._run_text(argv)
+        # The client returns text, so the count cannot be trimmed here the way
+        # a list can. What it can do is not exceed the caller's own bound in
+        # bytes, which is the same promise in the only currency available.
         return {
             "project_uuid": THINGS_PROJECT_UUID,
             "project_title": THINGS_PROJECT_TITLE,
