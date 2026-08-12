@@ -501,7 +501,16 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "operation": {"type": "string", "enum": ["search", "read"]},
                 "root": {"type": "string", "minLength": 1, "maxLength": 64},
                 "relative_path": {"type": "string", "minLength": 1, "maxLength": 512},
-                "query": {"type": "string", "minLength": 1, "maxLength": 200},
+                "query": {
+                    "type": "string", "minLength": 1, "maxLength": 200,
+                    "description": (
+                        "Words to look for in a document's name or, for text "
+                        "files, its contents. Word order and punctuation do not "
+                        "matter. Files matching every word come first; a file "
+                        "matching only some is still returned, marked "
+                        "matched_on partial."
+                    ),
+                },
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 30},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": 400},
             },
@@ -524,6 +533,36 @@ def _session_when(stamp: Any) -> str:
 
 
 _SESSION_EXCERPT_CHARS = 300
+
+# A file search used to be one literal substring of the path. That is not how
+# anyone names a document or asks for one: "holiday itinerary" matched nothing
+# in a folder holding Ibiza-Trip-Itinerary.pdf, and five searches in a row came
+# back empty on a question the documents could answer. Words are matched
+# separately, separators are not punctuation the searcher should have to guess,
+# and a file matching some of them is still shown -- ranked below the ones
+# matching all of them, and labelled so the model can tell the difference.
+_FILE_SEARCH_MAX_SCANNED = 20_000
+_FILE_SEARCH_MAX_CONTENT_BYTES = 32 * 1024 * 1024
+_SEARCH_SEPARATORS = re.compile(r"[^0-9a-z]+")
+
+
+def _searchable(text: str) -> str:
+    return " " + _SEARCH_SEPARATORS.sub(" ", text.casefold()).strip() + " "
+
+
+def _matches(word: str, haystack: str) -> bool:
+    """A word matches where a word starts, so passport finds passports.
+
+    Anchoring to the start of a word and not to the end is the difference
+    between a search that tolerates a plural and one that matches the middle
+    of an unrelated word.
+    """
+    return f" {word}" in haystack
+
+
+def _search_tokens(query: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(_searchable(query).split()))
+
 
 
 def _session_denied_patterns():
@@ -2813,12 +2852,18 @@ class PrivateReadService:
             raise SourceFailure(
                 "invalid_arguments", "file search requires query and max_results"
             )
-        query = self._bounded_text(args["query"], "query", 200).casefold()
+        tokens = _search_tokens(self._bounded_text(args["query"], "query", 200))
+        if not tokens:
+            raise SourceFailure(
+                "invalid_arguments", "file search needs a word to search for"
+            )
         maximum = self._bounded_int(args["max_results"], "max_results", 30)
         root_real = roots[name].resolve(strict=True)
         if roots[name].is_symlink():
             raise SourceFailure("path_denied", "configured root cannot be a symlink")
-        matches: list[dict[str, Any]] = []
+        scored: list[tuple[int, int, str, dict[str, Any]]] = []
+        scanned = 0
+        content_bytes = 0
         for directory, names, files in os.walk(root_real, followlinks=False):
             names[:] = sorted(
                 item
@@ -2828,34 +2873,53 @@ class PrivateReadService:
             for filename in sorted(files):
                 if filename.startswith("."):
                     continue
+                scanned += 1
+                if scanned > _FILE_SEARCH_MAX_SCANNED:
+                    break
                 relative = str(Path(directory, filename).relative_to(root_real))
                 try:
                     path = self._safe_file(root_real, relative)
                 except SourceFailure:
                     continue
-                content_match = False
+                haystack = _searchable(relative)
+                in_name = {word for word in tokens if _matches(word, haystack)}
+                in_text: set[str] = set()
+                size = path.stat().st_size
                 if (
-                    path.stat().st_size <= self.output_bytes
+                    len(in_name) < len(tokens)
+                    and size <= self.output_bytes
+                    and content_bytes < _FILE_SEARCH_MAX_CONTENT_BYTES
                     and path.suffix.casefold() in _TEXT_SUFFIXES
                 ):
                     try:
-                        content_match = (
-                            query in path.read_text(encoding="utf-8").casefold()
-                        )
+                        body = _searchable(path.read_text(encoding="utf-8"))
                     except (OSError, UnicodeError):
-                        content_match = False
-                if query in relative.casefold() or content_match:
-                    matches.append({
-                        "root": name,
-                        "relative_path": relative,
-                        "size_bytes": path.stat().st_size,
-                    })
-                    if len(matches) > maximum:
-                        raise SourceFailure(
-                            "cap_exceeded",
-                            "file search exceeded the requested result cap",
-                        )
-        return matches
+                        body = ""
+                    content_bytes += size
+                    in_text = {word for word in tokens if _matches(word, body)}
+                hit = in_name | in_text
+                if not hit:
+                    continue
+                # Everything in the name is the strongest thing a search can
+                # say; everything, somewhere, is next; some of it is still
+                # worth showing, because a partly-remembered name is the
+                # ordinary case and returning nothing teaches nothing.
+                if len(in_name) == len(tokens):
+                    rank, why = 0, "name"
+                elif len(hit) == len(tokens):
+                    rank, why = 1, "contents"
+                else:
+                    rank, why = 2, "partial"
+                scored.append((rank, -len(hit), relative, {
+                    "root": name,
+                    "relative_path": relative,
+                    "size_bytes": size,
+                    "matched_on": why,
+                }))
+            if scanned > _FILE_SEARCH_MAX_SCANNED:
+                break
+        scored.sort(key=lambda item: item[:3])
+        return [item[3] for item in scored[:maximum]]
 
 
 def handlers_for(service: PrivateReadService) -> dict[str, Callable[..., str]]:

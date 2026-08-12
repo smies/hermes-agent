@@ -1498,6 +1498,78 @@ def test_locate_says_where_a_document_is_without_being_able_to_open_it(tmp_path)
         )["status"] == "error", malformed
 
 
+def test_a_file_search_finds_a_document_the_way_it_is_asked_for(tmp_path):
+    """Search matched the query as one literal substring of the path.
+
+    Nobody names a document the way they ask for it. "holiday itinerary" found
+    nothing in a folder holding Ibiza-Trip-Itinerary-2026.pdf, and on the turn
+    where Lucy asked about the trip five searches in a row came back empty on a
+    question the documents could answer.
+
+    Words are matched separately and punctuation is not something the asker has
+    to guess. Everything-in-the-name ranks first, everything-somewhere next, and
+    a file matching only some of the words is still shown and labelled, because
+    a half-remembered name is the ordinary case.
+    """
+    root = tmp_path / "personal"
+    (root / "Travel").mkdir(parents=True)
+    (root / "Travel" / "Ibiza-Trip-Itinerary-2026.pdf").write_bytes(b"%PDF-1.4 ")
+    (root / "Travel" / "hotel-booking.md").write_text(
+        "Confirmation for the holiday itinerary", encoding="utf-8"
+    )
+    (root / "insurance.md").write_text("Travel cover", encoding="utf-8")
+    (root / "20.11.25_180-Strand-Report.pdf").write_bytes(b"%PDF-1.4 ")
+    (root / "Passports-Renewal.pdf").write_bytes(b"%PDF-1.4 ")
+    service = PrivateReadService({
+        "enabled": True,
+        "output_bytes": 65536,
+        "files": {"roots": [{"name": "documents", "path": str(root)}],
+                  "allowed_bases": [str(tmp_path)]},
+    })
+
+    def search(query, limit=10):
+        return json.loads(service.execute("kite_personal_files_read", {
+            "operation": "search", "root": "documents",
+            "query": query, "max_results": limit,
+        }))["data"]
+
+    # Word order, case and punctuation do not decide whether it is found.
+    hits = search("holiday itinerary")
+    assert [item["relative_path"] for item in hits] == [
+        "Travel/hotel-booking.md",       # every word, in the contents
+        "Travel/Ibiza-Trip-Itinerary-2026.pdf",   # one word, in the name
+    ]
+    assert hits[0]["matched_on"] == "contents"
+    assert hits[1]["matched_on"] == "partial"
+
+    assert [item["relative_path"] for item in search("itinerary ibiza")] == [
+        "Travel/Ibiza-Trip-Itinerary-2026.pdf",
+        "Travel/hotel-booking.md",
+    ]
+    assert search("ibiza trip 2026")[0]["matched_on"] == "name"
+
+    # A document whose name is punctuated one way, asked for another way. This
+    # is not hypothetical: it is how the name was typed when it was asked for.
+    named = search("20-11-25 180 Strand")
+    assert named[0]["relative_path"] == "20.11.25_180-Strand-Report.pdf"
+    assert named[0]["matched_on"] == "name"
+    assert search("20/11/25_180 strand")[0]["matched_on"] == "name"
+
+    # A word matches where a word starts, so a plural is not a different
+    # document -- and the middle of an unrelated word is not a match at all.
+    assert [item["relative_path"] for item in search("passport")] == [
+        "Passports-Renewal.pdf"
+    ]
+    assert search("port") == []
+
+    # More matches than asked for is a shortlist, not a failed read.
+    limited = search("travel", limit=1)
+    assert len(limited) == 1
+
+    _ = search("Mauritius")
+    assert search("Mauritius") == []
+
+
 def test_personal_file_containment_and_bounds(tmp_path):
     root = tmp_path / "personal"
     root.mkdir()
@@ -1530,7 +1602,12 @@ def test_personal_file_containment_and_bounds(tmp_path):
         )
     )
     assert found["data"] == [
-        {"relative_path": "trip.md", "root": "obsidian", "size_bytes": 29}
+        {
+            "relative_path": "trip.md",
+            "root": "obsidian",
+            "size_bytes": 29,
+            "matched_on": "contents",
+        }
     ]
     read = json.loads(
         service.execute(
