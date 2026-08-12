@@ -546,6 +546,26 @@ _FILE_SEARCH_MAX_CONTENT_BYTES = 32 * 1024 * 1024
 _SEARCH_SEPARATORS = re.compile(r"[^0-9a-z]+")
 
 
+# "file search requires query and max_results" was the answer to a call that
+# passed both. What it objected to was max_lines -- advertised on the same tool,
+# for the other operation -- and it never said so. A refusal that does not name
+# the argument it refused costs a round trip to guess at, and the guess is
+# often wrong twice.
+def _require_args(
+    args: Mapping[str, Any], allowed: Iterable[str], required: Iterable[str], label: str
+) -> None:
+    extra = sorted(set(args) - set(allowed))
+    missing = sorted(set(required) - set(args))
+    if not extra and not missing:
+        return
+    complaint = []
+    if missing:
+        complaint.append("needs " + ", ".join(missing))
+    if extra:
+        complaint.append("does not take " + ", ".join(extra))
+    raise SourceFailure("invalid_arguments", f"{label} " + " and ".join(complaint))
+
+
 def _searchable(text: str) -> str:
     return " " + _SEARCH_SEPARATORS.sub(" ", text.casefold()).strip() + " "
 
@@ -1220,12 +1240,12 @@ class PrivateReadService:
 
     @staticmethod
     def _require_exact(
-        args: dict[str, Any], allowed: set[str], required: set[str]
+        args: dict[str, Any],
+        allowed: set[str],
+        required: set[str],
+        label: str = "this read",
     ) -> None:
-        if set(args) - allowed or not required.issubset(args):
-            raise SourceFailure(
-                "invalid_arguments", "arguments do not match the typed operation"
-            )
+        _require_args(args, allowed, required, label)
 
     @staticmethod
     def _bounded_text(
@@ -1817,27 +1837,22 @@ class PrivateReadService:
             "operation": operation,
         }
         if operation == "item":
-            if set(args) != {"operation", "item_id"}:
-                raise SourceFailure(
-                    "invalid_arguments", "exact Things item requires only item_id"
-                )
+            _require_args(
+                args, {"operation", "item_id"}, {"operation", "item_id"},
+                "an exact Things item",
+            )
             canonical["item_id"] = self._bounded_text(
                 args.get("item_id"), "item_id", 256
             )
         elif operation in {"search", "recent_completed"}:
             required = {"operation", "query", "max_results"}
-            if set(args) != required:
-                raise SourceFailure(
-                    "invalid_arguments", "Things lookup requires query and max_results"
-                )
+            _require_args(args, required, required, "a Things lookup")
             canonical["query"] = self._bounded_text(args.get("query"), "query", 200)
             canonical["max_results"] = self._bounded_int(
                 args.get("max_results"), "max_results", 30
             )
-        elif set(args) != {"operation"}:
-            raise SourceFailure(
-                "invalid_arguments", "Things snapshot accepts no selectors"
-            )
+        else:
+            _require_args(args, {"operation"}, {"operation"}, "a Things snapshot")
         if "things" in self.backends:
             return self._injected("things", str(operation), canonical)
         cfg = self.config.get("things")
@@ -2158,13 +2173,10 @@ class PrivateReadService:
         allowed_args = set(expected[str(operation)]) | (
             {"query"} if operation == "list" else set()
         )
-        if set(args) != allowed_args and not (
-            operation == "list" and set(args) == expected["list"]
-        ):
-            raise SourceFailure(
-                "invalid_arguments",
-                "Property Intel arguments do not match the operation",
-            )
+        _require_args(
+            args, allowed_args, expected[str(operation)],
+            f"the Property Intel {operation} operation",
+        )
         canonical = dict(args)
         for key in ("property_id", "note_id", "entry_id"):
             if key in canonical and _UUID_RE.fullmatch(str(canonical[key])) is None:
@@ -2775,13 +2787,12 @@ class PrivateReadService:
             raise SourceFailure("path_denied", "personal file root is unavailable")
         operation = args.get("operation")
         if operation == "read":
-            if (
-                set(args) - {"operation", "root", "relative_path", "max_lines"}
-                or "relative_path" not in args
-            ):
-                raise SourceFailure(
-                    "invalid_arguments", "file read requires one relative_path"
-                )
+            _require_args(
+                args,
+                {"operation", "root", "relative_path", "max_lines"},
+                {"operation", "root", "relative_path"},
+                "a file read",
+            )
             maximum_lines = self._bounded_int(
                 args.get("max_lines", 400), "max_lines", 400
             )
@@ -2843,15 +2854,16 @@ class PrivateReadService:
                 "line_count": len(lines),
                 "text": text,
             }
-        if operation != "search" or set(args) != {
-            "operation",
-            "root",
-            "query",
-            "max_results",
-        }:
+        if operation != "search":
             raise SourceFailure(
-                "invalid_arguments", "file search requires query and max_results"
+                "operation_denied", "a personal file read is a search or a read"
             )
+        _require_args(
+            args,
+            {"operation", "root", "query", "max_results"},
+            {"operation", "root", "query", "max_results"},
+            "a file search",
+        )
         tokens = _search_tokens(self._bounded_text(args["query"], "query", 200))
         if not tokens:
             raise SourceFailure(

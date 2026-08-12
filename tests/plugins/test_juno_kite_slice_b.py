@@ -1570,6 +1570,57 @@ def test_a_file_search_finds_a_document_the_way_it_is_asked_for(tmp_path):
     assert search("Mauritius") == []
 
 
+def test_a_refused_argument_is_named(tmp_path):
+    """"file search requires query and max_results" -- to a call passing both.
+
+    What it objected to was max_lines: advertised on the same tool, for the
+    other operation, and never named. A refusal that does not say which
+    argument it refused costs a round trip to guess at, and the guess is often
+    wrong twice.
+    """
+    root = tmp_path / "personal"
+    root.mkdir()
+    (root / "trip.md").write_text("Ibiza", encoding="utf-8")
+    service = PrivateReadService({
+        "enabled": True,
+        "output_bytes": 4096,
+        "files": {"roots": [{"name": "obsidian", "path": str(root)}],
+                  "allowed_bases": [str(tmp_path)]},
+        "property_intel": {"base_url": "https://example.invalid"},
+    })
+
+    def why(tool, args):
+        result = json.loads(service.execute(tool, args))
+        assert result["status"] == "error", result
+        return result["error"]["message"]
+
+    said = why("kite_personal_files_read", {
+        "operation": "search", "root": "obsidian",
+        "query": "Ibiza", "max_results": 5, "max_lines": 20,
+    })
+    assert "max_lines" in said
+    assert "does not take" in said
+    assert "query" not in said
+
+    said = why("kite_personal_files_read", {"operation": "read", "root": "obsidian"})
+    assert "needs relative_path" in said
+
+    said = why("kite_property_read", {
+        "operation": "list", "max_results": 5, "property_id": "nope",
+    })
+    assert "property_id" in said and "does not take" in said
+
+    said = why("kite_things_read", {"operation": "search", "query": "nacho"})
+    assert "needs max_results" in said
+
+    # And a call that is right still gets through.
+    ok = json.loads(service.execute("kite_personal_files_read", {
+        "operation": "search", "root": "obsidian", "query": "Ibiza",
+        "max_results": 5,
+    }))
+    assert ok["status"] == "ok"
+
+
 def test_personal_file_containment_and_bounds(tmp_path):
     root = tmp_path / "personal"
     root.mkdir()
