@@ -935,6 +935,26 @@ def _run_preview_reader(argv: list[str], limit: int = _PREVIEW_MAX_CHARS) -> str
     return re.sub(r"\s+", " ", str(completed.stdout or "")).strip()[:limit]
 
 
+def _decoded_artifact_bytes(payload: Mapping[str, Any]) -> Optional[bytes]:
+    """The attachment's bytes, if the source command sent them; else None.
+
+    Best-effort by design: this feeds the read path's local text extraction,
+    where failing to decode means returning the source's own empty text --
+    exactly what happened before extraction existed here -- rather than
+    turning a readable turn into an error.
+    """
+    binary = payload.get("artifact_bytes")
+    if isinstance(binary, bytes):
+        return binary
+    encoded = payload.get("artifact_base64")
+    if isinstance(encoded, str) and encoded:
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _document_preview(
     data: bytes,
     mime_type: str,
@@ -1467,10 +1487,29 @@ class PrivateReadService:
 
     def _gmail_attachment(self, args: dict[str, Any]) -> Any:
         result = self._gmail_attachment_payload(args)
+        text = result.get("text")
+        # The source command decodes only genuinely textual formats and
+        # returns "" for everything else -- so a PDF read as an attachment was
+        # always empty, while the same bytes staged for release extracted
+        # fine. The engagement letter is the live case: "text extraction
+        # returned empty" for a PDF this module reads perfectly well. Extract
+        # here, exactly as the release path and personal-file reads do, with
+        # the same bounds.
+        if isinstance(text, str) and not text.strip():
+            artifact = _decoded_artifact_bytes(result)
+            if artifact is not None:
+                mime = str(result.get("mime_type") or "").split(";", 1)[0].lower()
+                text = _document_preview(
+                    artifact,
+                    mime,
+                    limit=min(_READ_EXTRACT_CHARS, self.output_bytes // 2),
+                    pages=_READ_MAX_PAGES,
+                )
         return {
-            key: result[key]
-            for key in ("filename", "mime_type", "size_bytes", "text")
-            if key in result
+            "filename": result.get("filename"),
+            "mime_type": result.get("mime_type"),
+            "size_bytes": result.get("size_bytes"),
+            "text": text if isinstance(text, str) else "",
         }
 
     def _gmail_attachment_payload(

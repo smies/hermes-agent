@@ -789,6 +789,116 @@ def test_a_requested_result_cap_bounds_the_read_instead_of_failing_it(tmp_path):
     )
 
 
+def _pdf_with_text(text: str) -> bytes:
+    """A minimal but structurally valid PDF: pdftotext needs a real xref."""
+    body = f"BT /F1 12 Tf 20 700 Td ({text}) Tj ET".encode("latin-1")
+    objs = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+        b"/Resources<</Font<</F1<</Type/Font/Subtype/Type1"
+        b"/BaseFont/Helvetica>>>>>>/Contents 4 0 R>>",
+        b"<</Length " + str(len(body)).encode("ascii")
+        + b">>\nstream\n" + body + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for n, obj in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{n} 0 obj".encode("ascii") + obj + b"endobj\n"
+    xref = len(out)
+    out += b"xref\n0 " + str(len(objs) + 1).encode("ascii")
+    out += b"\n0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode("ascii")
+    out += (b"trailer<</Size " + str(len(objs) + 1).encode("ascii")
+            + b"/Root 1 0 R>>\nstartxref\n" + str(xref).encode("ascii")
+            + b"\n%%EOF\n")
+    return bytes(out)
+
+
+def test_a_pdf_attachment_is_read_not_returned_empty(tmp_path):
+    """"Text extraction returned empty", live, for a PDF this module reads.
+
+    The source command decodes only genuinely textual formats and returns ""
+    for everything else, and the read path passed that through -- so every PDF
+    attachment read as empty while the same bytes staged for release extracted
+    fine. The engagement letter was the live case: retrieved, authorised, and
+    reported unreadable.
+    """
+    import base64 as _b64
+
+    pdf = _pdf_with_text("Engagement letter: Villa purchase at 3.2m EUR")
+    gmail = RecordingBackend({
+        "search": [{"id": "message-1", "subject": "engagement letter"}],
+        "get": {
+            "id": "message-1",
+            "body": "engagement letter attached",
+            "attachments": [
+                {"attachment_id": "attachment-1", "filename": "EL MS 07 08 2026.pdf"}
+            ],
+        },
+        "attachment_extract": {
+            "filename": "EL MS 07 08 2026.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": len(pdf),
+            "text": "",
+            "artifact_base64": _b64.b64encode(pdf).decode("ascii"),
+        },
+    })
+
+    def check(kite):
+        _invoke(kite, "kite_gmail_search",
+                {"account": "personal", "query": "engagement", "max_results": 3})
+        _invoke(kite, "kite_gmail_get",
+                {"account": "personal", "message_id": "message-1"})
+        result = _invoke(kite, "kite_gmail_attachment_extract", {
+            "account": "personal", "message_id": "message-1",
+            "attachment_id": "attachment-1",
+        })
+        assert result["status"] == "ok", result
+        assert "Villa purchase at 3.2m EUR" in result["data"]["text"]
+        # The binary itself never reaches the model.
+        assert "artifact_base64" not in result["data"]
+
+    _bound_turn(tmp_path, {"gmail": gmail}, check)
+
+
+def test_an_unextractable_attachment_still_reads_as_empty_not_an_error(tmp_path):
+    """Failing to extract must not be worse than the old behaviour."""
+    gmail = RecordingBackend({
+        "search": [{"id": "message-1", "subject": "engagement letter"}],
+        "get": {
+            "id": "message-1",
+            "body": "attached",
+            "attachments": [
+                {"attachment_id": "attachment-1", "filename": "corrupt.pdf"}
+            ],
+        },
+        "attachment_extract": {
+            "filename": "corrupt.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 40,
+            "text": "",
+            "artifact_base64": "not-valid-base64!!!",
+        },
+    })
+
+    def check(kite):
+        _invoke(kite, "kite_gmail_search",
+                {"account": "personal", "query": "engagement", "max_results": 3})
+        _invoke(kite, "kite_gmail_get",
+                {"account": "personal", "message_id": "message-1"})
+        result = _invoke(kite, "kite_gmail_attachment_extract", {
+            "account": "personal", "message_id": "message-1",
+            "attachment_id": "attachment-1",
+        })
+        assert result["status"] == "ok", result
+        assert result["data"]["text"] == ""
+
+    _bound_turn(tmp_path, {"gmail": gmail}, check)
+
+
 def test_gmail_accounts_and_exact_id_chain(tmp_path):
     gmail = RecordingBackend({
         "search": [{"id": "message-1", "subject": "Synthetic trip"}],
