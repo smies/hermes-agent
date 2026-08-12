@@ -3012,13 +3012,18 @@ class PrivateReadService:
                 }
             text = path.read_text(encoding="utf-8")
             lines = text.splitlines()
-            if len(lines) > maximum_lines:
-                raise SourceFailure(
-                    "cap_exceeded", "file exceeds the requested line cap"
-                )
+            # max_lines is how much was asked for, not how much there had
+            # better be. Refusing meant every note longer than the default
+            # four hundred lines was unreadable rather than partly read --
+            # and a long note is exactly where a long answer lives.
+            truncated = len(lines) > maximum_lines
+            if truncated:
+                lines = lines[:maximum_lines]
+                text = "\n".join(lines)
             return {
                 "root": name,
                 "relative_path": str(path.relative_to(roots[name].resolve())),
+                "truncated": truncated,
                 "line_count": len(lines),
                 "text": text,
             }

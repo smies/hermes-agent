@@ -1703,6 +1703,62 @@ def test_a_file_search_finds_a_document_the_way_it_is_asked_for(tmp_path):
     assert search("Mauritius") == []
 
 
+def test_a_long_note_is_partly_read_not_refused(tmp_path):
+    """max_lines defaulted to 400, so a 401-line note was unreadable.
+
+    It is how much was asked for, not how much there had better be. Refusing
+    returned nothing at all from a file the answer was probably in -- and a
+    long note is exactly where a long answer lives.
+    """
+    root = tmp_path / "personal"
+    root.mkdir()
+    note = root / "ibiza-purchase.md"
+    note.write_text(
+        "\n".join([f"line {n}" for n in range(600)] + ["completion is 8 October"]),
+        encoding="utf-8",
+    )
+    service = PrivateReadService({
+        "enabled": True,
+        "output_bytes": 65536,
+        "files": {"roots": [{"name": "obsidian", "path": str(root)}],
+                  "allowed_bases": [str(tmp_path)]},
+    })
+
+    def read(**extra):
+        return json.loads(service.execute("kite_personal_files_read", {
+            "operation": "read", "root": "obsidian",
+            "relative_path": "ibiza-purchase.md", **extra,
+        }))
+
+    # The default no longer refuses a file merely for being long.
+    default = read()
+    assert default["status"] == "ok", default
+    assert default["data"]["truncated"] is True
+    assert default["data"]["line_count"] == 400
+    assert default["data"]["text"].startswith("line 0")
+
+    # A smaller ask is honoured exactly, and still says it was cut.
+    fewer = read(max_lines=10)
+    assert fewer["data"]["line_count"] == 10
+    assert fewer["data"]["truncated"] is True
+
+    # Known limit, asserted so it is a decision and not a surprise: 400 lines
+    # is the schema ceiling and there is no offset, so the tail of a very long
+    # note cannot be reached at all. Partly read beats not read; reaching the
+    # rest needs pagination this reader does not have.
+    assert read(max_lines=400)["data"]["line_count"] == 400
+    assert "completion is 8 October" not in read(max_lines=400)["data"]["text"]
+
+    # A file that fits says so plainly.
+    short = root / "short.md"
+    short.write_text("one\ntwo\n", encoding="utf-8")
+    fitted = json.loads(service.execute("kite_personal_files_read", {
+        "operation": "read", "root": "obsidian", "relative_path": "short.md",
+    }))
+    assert fitted["data"]["truncated"] is False
+    assert fitted["data"]["line_count"] == 2
+
+
 def test_a_refused_argument_is_named(tmp_path):
     """"file search requires query and max_results" -- to a call passing both.
 
