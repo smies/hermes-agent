@@ -3825,7 +3825,23 @@ class TrustedPrincipalRuntime:
                         )
                         property_mode = self._property_output_authorized(binding, state)
             if property_provenance and not property_mode:
-                leak_reason = "Property output authority or provenance is unavailable"
+                # The expanded Property prose mode is for a turn whose only
+                # source was Property Intel. Reading anything alongside it --
+                # recall, mail, the calendar -- turns the mode off, and that
+                # used to refuse the whole answer. Lucy asked what the house
+                # being bought was, Kite read the transaction and then checked
+                # its own notes, and the turn was withheld for it.
+                #
+                # Provenance without the mode means more scrutiny, not no
+                # answer: both gates apply. The Property gate bounds the form
+                # its data would be dumped in -- tables, bullets, size -- and
+                # the ordinary gate catches the identifiers the Property one
+                # deliberately does not inspect. Passing both is stricter than
+                # either, so this cannot release what the authorized path
+                # would not.
+                leak_reason = self._property_output_leak_reason(
+                    answer
+                ) or self._leak_reason(answer, output=True)
             elif property_mode:
                 leak_reason = self._property_output_leak_reason(answer)
             elif host_authored:

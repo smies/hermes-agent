@@ -1342,6 +1342,61 @@ def test_a_property_list_is_an_index_not_the_whole_file(tmp_path):
     )
 
 
+def test_reading_something_alongside_property_does_not_withhold_the_answer(tmp_path):
+    """Lucy asked what the house being bought was and the answer was withheld.
+
+    The expanded Property prose mode is for a turn whose only source was
+    Property Intel. Kite read the transaction and then checked one other
+    source, which turned the mode off -- and provenance without the mode
+    refused the whole turn rather than checking it more carefully.
+
+    Both gates apply now. The Property gate bounds the form its data would be
+    dumped in; the ordinary gate catches the identifiers the Property one
+    deliberately does not inspect. Passing both is stricter than either, so
+    this releases nothing the authorized path would not.
+    """
+    property_id = "123e4567-e89b-12d3-a456-426614174000"
+    verdicts = {}
+
+    def turn(label, text):
+        def check(kite):
+            _invoke(kite, "kite_property_read",
+                    {"operation": "property", "property_id": property_id})
+            _invoke(kite, "kite_whatsapp_archive_read",
+                    {"operation": "search", "query": "villa", "max_results": 2})
+            verdicts[label] = json.loads(
+                kite.transform_llm_output(
+                    response_text=text, session_id="kite-session"
+                ).split(RESPONSE_PREFIX, 1)[1]
+            )
+
+        _bound_turn(
+            tmp_path,
+            {
+                "property_intel": RecordingBackend({"property": {"id": property_id}}),
+                "whatsapp": RecordingBackend({"search": [{"message": "ordinary"}]}),
+            },
+            check,
+        )
+
+    turn("prose", "The purchase is Villa Lena at 3.2m EUR, in due diligence. "
+                  "The seller confirmed an 8 October move-out.")
+    turn("identifier", f"Property ID: {property_id}")
+    turn("table", "\n".join([
+        "| field | value |", "| --- | --- |",
+        "| price | 3200000 |", "| stage | due_diligence |",
+    ]))
+
+    # An ordinary prose answer, from two sources, is released.
+    assert verdicts["prose"]["denied"] is False, verdicts["prose"]
+    assert "Villa Lena" in verdicts["prose"]["answer"]
+    # The ordinary gate still applies: an identifier is still refused.
+    assert verdicts["identifier"]["denied"] is True
+    # And so does the Property form gate, which the ordinary one has no
+    # opinion about: a table dump of its data is still refused.
+    assert verdicts["table"]["denied"] is True
+
+
 def test_property_mode_denies_over_limit_mixed_source_and_non_james(tmp_path):
     property_id = "123e4567-e89b-12d3-a456-426614174000"
 
