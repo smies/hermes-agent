@@ -11,6 +11,7 @@ import copy
 import io
 import json
 import logging
+from datetime import datetime
 import threading
 import zlib
 from contextvars import copy_context
@@ -6106,8 +6107,9 @@ def test_a_document_turn_carries_its_instruction_into_the_turn(
     """Twice Juno refused a document request with one API call and no consult.
 
     The tool description already forbade that and was not enough. A static
-    description is skimmed; a line in the turn is read. This fires only on a
-    document turn, so ordinary questions are untouched.
+    description is skimmed; a line in the turn is read. The document
+    instruction fires only on a document turn; an ordinary question carries
+    the turn's other standing line and nothing about documents.
     """
     from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_INBOUND_TEXT
 
@@ -6118,15 +6120,57 @@ def test_a_document_turn_carries_its_instruction_into_the_turn(
     finally:
         _ACTIVE_INBOUND_TEXT.reset(token)
 
+    assert result is not None, typed
     if not expect_context:
-        assert result is None, typed
+        assert "consult_kite" not in result["context"], typed
+        assert "document" not in result["context"].lower(), typed
         return
-    assert result is not None and "consult_kite" in result["context"], typed
+    assert "consult_kite" in result["context"], typed
     lowered = result["context"].lower()
     # It directs, without deciding entitlement itself.
     assert "host's decisions" in lowered
     assert "children's documents" in lowered
     assert "without having asked" in lowered
+
+
+def test_juno_is_told_what_day_it_is_on_every_turn(tmp_path):
+    """Asked for the day's flight timings, Juno gave the previous day's.
+
+    The system prompt is built once per session and cached, and says
+    "Conversation started" -- accurate, and read as "today". A WhatsApp
+    conversation lives for days and Juno has no tools of its own to check the
+    date with, so by the next morning it is confidently a day behind. Live on
+    2026-08-12 at 05:58, in a session opened on the 11th, it answered "Today --
+    Tuesday 11 August" and gave the departure time of a flight that had
+    already gone. She had to correct it: "Today is Wednesday".
+
+    So the day is put in the turn, which is built fresh every time, rather
+    than in the prompt, which is not.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_INBOUND_TEXT
+
+    juno = _juno_for_context(tmp_path)
+    asked = "What are the timings today for holiday?"
+    token = _ACTIVE_INBOUND_TEXT.set(asked)
+    try:
+        result = _session(lambda: juno.pre_llm_call(user_message=asked), mode="juno")
+    finally:
+        _ACTIVE_INBOUND_TEXT.reset(token)
+
+    today = datetime.now().astimezone()
+    assert result is not None
+    context = result["context"]
+    assert today.strftime("%A") in context
+    assert today.strftime("%B") in context
+    assert str(today.year) in context
+    assert str(today.day) in context
+    # And it says why the other date in the conversation is not today, because
+    # that date is still up there and still says a day.
+    assert "when it started" in context
+
+    # This is Juno's, not Kite's: Kite gets a policy view instead.
+    kite = _runtime(tmp_path, tmp_path / "family", mode="kite", clock=Clock())
+    assert kite._juno_turn_context() is None
 
 
 def test_the_turn_instruction_never_reaches_the_kite_lane(tmp_path):

@@ -2580,7 +2580,7 @@ class TrustedPrincipalRuntime:
         return rendered
 
     def _juno_turn_context(self) -> Optional[dict]:
-        """Put the document instruction in the turn, not in a tool description.
+        """What this particular turn needs said, in the turn.
 
         Twice now Juno has refused a document request outright -- "I can't
         access or send another person's passport" for the principal's own
@@ -2597,11 +2597,21 @@ class TrustedPrincipalRuntime:
             return None
         from .disclosure import DOCUMENT_DESCRIPTOR, classify_output_tier
 
+        # The system prompt is built once per session and cached, and says
+        # "Conversation started" -- accurate, and read as "today". A WhatsApp
+        # session lives for days, and Juno has no tools of its own to check
+        # with, so by the next morning it is confidently a day behind. Asked
+        # for the day's flight timings on the 12th it gave the 11th's, for a
+        # flight that had already gone. This line is built per turn.
+        lines = [
+            "JUNO--KITE: today is "
+            + datetime.now().astimezone().strftime("%A %-d %B %Y")
+            + ". The date at the top of this conversation is when it started, "
+            "which may be days ago."
+        ]
         inbound = _ACTIVE_INBOUND_TEXT.get()
-        if not inbound or classify_output_tier(inbound) != DOCUMENT_DESCRIPTOR:
-            return None
-        return {
-            "context": (
+        if inbound and classify_output_tier(inbound) == DOCUMENT_DESCRIPTOR:
+            lines.append(
                 "JUNO--KITE: this turn is a request for a specific document. "
                 "Call consult_kite before answering. Whether it exists, and "
                 "whose it is, and whether it may be released, are the host's "
@@ -2610,7 +2620,7 @@ class TrustedPrincipalRuntime:
                 "or access it without having asked; if the host denies it, "
                 "report the reason it gave."
             )
-        }
+        return {"context": "\n".join(lines)}
 
     def pre_llm_call(
         self,
