@@ -20,7 +20,7 @@ import re
 import sqlite3
 import threading
 from collections import OrderedDict
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 import stat
 import subprocess
 import tempfile
@@ -97,6 +97,68 @@ from .document_release import _EXECUTABLE_SUFFIXES
 _DATE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?)?\Z"
 )
+# A date argument was one of the readers' most reliable ways to lose an answer.
+# "after must be an ISO date" is true and useless: it does not say what an ISO
+# date looks like, so the retry is a guess. And the forms being refused were
+# the ones anybody writing a mail query reaches for first -- Gmail's own
+# YYYY/MM/DD, or "30d" for the last month. The window wanted is unambiguous in
+# every one of them.
+#
+# The regex above also let 2026-13-45 through, which then went to the source as
+# a search term nothing could match. Parsing settles that in passing.
+_RELATIVE_DATE_RE = re.compile(r"(\d{1,4})\s*([dwmy])\Z", re.IGNORECASE)
+_RELATIVE_DAYS = {"d": 1, "w": 7, "m": 31, "y": 366}
+_DATE_HELP = (
+    "give a date as 2026-08-01 (or 2026/08/01), or a span back from today "
+    "as 7d, 3w, 6m, 1y, or today/yesterday"
+)
+
+
+def _today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _normalise_date(value: str, key: str, *, allow_time: bool = False) -> str:
+    """Return YYYY-MM-DD for anything that unambiguously names a day.
+
+    With allow_time, a full ISO timestamp is passed through untouched -- a
+    calendar window may legitimately want an hour, and rounding it to the day
+    would quietly widen the read.
+    """
+
+    text = value.strip()
+    if allow_time and "T" in text and _DATE_RE.fullmatch(text) is not None:
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise SourceFailure(
+                "invalid_arguments", f"{key} is not a date I can read -- {_DATE_HELP}"
+            ) from None
+        return text
+    lowered = text.lower()
+    if lowered in {"today", "now"}:
+        return _today().isoformat()
+    if lowered == "yesterday":
+        return (_today() - timedelta(days=1)).isoformat()
+    relative = _RELATIVE_DATE_RE.fullmatch(lowered)
+    if relative is not None:
+        span = int(relative.group(1)) * _RELATIVE_DAYS[relative.group(2).lower()]
+        if span > 36600:
+            raise SourceFailure("invalid_arguments", f"{key} reaches back too far")
+        return (_today() - timedelta(days=span)).isoformat()
+    calendrical = text.replace("/", "-").replace(".", "-")
+    day = calendrical[:10]
+    try:
+        parsed = date.fromisoformat(day)
+    except ValueError:
+        raise SourceFailure(
+            "invalid_arguments", f"{key} is not a date I can read -- {_DATE_HELP}"
+        ) from None
+    if len(calendrical) > 10 and _DATE_RE.fullmatch(calendrical) is None:
+        raise SourceFailure(
+            "invalid_arguments", f"{key} is not a date I can read -- {_DATE_HELP}"
+        )
+    return parsed.isoformat()
 # The release path already settled this argument -- refuse what executes and
 # carry everything else -- but reading kept its own allow-list of twelve
 # extensions, so a HEIC photo of a document could be released and never found.
@@ -257,8 +319,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "account": {"type": "string", "enum": ["personal", "kite"]},
                 "query": {"type": "string", "minLength": 1, "maxLength": 512},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 25},
-                "after": {"type": "string", "maxLength": 32},
-                "before": {"type": "string", "maxLength": 32},
+                "after": {
+                    "type": "string", "maxLength": 32, "description": _DATE_HELP,
+                },
+                "before": {
+                    "type": "string", "maxLength": 32, "description": _DATE_HELP,
+                },
             },
             ("account", "query", "max_results"),
         ),
@@ -300,8 +366,14 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "parameters": _object_schema(
             {
                 "account": {"type": "string", "enum": ["personal", "work_free_busy"]},
-                "start": {"type": "string", "minLength": 10, "maxLength": 40},
-                "end": {"type": "string", "minLength": 10, "maxLength": 40},
+                "start": {
+                    "type": "string", "minLength": 2, "maxLength": 40,
+                    "description": _DATE_HELP,
+                },
+                "end": {
+                    "type": "string", "minLength": 2, "maxLength": 40,
+                    "description": _DATE_HELP,
+                },
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
             },
             ("account", "start", "end", "max_results"),
@@ -358,7 +430,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "name": {"type": "string", "minLength": 1, "maxLength": 128},
                 "query": {"type": "string", "minLength": 1, "maxLength": 200},
                 "message_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                "since": {"type": "string", "minLength": 10, "maxLength": 40},
+                "since": {
+                    "type": "string", "minLength": 2, "maxLength": 40,
+                    "description": _DATE_HELP,
+                },
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
             },
             ("operation", "max_results"),
@@ -1155,12 +1230,10 @@ class PrivateReadService:
         maximum = self._bounded_int(args["max_results"], "max_results", 25)
         for key, operator in (("after", "after"), ("before", "before")):
             if key in args:
-                value = self._bounded_text(args[key], key, 32)
-                if _DATE_RE.fullmatch(value) is None:
-                    raise SourceFailure(
-                        "invalid_arguments", f"{key} must be an ISO date"
-                    )
-                query += f" {operator}:{value[:10].replace('-', '/')}"
+                value = _normalise_date(
+                    self._bounded_text(args[key], key, 32), key
+                )
+                query += f" {operator}:{value.replace('-', '/')}"
         canonical = {
             "account": alias,
             "account_identity": identity,
@@ -1172,11 +1245,10 @@ class PrivateReadService:
             raise SourceFailure(
                 "malformed_result", "Gmail search did not return a result list"
             )
-        if len(result) > maximum:
-            raise SourceFailure(
-                "cap_exceeded", "Gmail search exceeded the requested result cap"
-            )
-        return result
+        # max_results says how many are wanted, not how many there had better
+        # be: a source that overshoots is bounded here, not turned into a
+        # failed read.
+        return result[:maximum]
 
     def _gmail_get(self, args: dict[str, Any]) -> Any:
         self._require_exact(args, {"account", "message_id"}, {"account", "message_id"})
@@ -1612,14 +1684,16 @@ class PrivateReadService:
         account = args.get("account")
         if account not in {"personal", "work_free_busy"}:
             raise SourceFailure("account_denied", "calendar account is unavailable")
-        start = self._bounded_text(args["start"], "start", 40)
-        end = self._bounded_text(args["end"], "end", 40)
-        if (
-            _DATE_RE.fullmatch(start) is None
-            or _DATE_RE.fullmatch(end) is None
-            or start >= end
-        ):
-            raise SourceFailure("invalid_arguments", "calendar window is malformed")
+        start = _normalise_date(
+            self._bounded_text(args["start"], "start", 40), "start", allow_time=True
+        )
+        end = _normalise_date(
+            self._bounded_text(args["end"], "end", 40), "end", allow_time=True
+        )
+        if start >= end:
+            raise SourceFailure(
+                "invalid_arguments", "the calendar window ends before it starts"
+            )
         maximum = self._bounded_int(args["max_results"], "max_results", 50)
         canonical = {
             "account": account,
@@ -1636,10 +1710,7 @@ class PrivateReadService:
             raise SourceFailure(
                 "malformed_result", "calendar source did not return an event list"
             )
-        if len(result) > maximum:
-            raise SourceFailure(
-                "cap_exceeded", "calendar source exceeded the requested result cap"
-            )
+        result = result[:maximum]
         if account == "work_free_busy":
             return self.redact_work_calendar(result)
         return result
@@ -2199,12 +2270,13 @@ class PrivateReadService:
             raise SourceFailure(
                 "invalid_arguments", "exact WhatsApp message lookup requires message_id"
             )
-        if "since" in canonical and _DATE_RE.fullmatch(canonical["since"]) is None:
-            raise SourceFailure(
-                "invalid_arguments", "WhatsApp since must be an ISO date"
+        if "since" in canonical:
+            canonical["since"] = _normalise_date(
+                canonical["since"], "since", allow_time=True
             )
         if "whatsapp" in self.backends:
-            return self._injected("whatsapp", str(operation), canonical)
+            data = self._injected("whatsapp", str(operation), canonical)
+            return data[:maximum] if isinstance(data, list) else data
         cfg = self.config.get("whatsapp")
         if not isinstance(cfg, dict):
             raise SourceFailure(
@@ -2234,11 +2306,7 @@ class PrivateReadService:
             raise SourceFailure(
                 "malformed_result", "WhatsApp archive returned malformed data"
             )
-        if len(data) > maximum:
-            raise SourceFailure(
-                "cap_exceeded", "WhatsApp archive exceeded the requested cap"
-            )
-        return data
+        return data[:maximum]
 
     def root_names(self) -> tuple[str, ...]:
         """Configured personal-file root names, or empty when unavailable."""

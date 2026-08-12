@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import datetime, timedelta, timezone
 from contextvars import copy_context
 from pathlib import Path
 from types import SimpleNamespace
@@ -629,6 +630,118 @@ def test_read_argument_change_denies_before_backend(tmp_path):
         assert backend.calls == []
 
     _bound_turn(tmp_path, {"gmail": backend}, check)
+
+
+def test_a_date_argument_is_read_the_way_it_is_written(tmp_path):
+    """"after must be an ISO date" said what was wrong and not what to write.
+
+    The forms it refused are the ones anyone writing a mail query reaches for
+    first -- Gmail's own 2026/08/01, or "30d" for the last month -- and every
+    one of them names a window unambiguously. The retry after a refusal is a
+    guess, and each guess costs a round trip that the question may not survive.
+
+    The old regex also let 2026-13-45 through to the source, where it matched
+    nothing and looked like an absence of mail.
+    """
+    gmail = RecordingBackend({"search": []})
+    calendar = RecordingBackend({"list": []})
+
+    def check(kite):
+        def search(**extra):
+            _invoke(kite, "kite_gmail_search", {
+                "account": "personal", "query": "Ibiza", "max_results": 5, **extra,
+            })
+            return gmail.calls[-1][1]["query"]
+
+        assert search(after="2026-08-01").endswith("after:2026/08/01")
+        assert search(after="2026/08/01").endswith("after:2026/08/01")
+        assert search(before="2026.08.01").endswith("before:2026/08/01")
+
+        today = datetime.now(timezone.utc).date()
+        assert search(after="7d").endswith(
+            (today - timedelta(days=7)).strftime(" after:%Y/%m/%d")
+        )
+        assert search(after="3w").endswith(
+            (today - timedelta(days=21)).strftime(" after:%Y/%m/%d")
+        )
+        assert search(before="today").endswith(today.strftime(" before:%Y/%m/%d"))
+
+        # A day that does not exist is caught here rather than becoming a
+        # search nothing can match.
+        failed = _invoke(kite, "kite_gmail_search", {
+            "account": "personal", "query": "Ibiza",
+            "max_results": 5, "after": "2026-13-45",
+        })
+        assert failed["status"] == "error"
+        assert failed["error"]["code"] == "invalid_arguments"
+        # And the refusal says what to write instead.
+        assert "2026-08-01" in failed["error"]["message"]
+        assert "7d" in failed["error"]["message"]
+
+        # The same forms open a calendar window. The schema used to require ten
+        # characters, which ruled out the short ones before the reader saw them.
+        _invoke(kite, "kite_calendar_read", {
+            "account": "personal", "start": "30d", "end": "today", "max_results": 5,
+        })
+        window = calendar.calls[-1][1]
+        assert window["start"] == (today - timedelta(days=30)).isoformat()
+        assert window["end"] == today.isoformat()
+
+        # An hour is still an hour: a full timestamp is not rounded to the day.
+        _invoke(kite, "kite_calendar_read", {
+            "account": "personal",
+            "start": "2026-08-01T09:00:00Z",
+            "end": "2026-08-01T17:00:00Z",
+            "max_results": 5,
+        })
+        assert calendar.calls[-1][1]["start"] == "2026-08-01T09:00:00Z"
+
+    _bound_turn(tmp_path, {"gmail": gmail, "calendar": calendar}, check)
+
+
+def test_a_requested_result_cap_bounds_the_read_instead_of_failing_it(tmp_path):
+    """max_results is how many are wanted, not how many there had better be.
+
+    Three readers treated a source that overshot the cap as a malformed read
+    and returned nothing. The caller had asked for five; five were available;
+    the answer was an error.
+    """
+    def check(kite):
+        mail = _invoke(kite, "kite_gmail_search", {
+            "account": "personal", "query": "Ibiza", "max_results": 2,
+        })["data"]
+        assert [item["id"] for item in mail] == ["message-1", "message-2"]
+
+        events = _invoke(kite, "kite_calendar_read", {
+            "account": "personal",
+            "start": "2026-08-01",
+            "end": "2026-08-31",
+            "max_results": 1,
+        })["data"]
+        assert [event["summary"] for event in events] == ["Flight"]
+
+        messages = _invoke(kite, "kite_whatsapp_archive_read", {
+            "operation": "search", "query": "Ibiza",
+            "max_results": 2, "since": "30d",
+        })["data"]
+        assert [item["message_id"] for item in messages] == ["m-1", "m-2"]
+
+    _bound_turn(
+        tmp_path,
+        {
+            "gmail": RecordingBackend({"search": [
+                {"id": f"message-{n}"} for n in range(1, 6)
+            ]}),
+            "calendar": RecordingBackend({"list": [
+                {"summary": "Flight", "start": "2026-08-02", "end": "2026-08-03"},
+                {"summary": "Hotel", "start": "2026-08-03", "end": "2026-08-09"},
+            ]}),
+            "whatsapp": RecordingBackend({"search": [
+                {"message_id": f"m-{n}"} for n in range(1, 6)
+            ]}),
+        },
+        check,
+    )
 
 
 def test_gmail_accounts_and_exact_id_chain(tmp_path):
