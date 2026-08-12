@@ -1574,6 +1574,135 @@ async def test_approving_one_document_does_not_approve_the_next(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_lucy_asks_about_the_trip_and_is_answered(tmp_path):
+    """The question that failed live on 2026-08-11, end to end.
+
+    She asked what the plan for the trip was. Everything Kite reached for came
+    back empty or refused: the file search matched "holiday itinerary" as one
+    literal substring of a path and found nothing, the Gmail search was told
+    its date was not an ISO date without being told what one looked like, and
+    the turn dragged on until it outlived its authority and reported itself as
+    a policy refusal.
+
+    Each of those was fixed on its own with its own test. This is the turn
+    they were fixed for: a room with both of them in it, a question that is not
+    a request for a document, answered from the documents and the mail.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    root = tmp_path / "family"
+    (root / "Travel").mkdir(parents=True)
+    (root / "Travel" / "Ibiza-Trip-Itinerary-2026.md").write_text(
+        "Flights 4 September. Villa from the 5th. Car booked.", encoding="utf-8"
+    )
+    clock = Clock()
+    roster = MutableRoster()
+    roster.participants = [[JAMES_PHONE, JAMES_LID], [LUCY_PHONE, LUCY_LID]]
+    adapter = RecordingWhatsAppAdapter(roster)
+    config = _with_lucy(_config(tmp_path, root, mode="juno"))
+    juno = TrustedPrincipalRuntime(
+        copy.deepcopy(config), active_profile="juno", clock=clock
+    )
+
+    question = "What's the plan for the trip?"
+    ingress = await juno.pre_gateway_dispatch(
+        event=_event(question, sender=LUCY_PHONE),
+        gateway=SimpleNamespace(adapters={Platform.WHATSAPP: adapter}),
+        critical_ingress_token=object(),
+    )
+    assert ingress["action"] == "critical_allow"
+    audience = _ACTIVE_AUDIENCE.get()
+    assert audience.principal == "lucy"
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": question}),
+        mode="juno", sender=LUCY_PHONE,
+    )
+
+    kite_config = copy.deepcopy(config)
+    kite_config["juno_kite_trusted_principal"]["mode"] = "kite"
+    kite_config["juno_kite_trusted_principal"]["profile"] = "kite"
+    mail_calls = []
+
+    def mail(operation, args):
+        mail_calls.append((operation, dict(args)))
+        # More than was asked for, which is what a mail account does.
+        return [
+            {"id": f"message-{n}", "subject": "Ibiza villa confirmation"}
+            for n in range(1, 6)
+        ]
+
+    gmail = SimpleNamespace(execute=mail)
+    kite = TrustedPrincipalRuntime(
+        kite_config, active_profile="kite", clock=clock,
+        private_read_backends={"gmail": gmail},
+    )
+    started = clock.value
+
+    def kite_turn():
+        kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+        # Asked for the way anyone would ask, not the way the file is named.
+        found = _invoke(kite, "kite_personal_files_read", {
+            "operation": "search", "root": "family",
+            "query": "holiday itinerary", "max_results": 5,
+        })["data"]
+        assert [item["relative_path"] for item in found] == [
+            "Travel/Ibiza-Trip-Itinerary-2026.md"
+        ]
+        read = _invoke(kite, "kite_personal_files_read", {
+            "operation": "read", "root": "family",
+            "relative_path": found[0]["relative_path"], "max_lines": 20,
+        })
+        assert read["status"] == "ok"
+        assert "4 September" in read["data"]["text"]
+
+        # And a date written the way a mail query gets written.
+        found_mail = _invoke(kite, "kite_gmail_search", {
+            "account": "personal", "query": "Ibiza villa",
+            "max_results": 3, "after": "90d",
+        })
+        assert found_mail["status"] == "ok"
+        # Three, because three were asked for -- not an error because five came.
+        assert len(found_mail["data"]) == 3
+        # The relative form became a real Gmail date bound, not a refusal.
+        assert "after:" in mail_calls[-1][1]["query"]
+
+        return kite.transform_llm_output(
+            response_text=(
+                "Flights are on 4 September and the villa is from the 5th; "
+                "the car is booked."
+            ),
+            session_id="kite-session",
+            turn_id="kite-turn",
+        )
+
+    envelope = _session(
+        kite_turn, mode="kite", context_id=prepared.mapping.context_id
+    )
+    answer = _session(
+        lambda: juno._verify_response(envelope, prepared.mapping, prepared.request_id),
+        mode="juno",
+    )
+
+    # She gets the answer itself, not a refusal, and no file was sent: this
+    # was a question about the trip, not a request for the itinerary.
+    assert "4 September" in answer
+    assert "denied" not in answer.lower()
+    assert adapter.document_calls == []
+
+    # And the turn still holds live authority when the answer lands. The turn
+    # that failed ran 147 seconds and outlived it; nothing here should even
+    # approach that, so a consultation whose clock has not moved must be well
+    # inside its window rather than incidentally passing.
+    assert clock.value == started
+    request = juno.store.get_request(prepared.request_id)
+    assert request is None or request.expires_at > clock.value
+
+
+@pytest.mark.asyncio
 async def test_a_shared_document_is_delivered_into_a_room_with_lucy_in_it(tmp_path):
     """The two-person case all the way to the file arriving.
 
