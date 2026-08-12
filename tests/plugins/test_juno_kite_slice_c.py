@@ -6175,6 +6175,52 @@ def test_juno_is_told_what_day_it_is_on_every_turn(tmp_path):
     assert kite._juno_turn_context() is None
 
 
+@pytest.mark.asyncio
+async def test_a_bare_yes_with_nothing_waiting_is_conversation(tmp_path):
+    """Juno asked which currencies to convert. James said "Yes".
+
+    He got "Document release denied." and the question never reached the
+    model: the check deciding whether to take a message away from the model
+    matched any bare affirmative, whether or not a release was waiting. Every
+    "yes", "ok", "yeah", "go ahead" and "do it" in the room was being
+    swallowed the same way.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    juno = _runtime(tmp_path, root, mode="juno", clock=Clock())
+    assert not juno._pending_releases
+
+    ordinary = ["Yes", "yes", "ok", "Okay", "yeah", "go ahead", "do it",
+                "\u2705", "\U0001F44D", "approve"]
+    for text in ordinary:
+        assert juno._is_document_approval_text(text) is False, text
+
+    # An explicit APPROVE is never conversation, so it is still taken --
+    # a stale one should be told it is stale, not answered as a remark.
+    assert juno._is_document_approval_text("APPROVE C7-ABCDEFGH23456789") is True
+    assert juno._is_document_approval_text("APPROVE") is True
+
+    # And with a release actually waiting, a bare yes means what it says.
+    from plugins.juno_kite_trusted_principal.runtime import _ACTIVE_AUDIENCE
+
+    await juno.pre_gateway_dispatch(
+        event=_event("Send me the passport"),
+        gateway=SimpleNamespace(
+            adapters={Platform.WHATSAPP: RecordingWhatsAppAdapter(MutableRoster())}
+        ),
+        critical_ingress_token=object(),
+    )
+    juno._remember_pending_release(
+        "C7-ABCDEFGH23456789",
+        chat_id=GROUP,
+        audience=_ACTIVE_AUDIENCE.get(),
+        expires_at=int(juno.clock()) + 600,
+        document={"title": "a staged document"},
+    )
+    assert juno._is_document_approval_text("Yes") is True
+    assert juno._is_document_approval_text("what's the rate") is False
+
+
 def test_the_turn_instruction_never_reaches_the_kite_lane(tmp_path):
     """Kite has its own policy view; this is only for the low-trust side."""
     root = tmp_path / "family"

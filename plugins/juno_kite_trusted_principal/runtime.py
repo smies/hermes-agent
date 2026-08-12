@@ -1211,12 +1211,31 @@ class TrustedPrincipalRuntime:
             "redact_scope": True,
         }
 
-    @staticmethod
-    def _is_document_approval_text(value: Any) -> bool:
+    def _is_document_approval_text(self, value: Any) -> bool:
+        """Is this message an approval, or is it just somebody saying yes?
+
+        A bare yes is an approval only while a release is actually waiting.
+        The intent was always that -- the handler checks it -- but the check
+        that decides whether to take the message away from the model did not,
+        so every "yes", "ok", "yeah", "go ahead" and "do it" in the room was
+        swallowed and answered "Document release denied."
+
+        Live: Juno asked which currencies to convert, James said "Yes", and
+        that is what he got back. The question never reached the model.
+
+        An explicit APPROVE stays intercepted whatever is outstanding: it is
+        unambiguous, it is never conversation, and a stale one deserves to be
+        told it is stale rather than answered as a remark.
+        """
         text = str(value or "").strip()
         if text == "APPROVE" or text.startswith("APPROVE "):
             return True
-        return _CONFIRMATION_PATTERN.fullmatch(text) is not None
+        if _CONFIRMATION_PATTERN.fullmatch(text) is None:
+            return False
+        return any(
+            self._pending_release(pending) is not None
+            for pending in tuple(self._pending_releases)
+        )
 
     @staticmethod
     async def _send_document_receipt(adapter: Any, chat_id: str, text: str) -> None:
