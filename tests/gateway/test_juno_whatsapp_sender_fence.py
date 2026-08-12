@@ -130,6 +130,48 @@ def test_legacy_juno_self_chat_can_configure_sender_companion_fence(
     assert adapter._private_read_fence_profile == "juno"
 
 
+def test_a_juno_profile_with_no_fence_says_so(tmp_path: Path, caplog) -> None:
+    """The reason the outage lasted two hours: this path returned in silence.
+
+    Installing nothing is ordinary for every other profile. On Juno, with the
+    plugin enabled, it is never ordinary -- without the fence the bridge
+    attaches no provenance, the ingress check has nothing to verify, and every
+    message is dropped without a reply. On 2026-08-12 that ran from 08:49 to
+    10:55 and the only trace was per-message ingress warnings nobody was
+    watching.
+    """
+    import logging as _logging
+
+    broken = _trusted_principal_activation()
+    broken["policy_generation"] = ""  # will not qualify
+    runner = _activation_runner(broken)
+    adapter = _unconfigured_adapter(tmp_path)
+    with caplog.at_level(_logging.ERROR):
+        runner._configure_juno_private_read_sender_fence(Platform.WHATSAPP, adapter)
+    assert adapter._private_read_fence_profile is None
+    assert "fence NOT installed" in caplog.text
+    assert "dropped at ingress" in caplog.text
+
+    # A profile that was never meant to have one stays quiet.
+    caplog.clear()
+    other = _activation_runner(_trusted_principal_activation(), profile="default")
+    other_adapter = _unconfigured_adapter(tmp_path / "other")
+    with caplog.at_level(_logging.ERROR):
+        other._configure_juno_private_read_sender_fence(
+            Platform.WHATSAPP, other_adapter
+        )
+    assert "fence NOT installed" not in caplog.text
+
+    # And a healthy Juno says nothing either -- the log means something.
+    caplog.clear()
+    good = _activation_runner()
+    good_adapter = _unconfigured_adapter(tmp_path / "good")
+    with caplog.at_level(_logging.ERROR):
+        good._configure_juno_private_read_sender_fence(Platform.WHATSAPP, good_adapter)
+    assert good_adapter._private_read_fence_profile == "juno"
+    assert "fence NOT installed" not in caplog.text
+
+
 def test_a_config_that_names_its_shared_policy_still_installs_the_fence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -14196,6 +14196,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if parsed is not None and self._active_profile_name() == parsed.profile:
                     profile = parsed.profile
             if profile is None:
+                # Nothing to install is ordinary for every other profile. On
+                # Juno, with the plugin enabled, it is never ordinary: without
+                # the fence the bridge attaches no provenance to inbound
+                # messages, the plugin's ingress check has nothing to verify,
+                # and every message is dropped in silence. That is exactly what
+                # happened on 2026-08-12 -- two messages received and lost over
+                # two hours -- and the reason nobody noticed is that this
+                # return says nothing.
+                if (
+                    self._active_profile_name() == "juno"
+                    and not bool(getattr(self.config, "multiplex_profiles", False))
+                    and "juno_kite_trusted_principal"
+                    in set(getattr(self.config, "enabled_plugins", ()) or ())
+                ):
+                    logger.error(
+                        "Juno sender-companion fence NOT installed: the "
+                        "trusted-principal config did not qualify. Inbound "
+                        "messages will carry no provenance and every one will "
+                        "be dropped at ingress without a reply"
+                    )
                 return
             if trusted_principal is not None:
                 configure = getattr(
