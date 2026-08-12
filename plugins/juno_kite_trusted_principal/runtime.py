@@ -874,7 +874,19 @@ class TrustedPrincipalRuntime:
             or not auth.get("token")
         ):
             raise ValueError("Kite peer must use configured bearer authentication")
-        timeout = int(entry.get("timeout", 120))
+        # One number, not two. How long to wait on the wire and how long the
+        # turn's authority lasts are the same question asked twice, and when
+        # they were set independently the short one won in silence: 120s on the
+        # wire against 300s of authority, so a consultation still searching at
+        # two minutes was aborted and the answer it went on to finish could not
+        # be released. Absent an explicit timeout the wire now follows the TTL,
+        # so there is one place to change it. An explicit one is still honoured
+        # -- wanting to fail fast is legitimate, and the tests do -- and is
+        # still told when it undercuts the authority it is waiting for.
+        configured = entry.get("timeout")
+        timeout = int(
+            configured if configured is not None else self.limits.turn_ttl_seconds
+        )
         if timeout <= 0:
             raise ValueError("Kite peer timeout must be positive")
         # Two independent numbers where the short one wins silently. Giving up

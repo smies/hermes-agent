@@ -6671,6 +6671,31 @@ def test_a_closed_gate_says_why_in_the_log(tmp_path, caplog):
     assert "passport number" not in caplog.text
 
 
+def test_the_wire_follows_the_turn_ttl_when_nothing_says_otherwise(tmp_path):
+    """How long to wait and how long the authority lasts are one question.
+
+    They were two numbers, set in two places, and the short one won in
+    silence -- 120s on the wire against 300s of authority. Absent an explicit
+    timeout the wire follows the TTL, so there is one place to change it.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    config = _config(tmp_path, root, mode="juno")
+    entry = config["a2a_agents"]["kite"]
+    entry.pop("timeout", None)
+    config["juno_kite_trusted_principal"]["limits"]["turn_ttl_seconds"] = 240
+
+    juno = TrustedPrincipalRuntime(config, active_profile="juno", clock=Clock())
+    assert juno.peer["timeout"] == 240
+
+    # An explicit one still wins: failing fast is a legitimate thing to want.
+    entry["timeout"] = 5
+    juno = TrustedPrincipalRuntime(
+        copy.deepcopy(config), active_profile="juno", clock=Clock()
+    )
+    assert juno.peer["timeout"] == 5
+
+
 def test_giving_up_early_on_the_wire_is_said_out_loud(tmp_path, caplog):
     """Two numbers, independently set, and the short one wins in silence.
 
