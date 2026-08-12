@@ -1178,6 +1178,94 @@ def test_property_mode_denies_container_dumps_and_credentials(tmp_path, answer):
     _bound_turn(tmp_path, {"property_intel": prop}, check)
 
 
+def test_a_purchase_transaction_answers_without_its_whole_history(tmp_path):
+    """Lucy asked what the house being bought was, and got nothing.
+
+    A transaction carries its whole history: for the live one that is 59
+    documents, 100 audit events and 23 tasks -- 140,321 characters, past the
+    100,000 the host holds inline. It was truncated mid-JSON and the model
+    reported the result incomplete rather than guess. The answer she wanted --
+    price, stage, the seller's possession summary -- is about 1,200 characters
+    of it, near the top.
+    """
+    payload = {
+        "transaction": {
+            "agreedPrice": "3200000.00", "currency": "EUR",
+            "stage": "due_diligence", "propertyTitle": "Villa Lena",
+            "sellerPossessionSummary": "Seller confirmed the October move-out.",
+        },
+        "parties": [{"name": f"party-{n}", "role": "buyer"} for n in range(3)],
+        "documents": [
+            {"id": f"doc-{n}", "documentType": "planning", "blocking": True,
+             "notes": "x" * 900}
+            for n in range(40)
+        ],
+        "events": [
+            {"id": f"ev-{n}", "createdAt": "2026-08-10", "actor": "Hermes agent",
+             "action": "update-item", "entityType": "decision",
+             "detail": {"changedFields": ["title"], "padding": "y" * 300}}
+            for n in range(60)
+        ],
+        "readiness": {
+            "arras": {"ready": False, "blockers": [
+                {"title": f"blocker-{n}", "severity": "high", "gate": True,
+                 "reason": "Task is in progress.", "padding": "z" * 400}
+                for n in range(20)
+            ]},
+        },
+    }
+
+    def check(kite):
+        result = _invoke(kite, "kite_property_read", {
+            "operation": "transaction",
+            "property_id": "123e4567-e89b-12d3-a456-426614174000",
+        })
+        assert result["status"] == "ok", result
+        data = result["data"]
+
+        # The answer is whole.
+        assert data["transaction"]["agreedPrice"] == "3200000.00"
+        assert "October move-out" in data["transaction"]["sellerPossessionSummary"]
+        # Small collections are untouched.
+        assert len(data["parties"]) == 3
+
+        # The long ones are bounded, and say by how much.
+        assert len(data["documents"]) == 12
+        assert len(data["events"]) == 12
+        assert data["omitted_for_size"]["counts"] == {"documents": 28, "events": 48}
+        assert "max_results" in data["omitted_for_size"]["note"]
+
+        # A document keeps what identifies it and loses the essay.
+        assert data["documents"][0]["documentType"] == "planning"
+        assert "notes" not in data["documents"][0]
+        # The audit trail keeps only what identifies an entry.
+        assert set(data["events"][0]) == {
+            "createdAt", "actor", "action", "entityType"
+        }
+        # Blockers are bounded and projected too.
+        blockers = data["readiness"]["arras"]["blockers"]
+        assert len(blockers) == 12
+        assert "padding" not in blockers[0]
+        assert data["readiness"]["arras"]["ready"] is False
+
+        assert len(json.dumps(data)) < 20_000
+
+        # And more can be asked for.
+        wider = _invoke(kite, "kite_property_read", {
+            "operation": "transaction",
+            "property_id": "123e4567-e89b-12d3-a456-426614174000",
+            "max_results": 30,
+        })["data"]
+        assert len(wider["documents"]) == 30
+        assert wider["omitted_for_size"]["counts"] == {"documents": 10, "events": 30}
+
+    _bound_turn(
+        tmp_path,
+        {"property_intel": RecordingBackend({"transaction": payload})},
+        check,
+    )
+
+
 def test_a_property_list_is_an_index_not_the_whole_file(tmp_path):
     """"What's the latest on the property purchase?" could not be answered.
 

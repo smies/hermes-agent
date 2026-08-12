@@ -65,6 +65,75 @@ OBSIDIAN_ROOT = "/Users/james/Documents/Obsidian Vault"
 # amenities, legal text and geometry -- 170KB for the list, which crowds out
 # the question being asked and sits one growth spurt from the byte cap. Depth
 # is what the detail operations are for; this is the index.
+# A purchase transaction carries its whole history: for Villa Lena that is 59
+# documents, 100 audit events and 23 tasks -- 140,321 characters, past the
+# 100,000 the host will hold inline, so it was truncated mid-JSON and the model
+# reported the result incomplete. Lucy asked what the house being bought was,
+# and the answer -- price, stage, seller's possession summary -- is 1,200
+# characters of that near the top.
+#
+# The whole record is still the shape it was. Every collection is bounded and
+# says how much it held; the audit trail keeps only what identifies each entry,
+# since "update-item / changedFields: [title]" repeated a hundred times answers
+# nothing.
+_TRANSACTION_DEFAULT_ITEMS = 12
+_TRANSACTION_EVENT_FIELDS = ("createdAt", "actor", "action", "entityType")
+_TRANSACTION_BLOCKER_FIELDS = ("title", "severity", "gate", "type", "reason")
+_TRANSACTION_DROPPED_FIELDS = {
+    "documents": {"notes"},
+    "tasks": {"dependencyIds", "templateKey", "sortOrder"},
+}
+
+
+def _bounded_transaction(payload: Any, limit: int) -> Any:
+    """Bound every collection in a transaction, and say what was left out."""
+    if not isinstance(payload, dict):
+        return payload
+    bounded: dict[str, Any] = {}
+    omitted: dict[str, int] = {}
+    for key, value in payload.items():
+        if key == "readiness" and isinstance(value, dict):
+            bounded[key] = {
+                gate: (
+                    {
+                        **{k: v for k, v in stage.items() if k != "blockers"},
+                        "blockers": [
+                            {f: b[f] for f in _TRANSACTION_BLOCKER_FIELDS if f in b}
+                            for b in (stage.get("blockers") or [])[:limit]
+                            if isinstance(b, dict)
+                        ],
+                    }
+                    if isinstance(stage, dict) else stage
+                )
+                for gate, stage in value.items()
+            }
+            continue
+        if not (isinstance(value, list) and value and isinstance(value[0], dict)):
+            bounded[key] = value
+            continue
+        if len(value) > limit:
+            omitted[key] = len(value) - limit
+        items = value[:limit]
+        if key == "events":
+            items = [
+                {f: i[f] for f in _TRANSACTION_EVENT_FIELDS if f in i} for i in items
+            ]
+        else:
+            drop = _TRANSACTION_DROPPED_FIELDS.get(key, frozenset())
+            items = [{k: v for k, v in i.items() if k not in drop} for i in items]
+        bounded[key] = items
+    if omitted:
+        bounded["omitted_for_size"] = {
+            "counts": omitted,
+            "note": (
+                "Each of these held more than was returned. Ask for this "
+                "transaction again with a larger max_results if the rest "
+                "matters; the transaction, parties and money records are whole."
+            ),
+        }
+    return bounded
+
+
 _PROPERTY_LIST_FIELDS = (
     "id", "canonicalTitle", "displayArea", "market", "status",
     "interestLevel", "viewingPriority", "propertyType", "transactionType",
@@ -230,6 +299,13 @@ _WORK_FIELDS = frozenset({
 _PROPERTY_MAX_DEPTH = 12
 _PROPERTY_MAX_CONTAINER_ITEMS = 1024
 _PROPERTY_MAX_TOTAL_ITEMS = 8192
+# What the sanitiser may walk, which is not what the reader may return. These
+# were the same number, so a payload larger than the answer allowance was
+# refused outright instead of being bounded down to one -- the same mistake
+# that made every passport unreadable this morning, in a different place. The
+# walk still has to stop somewhere, hence a bound of its own; it is the input
+# it is bounding, and output_bytes goes on governing what comes back.
+_PROPERTY_MAX_INPUT_BYTES = 4 * 1024 * 1024
 _PROPERTY_REDACTION = "[REDACTED]"
 _PROPERTY_OPERATIONAL_CONTEXT_KEYS = frozenset({
     "auth",
@@ -2126,13 +2202,13 @@ class PrivateReadService:
                     )
                 return current
             if isinstance(current, str):
-                if len(current) > self.output_bytes:
+                if len(current) > _PROPERTY_MAX_INPUT_BYTES:
                     raise SourceFailure(
                         "cap_exceeded",
                         "Property Intel result exceeded its processing byte cap",
                     )
                 processed_bytes += len(current.encode("utf-8"))
-                if processed_bytes > self.output_bytes:
+                if processed_bytes > _PROPERTY_MAX_INPUT_BYTES:
                     raise SourceFailure(
                         "cap_exceeded",
                         "Property Intel result exceeded its processing byte cap",
@@ -2179,7 +2255,7 @@ class PrivateReadService:
                             "Property Intel object keys must be strings",
                         )
                     processed_bytes += len(key.encode("utf-8"))
-                    if processed_bytes > self.output_bytes:
+                    if processed_bytes > _PROPERTY_MAX_INPUT_BYTES:
                         raise SourceFailure(
                             "cap_exceeded",
                             "Property Intel result exceeded its processing byte cap",
@@ -2214,7 +2290,10 @@ class PrivateReadService:
             raise SourceFailure(
                 "malformed_result", "Property Intel result is not valid JSON data"
             ) from exc
-        if len(encoded) > self.output_bytes:
+        # Still the input to the bounding step, not the answer. What actually
+        # goes back is measured in execute(), against output_bytes, after the
+        # reader has had its chance to make it fit.
+        if len(encoded) > _PROPERTY_MAX_INPUT_BYTES:
             raise SourceFailure(
                 "cap_exceeded", "Property Intel sanitized result exceeded its byte cap"
             )
@@ -2241,7 +2320,7 @@ class PrivateReadService:
             )
         allowed_args = set(expected[str(operation)]) | (
             {"query"} if operation == "list" else set()
-        )
+        ) | ({"max_results"} if operation == "transaction" else set())
         _require_args(
             args, allowed_args, expected[str(operation)],
             f"the Property Intel {operation} operation",
@@ -2275,6 +2354,14 @@ class PrivateReadService:
             }[str(operation)]
             data = self._http_get(base + path, cfg)
         data = self._sanitize_property_payload(data)
+        if operation == "transaction":
+            return _bounded_transaction(
+                data,
+                self._bounded_int(
+                    canonical.get("max_results", _TRANSACTION_DEFAULT_ITEMS),
+                    "max_results", 30,
+                ),
+            )
         if operation in {"list", "research_notes"}:
             if not isinstance(data, list):
                 raise SourceFailure(
@@ -2330,13 +2417,17 @@ class PrivateReadService:
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with self.url_opener.open(request, timeout=self.timeout) as response:
-                raw = response.read(self.output_bytes + 1)
+                # Read what the source sends, then bound it. Capping the read
+                # at the answer allowance refused the whole call before the
+                # projection that would have made it fit -- which is how a
+                # question about the house being bought came back empty.
+                raw = response.read(_PROPERTY_MAX_INPUT_BYTES + 1)
         except urllib.error.HTTPError as exc:
             code = "missing_auth" if exc.code in {401, 403} else "source_failure"
             raise SourceFailure(
                 code, "Property Intel source request failed", exc.code >= 500
             ) from exc
-        if len(raw) > self.output_bytes:
+        if len(raw) > _PROPERTY_MAX_INPUT_BYTES:
             raise SourceFailure(
                 "cap_exceeded",
                 "Property Intel returned more than this reader may hold. "
