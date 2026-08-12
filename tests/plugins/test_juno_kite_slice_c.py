@@ -6674,6 +6674,63 @@ def test_a_closed_gate_says_why_in_the_log(tmp_path, caplog):
 
 
 @pytest.mark.asyncio
+async def test_an_empty_reader_list_is_not_offered_as_a_choice(tmp_path):
+    """"The readers here are: . Use one of those" -- to a lane with none.
+
+    The refusal was widened so a Kite reaching for the wrong tool is told what
+    it may reach for instead. With no readers configured it pointed at an empty
+    list and told the model to pick from it, which sends it looking for a tool
+    that does not exist. The synthetic vertical runs exactly that way and had
+    been failing on it unnoticed, because nothing ran the synthetic vertical.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    clock = Clock()
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    await juno.pre_gateway_dispatch(
+        event=_event("What is the plan?"),
+        gateway=SimpleNamespace(
+            adapters={Platform.WHATSAPP: RecordingWhatsAppAdapter(MutableRoster())}
+        ),
+        critical_ingress_token=object(),
+    )
+
+    def refusal_for(kite):
+        prepared = _session(
+            lambda: juno._prepare_request({"question_or_goal": "What is the plan?"}),
+            mode="juno",
+        )
+
+        def turn():
+            kite.pre_llm_call(
+                user_message=prepared.message,
+                session_id="kite-session", turn_id="kite-turn",
+            )
+            return kite.pre_tool_call(
+                "some_unclassified_tool", {},
+                session_id="kite-session", turn_id="kite-turn",
+            )
+
+        blocked = _session(
+            turn, mode="kite", context_id=prepared.mapping.context_id
+        )
+        assert blocked is not None
+        return blocked["message"]
+
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+    assert kite.private_read_tool_names
+    named = refusal_for(kite)
+    assert "The readers here are: kite_" in named
+
+    bare = _runtime(tmp_path, root, mode="kite", clock=clock)
+    object.__setattr__(bare, "private_read_tool_names", frozenset())
+    empty = refusal_for(bare)
+    assert "no readers configured" in empty
+    assert "Use one of those" not in empty
+    assert "are: ." not in empty
+
+
+@pytest.mark.asyncio
 async def test_a_signature_mismatch_says_which_end_changed(tmp_path, caplog):
     """Live at 08:38 on 2026-08-12, and undiagnosable from either log.
 

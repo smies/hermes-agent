@@ -293,7 +293,16 @@ async def _run() -> None:
                     session_id="synthetic-kite-session",
                     turn_id=turn_id,
                 )
-                assert "tool is not explicitly classified" in result
+                # The refusal names this lane's readers, so a Kite that
+                # reached for the wrong tool is told what it may reach for
+                # instead rather than being left to guess -- see 44e62b594.
+                # Asserted on the shape, not the sentence, so a reworded
+                # refusal does not read as a broken gate.
+                assert "is not available on this lane" in result
+                # This vertical configures no readers, so the refusal must not
+                # point at an empty list and tell the model to pick from it.
+                assert "no readers configured" in result
+                assert "Use one of those" not in result
                 policy_checks.append("unknown-tool-blocked")
                 answer = "unknown tool denied"
             elif "synthetic changed action" in event.text:

@@ -3256,6 +3256,16 @@ class TrustedPrincipalRuntime:
                 # authority, and the answer died as a stale binding. A refusal
                 # that lists the alternatives ends that loop in one call.
                 available = ", ".join(sorted(self.private_read_tool_names))
+                if not available:
+                    # Pointing at an empty list and saying "use one of those"
+                    # is worse than saying nothing: it sends the model looking
+                    # for a tool that does not exist. The synthetic vertical
+                    # runs with no readers configured and got exactly that.
+                    return self._block(
+                        f"{tool_name} is not available on this lane, and this "
+                        "lane has no readers configured. Say that nothing here "
+                        "can answer the question."
+                    )
                 return self._block(
                     f"{tool_name} is not available on this lane. The readers "
                     f"here are: {available}. Use one of those, or say that "
