@@ -10,6 +10,7 @@ import asyncio
 import copy
 import io
 import json
+import logging
 import threading
 import zlib
 from contextvars import copy_context
@@ -6479,6 +6480,55 @@ async def test_an_overtaken_consultation_says_so_rather_than_refusing(tmp_path):
     assert "did not refuse" in said
     assert "overtook" in said
     assert "not a refusal:" not in said
+
+
+def test_a_closed_gate_says_why_in_the_log(tmp_path, caplog):
+    """Fifteen blocks in two days recorded as "ValueError" and nothing else.
+
+    That is as much as no log at all, and it is how a whole evening went by
+    without knowing which gate was closing -- the same lesson the TTL message
+    taught. Every ValueError on these paths carries a fixed, host-written
+    sentence, and it is already considered safe enough to hand to Juno.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    kite = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    def refuse(**_kwargs):
+        raise ValueError("hook turn does not match same-turn policy binding")
+
+    kite._current_valid_binding = refuse
+    with caplog.at_level(logging.WARNING):
+        blocked = _session(
+            lambda: kite.pre_tool_call(
+                "kite_gmail_search", {"account": "personal", "query": "x",
+                                      "max_results": 1},
+                session_id="kite-session", turn_id="kite-turn",
+            ),
+            mode="kite", context_id="ctx-diag",
+        )
+    assert blocked["action"] == "block"
+    assert "hook turn does not match same-turn policy binding" in caplog.text
+
+    # Anything that is not one of our own sentences keeps its type and no more:
+    # an arbitrary exception may be carrying content, and the log is not the
+    # place to find out.
+    def leak(**_kwargs):
+        raise RuntimeError("a passport number or someone's address")
+
+    kite._current_valid_binding = leak
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _session(
+            lambda: kite.pre_tool_call(
+                "kite_gmail_search", {"account": "personal", "query": "x",
+                                      "max_results": 1},
+                session_id="kite-session", turn_id="kite-turn",
+            ),
+            mode="kite", context_id="ctx-diag",
+        )
+    assert "RuntimeError" in caplog.text
+    assert "passport number" not in caplog.text
 
 
 def test_the_lane_wait_outlives_a_real_consultation(tmp_path):

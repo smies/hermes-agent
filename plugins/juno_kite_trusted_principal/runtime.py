@@ -1402,7 +1402,7 @@ class TrustedPrincipalRuntime:
             if extension is None:
                 raise ValueError("document MIME is unsupported")
         except Exception as exc:
-            logger.warning("Juno document dispatch denied: %s", type(exc).__name__)
+            logger.warning("Juno document dispatch denied: %s", self._why(exc))
             if record is not None and record.state == "dispatching":
                 self.document_releases.terminalize(record, "denied")
                 self.document_releases.unlink_record(record)
@@ -1725,7 +1725,7 @@ class TrustedPrincipalRuntime:
         except PermissionError:
             return self._ingress_skip("required-co-principal-unproved")
         except Exception as exc:
-            logger.warning("Juno audience ingress blocked: %s", type(exc).__name__)
+            logger.warning("Juno audience ingress blocked: %s", self._why(exc))
             # Group-only principals must remain silent when roster/co-member
             # proof is unavailable. Other protected group principals are also
             # skipped: allowing on hook failure would bypass the pre-model gate.
@@ -2060,7 +2060,7 @@ class TrustedPrincipalRuntime:
                     self.store.abort_request(request_id)
                 except Exception:
                     logger.warning("Juno--Kite request abort failed closed")
-            logger.warning("Juno--Kite consultation blocked: %s", type(exc).__name__)
+            logger.warning("Juno--Kite consultation blocked: %s", self._why(exc))
             return f"BLOCKED: consult_kite denied ({self._public_reason(exc)})."
 
     async def consult_kite_delivering(self, args: dict, **kwargs: Any) -> str:
@@ -2281,6 +2281,21 @@ class TrustedPrincipalRuntime:
                 "delivery in this conversation"
             ),
         })
+
+    @staticmethod
+    def _why(exc: Exception) -> str:
+        """What to write in the log about a gate that closed.
+
+        Fifteen blocks in two days recorded as "ValueError" and nothing else,
+        which is exactly as much as no log at all -- the same lesson the TTL
+        message taught. Every ValueError raised on these paths carries a fixed,
+        host-written sentence, and _public_reason already hands that same text
+        to Juno, so Kite's own log is not where it becomes a disclosure. An
+        exception from anywhere else keeps its type and no more.
+        """
+        if isinstance(exc, ValueError):
+            return f"{type(exc).__name__}: {str(exc)[:200]}"
+        return type(exc).__name__
 
     @staticmethod
     def _public_reason(exc: Exception) -> str:
@@ -3154,7 +3169,7 @@ class TrustedPrincipalRuntime:
                 return self._block("action binding is stale or already consumed")
             return None
         except Exception as exc:
-            logger.warning("Kite tool gate blocked: %s", type(exc).__name__)
+            logger.warning("Kite tool gate blocked: %s", self._why(exc))
             return self._block("internal or missing policy binding")
 
     def pre_tool_dispatch(
@@ -3205,7 +3220,7 @@ class TrustedPrincipalRuntime:
                 return self._block("final action does not match claimed authority")
             return None
         except Exception as exc:
-            logger.warning("Kite final tool gate blocked: %s", type(exc).__name__)
+            logger.warning("Kite final tool gate blocked: %s", self._why(exc))
             return self._block("internal or missing final policy binding")
 
     def _signed_response(
