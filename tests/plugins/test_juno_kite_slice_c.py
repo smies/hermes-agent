@@ -198,6 +198,33 @@ def _pdf_with_stream(
     )
 
 
+def _pdf_with_indirect_length(
+    payload: bytes, *, length_object: bytes | None = None, also_direct: bool = False
+) -> bytes:
+    """A PDF that gives its stream length as a reference to another object.
+
+    This is what a producer writes when it does not know the length until the
+    stream has been written, which is most of them: an airline e-ticket here
+    had sixteen such streams out of seventy-two.
+    """
+    encoded = zlib.compress(payload)
+    declared = length_object if length_object is not None else str(
+        len(encoded)
+    ).encode("ascii")
+    direct = b"/Length " + str(len(encoded)).encode("ascii") + b" " if also_direct else b""
+    return (
+        b"%PDF-1.4\n"
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 10 10]"
+        b"/Contents 4 0 R>>endobj\n"
+        b"5 0 obj " + declared + b" endobj\n"
+        b"4 0 obj<</Filter /FlateDecode " + direct + b"/Length 5 0 R>>\nstream\n"
+        + encoded
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+
+
 def _config(tmp_path: Path, personal_root: Path, *, mode: str) -> dict:
     config = _slice_b_config(tmp_path, mode=mode)
     section = config["juno_kite_trusted_principal"]
@@ -764,6 +791,75 @@ def test_format_gate_rejects_active_tokens_in_flate_stream(tmp_path, token):
     runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
 
     assert runtime.document_releases.inspect_source_for_test(source) is None
+
+
+def test_format_gate_reads_a_stream_length_written_as_a_reference(tmp_path):
+    """The e-ticket Lucy asked about could not be released.
+
+    A stream dictionary may give its length as a reference to another object
+    -- /Length 5 0 R -- which is what a producer writes when it does not know
+    the length until the stream is written. The gate accepted only a literal
+    number, so one such stream refused the whole document: sixteen of the
+    seventy-two in that e-ticket, and a third of the real PDFs on this
+    machine. On 2026-08-12 at 05:59 the capability layer had already said yes
+    and this is what the answer died on.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    source = root / "e-ticket.pdf"
+    source.write_bytes(
+        _pdf_with_indirect_length(b"BT (BA2065 Gatwick to Mauritius 21:00) Tj ET")
+    )
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    inspected = runtime.document_releases.inspect_source_for_test(source)
+    assert inspected.page_count == 1
+    # That it was read rather than waved through is the next test's job: the
+    # inspection result carries no text, so the proof is that content hidden
+    # in such a stream is still caught.
+
+
+def test_a_referenced_length_does_not_smuggle_anything_past_the_gate(tmp_path):
+    """The resolved length has to be right, and the stream still gets read.
+
+    Resolving a reference is only safe because nothing is taken on its word:
+    the length must put endstream exactly where the stream ends, which is the
+    check a literal length has always had to pass. So a wrong resolution
+    refuses the document rather than misreading it, and content hidden in a
+    stream that declares its length this way is inspected like any other.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    runtime = _runtime(tmp_path, root, mode="kite", clock=Clock())
+
+    def inspect(name, data):
+        source = root / name
+        source.write_bytes(data)
+        return runtime.document_releases.inspect_source_for_test(source)
+
+    # Active content compressed inside a referenced-length stream is still
+    # caught -- this is the whole reason the streams are decoded.
+    assert inspect(
+        "active.pdf",
+        _pdf_with_indirect_length(b"/JavaScript (app.alert(1))"),
+    ) is None
+
+    # A reference to an object that says the wrong length: endstream is not
+    # where it claims, so the document is refused.
+    assert inspect(
+        "wrong.pdf", _pdf_with_indirect_length(b"payload", length_object=b"4")
+    ) is None
+
+    # A reference to an object that is not there at all.
+    assert inspect(
+        "dangling.pdf",
+        _pdf_with_indirect_length(b"payload").replace(b"5 0 obj", b"9 0 obj", 1),
+    ) is None
+
+    # Two lengths, one literal and one referenced, is still ambiguous.
+    assert inspect(
+        "ambiguous.pdf", _pdf_with_indirect_length(b"payload", also_direct=True)
+    ) is None
 
 
 @pytest.mark.parametrize(

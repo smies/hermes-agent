@@ -137,6 +137,16 @@ _PDF_OPAQUE_FILTER = b"\x00opaque"
 _PDF_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
 _PDF_STREAM_START = re.compile(rb"(?<![A-Za-z0-9])stream(?:\r\n|\n|\r)")
 _PDF_DIRECT_LENGTH = re.compile(rb"/Length\s+([0-9]+)\s*(?=[/>])")
+# A stream dictionary may give its length as a reference to another object --
+# /Length 12 0 R -- which is what a producer writes when it does not know the
+# length until the stream has been written, and that is most of them. Refusing
+# it refused the whole document: one such stream out of seventy-two in an
+# airline e-ticket, and Lucy's question about the flight died on it while the
+# capability layer had already said yes.
+_PDF_INDIRECT_LENGTH = re.compile(rb"/Length\s+([0-9]{1,10})\s+([0-9]{1,5})\s+R(?![A-Za-z0-9])")
+_PDF_INTEGER_OBJECT = re.compile(
+    rb"(?<![0-9])([0-9]{1,10})\s+([0-9]{1,5})\s+obj\s*([0-9]{1,10})\s*endobj"
+)
 _PDF_FILTER_VALUE = re.compile(rb"/Filter\s*(/[^\s<>\[\]()/]+|\[[^\]]*\])")
 _PDF_WHITESPACE = b"\x00\x09\x0a\x0c\x0d\x20"
 _PDF_DECOMPRESSION_INPUT_CHUNK_BYTES = 64 * 1024
@@ -407,11 +417,51 @@ class DocumentReleaseService:
             raise DocumentReleaseDenied("document stream is malformed") from exc
         return b"".join(output)
 
+    @staticmethod
+    def _integer_objects(data: bytes) -> dict[tuple[bytes, bytes], int]:
+        """Every object in the file that is just a number, collected once.
+
+        A stream length written as a reference is resolved from here. Nothing
+        is trusted on the strength of it: the resolved length still has to put
+        `endstream` exactly where the stream ends, which is the same check a
+        direct length has always had to pass, so a wrong resolution refuses the
+        document rather than misreading it.
+        """
+        found: dict[tuple[bytes, bytes], int] = {}
+        for match in _PDF_INTEGER_OBJECT.finditer(data):
+            number, generation, value = match.groups()
+            found.setdefault((number.lstrip(b"0") or b"0", generation), int(value))
+        return found
+
+    @classmethod
+    def _stream_length(
+        cls, dictionary: bytes, objects: dict[tuple[bytes, bytes], int]
+    ) -> int:
+        direct = list(_PDF_DIRECT_LENGTH.finditer(dictionary))
+        indirect = list(_PDF_INDIRECT_LENGTH.finditer(dictionary))
+        if len(direct) + len(indirect) != 1:
+            raise DocumentReleaseDenied("document stream length is unsupported")
+        if direct:
+            encoded = direct[0].group(1)
+            if len(encoded) > 10:
+                raise DocumentReleaseDenied("document stream length is unsupported")
+            length = int(encoded)
+        else:
+            number, generation = indirect[0].groups()
+            key = (number.lstrip(b"0") or b"0", generation)
+            if key not in objects:
+                raise DocumentReleaseDenied("document stream length is unresolvable")
+            length = objects[key]
+        if length > MAX_DOCUMENT_BYTES:
+            raise DocumentReleaseDenied("document stream length is unsupported")
+        return length
+
     @classmethod
     def _decoded_pdf_streams(cls, data: bytes) -> list[bytes]:
         decoded_streams: list[bytes] = []
         total_decoded = 0
         cursor = 0
+        objects = cls._integer_objects(data)
         while match := _PDF_STREAM_START.search(data, cursor):
             if len(decoded_streams) >= MAX_PDF_STREAMS_INSPECTED:
                 raise DocumentReleaseDenied("document stream inspection bounds exceeded")
@@ -419,15 +469,7 @@ class DocumentReleaseService:
             normalized_dictionary = _PDF_NAME_ESCAPE.sub(
                 lambda item: bytes((int(item.group(1), 16),)), dictionary
             )
-            lengths = list(_PDF_DIRECT_LENGTH.finditer(normalized_dictionary))
-            if len(lengths) != 1:
-                raise DocumentReleaseDenied("document stream length is unsupported")
-            encoded_length_bytes = lengths[0].group(1)
-            if len(encoded_length_bytes) > 10:
-                raise DocumentReleaseDenied("document stream length is unsupported")
-            encoded_length = int(encoded_length_bytes)
-            if encoded_length > MAX_DOCUMENT_BYTES:
-                raise DocumentReleaseDenied("document stream length is unsupported")
+            encoded_length = cls._stream_length(normalized_dictionary, objects)
             content_start = match.end()
             content_end = content_start + encoded_length
             if content_end > len(data):
