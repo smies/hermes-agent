@@ -11,6 +11,7 @@ import copy
 import io
 import json
 import logging
+import yaml
 from datetime import datetime
 import threading
 import zlib
@@ -6669,6 +6670,120 @@ def test_a_closed_gate_says_why_in_the_log(tmp_path, caplog):
         )
     assert "RuntimeError" in caplog.text
     assert "passport number" not in caplog.text
+
+
+def test_both_profiles_can_read_one_shared_policy(tmp_path):
+    """Fifteen of seventeen keys were duplicated between two config files.
+
+    There is no include mechanism in the loader -- each profile gets one file
+    -- so the two stayed in step by hand, and the pair that must agree exactly
+    is the policy and the generation naming it. An edit to one side with the
+    generation left alone is invisible to the lane, because the generations
+    still match while the policies no longer do.
+
+    One file now holds what both read. What legitimately differs stays local
+    and wins.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    full = _config(tmp_path, root, mode="kite")
+    section = full["juno_kite_trusted_principal"]
+
+    shared_keys = [
+        k for k in section if k not in {"mode", "profile", "private_reads"}
+    ]
+    shared = {k: section[k] for k in shared_keys}
+    shared_file = tmp_path / "juno-kite-shared.yaml"
+    shared_file.write_text(yaml.safe_dump(shared), encoding="utf-8")
+
+    # Each profile keeps only what is its own, plus the pointer.
+    lean = {k: section[k] for k in ("mode", "profile", "private_reads") if k in section}
+    lean["shared_from"] = str(shared_file)
+    split = {**full, "juno_kite_trusted_principal": lean}
+
+    from_one_file = TrustedPrincipalRuntime(
+        copy.deepcopy(split), active_profile="kite", clock=Clock()
+    )
+    as_before = TrustedPrincipalRuntime(
+        copy.deepcopy(full), active_profile="kite", clock=Clock()
+    )
+    # Same policy, same generation, same limits, same everything shared.
+    assert from_one_file.policy_generation == as_before.policy_generation
+    assert from_one_file.limits == as_before.limits
+    assert json.dumps(from_one_file.config.get("policy"), sort_keys=True) == \
+        json.dumps(as_before.config.get("policy"), sort_keys=True)
+    assert from_one_file.mode == "kite"
+    # The pointer does not survive into the effective config.
+    assert "shared_from" not in from_one_file.config
+
+    # Where both name a key, the profile's own value wins -- otherwise the
+    # readers Kite has and Juno does not would arrive from the file they
+    # share. A local value that diverges is drift by another route, which is
+    # why the deploy check compares what each profile effectively loads rather
+    # than what its file happens to say.
+    shared_file.write_text(
+        yaml.safe_dump({**shared, "policy_generation": "from-the-shared-file"}),
+        encoding="utf-8",
+    )
+    overridden = TrustedPrincipalRuntime(
+        {**full, "juno_kite_trusted_principal": {**lean, "shared_from": str(shared_file),
+                                                 "policy_generation": "from-the-profile"}},
+        active_profile="kite", clock=Clock(),
+    )
+    assert overridden.policy_generation == "from-the-profile"
+    # And with nothing local to say otherwise, the shared file decides.
+    inherited = TrustedPrincipalRuntime(
+        {**full, "juno_kite_trusted_principal": {**lean, "shared_from": str(shared_file)}},
+        active_profile="kite", clock=Clock(),
+    )
+    assert inherited.policy_generation == "from-the-shared-file"
+
+
+def test_a_shared_policy_that_cannot_be_read_says_so_rather_than_refusing(tmp_path):
+    """The failure that must not be quiet.
+
+    This plugin fails closed. A policy that loads half-formed refuses
+    everything for everyone and reads as a policy decision rather than a
+    missing file -- which is exactly what a room with no capabilities looked
+    like the last time it happened.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    full = _config(tmp_path, root, mode="kite")
+    section = full["juno_kite_trusted_principal"]
+    lean = {k: section[k] for k in ("mode", "profile", "private_reads") if k in section}
+
+    def build(reference):
+        config = {**full, "juno_kite_trusted_principal": {**lean, "shared_from": reference}}
+        return TrustedPrincipalRuntime(config, active_profile="kite", clock=Clock())
+
+    missing = tmp_path / "not-here.yaml"
+    with pytest.raises(ValueError, match="unreadable"):
+        build(str(missing))
+
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("policy: [unclosed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        build(str(broken))
+
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="holds no mapping"):
+        build(str(empty))
+
+    with pytest.raises(ValueError, match="must be absolute"):
+        build("juno-kite-shared.yaml")
+
+    # And the file both profiles read cannot decide which profile this is.
+    usurper = tmp_path / "usurper.yaml"
+    usurper.write_text(
+        yaml.safe_dump({**{k: section[k] for k in section
+                           if k not in {"mode", "profile", "private_reads"}},
+                        "mode": "juno"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="must not set mode"):
+        build(str(usurper))
 
 
 def test_the_wire_follows_the_turn_ttl_when_nothing_says_otherwise(tmp_path):

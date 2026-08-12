@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import yaml
 import json
 import logging
 import os
@@ -442,6 +443,7 @@ class TrustedPrincipalRuntime:
         section = host_config.get("juno_kite_trusted_principal")
         if not isinstance(section, dict):
             raise ValueError("juno_kite_trusted_principal config is required")
+        section = self._with_shared_policy(section)
         self.host_config = host_config
         self.config = section
         self.enabled = section.get("enabled") is True
@@ -910,6 +912,57 @@ class TrustedPrincipalRuntime:
             )
         self.peer_name = name
         return {"url": actual_url, "auth": dict(auth), "timeout": timeout}
+
+    @staticmethod
+    def _with_shared_policy(section: dict) -> dict:
+        """Merge the block both profiles share from the one file that holds it.
+
+        Kite and Juno keep separate config.yaml files and the loader has no
+        include mechanism, so fifteen of this plugin's seventeen keys were
+        duplicated verbatim between them and stayed in step only by hand. Two
+        of those -- the policy and the generation naming it -- must agree
+        exactly or the lane breaks, and an edit to one side with the generation
+        left alone is invisible to the lane: the generations still match while
+        the policies no longer do.
+
+        Local keys win, so what legitimately differs -- mode, profile, and the
+        readers Kite has and Juno does not -- stays where it is read.
+
+        A shared file that is named but cannot be read raises here. The
+        alternative is a policy that loads half-formed, and this plugin fails
+        closed: it would refuse everything for everyone and look like a policy
+        decision rather than a missing file.
+        """
+        reference = str(section.get("shared_from") or "").strip()
+        if not reference:
+            return section
+        path = Path(reference)
+        if not path.is_absolute():
+            raise ValueError("juno_kite_trusted_principal shared_from must be absolute")
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(
+                f"juno_kite_trusted_principal shared_from is unreadable: {path}"
+            ) from exc
+        except yaml.YAMLError as exc:
+            raise ValueError(
+                f"juno_kite_trusted_principal shared_from is malformed: {path}"
+            ) from exc
+        if not isinstance(loaded, dict) or not loaded:
+            raise ValueError(
+                f"juno_kite_trusted_principal shared_from holds no mapping: {path}"
+            )
+        # What a profile is cannot come from the file both profiles read.
+        for key in ("mode", "profile", "shared_from"):
+            if key in loaded:
+                raise ValueError(
+                    f"juno_kite_trusted_principal shared_from must not set {key}"
+                )
+        merged = dict(loaded)
+        merged.update(section)
+        merged.pop("shared_from", None)
+        return merged
 
     def juno_available(self) -> bool:
         return (
