@@ -11,6 +11,7 @@ import copy
 import io
 import json
 import logging
+import re
 import yaml
 from datetime import datetime
 import threading
@@ -6670,6 +6671,73 @@ def test_a_closed_gate_says_why_in_the_log(tmp_path, caplog):
         )
     assert "RuntimeError" in caplog.text
     assert "passport number" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_signature_mismatch_says_which_end_changed(tmp_path, caplog):
+    """Live at 08:38 on 2026-08-12, and undiagnosable from either log.
+
+    Juno rejected a well-formed 3,526-character response of Kite's as having
+    an invalid signature. Both sides held the same key -- checked -- which
+    leaves the text having been altered between the signing and the check, and
+    nothing anywhere to say so. An HMAC cannot report what changed; two
+    digests can at least report that something did, and which side of the lane
+    it happened on. The hash and the length, never the content.
+    """
+    root = tmp_path / "family"
+    root.mkdir()
+    clock = Clock()
+    juno = _runtime(tmp_path, root, mode="juno", clock=clock)
+    kite = _runtime(tmp_path, root, mode="kite", clock=clock)
+
+    await juno.pre_gateway_dispatch(
+        event=_event("What time is the transfer?"),
+        gateway=SimpleNamespace(
+            adapters={Platform.WHATSAPP: RecordingWhatsAppAdapter(MutableRoster())}
+        ),
+        critical_ingress_token=object(),
+    )
+    prepared = _session(
+        lambda: juno._prepare_request({"question_or_goal": "What time is the transfer?"}),
+        mode="juno",
+    )
+
+    def kite_turn():
+        kite.pre_llm_call(
+            user_message=prepared.message,
+            session_id="kite-session", turn_id="kite-turn",
+        )
+        return kite.transform_llm_output(
+            response_text="Pickup is timed to the 11:55 arrival.",
+            session_id="kite-session", turn_id="kite-turn",
+        )
+
+    with caplog.at_level(logging.INFO):
+        envelope = _session(
+            kite_turn, mode="kite", context_id=prepared.mapping.context_id
+        )
+    signed = re.search(r"envelope signed: ([0-9a-f]{12})", caplog.text)
+    assert signed, caplog.text
+    assert "Pickup is timed" not in caplog.text  # the hash, not the answer
+
+    # Something rewrites the text after Kite signed it -- the shape of the live
+    # failure, reproduced here with a single character.
+    tampered = envelope.replace("11:55", "11:56", 1)
+    assert tampered != envelope
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match="signature is invalid"):
+            _session(
+                lambda: juno._validate_response(
+                    tampered, prepared.mapping, prepared.request_id
+                ),
+                mode="juno",
+            )
+    received = re.search(r"envelope received: ([0-9a-f]{12})", caplog.text)
+    assert received, caplog.text
+    # Different digests: the text changed on the way, not the keys.
+    assert received.group(1) != signed.group(1)
+    assert "11:56" not in caplog.text
 
 
 def test_both_profiles_can_read_one_shared_policy(tmp_path):

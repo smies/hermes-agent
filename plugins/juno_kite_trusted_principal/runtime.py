@@ -206,6 +206,11 @@ def sign_payload(payload: dict, key: bytes) -> str:
     ).hexdigest()
 
 
+def _envelope_digest(envelope: str) -> str:
+    """A short hash of an envelope, for comparing the two ends of the lane."""
+    return hashlib.sha256(envelope.encode("utf-8")).hexdigest()[:12]
+
+
 def _verify_signature(payload: dict, key: bytes) -> bool:
     signature = payload.get("signature")
     if not isinstance(signature, str) or len(signature) != 64:
@@ -3877,6 +3882,17 @@ class TrustedPrincipalRuntime:
                 )
             if len(envelope.encode("utf-8")) > self.limits.response_bytes:
                 raise ValueError("response envelope exceeds byte limit")
+            # A digest of exactly what was signed. On 2026-08-12 at 08:38 Juno
+            # rejected a well-formed response of Kite's as having an invalid
+            # signature, with both sides holding the same key -- which leaves
+            # the text having been altered between the signing and the check,
+            # and no way to tell from either log. An HMAC cannot say what
+            # changed, but two digests can say that something did, and where.
+            # Content never appears here, only its hash and its length.
+            logger.info(
+                "Kite response envelope signed: %s (%s bytes)",
+                _envelope_digest(envelope), len(envelope.encode("utf-8")),
+            )
             return envelope
         except Exception as exc:
             logger.warning(
@@ -3957,6 +3973,13 @@ class TrustedPrincipalRuntime:
         if payload.get("version") != 2:
             raise ValueError("Kite response has an unsupported envelope version")
         if not _verify_signature(payload, self.response_key):
+            logger.warning(
+                "Kite response envelope received: %s (%s bytes) -- compare with "
+                "the digest Kite logged when it signed. Same digest means the "
+                "keys disagree; a different one means the text was altered "
+                "between them",
+                _envelope_digest(encoded), len(encoded.encode("utf-8")),
+            )
             raise ValueError("Kite response signature is invalid")
         expected = {
             "context_id": mapping.context_id,
