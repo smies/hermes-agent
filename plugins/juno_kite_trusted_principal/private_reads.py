@@ -106,11 +106,13 @@ _DATE_RE = re.compile(
 #
 # The regex above also let 2026-13-45 through, which then went to the source as
 # a search term nothing could match. Parsing settles that in passing.
-_RELATIVE_DATE_RE = re.compile(r"(\d{1,4})\s*([dwmy])\Z", re.IGNORECASE)
+_RELATIVE_DATE_RE = re.compile(
+    r"([+-]?)\s*(\d{1,4})\s*([dwmy])\Z", re.IGNORECASE
+)
 _RELATIVE_DAYS = {"d": 1, "w": 7, "m": 31, "y": 366}
 _DATE_HELP = (
-    "give a date as 2026-08-01 (or 2026/08/01), or a span back from today "
-    "as 7d, 3w, 6m, 1y, or today/yesterday"
+    "give a date as 2026-08-01 (or 2026/08/01), a span back from today as 7d, "
+    "3w, 6m, 1y, a span ahead as +30d, or today/tomorrow/yesterday"
 )
 
 
@@ -154,12 +156,19 @@ def _normalise_date(value: str, key: str, *, allow_time: bool = False) -> str:
         return _today().isoformat()
     if lowered == "yesterday":
         return (_today() - timedelta(days=1)).isoformat()
+    if lowered == "tomorrow":
+        return (_today() + timedelta(days=1)).isoformat()
     relative = _RELATIVE_DATE_RE.fullmatch(lowered)
     if relative is not None:
-        span = int(relative.group(1)) * _RELATIVE_DAYS[relative.group(2).lower()]
+        # A bare span reaches back, which is what a mail search means by it.
+        # A window into the future has to be sayable too -- "the next month" is
+        # the ordinary calendar question -- and the sign is how it is said.
+        sign, count, unit = relative.groups()
+        span = int(count) * _RELATIVE_DAYS[unit.lower()]
         if span > 36600:
-            raise SourceFailure("invalid_arguments", f"{key} reaches back too far")
-        return (_today() - timedelta(days=span)).isoformat()
+            raise SourceFailure("invalid_arguments", f"{key} reaches too far")
+        ahead = timedelta(days=span)
+        return ((_today() + ahead) if sign == "+" else (_today() - ahead)).isoformat()
     calendrical = text.replace("/", "-").replace(".", "-")
     day = calendrical[:10]
     try:
@@ -1808,7 +1817,10 @@ class PrivateReadService:
         )
         if start >= end:
             raise SourceFailure(
-                "invalid_arguments", "the calendar window ends before it starts"
+                "invalid_arguments",
+                "the calendar window ends before it starts -- a bare span like "
+                "30d reaches back from today, so a window ahead is start today, "
+                f"end +30d. {_DATE_HELP}",
             )
         maximum = self._bounded_int(args["max_results"], "max_results", 50)
         canonical = {

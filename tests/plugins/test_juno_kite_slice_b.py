@@ -710,6 +710,28 @@ def test_a_date_argument_is_read_the_way_it_is_written(tmp_path):
         assert window["start"].startswith(today.strftime("%Y-%m-%dT00:00:00"))
         assert window["end"].startswith(today.strftime("%Y-%m-%dT23:59:59"))
 
+        # A bare span reaches back, which is what a mail search means by it --
+        # but "the next month" is the ordinary calendar question and has to be
+        # sayable. The sign is how it is said.
+        _invoke(kite, "kite_calendar_read", {
+            "account": "personal", "start": "today", "end": "+30d",
+            "max_results": 5,
+        })
+        window = calendar.calls[-1][1]
+        assert window["start"].startswith(today.strftime("%Y-%m-%dT00:00:00"))
+        assert window["end"].startswith(
+            (today + timedelta(days=30)).strftime("%Y-%m-%dT23:59:59")
+        )
+
+        # And asking for it the other way says how to say it, rather than
+        # reporting an empty window and leaving the model to guess.
+        backwards = _invoke(kite, "kite_calendar_read", {
+            "account": "personal", "start": "today", "end": "30d",
+            "max_results": 5,
+        })
+        assert backwards["status"] == "error"
+        assert "+30d" in backwards["error"]["message"]
+
         # An hour is still an hour: a full timestamp is not rounded to the day.
         _invoke(kite, "kite_calendar_read", {
             "account": "personal",
