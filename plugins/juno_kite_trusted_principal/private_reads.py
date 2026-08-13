@@ -147,6 +147,16 @@ def _bounded_transaction(payload: Any, limit: int) -> Any:
     return bounded
 
 
+# A research note carries its whole markdown body: five of them is 213,728
+# characters, and the operation exists to tell notes apart, not to read them.
+# Reading one is what the note operation is for. Same shape as the property
+# list, one operation over.
+_PROPERTY_NOTE_FIELDS = (
+    "id", "kind", "status", "author", "pinned", "createdAt",
+    "latestEntryAt", "latestEntryKind", "entryCount", "openQuestionCount",
+)
+_PROPERTY_NOTE_EXCERPT_CHARS = 400
+
 _PROPERTY_LIST_FIELDS = (
     "id", "canonicalTitle", "displayArea", "market", "status",
     "interestLevel", "viewingPriority", "propertyType", "transactionType",
@@ -1925,7 +1935,15 @@ class PrivateReadService:
                 )
             raise SourceFailure("source_failure", "source command failed", True)
         output = str(completed.stdout or "")
-        if len(output.encode("utf-8")) > (max_output_bytes or self.output_bytes):
+        # What a source command prints is input to this reader, not the answer.
+        # Measuring it against the answer allowance refused a Gmail search
+        # outright for returning a lot of mail -- the same mistake as the
+        # passports, the transaction and the long note, in the last place it
+        # was still made. What comes back is bounded after, by max_results and
+        # then by output_bytes in execute().
+        if len(output.encode("utf-8")) > (
+            max_output_bytes or _EXTRACT_MAX_INPUT_BYTES
+        ):
             raise SourceFailure(
                 "cap_exceeded", "source command output exceeded its cap"
             )
@@ -2384,6 +2402,10 @@ class PrivateReadService:
             "list": {"operation", "max_results"},
             "property": {"operation", "property_id"},
             "research_notes": {"operation", "property_id", "max_results"},
+            # 'query' is added below for both list and research_notes: they are
+            # the two operations that return a collection, and the model
+            # reasonably assumed the narrowing that works on one works on the
+            # other. It asked twice and was refused twice.
             "note": {"operation", "note_id"},
             "note_entry": {"operation", "note_id", "entry_id"},
             "transaction": {"operation", "property_id"},
@@ -2393,7 +2415,7 @@ class PrivateReadService:
                 "operation_denied", "Property Intel operation is unavailable"
             )
         allowed_args = set(expected[str(operation)]) | (
-            {"query"} if operation == "list" else set()
+            {"query"} if operation in {"list", "research_notes"} else set()
         ) | ({"max_results"} if operation == "transaction" else set())
         _require_args(
             args, allowed_args, expected[str(operation)],
@@ -2447,6 +2469,24 @@ class PrivateReadService:
                     item for item in data if query in canonical_json(item).casefold()
                 ]
             total = len(data)
+            if operation == "research_notes":
+                data = [
+                    {
+                        **{
+                            key: item[key]
+                            for key in _PROPERTY_NOTE_FIELDS
+                            if isinstance(item, dict) and item.get(key) is not None
+                        },
+                        **(
+                            {"bodyExcerpt": str(item["bodyMd"])[
+                                :_PROPERTY_NOTE_EXCERPT_CHARS
+                            ]}
+                            if isinstance(item, dict) and item.get("bodyMd")
+                            else {}
+                        ),
+                    }
+                    for item in data
+                ]
             if operation == "list":
                 data = [
                     {
@@ -2718,7 +2758,12 @@ class PrivateReadService:
             raise
         except (OSError, ValueError) as exc:
             raise SourceFailure(
-                "path_denied", "path is unavailable or escapes its configured root"
+                "path_denied",
+                # A guessed path is the ordinary way to arrive here, and the
+                # answer is always the same: search first, then read what the
+                # search returned. Saying so ends the guessing in one call.
+                "no such file under that root. Search this root first and read "
+                "a relative_path the search returned, rather than guessing one",
             ) from exc
         mode = real.stat().st_mode
         if not stat.S_ISREG(mode):

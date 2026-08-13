@@ -1332,6 +1332,80 @@ def test_property_mode_denies_container_dumps_and_credentials(tmp_path, answer):
     _bound_turn(tmp_path, {"property_intel": prop}, check)
 
 
+def test_the_turn_that_could_not_find_nachos_letter(tmp_path):
+    """Lucy asked for the lawyer's latest letter. Four readers refused at once.
+
+    2026-08-13 19:38, source_failures: gmail:cap_exceeded,
+    property:cap_exceeded, property:invalid_arguments, personal:path_denied.
+    Three were the reader's own caps and shapes, not policy:
+
+    - a Gmail search that returned a lot of mail was refused outright, because
+      what a source command prints was measured against the answer allowance;
+    - research_notes returns whole markdown bodies -- five notes is 213,728
+      characters -- when the operation exists to tell notes apart;
+    - research_notes would not take the query that narrows the list, so the
+      model asked twice and was refused twice.
+    """
+    notes = [
+        {"id": f"123e4567-e89b-12d3-a456-42661417400{n}", "kind": "research",
+         "status": "open", "author": "Hermes", "entryCount": 4,
+         "bodyMd": "# Position\n\n" + ("nacho says the target holds. " * 400)}
+        for n in range(4)
+    ]
+
+    def check(kite):
+        # An index, not four whole notes.
+        listed = _invoke(kite, "kite_property_read", {
+            "operation": "research_notes",
+            "property_id": "123e4567-e89b-12d3-a456-426614174000",
+            "max_results": 10,
+        })
+        assert listed["status"] == "ok", listed
+        rows = listed["data"]["matches"] if isinstance(listed["data"], dict) else listed["data"]
+        assert len(rows) == 4
+        assert "bodyMd" not in rows[0]
+        assert rows[0]["bodyExcerpt"].startswith("# Position")
+        assert len(json.dumps(listed["data"])) < 6000
+
+        # And it narrows the same way the property list does.
+        narrowed = _invoke(kite, "kite_property_read", {
+            "operation": "research_notes",
+            "property_id": "123e4567-e89b-12d3-a456-426614174000",
+            "max_results": 10, "query": "nacho",
+        })
+        assert narrowed["status"] == "ok", narrowed
+
+    _bound_turn(
+        tmp_path,
+        {"property_intel": RecordingBackend({"research_notes": notes})},
+        check,
+    )
+
+
+def test_a_guessed_file_path_is_told_what_to_do_instead(tmp_path):
+    """"path is unavailable or escapes its configured root" -- so, what now?
+
+    A guessed relative_path is the ordinary way to arrive here and the answer
+    is always the same: search first, read what the search returned.
+    """
+    root = tmp_path / "personal"
+    root.mkdir()
+    (root / "real.md").write_text("here", encoding="utf-8")
+    service = PrivateReadService({
+        "enabled": True, "output_bytes": 65536,
+        "files": {"roots": [{"name": "obsidian", "path": str(root)}],
+                  "allowed_bases": [str(tmp_path)]},
+    })
+    failed = json.loads(service.execute("kite_personal_files_read", {
+        "operation": "read", "root": "obsidian",
+        "relative_path": "Letters/nacho-latest.pdf",
+    }))
+    assert failed["status"] == "error"
+    message = failed["error"]["message"]
+    assert "Search this root first" in message
+    assert "guessing" in message
+
+
 def test_a_purchase_transaction_answers_without_its_whole_history(tmp_path):
     """Lucy asked what the house being bought was, and got nothing.
 

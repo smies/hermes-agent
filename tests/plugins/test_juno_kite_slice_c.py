@@ -3003,15 +3003,23 @@ def test_attachment_transport_cap_does_not_reject_a_real_document(tmp_path):
     assert result["size_bytes"] == len(artifact)
     assert calls and calls[0][-3:] == ["attachment", "abc", "xyz"]
 
-    # An ordinary Gmail answer keeps the tight cap.
-    capped = False
-    try:
-        service._source_or_google_command(
-            "gmail", "get", {"account": "personal", "message_id": "abc"}
-        )
-    except Exception as exc:  # SourceFailure is frozen; inspect it directly
-        capped = getattr(exc, "code", "") == "cap_exceeded"
-    assert capped
+    # An ordinary Gmail read is no longer refused at the pipe for being large:
+    # what a source command prints is input to this reader, and measuring it
+    # against the answer allowance refused Lucy's search for Nacho's letter on
+    # 2026-08-13 for the sin of matching a lot of mail. The pipe is bounded by
+    # an input-shaped limit instead.
+    passed_the_pipe = service._source_or_google_command(
+        "gmail", "get", {"account": "personal", "message_id": "abc"}
+    )
+    assert passed_the_pipe["size_bytes"] == len(artifact)
+
+    # The answer is still bounded -- one layer later, where the answer is.
+    # execute() measures what actually goes back against output_bytes.
+    refused = json.loads(service.execute(
+        "kite_gmail_get", {"account": "personal", "message_id": "abc"}
+    ))
+    assert refused["status"] == "error"
+    assert refused["error"]["code"] == "cap_exceeded"
 
 
 @pytest.mark.asyncio
@@ -4945,15 +4953,23 @@ def test_attachment_transport_cap_does_not_reject_a_real_document(tmp_path):
     assert result["size_bytes"] == len(artifact)
     assert calls and calls[0][-3:] == ["attachment", "abc", "xyz"]
 
-    # An ordinary Gmail answer keeps the tight cap.
-    capped = False
-    try:
-        service._source_or_google_command(
-            "gmail", "get", {"account": "personal", "message_id": "abc"}
-        )
-    except Exception as exc:  # SourceFailure is frozen; inspect it directly
-        capped = getattr(exc, "code", "") == "cap_exceeded"
-    assert capped
+    # An ordinary Gmail read is no longer refused at the pipe for being large:
+    # what a source command prints is input to this reader, and measuring it
+    # against the answer allowance refused Lucy's search for Nacho's letter on
+    # 2026-08-13 for the sin of matching a lot of mail. The pipe is bounded by
+    # an input-shaped limit instead.
+    passed_the_pipe = service._source_or_google_command(
+        "gmail", "get", {"account": "personal", "message_id": "abc"}
+    )
+    assert passed_the_pipe["size_bytes"] == len(artifact)
+
+    # The answer is still bounded -- one layer later, where the answer is.
+    # execute() measures what actually goes back against output_bytes.
+    refused = json.loads(service.execute(
+        "kite_gmail_get", {"account": "personal", "message_id": "abc"}
+    ))
+    assert refused["status"] == "error"
+    assert refused["error"]["code"] == "cap_exceeded"
 
 
 @pytest.mark.asyncio
