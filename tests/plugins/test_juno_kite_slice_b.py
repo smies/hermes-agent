@@ -3259,3 +3259,54 @@ def test_reader_contract_a_refusal_names_the_argument(
         {backend_name: RecordingBackend({operation: make(1)})},
         check,
     )
+
+
+def test_paired_limits_are_derived_and_not_merely_chosen():
+    """Seven defects this week were two numbers where the smaller won quietly.
+
+    The wire timeout against the turn TTL. The attachment pipe against the
+    extraction ceiling -- 12MB against 8MB, whose base64 is 10.7MB, a margin
+    of rounding error, and a real 10.97MB legal note fell outside both. The
+    answer allowance used as an input bound, in five separate places.
+
+    Each was found by someone asking a question and not getting an answer.
+    Wherever two limits govern one path, one has to be computed from the
+    other, and this asserts the relationships that must hold.
+    """
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    # The pipe must carry whatever the extractor will read, once base64 has
+    # inflated it by a third, with room for the JSON envelope around it.
+    assert pr._ATTACHMENT_COMMAND_OUTPUT_BYTES > pr._EXTRACT_MAX_INPUT_BYTES * 4 / 3
+
+    # An extractor bound is an input bound, and must not be confused with the
+    # answer allowance -- which is per-service and much smaller. If these ever
+    # converge, an input has started being measured against an answer again.
+    assert pr._EXTRACT_MAX_INPUT_BYTES >= 32 * 1024 * 1024
+
+    # What a preview loads cannot exceed what a read loads: a preview is the
+    # cheaper of the two by construction.
+    assert pr._PREVIEW_MAX_PAGES <= pr._READ_MAX_PAGES
+    assert pr._PREVIEW_MAX_CHARS <= pr._READ_EXTRACT_CHARS
+
+    # A property walk bounds input; the answer is bounded separately, later.
+    assert pr._PROPERTY_MAX_INPUT_BYTES >= 4 * 1024 * 1024
+
+    # A transaction's default page must fit inside what one call may return,
+    # with the projection applied -- 12 items of the live record is ~33KB.
+    assert pr._TRANSACTION_DEFAULT_ITEMS <= 30
+
+    # And a file search must be allowed to scan more entries than it will ever
+    # return, or the bound would be the walk rather than the answer.
+    assert pr._FILE_SEARCH_MAX_SCANNED > 1000
+
+
+def test_the_wire_waits_at_least_as_long_as_the_authority_it_was_granted(tmp_path):
+    """The same pairing, one layer up: giving up early aborts a live turn."""
+    config = _slice_b_config(tmp_path, mode="juno")
+    entry = config["a2a_agents"]["kite"]
+    entry.pop("timeout", None)
+    config["juno_kite_trusted_principal"]["limits"]["turn_ttl_seconds"] = 300
+
+    juno = TrustedPrincipalRuntime(config, active_profile="juno", clock=lambda: 1_900_000_000)
+    assert juno.peer["timeout"] >= juno.limits.turn_ttl_seconds
