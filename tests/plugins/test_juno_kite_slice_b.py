@@ -2408,7 +2408,16 @@ def test_read_caps_a_document_on_what_it_loads_not_on_what_a_text_file_returns(
     filler = b"0" * 23_000
     (root / "scan.pdf").write_bytes(b"%PDF-1.4\n" + filler)
     (root / "notes.md").write_text("x" * 23_000, encoding="utf-8")
-    (root / "huge.pdf").write_bytes(b"%PDF-1.4\n" + b"0" * (8 * 1024 * 1024))
+    # Derived from the cap, not a number that happened to match it once: this
+    # asserted 8MB was refused, and stayed asserting it after the ceiling was
+    # raised for a solicitor's 10.97MB scan. Patched small so the test does not
+    # write tens of megabytes to say one thing.
+    monkeypatch.setattr(
+        "plugins.juno_kite_trusted_principal.private_reads"
+        "._EXTRACT_MAX_INPUT_BYTES",
+        50_000,
+    )
+    (root / "huge.pdf").write_bytes(b"%PDF-1.4\n" + b"0" * 60_000)
 
     seen: list[int] = []
 

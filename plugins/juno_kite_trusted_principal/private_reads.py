@@ -170,10 +170,25 @@ _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
 # cannot be shortened or cached. A 256 cap silently made every real attachment
 # unreachable: the schema rejected the argument before the reader ever ran.
 _ATTACHMENT_ID_MAX_CHARS = 1024
-# Transport headroom for one base64-encoded artifact plus its metadata. The
-# release ceiling is 8MB of decoded bytes, which is ~10.7MB encoded; this caps
-# the pipe, not the policy, which is enforced on the decoded size.
-_ATTACHMENT_COMMAND_OUTPUT_BYTES = 12 * 1024 * 1024
+# What an extractor is willing to load, which is not what it returns: a scan
+# is megabytes of image data behind a few hundred characters of text. 8MB was
+# too small for a real one -- a solicitor's scanned legal note ran to 10.97MB
+# and extracted 34,193 characters of text in 0.4 seconds once allowed through.
+_EXTRACT_MAX_INPUT_BYTES = 32 * 1024 * 1024
+# Transport headroom for one base64-encoded artifact plus its metadata.
+#
+# Derived, not chosen. These were two independent numbers and the smaller won
+# in silence: the pipe allowed 12MB while the extractor was willing to read
+# 8MB, which base64 inflates to 10.7MB -- so the margin was thin, and any
+# rounding of either number closed it. Nacho's legal note of 2026-08-13 is
+# 10.97MB, 14.6MB encoded, and was refused at the pipe before the size policy
+# could have an opinion. It extracts in 0.4 seconds once allowed through.
+#
+# The invariant: the pipe must be able to carry whatever the extractor is
+# willing to read. Raise _EXTRACT_MAX_INPUT_BYTES and this follows.
+_ATTACHMENT_COMMAND_OUTPUT_BYTES = (
+    _EXTRACT_MAX_INPUT_BYTES * 4 // 3 + 2 * 1024 * 1024
+)
 # The attachment command makes two API round-trips and downloads the document,
 # where an ordinary text answer makes one and returns a few KB. The shared 15s
 # source timeout killed it mid-download. Bounded well inside the A2A call
@@ -793,9 +808,6 @@ _PREVIEW_MAX_PAGES = 2
 # discloses more. 40k characters is roughly a 20-page contract.
 _READ_EXTRACT_CHARS = 40_000
 _READ_MAX_PAGES = 20
-# What an extractor is willing to load, which is not what it returns: a scan
-# is megabytes of image data behind a few hundred characters of text.
-_EXTRACT_MAX_INPUT_BYTES = 8 * 1024 * 1024
 _TEXT_SUFFIXES = frozenset({
     ".txt",
     ".md",

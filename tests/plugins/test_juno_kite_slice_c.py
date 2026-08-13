@@ -2948,6 +2948,33 @@ async def test_lane_reset_never_breaks_dispatch(tmp_path):
     ) is None
 
 
+def test_the_pipe_can_carry_whatever_the_extractor_will_read(tmp_path):
+    """Nacho's legal note is 10.97MB and was refused before policy saw it.
+
+    Two independent numbers, and the smaller won in silence: the pipe allowed
+    12MB while the extractor was willing to read 8MB, which base64 inflates to
+    10.7MB. The margin was a rounding error wide, and a real scanned legal
+    note -- 14.6MB encoded -- fell outside both. It extracts 34,193 characters
+    in 0.4 seconds once allowed through.
+
+    The pipe is derived from the extraction cap now, so raising one raises the
+    other and they cannot drift apart again.
+    """
+    from plugins.juno_kite_trusted_principal.private_reads import (
+        _ATTACHMENT_COMMAND_OUTPUT_BYTES,
+        _EXTRACT_MAX_INPUT_BYTES,
+    )
+
+    # A maximum-sized attachment, base64-encoded, must fit down the pipe with
+    # room for the JSON envelope around it.
+    encoded_worst_case = _EXTRACT_MAX_INPUT_BYTES * 4 / 3
+    assert _ATTACHMENT_COMMAND_OUTPUT_BYTES > encoded_worst_case
+
+    # And the ceiling is big enough for the documents this household actually
+    # receives: a solicitor's scanned note ran to 10.97MB.
+    assert _EXTRACT_MAX_INPUT_BYTES >= 11 * 1024 * 1024
+
+
 def test_attachment_transport_cap_does_not_reject_a_real_document(tmp_path):
     """The live 22:53 and 22:55 failures: cap_exceeded on the pipe, not the file.
 
