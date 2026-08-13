@@ -3310,3 +3310,79 @@ def test_the_wire_waits_at_least_as_long_as_the_authority_it_was_granted(tmp_pat
 
     juno = TrustedPrincipalRuntime(config, active_profile="juno", clock=lambda: 1_900_000_000)
     assert juno.peer["timeout"] >= juno.limits.turn_ttl_seconds
+
+
+# Every (tool, operation) the schemas offer must be either exercised by the
+# reader contract above or listed here with the reason it is not. The contract
+# suite covered five of twenty-three pairs and read as though it covered the
+# readers; two live defects walked through the gap in one evening -- a Gmail
+# search refused by the shared subprocess helper, and research_notes returning
+# whole markdown bodies. A gap that is written down is a decision; a gap that
+# is not is an accident waiting for someone to ask a question.
+CONTRACT_EXEMPT = {
+    ("kite_gmail_get", ""): "one exact message; no collection to bound",
+    ("kite_gmail_attachment_extract", ""):
+        "one exact attachment; bounded by the extraction ceiling and asserted "
+        "by test_paired_limits_are_derived_and_not_merely_chosen",
+    ("kite_personal_files_read", "read"):
+        "one file; max_lines and start_line covered by "
+        "test_a_long_note_is_partly_read_not_refused",
+    ("kite_personal_files_read", "search"):
+        "covered by test_a_file_search_finds_a_document_the_way_it_is_asked_for",
+    ("kite_personal_files_locate", ""):
+        "bounded walk with its own truncation contract; covered in slice C",
+    ("kite_personal_files_release_located", ""):
+        "stages one located document; not a collection read",
+    ("kite_property_read", "property"): "one exact property record",
+    ("kite_property_read", "note"): "one exact note",
+    ("kite_property_read", "note_entry"): "one exact entry",
+    ("kite_property_read", "research_notes"):
+        "covered by test_the_turn_that_could_not_find_nachos_letter",
+    ("kite_property_read", "transaction"):
+        "returns a record whose every collection is bounded; covered by "
+        "test_a_purchase_transaction_answers_without_its_whole_history",
+    ("kite_session_search", ""):
+        "reads sqlite directly rather than an injectable backend; covered by "
+        "the recall tests in slice C",
+    ("kite_things_read", "snapshot"): "the pinned project; takes no selector",
+    ("kite_things_read", "item"): "one exact item",
+    ("kite_things_read", "recent_completed"):
+        "same shape as things search, which the contract covers",
+    ("kite_whatsapp_archive_read", "message"): "one exact message",
+    ("kite_whatsapp_archive_read", "deleted"):
+        "same shape as the archive search, which the contract covers",
+    ("kite_whatsapp_archive_read", "media_metadata"):
+        "same shape as the archive search, which the contract covers",
+}
+
+
+def test_every_reader_operation_is_covered_or_knowingly_exempt():
+    """No operation gets to be uncovered by accident."""
+    from plugins.juno_kite_trusted_principal.private_reads import TOOL_SCHEMAS
+
+    offered = set()
+    for tool, schema in TOOL_SCHEMAS.items():
+        operations = (
+            schema["parameters"]["properties"].get("operation", {}).get("enum")
+        )
+        for operation in operations or [""]:
+            offered.add((tool, operation))
+
+    covered = set()
+    for row in READER_CONTRACT:
+        tool, args = row[0], row[1]
+        covered.add((tool, args.get("operation", "")))
+
+    uncovered = offered - covered - set(CONTRACT_EXEMPT)
+    assert not uncovered, (
+        "these reader operations are neither exercised by READER_CONTRACT nor "
+        f"listed in CONTRACT_EXEMPT with a reason: {sorted(uncovered)}"
+    )
+
+    # And an exemption for something that no longer exists is stale bookkeeping.
+    stale = set(CONTRACT_EXEMPT) - offered
+    assert not stale, f"exemptions for operations that no longer exist: {sorted(stale)}"
+
+    # Every exemption states a reason, because "exempt" without one is just
+    # uncovered with extra steps.
+    assert all(reason.strip() for reason in CONTRACT_EXEMPT.values())
