@@ -506,3 +506,94 @@ class TestCustomProviderVisionAlias:
             ]
         }
         assert _supports_vision_override(cfg, "custom:my-vllm", "other") is None
+
+
+class TestOcrTextAlongsideImages:
+    """WhatsApp re-encodes what it carries, and small print does not survive.
+
+    Lucy sent a villa grocery list twice and was told twice that the product
+    lines were not legible. The image arrives at 1152x2048 and a couple of
+    hundred kilobytes; the model reads its headings and not its items, while
+    the OCR that ships with this machine reads them without difficulty.
+    """
+
+    def _png_with_no_text(self, tmp_path):
+        # A 1x1 PNG: a real image file with nothing to read out of it.
+        import base64
+        data = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+            "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        path = tmp_path / "blank.png"
+        path.write_bytes(data)
+        return str(path)
+
+    def test_recognised_text_travels_with_the_image(self, tmp_path, monkeypatch):
+        from agent import image_routing
+
+        image = self._png_with_no_text(tmp_path)
+        monkeypatch.setattr(
+            image_routing, "_ocr_text_for",
+            lambda path: "PANTRY\nOrtiz Anchovies\nTruffle Oil",
+        )
+        parts, _ = image_routing.build_native_content_parts("what is on this?", [image])
+        text = parts[0]["text"]
+        assert "Ortiz Anchovies" in text
+        assert "read from that image by this machine" in text
+        # The image itself still goes: the text is an aid, not a replacement.
+        assert any(part["type"] == "image_url" for part in parts)
+
+    def test_an_image_with_no_text_adds_nothing(self, tmp_path):
+        from agent import image_routing
+
+        image = self._png_with_no_text(tmp_path)
+        parts, _ = image_routing.build_native_content_parts("what is this?", [image])
+        text = parts[0]["text"]
+        assert "[Image attached at:" in text
+        assert "read from that image" not in text
+
+    def test_ocr_failure_never_costs_the_image(self, tmp_path, monkeypatch):
+        """A broken OCR must not take the picture down with it."""
+        from agent import image_routing
+
+        image = self._png_with_no_text(tmp_path)
+
+        def explode(*_args, **_kwargs):
+            raise OSError("no such interpreter")
+
+        monkeypatch.setattr(image_routing.subprocess, "run", explode)
+        parts, _ = image_routing.build_native_content_parts("hello", [image])
+        assert any(part["type"] == "image_url" for part in parts)
+        assert "[Image attached at:" in parts[0]["text"]
+
+    def test_recognition_is_cached_on_the_file_identity(self, tmp_path, monkeypatch):
+        from agent import image_routing
+
+        image = self._png_with_no_text(tmp_path)
+        image_routing._OCR_CACHE.clear()
+        calls = []
+
+        class _Done:
+            stdout = "SOMETHING"
+
+        def counted(*args, **kwargs):
+            calls.append(args)
+            return _Done()
+
+        monkeypatch.setattr(image_routing.subprocess, "run", counted)
+        for _ in range(3):
+            image_routing.build_native_content_parts("x", [image])
+        assert len(calls) == 1, "the same file should be read once, not once a turn"
+
+    def test_it_is_skipped_where_the_os_cannot_do_it(self, tmp_path, monkeypatch):
+        from agent import image_routing
+
+        image = self._png_with_no_text(tmp_path)
+        image_routing._OCR_CACHE.clear()
+        monkeypatch.setattr(image_routing.sys, "platform", "linux")
+        called = []
+        monkeypatch.setattr(image_routing.subprocess, "run",
+                            lambda *a, **k: called.append(a))
+        parts, _ = image_routing.build_native_content_parts("x", [image])
+        assert not called
+        assert any(part["type"] == "image_url" for part in parts)

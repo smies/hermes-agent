@@ -44,6 +44,9 @@ import mimetypes
 import os
 import re
 from pathlib import Path
+import subprocess
+import sys
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -725,6 +728,53 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     return f"data:{mime};base64,{b64}"
 
 
+# WhatsApp re-encodes what it carries: a phone screenshot of a menu arrives at
+# 1152x2048 and a couple of hundred kilobytes, and the model can read its
+# headings but not its product lines. Lucy sent a villa grocery list twice and
+# was told twice that it was not legible -- while the OCR that ships with this
+# machine reads "Ortiz Anchovies" and "Giuseppe Giusti Balsamic" off the same
+# file without difficulty.
+#
+# So the text goes in beside the image. Local, so nothing is posted anywhere to
+# find out what a picture says; bounded, cached on the file's identity, and
+# silent whenever it cannot help -- an image with no text in it adds nothing.
+_OCR_SCRIPT = Path(__file__).resolve().parent.parent / "tools" / "macos_ocr.py"
+_OCR_INTERPRETER = "/usr/bin/python3"
+_OCR_MAX_CHARS = 4000
+_OCR_TIMEOUT_SECONDS = 20
+_OCR_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
+_OCR_CACHE_MAX = 32
+
+
+def _ocr_text_for(path: str) -> str:
+    """Text the OS can read out of an image, or "" if it cannot help."""
+    if sys.platform != "darwin" or not _OCR_SCRIPT.exists():
+        return ""
+    try:
+        stamp = os.stat(path)
+        key = (path, stamp.st_mtime_ns, stamp.st_size)
+    except OSError:
+        return ""
+    cached = _OCR_CACHE.get(key)
+    if cached is not None:
+        _OCR_CACHE.move_to_end(key)
+        return cached
+    try:
+        finished = subprocess.run(
+            [_OCR_INTERPRETER, str(_OCR_SCRIPT), path, "1"],
+            capture_output=True, text=True, timeout=_OCR_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    lines = [line.strip() for line in (finished.stdout or "").splitlines()]
+    text = "\n".join(line for line in lines if line)[:_OCR_MAX_CHARS]
+    _OCR_CACHE[key] = text
+    while len(_OCR_CACHE) > _OCR_CACHE_MAX:
+        _OCR_CACHE.popitem(last=False)
+    return text
+
+
 def build_native_content_parts(
     user_text: str,
     image_paths: List[str],
@@ -800,7 +850,17 @@ def build_native_content_parts(
     if attached_paths or attached_urls:
         base_text = text or "What do you see in this image?"
         hint_lines: List[str] = []
-        hint_lines.extend(f"[Image attached at: {p}]" for p in attached_paths)
+        for p in attached_paths:
+            hint_lines.append(f"[Image attached at: {p}]")
+            recognised = _ocr_text_for(p)
+            if recognised:
+                # Labelled as the machine's reading rather than the user's
+                # words, and never a replacement for looking at the image.
+                hint_lines.append(
+                    "[Text read from that image by this machine, which may see "
+                    "small print the picture does not show clearly:\n"
+                    f"{recognised}\n]"
+                )
         hint_lines.extend(f"[Image attached: {u}]" for u in attached_urls)
         combined_text = f"{base_text}\n\n" + "\n".join(hint_lines)
         parts: List[Dict[str, Any]] = [{"type": "text", "text": combined_text}]

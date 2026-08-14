@@ -820,7 +820,11 @@ _TEXT_SUFFIXES = frozenset({
 _PREVIEW_TIMEOUT_SECONDS = 45
 _PDFTOTEXT_CANDIDATES = ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
 _SYSTEM_PYTHON = "/usr/bin/python3"
-_MACOS_OCR_SCRIPT = str(Path(__file__).resolve().parent / "macos_ocr.py")
+# Shared with agent.image_routing, which reads text out of images arriving in
+# ordinary conversation. One OCR helper, two callers.
+_MACOS_OCR_SCRIPT = str(
+    Path(__file__).resolve().parent.parent.parent / "tools" / "macos_ocr.py"
+)
 
 
 _CONVERTIBLE_IMAGE_MIME = {
