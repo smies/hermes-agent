@@ -13,6 +13,7 @@ import copy
 import hashlib
 import io
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -1236,6 +1237,34 @@ class SourceFailure(Exception):
     retryable: bool = False
 
 
+logger = logging.getLogger(__name__)
+
+
+def _reader_fault(source: str, tool_name: str, exc: BaseException) -> dict[str, Any]:
+    """What to return when this module, not the source, is what broke.
+
+    A defect here is not a flaky backend. Reported as one -- "backend
+    unavailable", retryable -- it invites Kite to try again and then work
+    around a problem that is not there. A missing import in the locate walk
+    was reported exactly that way on 2026-08-15 and read like an unreachable
+    filesystem.
+
+    The type and the traceback go to this machine's log, where someone can act
+    on them. What crosses to the model says the reader failed and, truthfully,
+    that repeating the request will not help: nothing about it was wrong.
+    """
+    logger.exception(
+        "Private read %s raised an unexpected %s", tool_name, type(exc).__name__
+    )
+    return _failure(
+        source,
+        "reader_failed",
+        "this reader failed unexpectedly; the fault is here rather than in the "
+        "question, and repeating it will not help",
+        retryable=False,
+    )
+
+
 def _failure(
     source: str, code: str, message: str, *, retryable: bool = False
 ) -> dict[str, Any]:
@@ -1453,15 +1482,8 @@ class PrivateReadService:
             return canonical_json(
                 _failure(source, "timeout", "source timed out", retryable=True)
             )
-        except Exception:
-            return canonical_json(
-                _failure(
-                    source,
-                    "backend_unavailable",
-                    "source backend is unavailable",
-                    retryable=True,
-                )
-            )
+        except Exception as exc:
+            return canonical_json(_reader_fault(source, str(tool_name), exc))
 
     def _injected(self, source: str, operation: str, args: dict[str, Any]) -> Any:
         backend = self.backends.get(source)
@@ -1845,15 +1867,8 @@ class PrivateReadService:
             return canonical_json(
                 _failure(source, exc.code, exc.message, retryable=exc.retryable)
             ), None
-        except Exception:
-            return canonical_json(
-                _failure(
-                    source,
-                    "backend_unavailable",
-                    "source backend is unavailable",
-                    retryable=True,
-                )
-            ), None
+        except Exception as exc:
+            return canonical_json(_reader_fault(source, str(tool_name), exc)), None
 
     def _source_or_google_command(
         self, source: str, operation: str, canonical: dict[str, Any]

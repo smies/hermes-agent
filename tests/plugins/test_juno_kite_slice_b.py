@@ -3613,3 +3613,47 @@ def test_locate_does_not_pay_repeatedly_to_learn_it_cannot_read_a_place(tmp_path
     assert "no access" in data["note"]
     # And it was probed once, not once per locate.
     assert probes.count(str(blocked)) == 1, probes
+
+
+def test_a_defect_in_this_module_is_not_reported_as_a_flaky_source(tmp_path, caplog):
+    """A missing import read to Kite as an unreachable filesystem.
+
+    On 2026-08-15 a NameError in the locate walk came back as
+    "backend_unavailable ... retryable: true" -- which invites a retry, and
+    then a workaround for a problem that is not there. The distinction is not
+    cosmetic: retryable says "the world was busy", and a bug in this file is
+    not the world being busy.
+    """
+    import logging as _logging
+
+    service = PrivateReadService({"enabled": True, "output_bytes": 65536})
+
+    def broken(_args):
+        raise NameError("name 'time' is not defined")
+
+    service._sessions = broken
+    with caplog.at_level(_logging.ERROR):
+        failed = json.loads(service.execute(
+            "kite_session_search", {"query": "anything", "max_results": 3}))
+
+    assert failed["status"] == "error"
+    assert failed["error"]["code"] == "reader_failed"
+    # Truthful about what to do next: nothing about the question was wrong.
+    assert failed["error"]["retryable"] is False
+    assert "fault is here rather than in the question" in failed["error"]["message"]
+
+    # The type and traceback reach this machine, where they can be acted on...
+    assert "NameError" in caplog.text
+    assert "kite_session_search" in caplog.text
+    # ...and the exception text itself does not cross to the model.
+    assert "name 'time' is not defined" not in json.dumps(failed)
+
+
+def test_a_source_that_is_genuinely_absent_still_says_so(tmp_path):
+    """The distinction only means anything if the other case still works."""
+    service = PrivateReadService({"enabled": True, "output_bytes": 65536})
+    absent = json.loads(service.execute(
+        "kite_things_read", {"operation": "snapshot"}))
+    assert absent["status"] == "error"
+    assert absent["error"]["code"] == "backend_unavailable"
+    assert absent["error"]["retryable"] is True
