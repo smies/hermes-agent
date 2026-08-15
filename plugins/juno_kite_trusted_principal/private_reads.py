@@ -561,7 +561,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             {
                 "operation": {
                     "type": "string",
-                    "enum": ["search", "message", "deleted", "media_metadata"],
+                    "enum": ["search", "message", "deleted", "media_metadata",
+                             "media_extract"],
                 },
                 "chat": {"type": "string", "minLength": 1, "maxLength": 128},
                 "name": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -2585,7 +2586,8 @@ class PrivateReadService:
             {"operation", "max_results"},
         )
         operation = args.get("operation")
-        if operation not in {"search", "message", "deleted", "media_metadata"}:
+        if operation not in {"search", "message", "deleted", "media_metadata",
+                             "media_extract"}:
             raise SourceFailure(
                 "operation_denied", "WhatsApp archive operation is unavailable"
             )
@@ -2617,7 +2619,14 @@ class PrivateReadService:
             )
         if "whatsapp" in self.backends:
             data = self._injected("whatsapp", str(operation), canonical)
-            return data[:maximum] if isinstance(data, list) else data
+            if not isinstance(data, list):
+                return data
+            if operation == "media_extract":
+                # Whatever produced the records, reading what they point at is
+                # this reader's job; an injected backend must not get a
+                # different answer from the real one.
+                return self._whatsapp_media_text(data[:maximum], self._whatsapp_state())
+            return data[:maximum]
         cfg = self.config.get("whatsapp")
         if not isinstance(cfg, dict):
             raise SourceFailure(
@@ -2638,7 +2647,7 @@ class PrivateReadService:
                 argv.extend([flag, canonical[key]])
         if operation == "deleted":
             argv.append("--deleted")
-        if operation == "media_metadata":
+        if operation in {"media_metadata", "media_extract"}:
             argv.append("--media")
         env = dict(os.environ)
         env["WHATSAPP_READONLY_STATE_DIR"] = str(cfg["state_dir"])
@@ -2647,7 +2656,104 @@ class PrivateReadService:
             raise SourceFailure(
                 "malformed_result", "WhatsApp archive returned malformed data"
             )
+        if operation == "media_extract":
+            return self._whatsapp_media_text(data[:maximum], self._whatsapp_state())
         return data[:maximum]
+
+    def _whatsapp_state(self) -> Optional[Path]:
+        """Where the archive keeps what it has downloaded, if it is configured."""
+        cfg = self.config.get("whatsapp")
+        state = (cfg or {}).get("state_dir") if isinstance(cfg, dict) else None
+        return Path(str(state)) if state else None
+
+    def _whatsapp_media_text(
+        self, rows: list[Any], state_dir: Optional[Path]
+    ) -> list[dict[str, Any]]:
+        """Read what a document sent over WhatsApp actually says.
+
+        The archive could describe an attachment and never open one. Asked for
+        the resort's weekly kids-club programme, Kite found the exact PDF, in
+        the right chat, on the right date -- and had to report that the reader
+        "exposed only the attachment metadata". The file was on this disk the
+        whole time, 166,561 bytes, and this module extracts its timetable in a
+        fraction of a second.
+
+        Gmail attachments gained this on 2026-08-13. WhatsApp media never had
+        it: findable, not readable, which is the same asymmetry one source
+        over.
+        """
+        if state_dir is None:
+            raise SourceFailure(
+                "backend_unavailable",
+                "the WhatsApp archive has no configured state directory, so "
+                "there is nowhere to read a downloaded attachment from",
+            )
+        media_root = (state_dir / "media").resolve()
+        extracted: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            media = row.get("media") if isinstance(row.get("media"), dict) else {}
+            cache = row.get("mediaCache") if isinstance(row.get("mediaCache"), dict) else {}
+            relative = str(cache.get("relativePath") or "")
+            descriptor = {
+                "id": row.get("id"),
+                "chat": row.get("chatJid"),
+                "file_name": media.get("fileName") or row.get("body"),
+                "mime_type": media.get("mimeType"),
+                "size_bytes": cache.get("bytes") or media.get("declaredBytes"),
+            }
+            if not relative or str(cache.get("status") or "") != "cached":
+                extracted.append({
+                    **descriptor, "outcome": "not_cached",
+                    "text": "",
+                    "note": "this attachment has not been downloaded to this "
+                            "machine, so there is nothing here to read",
+                })
+                continue
+            # The path comes from the archive's own record, which is still not
+            # a reason to follow it anywhere: it has to land inside the media
+            # cache, and be an ordinary file rather than a link to one.
+            try:
+                # relativePath is recorded relative to the state directory and
+                # already begins with "media/"; joining it to the media root
+                # would look for media/media/... and find nothing.
+                path = (state_dir / relative).resolve(strict=True)
+            except OSError:
+                extracted.append({**descriptor, "outcome": "unavailable", "text": ""})
+                continue
+            if media_root not in path.parents or path.is_symlink():
+                raise SourceFailure(
+                    "path_denied", "cached media path escapes the media cache"
+                )
+            if path.suffix.casefold() in _REFUSED_EXTENSIONS:
+                raise SourceFailure(
+                    "unsupported_content",
+                    "this attachment type is not safe to open here",
+                )
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise SourceFailure("path_denied", "cached media is not a regular file")
+            if info.st_size > _EXTRACT_MAX_INPUT_BYTES:
+                raise SourceFailure(
+                    "cap_exceeded", "attachment exceeds the extraction cap"
+                )
+            guessed = str(
+                media.get("mimeType")
+                or mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream"
+            ).split(";", 1)[0].lower()
+            text = _document_preview(
+                path.read_bytes(), guessed,
+                limit=min(_READ_EXTRACT_CHARS, self.output_bytes // 2),
+                pages=_READ_MAX_PAGES,
+            )
+            extracted.append({
+                **descriptor,
+                "outcome": "extracted" if text else "unreadable",
+                "text": text,
+            })
+        return extracted
 
     def root_names(self) -> tuple[str, ...]:
         """Configured personal-file root names, or empty when unavailable."""

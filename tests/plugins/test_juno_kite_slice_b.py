@@ -130,9 +130,22 @@ def _slice_b_config(tmp_path: Path, *, mode="juno") -> dict:
     return config
 
 
-def _runtime(tmp_path: Path, *, mode="juno", backends=None):
+def _runtime(tmp_path: Path, *, mode="juno", backends=None, whatsapp_state=None):
+    config = _slice_b_config(tmp_path, mode=mode)
+    if whatsapp_state is not None:
+        # Production configures the archive's state directory; reading a
+        # downloaded attachment needs to know where downloads live.
+        from plugins.juno_kite_trusted_principal.private_reads import (
+            WHATSAPP_QUERY,
+        )
+
+        config["juno_kite_trusted_principal"]["private_reads"]["whatsapp"] = {
+            "executable": "/bin/false",
+            "script": WHATSAPP_QUERY,
+            "state_dir": whatsapp_state,
+        }
     return TrustedPrincipalRuntime(
-        _slice_b_config(tmp_path, mode=mode),
+        config,
         active_profile=mode,
         private_read_backends=backends,
     )
@@ -145,8 +158,10 @@ def _bound_turn(
     question="What is the current status?",
     *,
     principal="james",
+    whatsapp_state=None,
 ):
-    juno = _runtime(tmp_path, mode="juno", backends=backends)
+    juno = _runtime(tmp_path, mode="juno", backends=backends,
+                    whatsapp_state=whatsapp_state)
     user_id = "fixture-user-101" if principal == "james" else "fixture-user-202"
     prepared = _run_in_session(
         lambda: juno._prepare_request({"question_or_goal": question}),
@@ -159,7 +174,8 @@ def _bound_turn(
         "message": prepared.message,
         "context_id": prepared.mapping.context_id,
     }
-    kite = _runtime(tmp_path, mode="kite", backends=backends)
+    kite = _runtime(tmp_path, mode="kite", backends=backends,
+                    whatsapp_state=whatsapp_state)
 
     def turn():
         policy = kite.pre_llm_call(
@@ -3353,6 +3369,11 @@ CONTRACT_EXEMPT = {
         "same shape as the archive search, which the contract covers",
     ("kite_whatsapp_archive_read", "media_metadata"):
         "same shape as the archive search, which the contract covers",
+    ("kite_whatsapp_archive_read", "media_extract"):
+        "returns extracted text rather than source rows, so the generic "
+        "bound-trimming contract does not describe it; covered by "
+        "test_a_document_sent_over_whatsapp_can_be_read_not_only_described "
+        "and test_whatsapp_media_that_is_not_here_says_so_rather_than_failing",
 }
 
 
@@ -3386,6 +3407,79 @@ def test_every_reader_operation_is_covered_or_knowingly_exempt():
     # Every exemption states a reason, because "exempt" without one is just
     # uncovered with extra steps.
     assert all(reason.strip() for reason in CONTRACT_EXEMPT.values())
+
+
+def test_a_document_sent_over_whatsapp_can_be_read_not_only_described(tmp_path):
+    """"The approved WhatsApp reader exposed only the attachment metadata."
+
+    James asked for the kids-club timetable. Kite found the exact PDF, in the
+    right chat, on the right date, and could only describe it -- while the
+    file sat on this disk and this module extracts its timetable in a fraction
+    of a second. Gmail attachments gained extraction on 2026-08-13; WhatsApp
+    media never had it. Findable, not readable, one source over.
+    """
+    state = tmp_path / "wa-state"
+    cache = state / "media" / "ab"
+    cache.mkdir(parents=True)
+    document = cache / "abcdef.pdf"
+    document.write_bytes(_pdf_with_text("YOUR WEEKLY RECREATION 10 AUG"))
+    row = {
+        "id": "MSG1", "chatJid": "1203@g.us", "body": "One Tribe Program.pdf",
+        "media": {"fileName": "One Tribe Program.pdf",
+                  "mimeType": "application/pdf", "declaredBytes": 999},
+        "mediaCache": {"status": "cached", "bytes": document.stat().st_size,
+                       "relativePath": "media/ab/abcdef.pdf"},
+    }
+
+    def check(kite):
+        got = _invoke(kite, "kite_whatsapp_archive_read", {
+            "operation": "media_extract", "query": "One Tribe", "max_results": 5,
+        })
+        assert got["status"] == "ok", got
+        first = got["data"][0]
+        assert first["outcome"] == "extracted"
+        assert "WEEKLY RECREATION" in first["text"]
+        assert first["file_name"] == "One Tribe Program.pdf"
+        # The bytes never travel; only what the document says.
+        assert "artifact_base64" not in first and "path" not in first
+
+    _bound_turn(
+        tmp_path,
+        {"whatsapp": RecordingBackend({"media_extract": [row]})},
+        check,
+        whatsapp_state=str(state),
+    )
+
+
+def test_whatsapp_media_that_is_not_here_says_so_rather_than_failing(tmp_path):
+    """An attachment nobody downloaded is a fact, not an error."""
+    state = tmp_path / "wa-state-2"
+    (state / "media").mkdir(parents=True)
+    rows = [
+        {"id": "A", "body": "never-downloaded.pdf",
+         "media": {"fileName": "never-downloaded.pdf", "mimeType": "application/pdf"},
+         "mediaCache": {"status": "pending", "relativePath": ""}},
+        {"id": "B", "body": "vanished.pdf",
+         "media": {"fileName": "vanished.pdf", "mimeType": "application/pdf"},
+         "mediaCache": {"status": "cached", "relativePath": "media/zz/gone.pdf"}},
+    ]
+
+    def check(kite):
+        got = _invoke(kite, "kite_whatsapp_archive_read", {
+            "operation": "media_extract", "query": "pdf", "max_results": 5,
+        })
+        assert got["status"] == "ok", got
+        outcomes = {row["id"]: row["outcome"] for row in got["data"]}
+        assert outcomes == {"A": "not_cached", "B": "unavailable"}
+        assert all(row["text"] == "" for row in got["data"])
+        assert "not been downloaded" in got["data"][0]["note"]
+
+    _bound_turn(
+        tmp_path,
+        {"whatsapp": RecordingBackend({"media_extract": rows})},
+        check,
+        whatsapp_state=str(state),
+    )
 
 
 def test_an_action_rule_describes_a_shape_not_a_sentence():
