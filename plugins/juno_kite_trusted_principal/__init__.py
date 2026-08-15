@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .actions import ACTION_TOOLSET, action_handlers_for
 from .private_reads import PRIVATE_READ_TOOLSET
 from .runtime import (
     TrustedPrincipalRuntime,
@@ -91,23 +92,41 @@ def register(ctx) -> None:
             description=TOOL_DESCRIPTION,
             emoji="🪁",
         )
-    elif (
-        runtime.mode == "kite"
-        and getattr(runtime, "private_reads", None) is not None
-        and runtime.private_reads.enabled
-    ):
-        handlers = runtime.private_read_handlers()
-        for name in sorted(handlers):
-            schema = runtime.private_reads.schema_for(name)
-            ctx.register_tool(
-                name=name,
-                toolset=PRIVATE_READ_TOOLSET,
-                schema=schema,
-                handler=handlers[name],
-                check_fn=runtime.private_reads_available,
-                description=str(schema["description"]),
-                emoji="🔒",
-            )
+    elif runtime.mode == "kite":
+        if (
+            getattr(runtime, "private_reads", None) is not None
+            and runtime.private_reads.enabled
+        ):
+            handlers = runtime.private_read_handlers()
+            for name in sorted(handlers):
+                schema = runtime.private_reads.schema_for(name)
+                ctx.register_tool(
+                    name=name,
+                    toolset=PRIVATE_READ_TOOLSET,
+                    schema=schema,
+                    handler=handlers[name],
+                    check_fn=runtime.private_reads_available,
+                    description=str(schema["description"]),
+                    emoji="🔒",
+                )
+        # Actions are registered only for the tools policy actually classifies
+        # as mutating. An action nobody may take is not offered, so the model
+        # cannot spend a turn discovering it is refused.
+        if getattr(runtime, "actions", None) is not None and runtime.actions.enabled:
+            action_handlers = action_handlers_for(runtime.actions)
+            for name in sorted(action_handlers):
+                if name not in runtime.mutating_tools:
+                    continue
+                schema = runtime.actions.schema_for(name)
+                ctx.register_tool(
+                    name=name,
+                    toolset=ACTION_TOOLSET,
+                    schema=schema,
+                    handler=action_handlers[name],
+                    check_fn=runtime.actions_available,
+                    description=str(schema["description"]),
+                    emoji="✅",
+                )
 
 
 __all__ = [

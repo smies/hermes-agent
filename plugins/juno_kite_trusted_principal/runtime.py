@@ -588,7 +588,14 @@ class TrustedPrincipalRuntime:
         if not isinstance(self.policy, dict):
             raise ValueError("policy must be a mapping")
         self._validate_policy()
+        from .actions import ActionService
         from .private_reads import PrivateReadService, TOOL_NAMES
+
+        self.actions = ActionService(
+            section.get("private_reads"),
+            command_runner=private_read_command_runner,
+        )
+        self.action_tool_names = frozenset(self.actions.tool_names)
 
         self.private_reads = PrivateReadService(
             section.get("private_reads"),
@@ -890,9 +897,19 @@ class TrustedPrincipalRuntime:
                     raise ValueError(
                         "semantic capability IDs must be unique bounded labels"
                     )
-            if eligibility["dm"] is False and action_caps:
+            if eligibility["dm"] is False and action_caps and not required:
+                # A principal reachable only in a group may still act. Who sent
+                # a group message is established by the sender fence -- the
+                # same identification every one of their reads already trusts
+                # -- so acting asks for no trust that reading did not.
+                #
+                # What the original blanket ban was reaching for is still worth
+                # keeping: they should not act *unilaterally*. A required
+                # co-principal says exactly that, so it is required here rather
+                # than the capability being refused outright.
                 raise ValueError(
-                    "group-only principals cannot have action capabilities"
+                    "a group-only principal may hold action capabilities only "
+                    "with a required co-principal"
                 )
             if set(map(str, semantic_policy)) != set(map(str, read_caps)):
                 raise ValueError(
@@ -1100,6 +1117,16 @@ class TrustedPrincipalRuntime:
             and self.mode == "kite"
             and self._profile_matches()
             and self.private_reads.enabled
+        )
+
+    def actions_available(self) -> bool:
+        """Static schema availability; the authority to act is checked at dispatch."""
+        return bool(
+            self.enabled
+            and self.mode == "kite"
+            and self._profile_matches()
+            and self.actions.enabled
+            and bool(self.mutating_tools)
         )
 
     def _profile_matches(self) -> bool:
