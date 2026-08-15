@@ -3555,3 +3555,61 @@ def test_a_rule_this_gate_could_not_enforce_is_refused_at_load():
     ):
         with _pytest.raises(ValueError):
             _validate_action_schema(_normalise_action_schema(broken))
+
+
+def test_locate_does_not_pay_repeatedly_to_learn_it_cannot_read_a_place(tmp_path):
+    """Four locates in one turn cost a minute, finding out the same thing.
+
+    macOS grants file access per responsible process, and a directory outside
+    the grant does not fail fast: scandir hangs on a consent decision nobody is
+    there to make and returns EINTR after five or six seconds. Three bases,
+    four locates in one turn, twelve stalls.
+
+    And "no matches" meant two different things -- not there, or never looked
+    at -- with no way for the answer to say which, so Kite could report a
+    document missing from a place it had not opened.
+    """
+    import unittest.mock as _mock
+
+    from plugins.juno_kite_trusted_principal import private_reads as pr
+
+    # A root must be a folder inside a configured area, not the area itself.
+    area_a = tmp_path / "area-a"
+    readable = area_a / "reachable"
+    readable.mkdir(parents=True)
+    (readable / "One Tribe Program.pdf").write_bytes(b"%PDF-1.4 ")
+    blocked = tmp_path / "area-b"
+    blocked.mkdir()
+
+    probes: list[str] = []
+    real_scandir = pr.os.scandir
+
+    def counting_scandir(path):
+        probes.append(str(path))
+        if str(path) == str(blocked):
+            raise OSError(4, "Interrupted system call")
+        return real_scandir(path)
+
+    pr._reset_locate_base_probe()
+    service = PrivateReadService({
+        "enabled": True, "output_bytes": 65536,
+        "files": {"roots": [{"name": "docs", "path": str(readable)}],
+                  "allowed_bases": [str(area_a), str(blocked)]},
+    })
+
+    with _mock.patch.object(pr.os, "scandir", counting_scandir):
+        for _ in range(4):
+            found = json.loads(service.execute("kite_personal_files_locate", {
+                "query": "One Tribe", "max_results": 5,
+            }))
+            assert found["status"] == "ok", found
+
+    data = found["data"]
+    # The document in the place it can read is still found.
+    assert [m["file_name"] for m in data["matches"]] == ["One Tribe Program.pdf"]
+    # The place it cannot read is named, so "no matches" cannot be mistaken
+    # for "not there".
+    assert data["not_searched"] == ["area-b"]
+    assert "no access" in data["note"]
+    # And it was probed once, not once per locate.
+    assert probes.count(str(blocked)) == 1, probes

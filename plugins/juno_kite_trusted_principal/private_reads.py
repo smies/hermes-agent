@@ -19,6 +19,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 import stat
@@ -795,6 +796,45 @@ _LOCATE_MAX_SCANNED = 20_000
 # Credential-shaped path components stay invisible to locate for the same
 # reason they are unreadable: naming a file called id_rsa discloses that it
 # exists and where, which is most of what an attacker wanted.
+# A base this process cannot read costs seconds to discover, every time.
+# macOS grants file access per responsible process, and a directory outside
+# the grant does not fail fast: scandir hangs on a consent decision nobody is
+# there to make and returns EINTR after five or six seconds. Three bases, four
+# locates in one turn, and a minute of a turn's budget went on finding out the
+# same thing twelve times.
+#
+# So find out once. The answer only changes when the grant changes, which is a
+# human action, so a short life is plenty and a stale "reachable" costs one
+# ordinary failed walk rather than anything worse.
+_LOCATE_BASE_PROBE_TTL_SECONDS = 300
+_LOCATE_BASE_PROBE: dict[str, tuple[float, bool]] = {}
+_LOCATE_PROBE_LOCK = threading.Lock()
+
+
+def _base_is_readable(base: Path, now: float) -> bool:
+    """Whether this process can list a base, remembered briefly."""
+    key = str(base)
+    with _LOCATE_PROBE_LOCK:
+        cached = _LOCATE_BASE_PROBE.get(key)
+        if cached is not None and now - cached[0] < _LOCATE_BASE_PROBE_TTL_SECONDS:
+            return cached[1]
+    try:
+        with os.scandir(base) as entries:
+            next(iter(entries), None)
+        readable = True
+    except OSError:
+        readable = False
+    with _LOCATE_PROBE_LOCK:
+        _LOCATE_BASE_PROBE[key] = (now, readable)
+    return readable
+
+
+def _reset_locate_base_probe() -> None:
+    """Forget what is reachable. For tests, and for a grant that just changed."""
+    with _LOCATE_PROBE_LOCK:
+        _LOCATE_BASE_PROBE.clear()
+
+
 _LOCATE_DENIED_PART = re.compile(
     r"(?i)(?:^|[._-])(?:credential|credentials|secret|secrets|token|tokens|"
     r"password|passwords|private[-_]?key|keychain|wallet)(?:[._-]|$)"
@@ -3101,6 +3141,8 @@ class PrivateReadService:
         found: list[dict[str, Any]] = []
         seen: set[str] = set()
         scanned = 0
+        unreadable: list[str] = []
+        probe_clock = time.monotonic()
         for base in bases:
             try:
                 base_real = base.expanduser().resolve(strict=True)
@@ -3115,6 +3157,12 @@ class PrivateReadService:
             ):
                 continue
             seen.add(str(base_real))
+            if not _base_is_readable(base_real, probe_clock):
+                # Not a failure: this process simply has no access here, and
+                # walking it anyway buys nothing but the stall. Recorded so the
+                # answer can say what it did not look at.
+                unreadable.append(base_real.name or str(base_real))
+                continue
             for directory, names, files in os.walk(base_real, followlinks=False):
                 names[:] = sorted(
                     item
@@ -3125,7 +3173,7 @@ class PrivateReadService:
                 for filename in sorted(files):
                     scanned += 1
                     if scanned > _LOCATE_MAX_SCANNED:
-                        return self._locate_result(found, truncated=True)
+                        return self._locate_result(found, truncated=True, unreadable=unreadable)
                     if filename.startswith(".") or query not in filename.casefold():
                         continue
                     path = Path(directory, filename)
@@ -3169,12 +3217,15 @@ class PrivateReadService:
                         "releasable_now": root_name is not None,
                     })
                     if len(found) >= maximum:
-                        return self._locate_result(found, truncated=True)
-        return self._locate_result(found, truncated=False)
+                        return self._locate_result(found, truncated=True, unreadable=unreadable)
+        return self._locate_result(found, truncated=False, unreadable=unreadable)
 
     @staticmethod
-    def _locate_result(found: list[dict[str, Any]], *, truncated: bool) -> Any:
-        return {
+    def _locate_result(
+        found: list[dict[str, Any]], *, truncated: bool,
+        unreadable: Optional[list[str]] = None,
+    ) -> Any:
+        result = {
             "matches": found,
             "truncated": truncated,
             "note": (
@@ -3183,6 +3234,16 @@ class PrivateReadService:
                 "and releasing it requires the principal's approval."
             ),
         }
+        if unreadable:
+            # Saying nothing here would let "no matches" mean two different
+            # things: not there, or not looked at.
+            result["not_searched"] = sorted(unreadable)
+            result["note"] += (
+                " Not searched, because this process has no access to them: "
+                + ", ".join(sorted(unreadable))
+                + ". A document could be in one of those and not appear here."
+            )
+        return result
 
     def _files(self, args: dict[str, Any]) -> Any:
         self._require_exact(
