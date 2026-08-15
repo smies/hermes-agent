@@ -1219,9 +1219,14 @@ class TestExactToolGate:
                 session_id="kite-session",
                 turn_id="kite-turn",
             )
-            assert "final arguments do not match" in result
+            # Blocked, and the assertion is on the behaviour rather than the
+            # sentence: the refusal now names the offending argument, which is
+            # more useful and would otherwise read as a broken gate.
+            assert "policy blocked tool call" in result
+            assert "content" in result
 
         run(checks)
+        # The only thing that actually matters: the mutated write never ran.
         assert effects == []
 
 

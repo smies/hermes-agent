@@ -219,6 +219,106 @@ def _verify_signature(payload: dict, key: bytes) -> bool:
     return hmac.compare_digest(signature, sign_payload(unsigned, key))
 
 
+# An action rule used to carry the exact arguments a call had to match, so
+# "add buy milk to the list" needed a rule containing "buy milk". Nothing a
+# person actually says can be enumerated in advance, which made actions
+# unreachable from a conversation rather than merely restricted.
+#
+# A rule now describes the shape each argument may take. The gate validates
+# against that shape, which is the same guarantee -- nothing runs that the
+# policy did not describe -- expressed in a way a sentence can satisfy.
+_ACTION_ARGUMENT_KEYS = {"type", "max_length", "pattern", "enum", "required", "const"}
+_ACTION_TYPES = {"string": str, "integer": int, "boolean": bool}
+
+
+def _normalise_action_schema(schema: Any) -> dict:
+    """Accept a literal argument as the schema that matches only that literal.
+
+    Rules were written as exact arguments -- `{"encoding": "utf-8"}` -- and
+    that is precisely `{"type": "string", "const": "utf-8"}`. Normalising the
+    one into the other keeps every existing rule meaning exactly what it meant,
+    and lets a rule loosen a single argument without being rewritten.
+    """
+    if not isinstance(schema, dict) or not schema:
+        raise ValueError("action rule arguments must describe at least one argument")
+    normalised = {}
+    for name, spec in schema.items():
+        if isinstance(spec, dict) and set(spec) & _ACTION_ARGUMENT_KEYS:
+            normalised[name] = dict(spec)
+            continue
+        for label, python_type in _ACTION_TYPES.items():
+            if isinstance(spec, bool) == (python_type is bool) and isinstance(
+                spec, python_type
+            ):
+                normalised[name] = {"type": label, "const": spec}
+                break
+        else:
+            raise ValueError(
+                f"action rule argument {name} is neither a supported literal "
+                "nor an argument spec"
+            )
+    return normalised
+
+
+def _validate_action_schema(schema: Any) -> None:
+    """Reject a rule this gate could not enforce, at load rather than at use."""
+    if not isinstance(schema, dict) or not schema:
+        raise ValueError("action rule arguments must describe at least one argument")
+    for name, spec in schema.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("action rule argument names must be strings")
+        if not isinstance(spec, dict) or set(spec) - _ACTION_ARGUMENT_KEYS:
+            raise ValueError(f"action rule argument {name} has an unsupported spec")
+        if spec.get("type") not in _ACTION_TYPES:
+            raise ValueError(f"action rule argument {name} needs a supported type")
+        if "pattern" in spec:
+            try:
+                re.compile(str(spec["pattern"]))
+            except re.error as exc:
+                raise ValueError(
+                    f"action rule argument {name} has an invalid pattern"
+                ) from exc
+        if "enum" in spec and not isinstance(spec["enum"], list):
+            raise ValueError(f"action rule argument {name} enum must be a list")
+        if "max_length" in spec and not isinstance(spec["max_length"], int):
+            raise ValueError(f"action rule argument {name} max_length must be an int")
+
+
+def _action_argument_violation(schema: dict, args: dict) -> str:
+    """Why these arguments do not fit this rule, or "" if they do."""
+    if not isinstance(args, dict):
+        return "arguments must be an object"
+    unexpected = sorted(set(args) - set(schema))
+    if unexpected:
+        return f"this action does not take {', '.join(unexpected)}"
+    missing = sorted(
+        name for name, spec in schema.items()
+        if spec.get("required", True) and name not in args
+    )
+    if missing:
+        return f"this action needs {', '.join(missing)}"
+    for name, value in args.items():
+        spec = schema[name]
+        expected = _ACTION_TYPES[spec["type"]]
+        # bool is an int in Python and almost never what an integer rule meant.
+        if isinstance(value, bool) != (expected is bool) or not isinstance(
+            value, expected
+        ):
+            return f"{name} must be a {spec['type']}"
+        if "const" in spec and value != spec["const"]:
+            return f"{name} must be {spec['const']!r}"
+        if "enum" in spec and value not in spec["enum"]:
+            return f"{name} must be one of {spec['enum']}"
+        if isinstance(value, str):
+            limit = spec.get("max_length")
+            if isinstance(limit, int) and len(value) > limit:
+                return f"{name} is longer than {limit} characters"
+            pattern = spec.get("pattern")
+            if pattern and re.fullmatch(str(pattern), value) is None:
+                return f"{name} is not in the form this action accepts"
+    return ""
+
+
 def _contains_wildcard(value: Any) -> bool:
     if isinstance(value, str):
         return "*" in value
@@ -507,10 +607,15 @@ class TrustedPrincipalRuntime:
                 raise ValueError(
                     "Slice B private reads cannot classify generic or non-plugin read tools"
                 )
-            if self.mutating_tools or self.action_rules:
-                raise ValueError(
-                    "Slice B private-read mode cannot enable mutating tools or rules"
-                )
+            # Reading and acting were kept apart while the read machinery was
+            # new -- sequencing scaffolding from the commit that introduced it,
+            # not a boundary anyone argued for. Left in place it costs every
+            # private read the moment a single action is enabled, which is the
+            # whole of Juno's usefulness traded for one calendar write.
+            #
+            # They are independent: what may be read is decided by read
+            # capabilities, what may be done by action capabilities and the
+            # rules below, and neither grants the other.
             self.read_tools = frozenset(TOOL_NAMES)
         if self.mode == "juno":
             self.peer = self._resolve_fixed_peer()
@@ -838,6 +943,8 @@ class TrustedPrincipalRuntime:
                 rule["arguments"], dict
             ):
                 raise ValueError("action rule tool must be classified as mutating")
+            rule = {**rule, "arguments": _normalise_action_schema(rule["arguments"])}
+            _validate_action_schema(rule["arguments"])
             if str(rule["principal"]) not in principals:
                 raise ValueError("action rule principal must have a policy")
             if not self.principal_action_capabilities[str(rule["principal"])]:
@@ -852,6 +959,16 @@ class TrustedPrincipalRuntime:
                 canonical_json(rule["arguments"]),
             ))
         self.action_rules = frozenset(normalized)
+        # The same rules, keyed for matching arguments rather than comparing
+        # them: a rule describes the shape an argument may take, so the gate
+        # validates instead of testing equality.
+        self.action_schemas: dict[tuple[str, str], tuple[dict, ...]] = {}
+        for rule in rules:
+            key = (str(rule["principal"]), str(rule["tool"]))
+            self.action_schemas.setdefault(key, ())
+            self.action_schemas[key] += (
+                _normalise_action_schema(rule["arguments"]),
+            )
 
     def _resolve_fixed_peer(self) -> dict:
         name = str(self.config.get("kite_peer") or "").strip()
@@ -3352,9 +3469,23 @@ class TrustedPrincipalRuntime:
                 return self._block("effective audience has no action capability")
             assert binding.mapping is not None and binding.request is not None
             canonical_args = canonical_json(args)
-            rule = (binding.mapping.principal, str(tool_name), canonical_args)
-            if rule not in self.action_rules:
-                return self._block("no exact canonical tool-and-arguments rule")
+            schemas = self.action_schemas.get(
+                (binding.mapping.principal, str(tool_name)), ()
+            )
+            if not schemas:
+                return self._block(
+                    f"{tool_name} is not an action this principal may take"
+                )
+            # Any rule for this principal and tool that the arguments satisfy.
+            # The last complaint is reported when none do, so the refusal names
+            # what is wrong with the call rather than only that it was refused.
+            violation = ""
+            for schema in schemas:
+                violation = _action_argument_violation(schema, args)
+                if not violation:
+                    break
+            if violation:
+                return self._block(violation)
             fingerprint = hashlib.sha256(
                 f"{tool_name}\0{canonical_args}".encode("utf-8")
             ).hexdigest()
@@ -3403,9 +3534,24 @@ class TrustedPrincipalRuntime:
                 return self._block("effective audience has no final action capability")
             assert binding.mapping is not None and binding.request is not None
             canonical_args = canonical_json(args)
-            rule = (binding.mapping.principal, str(tool_name), canonical_args)
-            if rule not in self.action_rules:
-                return self._block("final arguments do not match the exact action rule")
+            schemas = self.action_schemas.get(
+                (binding.mapping.principal, str(tool_name)), ()
+            )
+            if not schemas:
+                return self._block(
+                    f"{tool_name} is not an action this principal may take"
+                )
+            violation = ""
+            for schema in schemas:
+                violation = _action_argument_violation(schema, args)
+                if not violation:
+                    break
+            if violation:
+                return self._block(violation)
+            # The rule says what shape is permitted; the fingerprint says these
+            # are the very arguments the gate approved a moment ago. Widening
+            # the first does not weaken the second -- an argument that changed
+            # between claim and dispatch still fails here.
             fingerprint = hashlib.sha256(
                 f"{tool_name}\0{canonical_args}".encode("utf-8")
             ).hexdigest()

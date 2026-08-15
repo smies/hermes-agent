@@ -312,7 +312,14 @@ async def _run() -> None:
                     session_id="synthetic-kite-session",
                     turn_id=turn_id,
                 )
-                assert "final arguments do not match" in result
+                # Blocked is the point; the sentence is not. The refusal now
+                # names the argument that changed, which is more use to a
+                # model and would otherwise read here as a broken gate -- the
+                # same way this file read as broken when a refusal was
+                # reworded on 2026-08-11. That the mutation never ran is
+                # asserted by action_effects below, which is the real claim.
+                assert "policy blocked tool call" in result
+                assert "value" in result
                 policy_checks.append("changed-action-blocked")
                 answer = "changed action denied"
             else:

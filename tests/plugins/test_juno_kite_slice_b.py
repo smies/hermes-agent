@@ -3386,3 +3386,78 @@ def test_every_reader_operation_is_covered_or_knowingly_exempt():
     # Every exemption states a reason, because "exempt" without one is just
     # uncovered with extra steps.
     assert all(reason.strip() for reason in CONTRACT_EXEMPT.values())
+
+
+def test_an_action_rule_describes_a_shape_not_a_sentence():
+    """"add buy milk to the list" needed a rule containing "buy milk".
+
+    An action rule carried the exact arguments a call had to match, so nothing
+    anybody actually says could satisfy one -- actions were unreachable from a
+    conversation rather than merely restricted. A rule now describes the shape
+    each argument may take.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import (
+        _action_argument_violation, _normalise_action_schema,
+    )
+
+    schema = _normalise_action_schema({
+        "title": {"type": "string", "max_length": 200},
+        "notes": {"type": "string", "required": False, "max_length": 2000},
+        "list": {"type": "string", "enum": ["Personal Action List"]},
+    })
+    ok = {"title": "buy milk", "list": "Personal Action List"}
+    assert _action_argument_violation(schema, ok) == ""
+    assert _action_argument_violation(
+        schema, {**ok, "notes": "for the villa"}) == ""
+
+    # And the refusal says what is wrong with the call, not merely that it was
+    # refused -- the lesson from a week of unnamed arguments.
+    assert "does not take" in _action_argument_violation(schema, {**ok, "when": "now"})
+    assert "needs title" in _action_argument_violation(schema, {"list": ok["list"]})
+    assert "longer than 200" in _action_argument_violation(
+        schema, {**ok, "title": "x" * 201})
+    assert "must be one of" in _action_argument_violation(
+        schema, {**ok, "list": "Someone Else's List"})
+    assert "must be a string" in _action_argument_violation(schema, {**ok, "title": 7})
+
+
+def test_a_literal_argument_still_means_exactly_that_literal():
+    """Existing rules keep their meaning: a literal is a const schema.
+
+    Rules were written as exact arguments -- {"encoding": "utf-8"} -- which is
+    precisely {"type": "string", "const": "utf-8"}. Normalising one into the
+    other means no existing rule silently loosened when shapes arrived.
+    """
+    from plugins.juno_kite_trusted_principal.runtime import (
+        _action_argument_violation, _normalise_action_schema,
+    )
+
+    schema = _normalise_action_schema({"encoding": "utf-8", "overwrite": False})
+    assert schema["encoding"] == {"type": "string", "const": "utf-8"}
+    assert schema["overwrite"] == {"type": "boolean", "const": False}
+    assert _action_argument_violation(
+        schema, {"encoding": "utf-8", "overwrite": False}) == ""
+    assert "must be 'utf-8'" in _action_argument_violation(
+        schema, {"encoding": "latin-1", "overwrite": False})
+    # A boolean is not an integer here, whatever Python thinks.
+    assert _action_argument_violation(
+        schema, {"encoding": "utf-8", "overwrite": 0}) != ""
+
+
+def test_a_rule_this_gate_could_not_enforce_is_refused_at_load():
+    """A policy that cannot be enforced must fail loudly, not quietly allow."""
+    import pytest as _pytest
+    from plugins.juno_kite_trusted_principal.runtime import (
+        _normalise_action_schema, _validate_action_schema,
+    )
+
+    for broken, why in (
+        ({}, "empty"),
+        ({"x": {"type": "object"}}, "unsupported type"),
+        ({"x": {"type": "string", "pattern": "([unclosed"}}, "bad pattern"),
+        ({"x": {"type": "string", "enum": "not-a-list"}}, "enum not a list"),
+        ({"x": {"type": "string", "max_length": "200"}}, "max_length not an int"),
+        ({"x": {"unknown_key": 1}}, "unsupported spec"),
+    ):
+        with _pytest.raises(ValueError):
+            _validate_action_schema(_normalise_action_schema(broken))
