@@ -163,6 +163,7 @@ class TestReadClaudeCodeCredentials:
             lambda: None,
         )
 
+    @pytest.mark.real_claude_code_credentials
     def test_reads_valid_credentials(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
@@ -283,6 +284,7 @@ class TestResolveAnthropicToken:
 
         assert resolve_anthropic_token() == "sk-ant...ykey"
 
+    @pytest.mark.real_claude_code_credentials
     def test_falls_back_to_claude_code_credentials(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
@@ -400,6 +402,7 @@ class TestResolveAnthropicToken:
         assert resolve_anthropic_token() == "pool-oauth-token"
         assert captured == {"clear_expired": False, "refresh": False}
 
+    @pytest.mark.real_claude_code_credentials
     def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
@@ -524,6 +527,7 @@ class TestWriteClaudeCodeCredentials:
 
 
 class TestResolveWithRefresh:
+    @pytest.mark.real_claude_code_credentials
     def test_auto_refresh_on_expired_creds(self, monkeypatch, tmp_path):
         """When cred file has expired token + refresh token, auto-refresh is attempted."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -548,6 +552,7 @@ class TestResolveWithRefresh:
 
         assert result == "refreshed-token"
 
+    @pytest.mark.real_claude_code_credentials
     def test_static_env_oauth_token_does_not_block_refreshable_claude_creds(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-expired-env-token")
@@ -572,6 +577,7 @@ class TestResolveWithRefresh:
 
 class TestRunOauthSetupToken:
 
+    @pytest.mark.real_claude_code_credentials
     def test_returns_token_from_credential_files(self, monkeypatch, tmp_path):
         """After subprocess completes, reads credentials from Claude Code files."""
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")

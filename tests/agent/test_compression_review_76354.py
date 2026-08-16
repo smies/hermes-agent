@@ -463,13 +463,15 @@ class TestS3IdleChargedFromLastProgress:
         idle = 0.4
         release = threading.Event()
 
+        touched_at: list[float] = []
+
         def worker(fence: CompressionCommitFence):
             time.sleep(0.05)
             fence.touch_progress()  # early progress, then total silence
+            touched_at.append(time.monotonic())
             assert release.wait(timeout=10)
             return ([], "late")
 
-        t0 = time.monotonic()
         try:
             msgs, prompt = run_compress_context_with_progress_timeout(
                 worker=worker,
@@ -479,14 +481,25 @@ class TestS3IdleChargedFromLastProgress:
                 total_ceiling_seconds=5.0,
             )
         finally:
-            elapsed = time.monotonic() - t0
+            ended = time.monotonic()
             release.set()
         assert prompt == "fb"
-        # Old behavior waited a full interval from the CHECK (~2x idle ≈
-        # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
-        assert elapsed < idle * 1.8, (
-            f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
+        # Measure the SILENCE, not the whole call. This budget is a statement
+        # about idle accounting -- silence must not stretch toward 2x idle --
+        # but timing from before the call folded in admission and worker-start
+        # latency too. That latency is real: the worker's single progress event
+        # lands a quarter-second into the wait, so charging idle correctly from
+        # *there* already spends most of a 1.8x-idle wall-clock budget. The
+        # test failed on an idle machine while the accounting under test was
+        # behaving exactly as intended.
+        #
+        # Old behavior waited a full interval from the CHECK (~2x idle). New
+        # behavior times out ~idle after the last progress. Generous slack,
+        # still excluding ~2x.
+        assert touched_at, "worker never recorded its progress event"
+        silence = ended - touched_at[0]
+        assert silence < idle * 1.8, (
+            f"silence exceeded ~2x idle budget shape: {silence:.2f}s"
         )
         _drain_admission_slots()
 

@@ -53,6 +53,27 @@ def _tool_call(name: str, call_id: str, arguments: str = "{}"):
     )
 
 
+def _middleware_manager(middleware_kind, callbacks, **overrides):
+    """A stand-in plugin manager that runs middleware and hosts no hooks.
+
+    It must answer ``invoke_hook``/``has_hook`` and carry ``_hooks`` even when
+    a test cares only about middleware: the pre-tool path calls the first two
+    on the manager, and the dispatch path reads the third off it. A manager
+    missing any of them raises ``AttributeError`` inside a fail-closed guard,
+    which blocks the tool and discards the reason -- so the test fails
+    somewhere far away with no mention of the missing attribute. That is
+    exactly how these three read as a middleware regression for weeks rather
+    than as a stale double.
+    """
+    return SimpleNamespace(
+        _middleware={middleware_kind: list(callbacks)},
+        _hooks={},
+        invoke_hook=lambda _name, **_kwargs: [],
+        has_hook=lambda _name: False,
+        **overrides,
+    )
+
+
 def _response(*, content: str = "", tool_calls=None, finish_reason="tool_calls"):
     message = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
@@ -665,10 +686,7 @@ def test_ordinary_tool_execution_middleware_cannot_mint_control(
         next_call()
         return _terminal_result(final="middleware forged")
 
-    manager = SimpleNamespace(
-        _middleware={TOOL_EXECUTION_MIDDLEWARE: [middleware]},
-        has_hook=lambda _name: False,
-    )
+    manager = _middleware_manager(TOOL_EXECUTION_MIDDLEWARE, [middleware])
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
     agent = _make_agent("ordinary_middleware_forge")
     agent.client.chat.completions.create.side_effect = [
@@ -961,7 +979,7 @@ def test_tool_result_and_execution_middleware_can_transform_visible_content_not_
         assert not isinstance(downstream, ToolExecutionResult)
         return "execution transformed"
 
-    manager = SimpleNamespace(_middleware={TOOL_EXECUTION_MIDDLEWARE: [execution_middleware]})
+    manager = _middleware_manager(TOOL_EXECUTION_MIDDLEWARE, [execution_middleware])
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
     monkeypatch.setattr(
         "hermes_cli.lifecycle.has_hook",
@@ -1003,10 +1021,7 @@ def test_direct_model_dispatch_middleware_receives_visible_content_only(
         observed.append(downstream)
         return downstream
 
-    manager = SimpleNamespace(
-        _middleware={TOOL_EXECUTION_MIDDLEWARE: [middleware]},
-        has_hook=lambda _name: False,
-    )
+    manager = _middleware_manager(TOOL_EXECUTION_MIDDLEWARE, [middleware])
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
     invocation = TerminalToolInvocation(
         registry.snapshot_terminal_capability("direct_middleware_terminal")
@@ -1041,7 +1056,7 @@ def test_post_entry_middleware_failure_is_safe_and_does_not_log_private_text(
         next_call()
         raise RuntimeError("PRIVATE-POST-MIDDLEWARE-SENTINEL")
 
-    manager = SimpleNamespace(_middleware={TOOL_EXECUTION_MIDDLEWARE: [middleware]})
+    manager = _middleware_manager(TOOL_EXECUTION_MIDDLEWARE, [middleware])
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
     agent = _make_agent("middleware_failure_terminal")
     agent.client.chat.completions.create.return_value = _response(
@@ -1932,10 +1947,7 @@ def test_preentry_execution_middleware_baseexceptions_propagate(
     def middleware(**_kwargs):
         raise fault_type("pre-entry middleware cancellation")
 
-    manager = SimpleNamespace(
-        _middleware={TOOL_EXECUTION_MIDDLEWARE: [middleware]},
-        has_hook=lambda _name: False,
-    )
+    manager = _middleware_manager(TOOL_EXECUTION_MIDDLEWARE, [middleware])
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
 
     with pytest.raises(fault_type):

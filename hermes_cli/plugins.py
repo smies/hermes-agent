@@ -2321,6 +2321,17 @@ def resolve_pre_tool_block(
             reset_current_observability_context(observability_tokens)
             reset_completed = True
     except Exception:
+        # Blocking is right -- a gate that errors must not let the call
+        # through. Discarding *why* is not: the message names the tool and
+        # nothing else, so a broken gate and a plugin that legitimately
+        # blocked read identically from the outside. Three tests failed this
+        # way for weeks and were read as a middleware regression, because the
+        # real cause (an AttributeError on the plugin manager) was never
+        # written down anywhere. Debug level keeps it out of normal output
+        # while leaving a thread to pull.
+        logger.debug(
+            "pre-tool resolution failed for %s", tool_name, exc_info=True
+        )
         if not reset_completed:
             return (
                 "BLOCKED: approval observability context restoration failed for "

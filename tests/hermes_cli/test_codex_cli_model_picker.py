@@ -114,6 +114,7 @@ def claude_code_only_env(tmp_path, monkeypatch):
     return hermes_home
 
 
+@pytest.mark.real_claude_code_credentials
 def test_claude_code_file_detected_by_model_picker(claude_code_only_env):
     """anthropic should appear when credentials only exist in ~/.claude/.credentials.json."""
     from hermes_cli.model_switch import list_authenticated_providers

@@ -42,6 +42,7 @@ class TestReadClaudeCodeCredentialsFromKeychain:
 
 
 
+@pytest.mark.real_claude_code_credentials
 class TestReadClaudeCodeCredentialsPriority:
     """Bug 4: Keychain must be checked before the JSON file."""
 
@@ -115,6 +116,7 @@ class TestReadClaudeCodeCredentialsPriority:
         assert creds is None
 
 
+@pytest.mark.real_claude_code_credentials
 class TestReadClaudeCodeCredentialsDesync:
     """Reconciliation when Keychain and JSON file disagree.
 

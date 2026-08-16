@@ -506,6 +506,44 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_claude_code_credentials(monkeypatch, request):
+    """No test may see this machine's real Claude Code login.
+
+    ``read_claude_code_credentials()`` reads the macOS Keychain and
+    ``~/.claude/.credentials.json``. Neither is reached by HERMES_HOME
+    sandboxing or by the credential env-var filter above, so on any developer
+    machine that is logged in, ``load_pool("anthropic")`` seeded a live
+    refreshable OAuth token into the pool under test.
+
+    Two things were wrong with that. A real token entered test process memory
+    with nothing stopping a fixture from printing it. And pools quietly gained
+    an entry nobody wrote, so a test building a deliberately single-entry pool
+    got two — which is why ``test_unmatched_key_does_not_retry_only_pool_entry``
+    failed here and would have passed on a clean machine. Local isolation
+    existed in tests/test_hermetic_side_effect_guards.py, but only for the
+    tests that called it; this makes it the default.
+
+    The tests that exist to exercise these readers opt in with
+    ``@pytest.mark.real_claude_code_credentials`` and supply their own fake
+    keychain and home directory. Everything else gets nothing, which is the
+    right default: a test that did not ask about credentials should not be
+    handed one.
+    """
+    if request.node.get_closest_marker("real_claude_code_credentials"):
+        return
+    try:
+        from agent import anthropic_adapter
+    except Exception:
+        return
+    for reader in (
+        "_read_claude_code_credentials_from_keychain",
+        "_read_claude_code_credentials_from_file",
+    ):
+        if hasattr(anthropic_adapter, reader):
+            monkeypatch.setattr(anthropic_adapter, reader, lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser
