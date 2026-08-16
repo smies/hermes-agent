@@ -1275,10 +1275,23 @@ class TrustedPrincipalRuntime:
             read_caps = tuple(
                 sorted(set.intersection(*(set(values) for values in read_sets)))
             )
-            # Mixed/group conversations intentionally expose no actions in
-            # Slice A. Later action handlers require their own final audience
-            # revalidation seam before this can be non-empty.
-            action_caps = ()
+            # Actions were held to nothing in a group until the revalidation
+            # seam existed. It does now: `_current_valid_binding` re-reads the
+            # stored request at both gates and refuses the turn unless the
+            # roster generation, the audience digest and the action-capability
+            # fingerprint all still match what was bound, so a room that gains
+            # a member between authorising and acting fails that check.
+            #
+            # So actions intersect exactly as reads do -- a capability survives
+            # only while every proved member holds it. This is what lets Lucy
+            # act at all: she is reachable only in a group, so an empty group
+            # action set is an empty action set, whatever her policy grants.
+            action_sets = [
+                self.principal_action_capabilities[name] for name in proved_principals
+            ]
+            action_caps = tuple(
+                sorted(set.intersection(*(set(values) for values in action_sets)))
+            )
         conversation_binding = self._opaque_digest(
             "conversation-v2", {"platform": platform, "kind": "group", "chat": chat_id}
         )
