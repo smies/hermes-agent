@@ -11,6 +11,8 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+import datetime as _dt_module
+from datetime import datetime as datetime_module
 from types import SimpleNamespace
 
 import pytest
@@ -259,7 +261,7 @@ def test_the_service_is_absent_rather_than_broken_without_a_client():
 
 
 def test_every_named_action_has_a_schema_and_a_handler():
-    service = _service()
+    service = _google_service()
     handlers = action_handlers_for(service)
     assert sorted(handlers) == sorted(ACTION_TOOL_NAMES)
     for name in ACTION_TOOL_NAMES:
@@ -326,3 +328,250 @@ def test_an_action_rule_needs_a_principal_who_may_act_at_all(tmp_path):
 
     with pytest.raises(ValueError, match="semantic action capability"):
         _policy_runtime(tmp_path, grant)
+
+
+# --------------------------------------------------------------------------
+# Calendar events, and the invitation this action refuses to send
+# --------------------------------------------------------------------------
+
+GOOGLE_CONFIG = {
+    "things": {"client": "/opt/things/client", "endpoint": "http://127.0.0.1:9999"},
+    "calendar": {
+        "executable": "/opt/google/account",
+        "account_aliases": {"personal": "personal"},
+        "calendar_ids": {"personal": "primary"},
+    },
+    "gmail": {
+        "executable": "/opt/google/account",
+        "account_aliases": {"personal": "personal", "kite": "kite"},
+    },
+}
+
+
+def _google_service(*, returncode=0, stdout="{}", stderr="", record=None):
+    def runner(argv, **kwargs):
+        if record is not None:
+            record.append((argv, kwargs))
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    return ActionService(GOOGLE_CONFIG, command_runner=runner)
+
+
+def _do(service, tool, **args):
+    return json.loads(service.execute(tool, args))
+
+
+def test_an_event_never_carries_an_attendee(tmp_path=None):
+    """The flag exists on the command underneath; this action cannot reach it.
+
+    Inviting someone emails them. That is sending mail on James's behalf under
+    a different name, and it is the one thing this whole arrangement is built
+    to keep human.
+    """
+    calls: list = []
+    result = _do(_google_service(record=calls), "kite_calendar_add_event",
+                 title="Dentist", start="2026-09-01T09:00:00")
+
+    assert result["status"] == "ok"
+    argv = calls[0][0]
+    assert "--attendees" not in argv
+    assert result["invited"] == []
+    # And it cannot even be asked for.
+    schema = _google_service().schema_for("kite_calendar_add_event")
+    assert "attendees" not in schema["parameters"]["properties"]
+    denied = _do(_google_service(), "kite_calendar_add_event", title="Dentist",
+                 start="2026-09-01T09:00:00", attendees="someone@example.com")
+    assert denied["error"]["code"] == "invalid_arguments"
+    assert "attendees" in denied["error"]["message"]
+
+
+def test_no_argument_combination_reaches_the_invitation_flag():
+    """Every optional field exercised, and still nobody is invited.
+
+    The first version of this checked a bare title-and-start call, so the
+    branch that appends notes and location never ran -- and a mutation that
+    made that branch invite someone passed the suite. The dangerous path is
+    always the one with the most arguments.
+    """
+    calls: list = []
+    result = _do(_google_service(record=calls), "kite_calendar_add_event",
+                 title="Dentist", start="2026-09-01T09:00:00",
+                 end="2026-09-01T09:30:00", location="High Street",
+                 notes="Bring the referral letter")
+
+    argv = calls[0][0]
+    assert result["status"] == "ok"
+    assert argv[argv.index("--location") + 1] == "High Street"
+    assert argv[argv.index("--description") + 1] == "Bring the referral letter"
+    # The whole point, checked against the argv that actually ran.
+    assert not [a for a in argv if "attend" in a.lower()]
+    assert not [a for a in argv if "@" in a]
+    assert result["invited"] == []
+
+
+def test_an_event_with_no_end_runs_for_an_hour():
+    from datetime import datetime
+
+    calls: list = []
+    result = _do(_google_service(record=calls), "kite_calendar_add_event",
+                 title="Dentist", start="2026-09-01T09:00:00")
+    argv = calls[0][0]
+    started = datetime.fromisoformat(argv[argv.index("--start") + 1])
+    ended = datetime.fromisoformat(argv[argv.index("--end") + 1])
+    assert (ended - started).total_seconds() == 3600
+    assert result["end"] == ended.isoformat(timespec="seconds")
+
+
+def test_a_timed_event_carries_a_zone_because_google_demands_one():
+    """"Missing time zone definition for start time" -- the live first run.
+
+    A caller who says 10am means 10am where they are. The host knows its own
+    offset, so it supplies it rather than refusing until someone spells it out.
+    """
+    calls: list = []
+    _do(_google_service(record=calls), "kite_calendar_add_event",
+        title="Dentist", start="2026-09-01T09:00:00")
+    argv = calls[0][0]
+    for flag in ("--start", "--end"):
+        value = argv[argv.index(flag) + 1]
+        assert datetime_module.fromisoformat(value).tzinfo is not None, value
+
+
+def test_a_zone_the_caller_supplied_is_left_alone():
+    calls: list = []
+    _do(_google_service(record=calls), "kite_calendar_add_event",
+        title="Dentist", start="2026-09-01T09:00:00+05:00")
+    started = datetime_module.fromisoformat(calls[0][0][calls[0][0].index("--start") + 1])
+    assert started.utcoffset().total_seconds() == 5 * 3600
+
+
+def test_a_bare_date_becomes_a_whole_day_that_google_can_store():
+    """All-day events end on an exclusive date.
+
+    Passing the same day as start and end produces a zero-length event that
+    appears nowhere -- an action that reports success and changes nothing.
+    """
+    calls: list = []
+    _do(_google_service(record=calls), "kite_calendar_add_event",
+        title="Nacho off school", start="2026-09-14")
+    argv = calls[0][0]
+    assert argv[argv.index("--start") + 1] == "2026-09-14"
+    assert argv[argv.index("--end") + 1] == "2026-09-15"
+
+
+def test_an_end_date_the_caller_named_is_the_last_day_they_meant():
+    calls: list = []
+    _do(_google_service(record=calls), "kite_calendar_add_event",
+        title="Half term", start="2026-10-26", end="2026-10-30")
+    argv = calls[0][0]
+    # They said it runs through the 30th; Google wants the 31st.
+    assert argv[argv.index("--end") + 1] == "2026-10-31"
+
+
+def test_an_event_is_pinned_to_the_configured_calendar():
+    calls: list = []
+    _do(_google_service(record=calls), "kite_calendar_add_event",
+        title="Dentist", start="2026-09-01T09:00:00")
+    argv = calls[0][0]
+    assert argv[argv.index("--calendar") + 1] == "primary"
+    assert argv[:3] == ["/opt/google/account", "personal", "api"]
+
+
+def test_an_event_cannot_end_before_it_starts():
+    result = _do(_google_service(), "kite_calendar_add_event", title="Dentist",
+                 start="2026-09-01T09:00:00", end="2026-09-01T08:00:00")
+    assert result["error"]["code"] == "invalid_arguments"
+    assert "end after it starts" in result["error"]["message"]
+
+
+def test_a_calendar_failure_says_nothing_was_created():
+    result = _do(_google_service(returncode=1), "kite_calendar_add_event",
+                 title="Dentist", start="2026-09-01T09:00:00")
+    assert result["error"]["code"] == "action_failed"
+    assert "not created" in result["error"]["message"]
+
+
+# --------------------------------------------------------------------------
+# Drafts, which are not mail until a person says so
+# --------------------------------------------------------------------------
+
+
+def test_a_draft_is_drafted_and_says_it_was_not_sent():
+    calls: list = []
+    result = _do(_google_service(record=calls), "kite_gmail_create_draft",
+                 to="nacho@example.com", subject="The survey",
+                 body="Could you send the survey over?")
+
+    argv = calls[0][0]
+    assert argv[3:5] == ["gmail", "draft"]
+    assert "send" not in argv and "reply" not in argv
+    assert result["outcome"] == "drafted"
+    assert result["sent"] is False
+    # The turn must not be able to imply the mail has gone.
+    assert "not been sent" in result["say"]
+
+
+def test_a_draft_goes_to_the_named_mailbox():
+    calls: list = []
+    _do(_google_service(record=calls), "kite_gmail_create_draft",
+        to="nacho@example.com", subject="s", body="b", account="kite")
+    assert calls[0][0][1] == "kite"
+
+    calls.clear()
+    _do(_google_service(record=calls), "kite_gmail_create_draft",
+        to="nacho@example.com", subject="s", body="b")
+    assert calls[0][0][1] == "personal", "personal is the default"
+
+
+def test_an_unconfigured_mailbox_is_refused_by_name():
+    result = _do(_google_service(), "kite_gmail_create_draft",
+                 to="a@example.com", subject="s", body="b", account="work")
+    # Not "invalid_arguments": the shape was fine, the account is the problem,
+    # and saying which is the difference between a fixable call and a guess.
+    assert result["error"]["code"] == "account_denied"
+    assert "work" in result["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ({"to": "", "subject": "s", "body": "b"}, "to"),
+        ({"to": "not-an-address", "subject": "s", "body": "b"}, "not-an-address"),
+        ({"to": "a@example.com", "subject": "", "body": "b"}, "subject"),
+        ({"to": "a@example.com", "subject": "s", "body": ""}, "body"),
+        ({"to": ", ".join(f"a{i}@example.com" for i in range(11)),
+          "subject": "s", "body": "b"}, "recipients"),
+    ],
+)
+def test_a_bad_draft_argument_names_itself(args, expected):
+    result = _do(_google_service(), "kite_gmail_create_draft", **args)
+    assert result["error"]["code"] == "invalid_arguments"
+    assert expected in result["error"]["message"]
+
+
+def test_several_recipients_are_split_and_kept():
+    calls: list = []
+    result = _do(_google_service(record=calls), "kite_gmail_create_draft",
+                 to="a@example.com, b@example.com", subject="s", body="b",
+                 cc="c@example.com")
+    argv = calls[0][0]
+    assert argv[argv.index("--to") + 1] == "a@example.com, b@example.com"
+    assert argv[argv.index("--cc") + 1] == "c@example.com"
+    assert result["to"] == ["a@example.com", "b@example.com"]
+
+
+def test_a_draft_failure_says_nothing_was_written():
+    result = _do(_google_service(returncode=1), "kite_gmail_create_draft",
+                 to="a@example.com", subject="s", body="b")
+    assert result["error"]["code"] == "action_failed"
+    assert "nothing was written" in result["error"]["message"]
+
+
+def test_actions_are_offered_only_where_their_backend_exists():
+    only_calendar = ActionService({"calendar": GOOGLE_CONFIG["calendar"]})
+    assert only_calendar.tool_names == ("kite_calendar_add_event",)
+    assert only_calendar.enabled is True
+    # An action whose backend is missing is not merely refused at call time --
+    # it is never offered, so no turn is spent discovering it does not work.
+    assert _do(only_calendar, "kite_gmail_create_draft", to="a@example.com",
+               subject="s", body="b")["error"]["code"] == "operation_denied"

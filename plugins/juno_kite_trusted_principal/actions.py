@@ -13,24 +13,39 @@ should say what to do instead. The same lesson the readers learned all week.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from .private_reads import (
+    _DATE_HELP,
     THINGS_PROJECT_TITLE,
     THINGS_PROJECT_UUID,
     SourceFailure,
+    _normalise_date,
     canonical_json,
 )
 
 # Only what is registered here can ever be classified mutating, so a tool that
 # sends rather than drafts, or deletes rather than adds, is not refused by
 # instruction -- it simply is not here.
-ACTION_TOOL_NAMES: tuple[str, ...] = ("kite_things_add_task",)
+ACTION_TOOL_NAMES: tuple[str, ...] = (
+    "kite_things_add_task",
+    "kite_calendar_add_event",
+    "kite_gmail_create_draft",
+)
 ACTION_TOOLSET = "juno_kite_actions"
 
 _TITLE_MAX = 200
 _NOTES_MAX = 2000
+_SUBJECT_MAX = 300
+_BODY_MAX = 20000
+_RECIPIENTS_MAX = 10
+_DEFAULT_EVENT_MINUTES = 60
+# A syntactic check only. Whether an address is the *right* one is a question
+# no regex answers, which is exactly why a draft is never sent from here.
+_EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
 
 # Scheduling is deliberately absent. `when` works through the client, but the
 # date it lands on is a day early -- asking for "today" on 2026-08-15 stored a
@@ -63,7 +78,135 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "kite_calendar_add_event": {
+        "description": (
+            "Put one event on the household calendar. It goes on the calendar "
+            "and nowhere else: this cannot invite anyone, because inviting "
+            "people is sending mail on someone's behalf. Give a start time; "
+            "an event with no end runs for an hour."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["title", "start"],
+            "properties": {
+                "title": {
+                    "type": "string", "minLength": 1, "maxLength": _TITLE_MAX,
+                    "description": "What the event is.",
+                },
+                "start": {
+                    "type": "string",
+                    "description": "When it starts. " + _DATE_HELP,
+                },
+                "end": {
+                    "type": "string",
+                    "description": "When it ends. Omit for one hour.",
+                },
+                "location": {
+                    "type": "string", "maxLength": _TITLE_MAX,
+                    "description": "Where it is.",
+                },
+                "notes": {
+                    "type": "string", "maxLength": _NOTES_MAX,
+                    "description": "Anything else worth having to hand.",
+                },
+            },
+        },
+    },
+    "kite_gmail_create_draft": {
+        "description": (
+            "Write an email draft and leave it in Drafts. This never sends: "
+            "James presses Send himself, in Gmail. Say that the draft is "
+            "waiting rather than implying the mail has gone."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["to", "subject", "body"],
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "Recipient address, or several separated by commas.",
+                },
+                "subject": {
+                    "type": "string", "minLength": 1, "maxLength": _SUBJECT_MAX,
+                    "description": "Subject line.",
+                },
+                "body": {
+                    "type": "string", "minLength": 1, "maxLength": _BODY_MAX,
+                    "description": "The message, as plain text.",
+                },
+                "cc": {
+                    "type": "string",
+                    "description": "Anyone to copy, separated by commas.",
+                },
+                "account": {
+                    "type": "string", "enum": ["personal", "kite"],
+                    "description": "Which mailbox to draft in. Defaults to personal.",
+                },
+            },
+        },
+    },
 }
+
+
+def _instant(value: str) -> datetime:
+    """Compare a day and a timestamp on the same footing."""
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise SourceFailure("invalid_arguments", f"{value} is not a time") from None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _plus_default(start: str) -> str:
+    """An event with no end runs an hour, or covers the whole day given a day.
+
+    Google ends an all-day event on an *exclusive* date, so a single day ends
+    on the following one. Getting this wrong produces a zero-length event that
+    shows up nowhere -- an action that reports success and changes nothing.
+    """
+    if "T" not in start:
+        return (_instant(start) + timedelta(days=1)).date().isoformat()
+    ended = _instant(start) + timedelta(minutes=_DEFAULT_EVENT_MINUTES)
+    return ended.isoformat(timespec="seconds")
+
+
+def _local_offset(value: str) -> str:
+    """Attach this machine's offset to a bare time.
+
+    Google refuses a timed event with no zone ("Missing time zone definition
+    for start time"). Someone asking for 10am means 10am where they are, so
+    the host supplies what it knows rather than making the caller state it.
+    Dates are left alone: an all-day event has no zone.
+    """
+    if "T" not in value:
+        return value
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        return parsed.isoformat(timespec="seconds")
+    return parsed.astimezone().isoformat(timespec="seconds")
+
+
+def _addresses(raw: Any, key: str, *, required: bool = True) -> list[str]:
+    """Split and check recipients, naming the one that is wrong."""
+    text = str(raw or "").strip()
+    if not text:
+        if required:
+            raise SourceFailure("invalid_arguments", f"a draft needs a {key} address")
+        return []
+    found = [part.strip() for part in re.split(r"[,;]", text) if part.strip()]
+    if len(found) > _RECIPIENTS_MAX:
+        raise SourceFailure(
+            "invalid_arguments",
+            f"{key} has more than the {_RECIPIENTS_MAX} recipients allowed")
+    for address in found:
+        if _EMAIL_RE.fullmatch(address) is None:
+            raise SourceFailure(
+                "invalid_arguments",
+                f"{address} in {key} is not an email address")
+    return found
 
 
 class ActionService:
@@ -75,44 +218,182 @@ class ActionService:
         self.command_runner = command_runner or subprocess.run
         self.timeout = int(timeout_seconds)
 
+    _BACKENDS = {
+        "kite_things_add_task": ("things", "client"),
+        "kite_calendar_add_event": ("calendar", "executable"),
+        "kite_gmail_create_draft": ("gmail", "executable"),
+    }
+
+    def _configured(self, source: str, key: str) -> bool:
+        cfg = self.config.get(source)
+        return isinstance(cfg, dict) and bool(cfg.get(key))
+
     @property
     def enabled(self) -> bool:
-        things = self.config.get("things")
-        return isinstance(things, dict) and bool(things.get("client"))
+        return bool(self.tool_names)
 
     @property
     def tool_names(self) -> tuple[str, ...]:
-        return ACTION_TOOL_NAMES if self.enabled else ()
+        # Per backend, not all-or-nothing: a host with a calendar and no
+        # Things client should offer the calendar action rather than nothing,
+        # and must not offer an action whose backend it cannot reach.
+        return tuple(
+            name for name in ACTION_TOOL_NAMES
+            if self._configured(*self._BACKENDS[name])
+        )
 
     def schema_for(self, tool_name: str) -> dict[str, Any]:
         return ACTION_SCHEMAS[tool_name]
 
     def execute(self, tool_name: str, args: dict[str, Any]) -> str:
-        if tool_name != "kite_things_add_task":
+        handlers = {
+            "kite_things_add_task": self._add_task,
+            "kite_calendar_add_event": self._add_event,
+            "kite_gmail_create_draft": self._create_draft,
+        }
+        handler = handlers.get(tool_name)
+        if handler is None or tool_name not in self.tool_names:
             return canonical_json(
                 {"status": "error", "error": {
                     "code": "operation_denied",
                     "message": f"{tool_name} is not an action this host performs",
                     "retryable": False}})
         try:
-            return canonical_json(self._add_task(dict(args)))
+            self._reject_unknown(tool_name, args)
+            return canonical_json(handler(dict(args)))
         except SourceFailure as exc:
             return canonical_json({"status": "error", "error": {
                 "code": exc.code, "message": exc.message,
                 "retryable": exc.retryable}})
 
-    def _add_task(self, args: dict[str, Any]) -> dict[str, Any]:
-        # An argument this action does not implement must be refused, not
-        # dropped. Quietly ignoring `when` would answer "Added" to someone who
-        # asked for it tomorrow, and they would believe the date took.
-        allowed = set(ACTION_SCHEMAS["kite_things_add_task"]["parameters"]
-                      ["properties"])
+    def _reject_unknown(self, tool_name: str, args: dict[str, Any]) -> None:
+        """An argument this action does not implement is refused, not dropped.
+
+        Quietly ignoring one answers "done" to someone who asked for something
+        that did not happen -- a schedule that never took, a recipient never
+        copied.
+        """
+        allowed = set(ACTION_SCHEMAS[tool_name]["parameters"]["properties"])
         unexpected = sorted(set(args) - allowed)
         if unexpected:
             raise SourceFailure(
                 "invalid_arguments",
                 f"this action does not take {', '.join(unexpected)}; it takes "
                 f"{', '.join(sorted(allowed))}")
+
+    def _google(self, source: str, alias: str) -> tuple[str, str]:
+        cfg = self.config.get(source)
+        if not isinstance(cfg, dict):
+            raise SourceFailure(
+                "backend_unavailable", f"{source} is not configured", True)
+        executable = str(cfg.get("executable") or "")
+        aliases = cfg.get("account_aliases")
+        if not executable.startswith("/") or not isinstance(aliases, dict):
+            raise SourceFailure(
+                "backend_unavailable", f"the {source} command boundary is invalid")
+        fixed = str(aliases.get(alias) or "")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", fixed):
+            raise SourceFailure(
+                "account_denied", f"{alias} is not a configured {source} account")
+        return executable, fixed
+
+    def _add_event(self, args: dict[str, Any]) -> dict[str, Any]:
+        title = str(args.get("title") or "").strip()
+        if not title or len(title) > _TITLE_MAX:
+            raise SourceFailure(
+                "invalid_arguments",
+                f"an event needs a title of 1 to {_TITLE_MAX} characters")
+        start = _normalise_date(str(args.get("start") or ""), "start",
+                                allow_time=True)
+        end_raw = str(args.get("end") or "").strip()
+        if end_raw:
+            end = _normalise_date(end_raw, "end", allow_time=True)
+        else:
+            end = _plus_default(start)
+        if _instant(end) <= _instant(start):
+            raise SourceFailure(
+                "invalid_arguments", "an event has to end after it starts")
+        # An end date the caller named is the last day they mean, but Google
+        # reads it as the first day they do not.
+        if end_raw and "T" not in end:
+            end = (_instant(end) + timedelta(days=1)).date().isoformat()
+        start, end = _local_offset(start), _local_offset(end)
+
+        executable, alias = self._google("calendar", "personal")
+        calendar_ids = (self.config.get("calendar") or {}).get("calendar_ids") or {}
+        calendar_id = str(calendar_ids.get("personal") or "primary")
+        argv = [executable, alias, "api", "calendar", "create",
+                "--summary", title, "--start", start, "--end", end,
+                "--calendar", calendar_id]
+        location = str(args.get("location") or "").strip()
+        if location:
+            argv += ["--location", location]
+        notes = str(args.get("notes") or "").strip()
+        if notes:
+            if len(notes) > _NOTES_MAX:
+                raise SourceFailure(
+                    "invalid_arguments",
+                    f"notes are longer than the {_NOTES_MAX} characters allowed")
+            argv += ["--description", notes]
+        # No --attendees, ever. The flag exists on the underlying command and
+        # using it would email an invitation, which is sending mail on James's
+        # behalf under another name. An event lands on the calendar; telling
+        # anyone about it stays a human act.
+        completed = self._run(argv)
+        if completed.returncode != 0:
+            raise SourceFailure(
+                "action_failed",
+                "the calendar refused the event and it was not created", False)
+        return {
+            "status": "ok",
+            "outcome": "created",
+            "title": title,
+            "start": start,
+            "end": end,
+            "invited": [],
+            "say": f'Put "{title}" on the calendar for {start}.',
+        }
+
+    def _create_draft(self, args: dict[str, Any]) -> dict[str, Any]:
+        to = _addresses(args.get("to"), "to")
+        cc = _addresses(args.get("cc"), "cc", required=False)
+        subject = str(args.get("subject") or "").strip()
+        if not subject or len(subject) > _SUBJECT_MAX:
+            raise SourceFailure(
+                "invalid_arguments",
+                f"a draft needs a subject of 1 to {_SUBJECT_MAX} characters")
+        body = str(args.get("body") or "").strip()
+        if not body or len(body) > _BODY_MAX:
+            raise SourceFailure(
+                "invalid_arguments",
+                f"a draft needs a body of 1 to {_BODY_MAX} characters")
+        account = str(args.get("account") or "personal").strip() or "personal"
+        executable, alias = self._google("gmail", account)
+
+        argv = [executable, alias, "api", "gmail", "draft",
+                "--to", ", ".join(to), "--subject", subject, "--body", body]
+        if cc:
+            argv += ["--cc", ", ".join(cc)]
+        completed = self._run(argv)
+        if completed.returncode != 0:
+            raise SourceFailure(
+                "action_failed",
+                "the mailbox refused the draft and nothing was written", False)
+        return {
+            "status": "ok",
+            "outcome": "drafted",
+            "sent": False,
+            "to": to,
+            "cc": cc,
+            "subject": subject,
+            # Said so a turn cannot imply the mail has gone. It has not, and
+            # the difference matters more here than anywhere else.
+            "say": f'Left a draft to {", ".join(to)} in {account} Drafts, '
+                   f'subject "{subject}". It has not been sent -- '
+                   "press Send in Gmail when you are happy with it.",
+        }
+
+    def _add_task(self, args: dict[str, Any]) -> dict[str, Any]:
         title = str(args.get("title") or "").strip()
         if not title or len(title) > _TITLE_MAX:
             raise SourceFailure(
