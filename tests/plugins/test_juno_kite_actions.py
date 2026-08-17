@@ -118,16 +118,51 @@ def test_optional_notes_travel_and_omitted_ones_do_not():
     assert "notes" not in _payload(calls)
 
 
-def test_no_scheduling_is_offered_while_the_date_it_lands_on_is_wrong():
-    """`when` asked for today and stored yesterday, so it is not offered.
+@pytest.mark.parametrize(
+    "asked, sent",
+    [
+        ("today", "today"),
+        ("Tomorrow", "tomorrow"),
+        ("evening", "evening"),
+        ("anytime", "anytime"),
+        ("someday", "someday"),
+        ("2026-09-25", "2026-09-25"),
+        ("2026/09/25", "2026-09-25"),
+    ],
+)
+def test_a_day_or_a_list_name_both_reach_things(asked, sent):
+    calls: list = []
+    result = _add(_service(record=calls), title="Call the plumber", when=asked)
 
-    Filing a household task on the wrong day is worse than filing it on no
-    day: the person stops trusting the dates on the whole list.
+    assert _payload(calls)["when"] == sent
+    assert result["when"] == sent
+    assert sent in result["say"]
+
+
+def test_a_list_name_is_sent_as_the_word_not_as_a_date():
+    """"today" has to arrive as the word.
+
+    Things puts an item in the Today list when told "today". Sending today's
+    date instead sets a start date and leaves it out of the list, which looks
+    identical in a readback and is not what was asked for.
     """
-    schema = _service().schema_for("kite_things_add_task")
-    assert "when" not in schema["parameters"]["properties"]
-    result = _add(_service(), title="Call the plumber", when="today")
+    calls: list = []
+    _add(_service(record=calls), title="Call the plumber", when="today")
+    assert _payload(calls)["when"] == "today"
+
+
+def test_an_unscheduled_task_carries_no_day():
+    calls: list = []
+    result = _add(_service(record=calls), title="Call the plumber")
+    assert "when" not in _payload(calls)
+    assert result["when"] is None
+    assert result["say"].endswith("Personal Action List.")
+
+
+def test_a_schedule_nobody_can_read_is_refused_by_name():
+    result = _add(_service(), title="Call the plumber", when="next tuesday")
     assert result["error"]["code"] == "invalid_arguments"
+    assert "when" in result["error"]["message"]
 
 
 def test_the_confirmation_says_what_changed_in_the_words_it_was_asked_in():

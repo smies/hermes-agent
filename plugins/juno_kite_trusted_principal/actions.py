@@ -47,12 +47,13 @@ _DEFAULT_EVENT_MINUTES = 60
 # no regex answers, which is exactly why a draft is never sent from here.
 _EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
 
-# Scheduling is deliberately absent. `when` works through the client, but the
-# date it lands on is a day early -- asking for "today" on 2026-08-15 stored a
-# start date of 2026-08-14, and the client's own postcondition caught the
-# disagreement. A task filed on the wrong day is worse than one filed on no
-# day, so this adds to the list and leaves scheduling to the person until the
-# date handling upstream is fixed.
+# Scheduling was held back while two upstream faults made it unsafe: the MCP
+# server reported every scheduled item a day early under BST (a UTC timestamp
+# sliced instead of converted), and the client then asserted a Today-list
+# membership the server never reports at all. Both are fixed, so a task can
+# carry a day again. Verified end to end on 2026-08-17: "today" stores today,
+# and the call now exits clean rather than through failure recovery.
+_WHEN_LISTS = ("today", "tomorrow", "evening", "anytime", "someday")
 
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
     "kite_things_add_task": {
@@ -74,6 +75,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "notes": {
                     "type": "string", "maxLength": _NOTES_MAX,
                     "description": "Anything needed to act on it later.",
+                },
+                "when": {
+                    "type": "string", "maxLength": 40,
+                    "description": (
+                        "When to put it on the list: "
+                        + ", ".join(_WHEN_LISTS)
+                        + ", or a specific day. " + _DATE_HELP
+                        + " Omit to leave it unscheduled in the project."
+                    ),
                 },
             },
         },
@@ -187,6 +197,27 @@ def _local_offset(value: str) -> str:
     if parsed.tzinfo is not None:
         return parsed.isoformat(timespec="seconds")
     return parsed.astimezone().isoformat(timespec="seconds")
+
+
+def _schedule(raw: Any) -> str:
+    """A named list, or any day the readers would have understood.
+
+    The list names are checked first: "today" has to reach Things as the word,
+    so it lands in the Today list rather than merely carrying today's date.
+    Anything else goes through the same date vocabulary every reader accepts,
+    so "the 25th", "+30d" and an ISO date all work here exactly as they do
+    when asking a question. Offering a narrower language in the half that acts
+    than in the half that reads is the kind of small inconsistency that costs
+    a turn.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.casefold() in _WHEN_LISTS:
+        return text.casefold()
+    # Not a list name, so it has to be a day. _normalise_date names what is
+    # wrong with it if it is not.
+    return _normalise_date(text, "when")
 
 
 def _addresses(raw: Any, key: str, *, required: bool = True) -> list[str]:
@@ -407,6 +438,9 @@ class ActionService:
                     "invalid_arguments",
                     f"notes are longer than the {_NOTES_MAX} characters allowed")
             payload["notes"] = notes
+        when = _schedule(args.get("when"))
+        if when:
+            payload["when"] = when
 
         completed = self._call("add_todo", payload)
         output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
@@ -435,9 +469,11 @@ class ActionService:
             "outcome": "added",
             "list": THINGS_PROJECT_TITLE,
             "title": title,
+            "when": when or None,
             # Said plainly so the turn can report a real change in the words
             # the person used, rather than announcing that something happened.
-            "say": f'Added "{title}" to the {THINGS_PROJECT_TITLE}.',
+            "say": f'Added "{title}" to the {THINGS_PROJECT_TITLE}'
+                   + (f" for {when}." if when else "."),
         }
 
     def _outcome_after_failure(self, title: str, output: str) -> dict[str, Any]:
