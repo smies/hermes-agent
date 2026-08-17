@@ -1,5 +1,6 @@
 """Tests for Mattermost platform adapter."""
 import json
+import logging
 import os
 import time
 import pytest
@@ -166,7 +167,9 @@ class TestMattermostSend:
 
         self.adapter._session.post = MagicMock(return_value=mock_resp)
 
-        result = await self.adapter.send("channel_1", "Hello!")
+        # A real Mattermost channel ID is 26 characters; using a short stand-in
+        # sends this through name resolution, which is not what it is testing.
+        result = await self.adapter.send("c" * 26, "Hello!")
 
         assert result.success is True
         assert result.message_id == "post123"
@@ -176,7 +179,7 @@ class TestMattermostSend:
         assert "/api/v4/posts" in call_args[0][0]
         # Verify payload
         payload = call_args[1]["json"]
-        assert payload["channel_id"] == "channel_1"
+        assert payload["channel_id"] == "c" * 26
         assert payload["message"] == "Hello!"
 
 
@@ -610,3 +613,126 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.source.thread_id == "top_post_123"
     assert msg_event.source.message_id == "top_post_123"
     assert msg_event.message_id == "top_post_123"
+
+
+# ---------------------------------------------------------------------------
+# A channel name where an ID belongs
+# ---------------------------------------------------------------------------
+
+class TestMattermostChannelNameResolution:
+    """Mattermost answers 403 "no permissions" when given a name as an ID.
+
+    That message sends whoever reads it looking for a permissions problem
+    that does not exist. Here MATTERMOST_HOME_CHANNEL was '#alerts' for
+    months while the bot sat in the channel, a member, perfectly able to
+    post. Names are resolved; a name that resolves to nothing says so.
+    """
+
+    ALERTS = "f75a7z6wzp89pgke8qe9oryhah"
+
+    def _adapter(self, gets):
+        adapter = _make_adapter()
+
+        async def fake_api_get(path):
+            return gets.get(path, {})
+
+        adapter._api_get = fake_api_get
+        return adapter
+
+    def _teams_and_channel(self, name, channel_id, team="openclaw"):
+        return {
+            "users/me/teams": [{"id": "t1", "name": team}],
+            f"teams/t1/channels/name/{name}": {"id": channel_id, "type": "O"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_hashed_name_resolves_to_its_id(self):
+        adapter = self._adapter(self._teams_and_channel("alerts", self.ALERTS))
+        assert await adapter._resolve_channel_id("#alerts") == self.ALERTS
+
+    @pytest.mark.asyncio
+    async def test_a_bare_name_resolves_too(self):
+        adapter = self._adapter(self._teams_and_channel("alerts", self.ALERTS))
+        assert await adapter._resolve_channel_id("alerts") == self.ALERTS
+
+    @pytest.mark.asyncio
+    async def test_an_id_is_passed_through_untouched(self):
+        calls = []
+
+        adapter = _make_adapter()
+
+        async def fake_api_get(path):
+            calls.append(path)
+            return {}
+
+        adapter._api_get = fake_api_get
+        assert await adapter._resolve_channel_id(self.ALERTS) == self.ALERTS
+        # An ID must not cost a lookup on every message.
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_resolved_name_is_only_looked_up_once(self):
+        gets = self._teams_and_channel("alerts", self.ALERTS)
+        seen = []
+
+        adapter = _make_adapter()
+
+        async def fake_api_get(path):
+            seen.append(path)
+            return gets.get(path, {})
+
+        adapter._api_get = fake_api_get
+        assert await adapter._resolve_channel_id("#alerts") == self.ALERTS
+        assert await adapter._resolve_channel_id("#alerts") == self.ALERTS
+        assert seen.count("users/me/teams") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_name_in_no_team_is_left_alone_and_reported(self, caplog):
+        adapter = self._adapter({"users/me/teams": [{"id": "t1", "name": "openclaw"}]})
+        with caplog.at_level(logging.ERROR):
+            assert await adapter._resolve_channel_id("#nowhere") == "#nowhere"
+        assert "no channel named" in caplog.text
+        assert "nowhere" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_name_in_two_teams_refuses_to_guess(self, caplog):
+        adapter = self._adapter({
+            "users/me/teams": [{"id": "t1", "name": "alpha"}, {"id": "t2", "name": "beta"}],
+            "teams/t1/channels/name/alerts": {"id": "a" * 26},
+            "teams/t2/channels/name/alerts": {"id": "b" * 26},
+        })
+        with caplog.at_level(logging.ERROR):
+            resolved = await adapter._resolve_channel_id("#alerts")
+        # Picking one silently would post household alerts into the wrong team.
+        assert resolved == "#alerts"
+        assert "more than one team" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_dm_handle_is_not_treated_as_a_channel_name(self):
+        adapter = self._adapter({})
+        assert await adapter._resolve_channel_id("@someone") == "@someone"
+
+    @pytest.mark.asyncio
+    async def test_posting_translates_the_name_before_it_reaches_the_api(self):
+        adapter = self._adapter(self._teams_and_channel("alerts", self.ALERTS))
+        sent = {}
+
+        class _Resp:
+            status = 201
+            async def json(self):
+                return {"id": "post1"}
+            async def text(self):
+                return ""
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _Session:
+            def post(self, url, headers=None, json=None, timeout=None):
+                sent["payload"] = json
+                return _Resp()
+
+        adapter._session = _Session()
+        await adapter._api_post("posts", {"channel_id": "#alerts", "message": "hi"})
+        assert sent["payload"]["channel_id"] == self.ALERTS

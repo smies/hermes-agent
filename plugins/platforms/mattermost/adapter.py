@@ -126,6 +126,9 @@ class MattermostAdapter(BasePlatformAdapter):
 
         self._bot_user_id: str = ""
         self._bot_username: str = ""
+        # Channel names resolved to IDs, so a name costs one lookup per run
+        # rather than one per message.
+        self._channel_id_by_name: Dict[str, str] = {}
         self._approval_account_id = str(
             config.extra.get("approval_account_id") or ""
         ).strip()
@@ -175,6 +178,11 @@ class MattermostAdapter(BasePlatformAdapter):
         if ".." in path:
             logger.error("MM API path traversal blocked: %s", path)
             return {}
+        if self._session is None:
+            # Called before connect(), or after close(). Report it as a failed
+            # read rather than an AttributeError from inside the adapter.
+            logger.error("MM API GET %s attempted with no session", path)
+            return {}
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
             async with self._session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -187,6 +195,65 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.error("MM API GET %s network error: %s", path, exc)
             return {}
 
+    _CHANNEL_ID_RE = re.compile(r"[a-z0-9]{26}")
+
+    async def _resolve_channel_id(self, chat_id: str) -> str:
+        """Accept a channel name where an ID is expected, and say so if it is neither.
+
+        Mattermost's POST /posts wants a channel *ID*. Given a name it answers
+        403 "You do not have the appropriate permissions", which sends anyone
+        reading the log looking for a permissions problem that does not exist.
+        That cost real time here: `MATTERMOST_HOME_CHANNEL=#alerts` failed
+        silently for months while the bot sat in the channel, a member, able
+        to post.
+
+        So names are resolved rather than refused, and a name that resolves to
+        nothing is reported as what it is.
+        """
+        candidate = (chat_id or "").strip()
+        if not candidate:
+            return candidate
+        if candidate.startswith("@") or self._CHANNEL_ID_RE.fullmatch(candidate):
+            return candidate  # a DM handle, or already an ID
+
+        name = candidate.lstrip("#")
+        cached = self._channel_id_by_name.get(name)
+        if cached:
+            return cached
+
+        teams = await self._api_get("users/me/teams")
+        found: list[tuple[str, str]] = []
+        for team in teams if isinstance(teams, list) else []:
+            team_id = team.get("id") or ""
+            if not team_id:
+                continue
+            channel = await self._api_get(f"teams/{team_id}/channels/name/{name}")
+            if isinstance(channel, dict) and channel.get("id"):
+                found.append((team.get("name") or team_id, channel["id"]))
+
+        if not found:
+            logger.error(
+                "Mattermost: no channel named %r in any team this bot belongs to "
+                "(configure a channel ID, or invite the bot to the channel)",
+                name,
+            )
+            return candidate
+        if len(found) > 1:
+            logger.error(
+                "Mattermost: %r names a channel in more than one team (%s); "
+                "configure the channel ID to say which",
+                name, ", ".join(t for t, _ in found),
+            )
+            return candidate
+
+        team_name, channel_id = found[0]
+        logger.info(
+            "Mattermost: resolved channel %r in team %s to %s",
+            name, team_name, channel_id,
+        )
+        self._channel_id_by_name[name] = channel_id
+        return channel_id
+
     async def _api_post(
         self, path: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -196,6 +263,12 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.error("MM API path traversal blocked: %s", path)
             return {}
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+        # A channel name arriving as a channel_id comes back 403, so translate
+        # it here rather than letting the server mislabel it as permissions.
+        if isinstance(payload, dict) and payload.get("channel_id"):
+            resolved = await self._resolve_channel_id(str(payload["channel_id"]))
+            if resolved != payload["channel_id"]:
+                payload = {**payload, "channel_id": resolved}
         self._last_post_status = None
         self._last_post_error = ""
         try:
@@ -296,6 +369,8 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> Optional[str]:
         """Upload a file and return its file ID, or None on failure."""
         import aiohttp
+
+        channel_id = await self._resolve_channel_id(channel_id)
 
         url = f"{self._base_url}/api/v4/files"
         form = aiohttp.FormData()

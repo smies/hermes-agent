@@ -685,6 +685,34 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
+async def _await_on_gateway_loop(gateway_runner, coro):
+    """Await an adapter call on the loop that owns its HTTP session.
+
+    An adapter's aiohttp session belongs to the loop it was created on -- the
+    gateway's. Awaiting a request on any *other* loop arms the request timer
+    against a loop with no current task, and aiohttp raises "Timeout context
+    manager should be used inside a task". Cron delivery reaches this code
+    from its own loop, so the call has to be handed back to the gateway's
+    rather than run where it was asked for.
+
+    Confirmed by reproduction on aiohttp 3.14.1: a session made on one loop
+    and used from another fails this way every time, while the same call
+    driven onto its *own* loop succeeds. Worth writing down because the
+    obvious remedy does not work -- swapping ClientTimeout for
+    asyncio.wait_for leaves the error exactly as it was, since the loop, not
+    the timeout style, is the fault. gateway/platforms/weixin.py carries that
+    wait_for advice for the same symptom; it does not cure this cause.
+    """
+    owner = getattr(gateway_runner, "_gateway_loop", None)
+    try:
+        current = asyncio.get_running_loop()
+    except RuntimeError:
+        current = None
+    if owner is None or owner is current or getattr(owner, "is_closed", lambda: False)():
+        return await coro
+    return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, owner))
+
+
 async def _send_via_adapter(
     platform,
     pconfig,
@@ -714,6 +742,7 @@ async def _send_via_adapter(
     except Exception:
         runner = None
 
+
     if runner is not None:
         try:
             adapter = runner.adapters.get(platform)
@@ -728,7 +757,10 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                result = await _await_on_gateway_loop(
+                    runner,
+                    adapter.send(chat_id=chat_id, content=chunk, metadata=metadata),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
