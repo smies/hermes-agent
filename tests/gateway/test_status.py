@@ -889,6 +889,26 @@ class TestLaunchdPlistRespawnGovernance:
         assert "<key>ExitTimeOut</key>" in plist
         assert "<key>KeepAlive</key>" in plist
 
+    def test_plist_raises_the_descriptor_ceiling(self, tmp_path, monkeypatch):
+        """launchd would otherwise hand this job the stock 256-file limit.
+
+        A long-lived gateway holds SQLite connections, websockets and log
+        handles at once. On 2026-08-20 the default profile reached 256 and
+        spent hours logging "[Errno 24] Too many open files" once a second,
+        unable to open anything and so unable to answer anything.
+        """
+        import plistlib
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from hermes_cli.gateway import generate_launchd_plist
+
+        parsed = plistlib.loads(generate_launchd_plist().encode())
+        limit = parsed["SoftResourceLimits"]["NumberOfFiles"]
+        # Parsed rather than string-matched: a plist that says the right thing
+        # in a way launchd cannot read is worth nothing.
+        assert isinstance(limit, int)
+        assert limit >= 1024, f"{limit} is not meaningfully above the 256 default"
+
 
 class TestPermissionErrorOnLockFile:
     """Stale root-owned lock files from launchd Background sessions must not

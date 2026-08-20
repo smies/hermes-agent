@@ -4143,6 +4143,21 @@ def generate_launchd_plist() -> str:
     <key>ExitTimeOut</key>
     <integer>25</integer>
 
+    <!-- launchd hands a job the system-wide `launchctl limit maxfiles` soft
+         limit, which is 256 on stock macOS. That is a low ceiling for a
+         long-lived process holding SQLite connections, websockets and log
+         handles at once: on 2026-08-20 the default-profile gateway reached
+         it and spent hours logging "[Errno 24] Too many open files" once a
+         second, unable to open anything and so unable to answer anything.
+         The descriptor leak that walked it there is a separate bug, still
+         worth fixing; this only means a slow leak degrades visibly instead
+         of taking the gateway down overnight. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
     
