@@ -99,6 +99,15 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+
+def _review_input_budget_exhausted(agent: Any) -> bool:
+    """Return whether a detached review exhausted its aggregate input budget."""
+    budget = getattr(agent, "_review_input_token_budget", None)
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+        return False
+    used = getattr(agent, "session_input_tokens", 0)
+    return isinstance(used, int) and not isinstance(used, bool) and used >= budget
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1426,6 +1435,20 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
+
+        # Review-only aggregate replay bound (#93057). Usage from a completed
+        # request is charged before the next iteration reaches this gate, so
+        # the budget-crossing response and its tools finish but no further
+        # provider request is dispatched.
+        if _review_input_budget_exhausted(agent):
+            _turn_exit_reason = "review_input_budget_exhausted"
+            logger.info(
+                "review input budget exhausted (%s/%s tokens); stopping before "
+                "the next provider call",
+                getattr(agent, "session_input_tokens", 0),
+                getattr(agent, "_review_input_token_budget", None),
+            )
+            break
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -1970,6 +1993,7 @@ def run_conversation(
         )()
         if (
             agent.compression_enabled
+            and not getattr(agent, "_review_warm_snapshot_pending", False)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -2737,6 +2761,10 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                # Same-model reviews deliberately send one complete warm
+                # snapshot before detached compaction can affect follow-ups.
+                if getattr(agent, "_review_warm_snapshot_pending", False):
+                    agent._review_warm_snapshot_pending = False
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":

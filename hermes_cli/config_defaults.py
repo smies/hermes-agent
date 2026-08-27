@@ -1050,6 +1050,10 @@ DEFAULT_CONFIG = {
             # slots are occupied is skipped (never queued or awaited by the
             # foreground turn).
             "max_concurrency": 1,
+            # Aggregate input tokens replayed by one review tool loop. The
+            # first same-model request remains the full warm snapshot; later
+            # requests compact in memory. 0 or negative means unlimited.
+            "max_input_tokens": 600000,
         },
         "moa_reference": {
             "provider": "auto",

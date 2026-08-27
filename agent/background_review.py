@@ -31,6 +31,33 @@ logger = logging.getLogger(__name__)
 
 _BACKGROUND_REVIEW_GATE = NonBlockingConcurrencyGate()
 _DEFAULT_BACKGROUND_REVIEW_MAX_CONCURRENCY = 1
+_REVIEW_MAX_INPUT_TOKENS_DEFAULT = 600_000
+
+
+def _review_input_token_budget(
+    task_cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Resolve one review's aggregate input budget (``None`` = unlimited)."""
+    if task_cfg is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            auxiliary = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+            task_cfg = (
+                auxiliary.get("background_review", {})
+                if isinstance(auxiliary, dict)
+                else {}
+            )
+        except Exception:
+            task_cfg = {}
+    task = task_cfg if isinstance(task_cfg, dict) else {}
+    raw = task.get("max_input_tokens", _REVIEW_MAX_INPUT_TOKENS_DEFAULT)
+    try:
+        budget = int(raw)
+    except (TypeError, ValueError):
+        budget = _REVIEW_MAX_INPUT_TOKENS_DEFAULT
+    return budget if budget > 0 else None
 
 
 def acquire_background_review_capacity() -> Optional[ConcurrencyLease]:
@@ -899,17 +926,41 @@ def _run_review_in_thread(
             # conversation (the review fires every ~10 turns). Leave session
             # finalization to the real owner (CLI close / gateway reset / cron).
             review_agent._end_session_on_close = False
-            # Never let the review fork compress. It shares the parent's
-            # session_id, so if it won a compression race it would rotate the
-            # parent into a NEW child that the gateway never adopts (the fork
-            # is single-lifecycle and dies right after this run_conversation).
-            # The foreground turn would then start from the stale parent and
-            # compress it again, leaving the same parent with two sibling
-            # children (issue #38727). Review also needs full context to
-            # produce a good memory/skill summary — compressing would strip
-            # detail. Both compression triggers in conversation_loop.py gate on
-            # agent.compression_enabled, so this short-circuits both paths.
+            # Detached in-memory compaction (#93057). The public session_id is
+            # retained for same-model cache parity, but the compressor's own
+            # SessionDB binding must be severed before compression is enabled.
+            # Fail closed for missing, incompatible, or throwing engines.
             review_agent.compression_enabled = False
+            review_agent.compression_in_place = True
+            _review_compressor = getattr(review_agent, "context_compressor", None)
+            _bind_review_compressor = getattr(
+                _review_compressor, "bind_session_state", None
+            )
+            _compressor_detached = False
+            if callable(_bind_review_compressor):
+                try:
+                    _bind_review_compressor(session_db=None, session_id="")
+                    _compressor_detached = (
+                        getattr(_review_compressor, "_session_db", None) is None
+                        and getattr(_review_compressor, "_session_id", "") == ""
+                    )
+                except Exception:
+                    logger.warning(
+                        "background-review compressor detachment failed; "
+                        "review compression remains disabled",
+                        exc_info=True,
+                    )
+            else:
+                logger.warning(
+                    "background-review compressor has no detachment API; "
+                    "review compression remains disabled"
+                )
+            if _compressor_detached:
+                review_agent.compression_enabled = True
+                # Preserve one full warm same-model request; follow-up requests
+                # may compact the fork's private transcript in memory.
+                review_agent._review_warm_snapshot_pending = not _routed
+            review_agent._review_input_token_budget = _review_input_token_budget()
 
             from model_tools import get_tool_definitions
             from hermes_cli.plugins import (
