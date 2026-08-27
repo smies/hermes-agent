@@ -11,7 +11,7 @@ import threading
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
-from agent.concurrency_gate import NonBlockingConcurrencyGate
+from agent.concurrency_gate import ConcurrencyWaitCancelled, FairConcurrencyGate
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -20,31 +20,48 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
-_SEARCH_FILES_GATE = NonBlockingConcurrencyGate()
+_SEARCH_FILES_GATE = FairConcurrencyGate()
 _DEFAULT_SEARCH_MAX_CONCURRENCY = 2
 _DEFAULT_SEARCH_TIMEOUT_SECONDS = 15
+_DEFAULT_SEARCH_QUEUE_TIMEOUT_SECONDS = 45
 
 
-def _load_search_latency_controls() -> tuple[int, int]:
+def _load_search_latency_controls() -> tuple[int, int, int]:
     """Read internal search controls from config without changing tool args."""
     max_concurrency = _DEFAULT_SEARCH_MAX_CONCURRENCY
     timeout_seconds = _DEFAULT_SEARCH_TIMEOUT_SECONDS
+    queue_timeout_seconds = _DEFAULT_SEARCH_QUEUE_TIMEOUT_SECONDS
     try:
         from hermes_cli.config import load_config_readonly
 
         config = load_config_readonly()
         tools_config = config.get("tools", {}) if isinstance(config, dict) else {}
         search_config = tools_config.get("search_files", {}) if isinstance(tools_config, dict) else {}
-        max_concurrency = int(search_config.get("max_concurrency", max_concurrency))
-        timeout_seconds = int(search_config.get("timeout_seconds", timeout_seconds))
+        if isinstance(search_config, dict):
+            try:
+                max_concurrency = int(search_config.get("max_concurrency", max_concurrency))
+            except (TypeError, ValueError, OverflowError):
+                pass
+            try:
+                timeout_seconds = int(search_config.get("timeout_seconds", timeout_seconds))
+            except (TypeError, ValueError, OverflowError):
+                pass
+            try:
+                queue_timeout_seconds = int(
+                    search_config.get("queue_timeout_seconds", queue_timeout_seconds)
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
     except Exception:
         pass
     return (
         min(32, max(1, max_concurrency)),
         min(300, max(1, timeout_seconds)),
+        min(300, max(1, queue_timeout_seconds)),
     )
 
 
@@ -2105,13 +2122,27 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 already_searched=count,
             )
 
-        max_concurrency, timeout_seconds = _load_search_latency_controls()
-        capacity_lease = _SEARCH_FILES_GATE.try_acquire(max_concurrency)
+        max_concurrency, timeout_seconds, queue_timeout_seconds = (
+            _load_search_latency_controls()
+        )
+        try:
+            capacity_lease = _SEARCH_FILES_GATE.acquire(
+                max_concurrency,
+                timeout_seconds=queue_timeout_seconds,
+                cancel_check=is_interrupted,
+            )
+        except ConcurrencyWaitCancelled:
+            return tool_error(
+                "search_files was cancelled while waiting for capacity.",
+                status="cancelled",
+            )
         if capacity_lease is None:
             return tool_error(
-                "search_files capacity is occupied. Narrow the path, pattern, or "
-                "file_glob and retry shortly; this search was not queued.",
+                "search_files waited for capacity but the queue deadline expired. "
+                "Narrow the path, pattern, or file_glob and retry.",
+                error_type="search_queue_timeout",
                 max_concurrency=max_concurrency,
+                queue_timeout_seconds=queue_timeout_seconds,
                 retryable=True,
             )
 

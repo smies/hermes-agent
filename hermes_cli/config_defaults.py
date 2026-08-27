@@ -2347,11 +2347,13 @@ DEFAULT_CONFIG = {
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
         # Process-wide latency controls for the existing search_files tool.
-        # These do not alter its model-facing schema. Capacity exhaustion
-        # fails fast; broad searches preserve partial results on timeout.
+        # These do not alter its model-facing schema. Foreground callers wait
+        # fairly for capacity; broad searches preserve partial results on the
+        # separate execution timeout.
         "search_files": {
             "max_concurrency": 2,
             "timeout_seconds": 15,
+            "queue_timeout_seconds": 45,
         },
         "tool_search": {
             # Tiered disclosure: any deferrable (MCP/plugin) tool activates

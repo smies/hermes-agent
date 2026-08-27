@@ -11,7 +11,9 @@ from unittest.mock import MagicMock
 import pytest
 
 import tools.file_tools as file_tools
+from agent.concurrency_gate import ConcurrencyWaitCancelled, FairConcurrencyGate
 from tools.file_operations import SearchResult, ShellFileOperations
+from tools.interrupt import set_interrupt
 
 
 class SubprocessEnvironment:
@@ -39,7 +41,13 @@ class SubprocessEnvironment:
         }
 
 
-def _configure(monkeypatch, *, max_concurrency=2, timeout_seconds=15):
+def _configure(
+    monkeypatch,
+    *,
+    max_concurrency=2,
+    timeout_seconds=15,
+    queue_timeout_seconds=45,
+):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {
@@ -47,42 +55,211 @@ def _configure(monkeypatch, *, max_concurrency=2, timeout_seconds=15):
                 "search_files": {
                     "max_concurrency": max_concurrency,
                     "timeout_seconds": timeout_seconds,
+                    "queue_timeout_seconds": queue_timeout_seconds,
                 }
             }
         },
     )
 
 
-def test_search_capacity_exhaustion_fails_fast_and_releases(monkeypatch):
-    _configure(monkeypatch, max_concurrency=1)
+@pytest.fixture(autouse=True)
+def _isolated_search_gate(monkeypatch):
+    monkeypatch.setattr(file_tools, "_SEARCH_FILES_GATE", FairConcurrencyGate())
+
+
+def _wait_for_waiter_count(gate: FairConcurrencyGate, expected: int) -> None:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with gate._condition:
+            if len(gate._waiters) == expected:
+                return
+        time.sleep(0.005)
+    raise AssertionError(f"gate did not reach {expected} queued waiter(s)")
+
+
+def test_search_capacity_waits_then_admits_and_releases(monkeypatch):
+    _configure(monkeypatch, max_concurrency=1, queue_timeout_seconds=2)
     entered = threading.Event()
     release = threading.Event()
+    second_finished = threading.Event()
+    calls = []
 
     class BlockingOps:
-        def search(self, **_kwargs):
-            entered.set()
-            release.wait(2)
+        def search(self, **kwargs):
+            calls.append(kwargs["pattern"])
+            if kwargs["pattern"] == "first":
+                entered.set()
+                release.wait(2)
             return SearchResult()
 
     monkeypatch.setattr(file_tools, "_get_file_ops", lambda _task_id: BlockingOps())
     worker = threading.Thread(
         target=file_tools.search_tool,
-        kwargs={"pattern": "needle", "task_id": "capacity-first"},
+        kwargs={"pattern": "first", "task_id": "capacity-first"},
         daemon=True,
     )
     worker.start()
     assert entered.wait(1)
 
-    started = time.monotonic()
-    rejected = json.loads(file_tools.search_tool("needle", task_id="capacity-second"))
-    assert time.monotonic() - started < 0.2
-    assert "capacity" in rejected["error"].lower()
-    assert "narrow" in rejected["error"].lower()
-    assert "retry" in rejected["error"].lower()
+    result = {}
+
+    def run_second():
+        result.update(json.loads(file_tools.search_tool("second", task_id="capacity-second")))
+        second_finished.set()
+
+    second = threading.Thread(target=run_second, daemon=True)
+    second.start()
+    _wait_for_waiter_count(file_tools._SEARCH_FILES_GATE, 1)
+    assert not second_finished.is_set()
 
     release.set()
     worker.join(1)
+    second.join(1)
     assert not worker.is_alive()
+    assert not second.is_alive()
+    assert "error" not in result
+    assert calls == ["first", "second"]
+
+
+def test_fair_gate_admits_waiters_fifo():
+    gate = FairConcurrencyGate()
+    initial = gate.acquire(1, timeout_seconds=1)
+    assert initial is not None
+    admitted = []
+    threads = []
+
+    def wait_for_capacity(index):
+        lease = gate.acquire(1, timeout_seconds=2)
+        assert lease is not None
+        admitted.append(index)
+        lease.release()
+
+    for index in range(3):
+        thread = threading.Thread(target=wait_for_capacity, args=(index,), daemon=True)
+        thread.start()
+        threads.append(thread)
+        _wait_for_waiter_count(gate, index + 1)
+
+    initial.release()
+    for thread in threads:
+        thread.join(1)
+        assert not thread.is_alive()
+    assert admitted == [0, 1, 2]
+
+
+def test_fair_gate_timeout_removes_head_ticket():
+    gate = FairConcurrencyGate()
+    initial = gate.acquire(1, timeout_seconds=1)
+    assert initial is not None
+    results = {}
+
+    def wait(name, timeout):
+        started = time.monotonic()
+        results[name] = gate.acquire(1, timeout_seconds=timeout)
+        results[f"{name}_elapsed"] = time.monotonic() - started
+
+    timed_out = threading.Thread(target=wait, args=("timed_out", 0.1), daemon=True)
+    follower = threading.Thread(target=wait, args=("follower", 1), daemon=True)
+    timed_out.start()
+    _wait_for_waiter_count(gate, 1)
+    follower.start()
+    _wait_for_waiter_count(gate, 2)
+
+    timed_out.join(1)
+    assert not timed_out.is_alive()
+    assert results["timed_out"] is None
+    assert results["timed_out_elapsed"] >= 0.08
+    initial.release()
+    follower.join(1)
+    assert not follower.is_alive()
+    assert results["follower"] is not None
+    results["follower"].release()
+
+
+def test_fair_gate_cancellation_removes_head_ticket():
+    gate = FairConcurrencyGate()
+    initial = gate.acquire(1, timeout_seconds=1)
+    assert initial is not None
+    cancelled = threading.Event()
+    results = {}
+
+    def wait_cancelled():
+        try:
+            gate.acquire(1, timeout_seconds=2, cancel_check=cancelled.is_set)
+        except ConcurrencyWaitCancelled:
+            results["cancelled"] = True
+
+    def wait_follower():
+        results["follower"] = gate.acquire(1, timeout_seconds=1)
+
+    cancelled_thread = threading.Thread(target=wait_cancelled, daemon=True)
+    follower = threading.Thread(target=wait_follower, daemon=True)
+    cancelled_thread.start()
+    _wait_for_waiter_count(gate, 1)
+    follower.start()
+    _wait_for_waiter_count(gate, 2)
+
+    cancelled.set()
+    cancelled_thread.join(1)
+    assert not cancelled_thread.is_alive()
+    assert results["cancelled"] is True
+    initial.release()
+    follower.join(1)
+    assert not follower.is_alive()
+    assert results["follower"] is not None
+    results["follower"].release()
+
+
+def test_search_queue_timeout_is_model_actionable(monkeypatch):
+    _configure(monkeypatch, max_concurrency=1, queue_timeout_seconds=7)
+
+    class ExhaustedGate:
+        def acquire(self, limit, timeout_seconds, cancel_check):
+            assert limit == 1
+            assert timeout_seconds == 7
+            assert cancel_check is file_tools.is_interrupted
+            return None
+
+    monkeypatch.setattr(file_tools, "_SEARCH_FILES_GATE", ExhaustedGate())
+    result = json.loads(file_tools.search_tool("needle", task_id="queue-timeout"))
+
+    assert result["error_type"] == "search_queue_timeout"
+    assert result["queue_timeout_seconds"] == 7
+    assert result["retryable"] is True
+    assert "narrow" in result["error"].lower()
+    assert "retry" in result["error"].lower()
+
+
+def test_search_queue_interrupt_cleans_up_without_timeout_error(monkeypatch):
+    _configure(monkeypatch, max_concurrency=1, queue_timeout_seconds=2)
+    initial = file_tools._SEARCH_FILES_GATE.acquire(1, timeout_seconds=1)
+    assert initial is not None
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.update(
+            json.loads(file_tools.search_tool("needle", task_id="queue-cancel"))
+        ),
+        daemon=True,
+    )
+    worker.start()
+    _wait_for_waiter_count(file_tools._SEARCH_FILES_GATE, 1)
+    set_interrupt(True, worker.ident)
+    worker.join(1)
+    set_interrupt(False, worker.ident)
+
+    assert not worker.is_alive()
+    assert result["status"] == "cancelled"
+    assert "error_type" not in result
+
+    initial.release()
+    monkeypatch.setattr(
+        file_tools,
+        "_get_file_ops",
+        lambda _task_id: MagicMock(search=MagicMock(return_value=SearchResult())),
+    )
+    followup = json.loads(file_tools.search_tool("needle", task_id="queue-cancel-followup"))
+    assert "error" not in followup
 
 
 def test_search_capacity_is_released_after_error(monkeypatch):
@@ -118,6 +295,68 @@ def test_configured_budget_is_forwarded_without_changing_tool_schema(monkeypatch
     assert ops.search.call_args.kwargs["timeout_seconds"] == 7
     assert "timeout_seconds" not in file_tools.SEARCH_FILES_SCHEMA["parameters"]["properties"]
     assert "max_concurrency" not in file_tools.SEARCH_FILES_SCHEMA["parameters"]["properties"]
+    assert "queue_timeout_seconds" not in file_tools.SEARCH_FILES_SCHEMA["parameters"]["properties"]
+
+
+def test_queue_wait_does_not_reduce_execution_budget(monkeypatch):
+    _configure(
+        monkeypatch,
+        max_concurrency=1,
+        timeout_seconds=7,
+        queue_timeout_seconds=2,
+    )
+    initial = file_tools._SEARCH_FILES_GATE.acquire(1, timeout_seconds=1)
+    assert initial is not None
+    called = threading.Event()
+    result = {}
+
+    class Ops:
+        def search(self, **kwargs):
+            assert kwargs["timeout_seconds"] == 7
+            called.set()
+            return SearchResult()
+
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _task_id: Ops())
+
+    worker = threading.Thread(
+        target=lambda: result.update(
+            json.loads(file_tools.search_tool("needle", task_id="budget-separation"))
+        ),
+        daemon=True,
+    )
+    worker.start()
+    _wait_for_waiter_count(file_tools._SEARCH_FILES_GATE, 1)
+    assert not called.is_set()
+    initial.release()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert called.is_set()
+    assert "error" not in result
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, (2, 15, 45)),
+        ({"tools": {"search_files": {"max_concurrency": 5}}}, (5, 15, 45)),
+        (
+            {
+                "tools": {
+                    "search_files": {
+                        "max_concurrency": "bad",
+                        "timeout_seconds": None,
+                        "queue_timeout_seconds": [],
+                    }
+                }
+            },
+            (2, 15, 45),
+        ),
+    ],
+)
+def test_search_latency_config_resolves_old_and_invalid_configs(monkeypatch, config, expected):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    assert file_tools._load_search_latency_controls() == expected
 
 
 @pytest.fixture
@@ -198,3 +437,4 @@ def test_latency_defaults_are_canonical():
     assert DEFAULT_CONFIG["auxiliary"]["background_review"]["max_concurrency"] == 1
     assert DEFAULT_CONFIG["tools"]["search_files"]["max_concurrency"] <= 2
     assert DEFAULT_CONFIG["tools"]["search_files"]["timeout_seconds"] == 15
+    assert DEFAULT_CONFIG["tools"]["search_files"]["queue_timeout_seconds"] == 45
