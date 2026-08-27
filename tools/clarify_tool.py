@@ -111,6 +111,7 @@ def _parse_multi_select_response(raw_response) -> List[str]:
 
 def clarify_tool(
     question: str,
+    context: str = "",
     choices: Optional[List[str]] = None,
     multi_select: bool = False,
     callback: Optional[Callable] = None,
@@ -119,6 +120,8 @@ def clarify_tool(
     Ask the user a question, optionally with multiple-choice options.
 
     Args:
+        context:      Concise, self-contained user-visible context explaining
+                      why input is needed and what the decision affects.
         question:     The question text to present.
         choices:      Up to 4 predefined answer choices. When omitted the
                       question is purely open-ended.
@@ -128,7 +131,8 @@ def clarify_tool(
                       Has no effect when ``choices`` is omitted.
         callback:     Platform-provided function that handles the actual UI
                       interaction.  Signature:
-                      ``callback(question, choices, multi_select=False) -> str``.
+                      ``callback(prompt, choices, multi_select=False) -> str``,
+                      where ``prompt`` is context, a blank line, then question.
                       The optional ``multi_select`` keyword is passed so the
                       platform can render checkboxes instead of radio buttons.
                       Injected by the agent runner (cli.py / gateway).
@@ -136,9 +140,13 @@ def clarify_tool(
     Returns:
         JSON string with the user's response.
     """
-    if not question or not question.strip():
+    if not isinstance(context, str) or not context.strip():
+        return tool_error("Context text is required for every clarify prompt.")
+
+    if not isinstance(question, str) or not question.strip():
         return tool_error("Question text is required.")
 
+    context = context.strip()
     question = question.strip()
 
     # Validate and trim choices
@@ -159,8 +167,9 @@ def clarify_tool(
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
 
+    prompt = f"{context}\n\n{question}"
     try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
+        raw_response = _invoke_callback(callback, prompt, choices, multi_select)
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
 
@@ -170,6 +179,7 @@ def clarify_tool(
         user_response = str(raw_response).strip()
 
     return json.dumps({
+        "context": context,
         "question": question,
         "choices_offered": choices,
         "user_response": user_response,
@@ -196,11 +206,17 @@ CLARIFY_SCHEMA = {
         "multiple options via checkboxes. user_response will be a list of selected choices.\n"
         "3. **Open-ended** — omit choices entirely. The user types a free-form "
         "response.\n\n"
+        "Every call MUST include concise, self-contained user-visible context "
+        "covering the current status or findings, why user input is needed now, "
+        "and what the decision affects. Never recover or synthesize context from "
+        "hidden reasoning, chain-of-thought, internal logs, credentials, tokens, "
+        "or secrets.\n\n"
         "CRITICAL: when you are offering options, put each option ONLY in the "
-        "`choices` array — NEVER enumerate the options inside the `question` "
-        "text. The UI renders `choices` as selectable rows; options written "
-        "into the question string render as dead prose the user can't pick. "
-        "Right: question='Which deployment target?', choices=['staging', "
+        "`choices` array — NEVER enumerate the options inside `context` or "
+        "`question`. The UI renders `choices` as selectable rows; options written "
+        "into prompt text render as dead prose the user can't pick. Right: "
+        "context='The build is ready and the selected target controls where it "
+        "is released.', question='Which deployment target?', choices=['staging', "
         "'prod']. Wrong: question='Which target? 1) staging 2) prod', choices=[].\n\n"
         "Use this tool when:\n"
         "- The task is ambiguous and you need the user to choose an approach\n"
@@ -214,12 +230,26 @@ CLARIFY_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "context": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "A non-empty, concise, self-contained user-visible status "
+                    "or findings summary, "
+                    "including why input is needed now and what the decision "
+                    "affects. Do not include answer options here; put them only "
+                    "in `choices`. Use only facts safe to show the user, never "
+                    "hidden reasoning, chain-of-thought, internal logs, "
+                    "credentials, tokens, or secrets."
+                ),
+            },
             "question": {
                 "type": "string",
+                "minLength": 1,
                 "description": (
                     "The question itself, and ONLY the question (e.g. 'Which "
-                    "deployment target?'). Do NOT embed the answer options here "
-                    "— pass them as separate elements in `choices`."
+                    "deployment target?'). Do NOT include answer options here "
+                    "— put them only in `choices`."
                 ),
             },
             "choices": {
@@ -244,7 +274,7 @@ CLARIFY_SCHEMA = {
                 ),
             },
         },
-        "required": ["question"],
+        "required": ["context", "question"],
     },
 }
 
@@ -257,6 +287,7 @@ registry.register(
     toolset="clarify",
     schema=CLARIFY_SCHEMA,
     handler=lambda args, **kw: clarify_tool(
+        context=args.get("context", ""),
         question=args.get("question", ""),
         choices=args.get("choices"),
         multi_select=args.get("multi_select", False),

@@ -12,26 +12,58 @@ from tools.clarify_tool import (
     _flatten_choice,
 )
 
+TEST_CONTEXT = "The current step needs a user decision before work can continue."
+
 
 class TestClarifyToolBasics:
     """Basic functionality tests for clarify_tool."""
 
     def test_simple_question_with_callback(self):
-        """Should return user response for simple question."""
-        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
-            assert question == "What color?"
-            assert choices is None
+        """Context and question render together while choices stay separate."""
+        def mock_callback(prompt: str, choices: Optional[List[str]]) -> str:
+            assert prompt == (
+                "The palette is ready; this choice sets the final accent.\n\n"
+                "What color?"
+            )
+            assert choices == ["red", "blue"]
             return "blue"
 
-        result = json.loads(clarify_tool("What color?", callback=mock_callback))
+        result = json.loads(clarify_tool(
+            "  What color?  ",
+            context="  The palette is ready; this choice sets the final accent.  ",
+            choices=["red", "blue"],
+            callback=mock_callback,
+        ))
+        assert result["context"] == (
+            "The palette is ready; this choice sets the final accent."
+        )
         assert result["question"] == "What color?"
-        assert result["choices_offered"] is None
+        assert result["choices_offered"] == ["red", "blue"]
         assert result["user_response"] == "blue"
+
+    def test_missing_or_blank_context_never_invokes_callback(self):
+        calls = []
+
+        def mock_callback(prompt: str, choices: Optional[List[str]]) -> str:
+            calls.append((prompt, choices))
+            return "should not be returned"
+
+        for context in (None, "", " \n\t "):
+            result = json.loads(clarify_tool(
+                "What color?",
+                context=context,  # type: ignore[arg-type]
+                callback=mock_callback,
+            ))
+            assert "error" in result
+            assert "context" in result["error"].lower()
+            assert "required" in result["error"].lower()
+
+        assert calls == []
 
 
     def test_no_callback_returns_error(self):
         """Should return error when no callback is provided."""
-        result = json.loads(clarify_tool("What do you want?"))
+        result = json.loads(clarify_tool("What do you want?", context=TEST_CONTEXT))
         assert "error" in result
         assert "not available" in result["error"].lower()
 
@@ -48,7 +80,10 @@ class TestClarifyToolChoicesValidation:
             return "picked"
 
         many_choices = ["a", "b", "c", "d", "e", "f", "g"]
-        clarify_tool("Pick one", choices=many_choices, callback=mock_callback)
+        clarify_tool(
+            "Pick one", context=TEST_CONTEXT,
+            choices=many_choices, callback=mock_callback,
+        )
 
         assert len(choices_passed) == MAX_CHOICES
 
@@ -61,7 +96,10 @@ class TestClarifyToolChoicesValidation:
             choices_received.extend(choices or [])
             return "answer"
 
-        clarify_tool("Pick", choices=[1, 2, 3], callback=mock_callback)  # type: ignore
+        clarify_tool(
+            "Pick", context=TEST_CONTEXT,
+            choices=[1, 2, 3], callback=mock_callback,
+        )  # type: ignore
         assert choices_received == ["1", "2", "3"]
 
 
@@ -73,7 +111,9 @@ class TestClarifyToolCallbackHandling:
         def failing_callback(question: str, choices: Optional[List[str]]) -> str:
             raise RuntimeError("User cancelled")
 
-        result = json.loads(clarify_tool("Question?", callback=failing_callback))
+        result = json.loads(clarify_tool(
+            "Question?", context=TEST_CONTEXT, callback=failing_callback,
+        ))
         assert "error" in result
         assert "Failed to get user input" in result["error"]
         assert "User cancelled" in result["error"]
@@ -84,7 +124,9 @@ class TestClarifyToolCallbackHandling:
         def mock_callback(question: str, choices: Optional[List[str]]) -> str:
             return "  response with spaces  \n"
 
-        result = json.loads(clarify_tool("Q?", callback=mock_callback))
+        result = json.loads(clarify_tool(
+            "Q?", context=TEST_CONTEXT, callback=mock_callback,
+        ))
         assert result["user_response"] == "response with spaces"
 
 
@@ -120,6 +162,7 @@ class TestClarifyDictChoices:
 
         result = json.loads(clarify_tool(
             "Pick a layout",
+            context=TEST_CONTEXT,
             choices=[
                 {"choice": "Tight", "description": "Tight, covers all 3 points"},
                 {"description": "Loose layout"},
@@ -157,6 +200,22 @@ class TestClarifySchema:
         # The model should treat it as false when omitted
         assert "multi_select" not in CLARIFY_SCHEMA["parameters"]["required"]
 
+    def test_schema_requires_self_contained_context_and_separate_options(self):
+        parameters = CLARIFY_SCHEMA["parameters"]
+        assert parameters["required"] == ["context", "question"]
+        assert parameters["properties"]["context"]["minLength"] == 1
+
+        context_guidance = parameters["properties"]["context"]["description"].lower()
+        assert "self-contained" in context_guidance
+        assert "why input is needed now" in context_guidance
+        assert "what the decision affects" in context_guidance
+        assert "answer options" in context_guidance
+        assert "only" in context_guidance and "`choices`" in context_guidance
+
+        question_guidance = parameters["properties"]["question"]["description"].lower()
+        assert "answer options" in question_guidance
+        assert "only in `choices`" in question_guidance
+
 
 class TestClarifyToolMultiSelect:
     """Tests for multi_select (checkbox) support added to clarify_tool."""
@@ -168,6 +227,7 @@ class TestClarifyToolMultiSelect:
 
         result = json.loads(clarify_tool(
             "What color?",
+            context=TEST_CONTEXT,
             choices=["red", "blue", "green"],
             multi_select=False,
             callback=mock_callback,
@@ -182,6 +242,7 @@ class TestClarifyToolMultiSelect:
 
         result = json.loads(clarify_tool(
             "Which colors?",
+            context=TEST_CONTEXT,
             choices=["red", "blue", "green"],
             multi_select=True,
             callback=mock_callback,
@@ -196,6 +257,7 @@ class TestClarifyToolMultiSelect:
 
         result = json.loads(clarify_tool(
             "Which color?",
+            context=TEST_CONTEXT,
             choices=["red", "blue"],
             multi_select=True,
             callback=mock_callback,
@@ -215,6 +277,7 @@ class TestClarifyToolMultiSelect:
         many_choices = ["a", "b", "c", "d", "e", "f"]
         clarify_tool(
             "Pick some",
+            context=TEST_CONTEXT,
             choices=many_choices,
             multi_select=True,
             callback=mock_callback,
@@ -267,7 +330,12 @@ class TestRegistryMultiSelectPassThrough:
             return "a, b"
 
         result = json.loads(entry.handler(
-            {"question": "Pick", "choices": ["a", "b"], "multi_select": True},
+            {
+                "context": TEST_CONTEXT,
+                "question": "Pick",
+                "choices": ["a", "b"],
+                "multi_select": True,
+            },
             callback=cb,
         ))
         assert seen["multi"] is True
@@ -283,7 +351,7 @@ class TestRegistryMultiSelectPassThrough:
             return "a"
 
         result = json.loads(entry.handler(
-            {"question": "Pick", "choices": ["a", "b"]},
+            {"context": TEST_CONTEXT, "question": "Pick", "choices": ["a", "b"]},
             callback=cb,
         ))
         assert seen["multi"] is False

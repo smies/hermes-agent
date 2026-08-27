@@ -1765,6 +1765,7 @@ def execute_tool_calls_sequential(
             def _execute(next_args: dict) -> Any:
                 from tools.clarify_tool import clarify_tool as _clarify_tool
                 return _clarify_tool(
+                    context=next_args.get("context", ""),
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
