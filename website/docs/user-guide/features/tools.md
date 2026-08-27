@@ -32,6 +32,26 @@ High-level categories:
 
 For the authoritative code-derived registry, see [Built-in Tools Reference](/reference/tools-reference) and [Toolsets Reference](/reference/toolsets-reference).
 
+### `search_files` latency controls
+
+Broad file searches use bounded process-wide capacity and a shared wall-clock
+budget. Configure both in `~/.hermes/config.yaml` without changing the tool's
+model-facing arguments:
+
+```yaml
+tools:
+  search_files:
+    max_concurrency: 2
+    timeout_seconds: 15
+```
+
+When capacity is occupied, `search_files` fails fast with a narrowing/retry
+hint. A search that reaches its time budget returns any partial results and
+marks them truncated. Broad roots skip conventional metadata, dependency,
+virtualenv, and Python cache trees; the result lists those exclusions. Passing
+one of those directories as the search root searches it normally and reports
+that the default exclusions were disabled for the explicit root.
+
 :::tip Nous Tool Gateway
 Paid [Nous Portal](https://portal.nousresearch.com) subscribers can use web search, image generation, TTS, and browser automation through the **[Tool Gateway](tool-gateway.md)** — no separate API keys needed. Run `hermes model` to enable it, or configure individual tools with `hermes tools`.
 :::

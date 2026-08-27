@@ -1046,6 +1046,10 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            # Process-wide admission cap. A trigger that arrives while all
+            # slots are occupied is skipped (never queued or awaited by the
+            # foreground turn).
+            "max_concurrency": 1,
         },
         "moa_reference": {
             "provider": "auto",
@@ -2329,7 +2333,8 @@ DEFAULT_CONFIG = {
         "mode": "project",
     },
 
-    # Tool Search (progressive disclosure for large tool surfaces).
+    # Tool settings. Tool Search provides progressive disclosure for large
+    # tool surfaces; search_files keeps local traversal work bounded.
     # When the model is connected to many MCP servers or non-core plugin
     # tools, their JSON schemas can consume a substantial fraction of the
     # context window on every turn. When enabled, those tools are replaced
@@ -2341,6 +2346,13 @@ DEFAULT_CONFIG = {
     # See tools/tool_search.py for full design notes and the
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
+        # Process-wide latency controls for the existing search_files tool.
+        # These do not alter its model-facing schema. Capacity exhaustion
+        # fails fast; broad searches preserve partial results on timeout.
+        "search_files": {
+            "max_concurrency": 2,
+            "timeout_seconds": 15,
+        },
         "tool_search": {
             # Tiered disclosure: any deferrable (MCP/plugin) tool activates
             # the bridge; the listing then scales with catalog size.

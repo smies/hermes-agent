@@ -11,6 +11,7 @@ import threading
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
+from agent.concurrency_gate import NonBlockingConcurrencyGate
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -21,6 +22,30 @@ from tools import file_state
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+_SEARCH_FILES_GATE = NonBlockingConcurrencyGate()
+_DEFAULT_SEARCH_MAX_CONCURRENCY = 2
+_DEFAULT_SEARCH_TIMEOUT_SECONDS = 15
+
+
+def _load_search_latency_controls() -> tuple[int, int]:
+    """Read internal search controls from config without changing tool args."""
+    max_concurrency = _DEFAULT_SEARCH_MAX_CONCURRENCY
+    timeout_seconds = _DEFAULT_SEARCH_TIMEOUT_SECONDS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        tools_config = config.get("tools", {}) if isinstance(config, dict) else {}
+        search_config = tools_config.get("search_files", {}) if isinstance(tools_config, dict) else {}
+        max_concurrency = int(search_config.get("max_concurrency", max_concurrency))
+        timeout_seconds = int(search_config.get("timeout_seconds", timeout_seconds))
+    except Exception:
+        pass
+    return (
+        min(32, max(1, max_concurrency)),
+        min(300, max(1, timeout_seconds)),
+    )
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
@@ -2044,6 +2069,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 output_mode: str = "content", context: int = 0,
                 task_id: str = "default") -> str:
     """Search for content or files."""
+    capacity_lease = None
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
@@ -2079,6 +2105,16 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 already_searched=count,
             )
 
+        max_concurrency, timeout_seconds = _load_search_latency_controls()
+        capacity_lease = _SEARCH_FILES_GATE.try_acquire(max_concurrency)
+        if capacity_lease is None:
+            return tool_error(
+                "search_files capacity is occupied. Narrow the path, pattern, or "
+                "file_glob and retry shortly; this search was not queued.",
+                max_concurrency=max_concurrency,
+                retryable=True,
+            )
+
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
@@ -2103,7 +2139,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
-            limit=limit, offset=offset, output_mode=output_mode, context=context
+            limit=limit, offset=offset, output_mode=output_mode, context=context,
+            timeout_seconds=timeout_seconds,
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
         if hasattr(result, 'matches'):
@@ -2137,10 +2174,20 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # than relying on the model to infer it from total_count vs match count.
         if result_dict.get("truncated"):
             next_offset = offset + limit
-            result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
+            if result_dict.get("limit_reason") == "search_timeout":
+                result_json += (
+                    "\n\n[Hint: Search timed out with partial results. Narrow path, "
+                    "pattern, or file_glob and retry; offset pagination remains "
+                    f"available (next offset={next_offset}).]"
+                )
+            else:
+                result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
         return result_json
     except Exception as e:
         return tool_error(str(e))
+    finally:
+        if capacity_lease is not None:
+            capacity_lease.release()
 
 
 

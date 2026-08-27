@@ -300,6 +300,7 @@ auxiliary:
   background_review:
     provider: openrouter
     model: google/gemini-3-flash-preview   # auto (default) = main chat model
+    max_concurrency: 1                     # process-wide; occupied triggers are skipped
 ```
 
 When you point it at a model **different** from your main one, the review runs
@@ -312,6 +313,9 @@ identical and skill capture near-identical to the main-model review.
 
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
+Automatic reviews never wait in an unbounded queue: when the process-wide
+`max_concurrency` slots are occupied, a new trigger is skipped so the
+foreground turn can continue immediately. The default is `1`.
 
 ## Controlling skill writes (`skills.write_approval`)
 

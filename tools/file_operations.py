@@ -29,6 +29,9 @@ import os
 import re
 import difflib
 import hashlib
+import math
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -260,6 +263,8 @@ class SearchResult:
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
+    excluded_directories: List[str] = field(default_factory=list)
+    default_exclusions: Optional[str] = None
     
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
@@ -323,6 +328,10 @@ class SearchResult:
             result["warning"] = self.warning
         if self.error:
             result["error"] = self.error
+        if self.excluded_directories:
+            result["excluded_directories"] = self.excluded_directories
+        if self.default_exclusions:
+            result["default_exclusions"] = self.default_exclusions
         return result
 
 
@@ -351,6 +360,34 @@ class ExecuteResult:
 
 
 _SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+s\]\s*$")
+
+DEFAULT_SEARCH_EXCLUDED_DIRECTORIES = (
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    "virtualenv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+)
+_DEFAULT_SEARCH_EXCLUDED_SET = frozenset(DEFAULT_SEARCH_EXCLUDED_DIRECTORIES)
+
+
+def _explicit_generated_search_root(path: str) -> bool:
+    """Whether any supplied root explicitly enters an excluded tree."""
+    candidates = [part for chunk in str(path).split(",") for part in chunk.split()]
+    for candidate in candidates:
+        normalized = candidate.replace("\\", "/")
+        if any(part in _DEFAULT_SEARCH_EXCLUDED_SET for part in normalized.split("/") if part):
+            return True
+    return False
 
 
 def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]:
@@ -504,7 +541,8 @@ class FileOperations(ABC):
     @abstractmethod
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
-               output_mode: str = "content", context: int = 0) -> SearchResult:
+               output_mode: str = "content", context: int = 0,
+               timeout_seconds: int = 15) -> SearchResult:
         """Search for content or files."""
         ...
 
@@ -842,6 +880,7 @@ class ShellFileOperations(FileOperations):
 
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
+        self._search_context = threading.local()
     
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:
@@ -878,9 +917,38 @@ class ShellFileOperations(FileOperations):
     def _has_command(self, cmd: str) -> bool:
         """Check if a command exists in the environment (cached)."""
         if cmd not in self._command_cache:
-            result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
+            if getattr(self._search_context, "deadline", None) is not None:
+                result = self._search_exec(
+                    f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'"
+                )
+            else:
+                result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
+
+    def _search_exec(self, command: str, cwd: str = None) -> ExecuteResult:
+        """Execute within the current search's single wall-clock deadline."""
+        deadline = getattr(self._search_context, "deadline", None)
+        budget = getattr(self._search_context, "budget", 15)
+        if deadline is None:
+            return self._exec(command, cwd=cwd, timeout=budget)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._search_context.timed_out = True
+            return ExecuteResult(
+                stdout=f"[Command timed out after {budget}s]",
+                exit_code=124,
+            )
+        result = self._exec(command, cwd=cwd, timeout=max(1, math.ceil(remaining)))
+        if result.exit_code == 124:
+            self._search_context.timed_out = True
+        return result
+
+    def _search_exclusion_globs(self) -> List[str]:
+        return [
+            f"!**/{name}/**"
+            for name in getattr(self._search_context, "excluded_directories", ())
+        ]
     
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
@@ -2177,7 +2245,8 @@ class ShellFileOperations(FileOperations):
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
-               output_mode: str = "content", context: int = 0) -> SearchResult:
+               output_mode: str = "content", context: int = 0,
+               timeout_seconds: int = 15) -> SearchResult:
         """
         Search for content or files.
         
@@ -2195,57 +2264,86 @@ class ShellFileOperations(FileOperations):
             SearchResult with matches or file list
         """
         offset, limit = normalize_search_pagination(offset, limit)
-
-        # Expand ~ and other shell paths
-        path = self._expand_path(path)
-        
-        # Validate that the path exists before searching
-        check = self._exec(f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found")
-        if "not_found" in check.stdout:
-            # Multi-path recovery: models frequently pass several paths in
-            # one string ("dir1 dir2 dir3" or comma-separated). Instead of
-            # failing the whole call, split, search every path that exists,
-            # merge the results, and report the skipped parts.
-            multi = self._try_multi_path_search(
-                pattern, path, target, file_glob, limit, offset, output_mode, context
+        try:
+            budget = min(300, max(1, int(timeout_seconds)))
+        except (TypeError, ValueError):
+            budget = 15
+        explicit_override = _explicit_generated_search_root(path)
+        exclusions = () if explicit_override else DEFAULT_SEARCH_EXCLUDED_DIRECTORIES
+        previous = (
+            getattr(self._search_context, "deadline", None),
+            getattr(self._search_context, "budget", None),
+            getattr(self._search_context, "excluded_directories", None),
+            getattr(self._search_context, "timed_out", None),
+        )
+        self._search_context.deadline = time.monotonic() + budget
+        self._search_context.budget = budget
+        self._search_context.excluded_directories = exclusions
+        self._search_context.timed_out = False
+        try:
+            path = self._expand_path(path)
+            check = self._search_exec(
+                f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found"
             )
-            if multi is not None:
-                return multi
-            # Try to suggest nearby paths
-            parent = os.path.dirname(path) or "."
-            basename_query = os.path.basename(path)
-            hint_parts = [f"Path not found: {path}"]
-            # Check if parent directory exists and list similar entries
-            parent_check = self._exec(
-                f"test -d {self._escape_shell_arg(parent)} && echo yes || echo no"
-            )
-            if "yes" in parent_check.stdout and basename_query:
-                ls_result = self._exec(
-                    f"ls -1 {self._escape_shell_arg(parent)} 2>/dev/null | head -20"
+            if "not_found" in check.stdout:
+                result = self._try_multi_path_search(
+                    pattern, path, target, file_glob, limit, offset, output_mode, context
                 )
-                if ls_result.exit_code == 0 and ls_result.stdout.strip():
-                    lower_q = basename_query.lower()
-                    candidates = []
-                    for entry in ls_result.stdout.strip().split('\n'):
-                        if not entry:
-                            continue
-                        le = entry.lower()
-                        if lower_q in le or le in lower_q or le.startswith(lower_q[:3]):
-                            candidates.append(os.path.join(parent, entry))
-                    if candidates:
-                        hint_parts.append(
-                            "Similar paths: " + ", ".join(candidates[:5])
+                if result is None:
+                    parent = os.path.dirname(path) or "."
+                    basename_query = os.path.basename(path)
+                    hint_parts = [f"Path not found: {path}"]
+                    parent_check = self._search_exec(
+                        f"test -d {self._escape_shell_arg(parent)} && echo yes || echo no"
+                    )
+                    if "yes" in parent_check.stdout and basename_query:
+                        ls_result = self._search_exec(
+                            f"ls -1 {self._escape_shell_arg(parent)} 2>/dev/null | head -20"
                         )
-            return SearchResult(
-                error=". ".join(hint_parts),
-                total_count=0
-            )
-        
-        if target == "files":
-            return self._search_files(pattern, path, limit, offset)
-        else:
-            return self._search_content(pattern, path, file_glob, limit, offset, 
-                                        output_mode, context)
+                        if ls_result.exit_code == 0 and ls_result.stdout.strip():
+                            lower_q = basename_query.lower()
+                            candidates = []
+                            for entry in ls_result.stdout.strip().split('\n'):
+                                if not entry:
+                                    continue
+                                le = entry.lower()
+                                if lower_q in le or le in lower_q or le.startswith(lower_q[:3]):
+                                    candidates.append(os.path.join(parent, entry))
+                            if candidates:
+                                hint_parts.append("Similar paths: " + ", ".join(candidates[:5]))
+                    result = SearchResult(error=". ".join(hint_parts), total_count=0)
+            elif target == "files":
+                result = self._search_files(pattern, path, limit, offset)
+            else:
+                result = self._search_content(
+                    pattern, path, file_glob, limit, offset, output_mode, context
+                )
+
+            if getattr(self._search_context, "timed_out", False):
+                result.truncated = True
+                result.limit_reason = "search_timeout"
+            if explicit_override:
+                result.default_exclusions = "disabled for explicitly targeted generated/vendor root"
+            else:
+                result.excluded_directories = list(exclusions)
+            if result.limit_reason == "search_timeout":
+                note = (
+                    f"Search stopped after the {budget}s wall-clock budget; results are partial. "
+                    "Narrow path, pattern, or file_glob and retry."
+                )
+                result.warning = f"{result.warning} {note}" if result.warning else note
+            return result
+        finally:
+            for name, value in zip(
+                ("deadline", "budget", "excluded_directories", "timed_out"), previous
+            ):
+                if value is None:
+                    try:
+                        delattr(self._search_context, name)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(self._search_context, name, value)
     
     def _try_multi_path_search(self, pattern: str, path: str, target: str,
                                file_glob: Optional[str], limit: int, offset: int,
@@ -2264,7 +2362,7 @@ class ShellFileOperations(FileOperations):
         existing, missing = [], []
         for p in parts:
             expanded = self._expand_path(p)
-            chk = self._exec(
+            chk = self._search_exec(
                 f"test -e {self._escape_shell_arg(expanded)} && echo exists || echo not_found"
             )
             (existing if "exists" in chk.stdout else missing).append(expanded)
@@ -2285,6 +2383,8 @@ class ShellFileOperations(FileOperations):
             merged.counts.update(sub.counts)
             merged.total_count += sub.total_count
             merged.truncated = merged.truncated or sub.truncated
+            if sub.limit_reason and not merged.limit_reason:
+                merged.limit_reason = sub.limit_reason
         # Respect the caller's limit across the merged set.
         merged.matches = merged.matches[:limit]
         merged.files = merged.files[:limit]
@@ -2309,11 +2409,14 @@ class ShellFileOperations(FileOperations):
         if not self._has_command('rg'):
             return None
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
-        probe = self._exec(
-            f"rg -i --count-matches{glob_expr} "
+        exclusion_globs = "".join(
+            f" --glob {self._escape_shell_arg(glob)}"
+            for glob in self._search_exclusion_globs()
+        )
+        probe = self._search_exec(
+            f"rg -i --count-matches{glob_expr}{exclusion_globs} "
             f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
-            f"2>/dev/null | head -50",
-            timeout=30,
+            f"2>/dev/null | head -50"
         )
         ci_total = 0
         ci_files = 0
@@ -2331,11 +2434,10 @@ class ShellFileOperations(FileOperations):
         # default. When the pattern exists only there, say so instead of
         # returning a bare zero (bench case: match in .hidden/ silently
         # missing from results).
-        hidden = self._exec(
-            f"rg --hidden --no-ignore --count-matches{glob_expr} "
+        hidden = self._search_exec(
+            f"rg --hidden --no-ignore --count-matches{glob_expr}{exclusion_globs} "
             f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
-            f"2>/dev/null | head -50",
-            timeout=30,
+            f"2>/dev/null | head -50"
         )
         h_total = 0
         h_files = 0
@@ -2351,11 +2453,10 @@ class ShellFileOperations(FileOperations):
                 "by default. Search the hidden path explicitly to include them."
             )
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
-            fixed = self._exec(
-                f"rg -F --count-matches{glob_expr} "
+            fixed = self._search_exec(
+                f"rg -F --count-matches{glob_expr}{exclusion_globs} "
                 f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
-                f"2>/dev/null | head -50",
-                timeout=30,
+                f"2>/dev/null | head -50"
             )
             f_total = sum(
                 int(line.rpartition(":")[2])
@@ -2399,8 +2500,15 @@ class ShellFileOperations(FileOperations):
             )
 
         # Exclude hidden directories (matching ripgrep's default behavior).
-        hidden_exclude = "-not -path '*/.*'" if not has_hidden_path_ancestor else ""
-        hidden_filter_expr = f" {hidden_exclude}" if hidden_exclude else ""
+        filters = []
+        if not has_hidden_path_ancestor:
+            filters.append("-not -path '*/.*'")
+        filters.extend(
+            f"-not -path {self._escape_shell_arg(f'*/{name}/*')}"
+            for name in getattr(self._search_context, "excluded_directories", ())
+            if not name.startswith(".")
+        )
+        hidden_filter_expr = f" {' '.join(filters)}" if filters else ""
 
         # Use shell pagination for standard roots. For hidden roots, gather full
         # output so we can re-apply hidden-descendant filtering while allowing
@@ -2412,14 +2520,14 @@ class ShellFileOperations(FileOperations):
         cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
-        result = self._exec(cmd, timeout=60)
+        result = self._search_exec(cmd)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
             cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
-            result = self._exec(cmd_simple, timeout=60)
+            result = self._search_exec(cmd_simple)
             stdout, limit_reason = _search_stdout_and_limit(result)
 
         files = []
@@ -2472,24 +2580,28 @@ class ShellFileOperations(FileOperations):
             glob_pattern = pattern
 
         fetch_limit = limit + offset
+        exclusion_globs = "".join(
+            f" --glob {self._escape_shell_arg(glob)}"
+            for glob in self._search_exclusion_globs()
+        )
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
+            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)}{exclusion_globs} "
             f"{self._escape_shell_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
-        result = self._exec(cmd_sorted, timeout=60)
+        result = self._search_exec(cmd_sorted)
         stdout, limit_reason = _search_stdout_and_limit(result)
         all_files = [f for f in stdout.strip().split('\n') if f]
 
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                f"rg --files -g {self._escape_shell_arg(glob_pattern)}{exclusion_globs} "
                 f"{self._escape_shell_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
-            result = self._exec(cmd_plain, timeout=60)
+            result = self._search_exec(cmd_plain)
             stdout, limit_reason = _search_stdout_and_limit(result)
             all_files = [f for f in stdout.strip().split('\n') if f]
 
@@ -2561,6 +2673,8 @@ class ShellFileOperations(FileOperations):
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+        for exclusion in self._search_exclusion_globs():
+            cmd_parts.extend(["--glob", self._escape_shell_arg(exclusion)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -2584,7 +2698,7 @@ class ShellFileOperations(FileOperations):
         # truncating head cleanly (exit 0 on SIGPIPE), so pipefail does not
         # introduce false errors on a successful-but-truncated search.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
-        result = self._exec(cmd, timeout=60)
+        result = self._search_exec(cmd)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         # _exec merges stderr into stdout (stderr=subprocess.STDOUT), so rg's
@@ -2688,7 +2802,16 @@ class ShellFileOperations(FileOperations):
         
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.
-        cmd_parts.append("--exclude-dir='.*'")
+        search_root = Path(path)
+        explicitly_hidden = any(
+            part not in {".", ".."} and part.startswith(".")
+            for part in search_root.parts
+        )
+        if not explicitly_hidden:
+            cmd_parts.append("--exclude-dir='.*'")
+        for exclusion in getattr(self._search_context, "excluded_directories", ()):
+            if not exclusion.startswith("."):
+                cmd_parts.append(f"--exclude-dir={self._escape_shell_arg(exclusion)}")
         
         # Add context if requested
         if context > 0:
@@ -2718,7 +2841,7 @@ class ShellFileOperations(FileOperations):
         # successful search; the strict `== 2` guard below ignores that, so
         # pipefail does not turn truncated results into false errors.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
-        result = self._exec(cmd, timeout=60)
+        result = self._search_exec(cmd)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         # _exec merges stderr into stdout, so grep's diagnostic lines

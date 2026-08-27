@@ -25,8 +25,39 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
+from agent.concurrency_gate import ConcurrencyLease, NonBlockingConcurrencyGate
 
 logger = logging.getLogger(__name__)
+
+_BACKGROUND_REVIEW_GATE = NonBlockingConcurrencyGate()
+_DEFAULT_BACKGROUND_REVIEW_MAX_CONCURRENCY = 1
+
+
+def acquire_background_review_capacity() -> Optional[ConcurrencyLease]:
+    """Try to admit one automatic review without waiting or queueing."""
+    limit = _DEFAULT_BACKGROUND_REVIEW_MAX_CONCURRENCY
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        auxiliary = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+        review = auxiliary.get("background_review", {}) if isinstance(auxiliary, dict) else {}
+        limit = int(review.get("max_concurrency", limit))
+    except Exception:
+        limit = _DEFAULT_BACKGROUND_REVIEW_MAX_CONCURRENCY
+    limit = min(16, max(1, limit))
+
+    lease = _BACKGROUND_REVIEW_GATE.try_acquire(limit)
+    if lease is None:
+        skipped = _BACKGROUND_REVIEW_GATE.rejection_log_count()
+        if skipped:
+            logger.warning(
+                "Background review capacity occupied (limit=%d); skipped %d "
+                "review trigger(s) without queueing",
+                limit,
+                skipped,
+            )
+    return lease
 
 
 # ---------------------------------------------------------------------------
@@ -1062,4 +1093,5 @@ __all__ = [
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "acquire_background_review_capacity",
 ]

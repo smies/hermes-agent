@@ -1803,20 +1803,42 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
-        from agent.background_review import spawn_background_review_thread
-        from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
-            review_memory=review_memory,
-            review_skills=review_skills,
+        from agent.background_review import (
+            acquire_background_review_capacity,
+            spawn_background_review_thread,
         )
+        from tools.thread_context import propagate_context_to_thread
+        capacity_lease = acquire_background_review_capacity()
+        if capacity_lease is None:
+            return
+        try:
+            target, _prompt = spawn_background_review_thread(
+                self,
+                messages_snapshot,
+                review_memory=review_memory,
+                review_skills=review_skills,
+            )
+        except Exception:
+            capacity_lease.release()
+            raise
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+        def _run_with_capacity_release() -> None:
+            try:
+                target()
+            finally:
+                capacity_lease.release()
+
+        try:
+            t = threading.Thread(
+                target=propagate_context_to_thread(_run_with_capacity_release),
+                daemon=True,
+                name="bg-review",
+            )
+            t.start()
+        except Exception:
+            capacity_lease.release()
+            raise
 
     def _build_memory_write_metadata(
         self,
