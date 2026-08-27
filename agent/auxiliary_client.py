@@ -402,6 +402,50 @@ def aux_progress_hook(hook):
         _aux_progress.hook = prev
 
 
+# Content-free provider timing for compression observability. ContextVars
+# survive the protected-provider thread handoff; hooks receive only route
+# labels, monotonic timestamps, an opaque call id, and phase edges.
+_AUX_TIMING_HOOK: contextvars.ContextVar[Optional[Callable[[Dict[str, Any]], Any]]] = (
+    contextvars.ContextVar("auxiliary_timing_hook", default=None)
+)
+_AUX_TIMING_CALL_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "auxiliary_timing_call_id", default=None
+)
+
+
+@contextlib.contextmanager
+def aux_timing_hook(hook):
+    """Install a metadata-only provider timing hook for this context."""
+    token = _AUX_TIMING_HOOK.set(hook if callable(hook) else None)
+    try:
+        yield
+    finally:
+        _AUX_TIMING_HOOK.reset(token)
+
+
+def _notify_aux_timing(event: str, **metadata: Any) -> None:
+    """Emit one timing edge; observer failures never affect provider calls."""
+    hook = _AUX_TIMING_HOOK.get()
+    if hook is None:
+        return
+    payload = {
+        "event": event,
+        "at": time.monotonic(),
+        "call_id": metadata.pop("call_id", None) or _AUX_TIMING_CALL_ID.get(),
+    }
+    payload.update(metadata)
+    try:
+        hook(payload)
+    except Exception:
+        logger.debug("aux timing hook failed", exc_info=True)
+
+
+def _notify_aux_meaningful_token() -> None:
+    """Mark actual streamed content/reasoning, never generic SSE progress."""
+    if _AUX_TIMING_CALL_ID.get() is not None:
+        _notify_aux_timing("meaningful_token")
+
+
 def _run_protected_sync_provider_call(
     callback: Callable[[dict[str, Any]], Any],
     kwargs: dict[str, Any],
@@ -1467,6 +1511,26 @@ class _CodexCompletionsAdapter:
                 # a progress hook (gateway session hygiene): a reasoning
                 # model streaming a long summary must not look hung.
                 _notify_aux_progress()
+                _event_type = str(
+                    getattr(_event, "type", None)
+                    or (_event.get("type") if isinstance(_event, dict) else "")
+                    or ""
+                ).lower()
+                _delta = (
+                    _event.get("delta")
+                    if isinstance(_event, dict)
+                    else getattr(_event, "delta", None)
+                )
+                if (
+                    isinstance(_delta, str)
+                    and _delta
+                    and "delta" in _event_type
+                    and (
+                        "output_text" in _event_type
+                        or "reasoning" in _event_type
+                    )
+                ):
+                    _notify_aux_meaningful_token()
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
@@ -2933,17 +2997,48 @@ def _relay_sync_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    provider_name = str(provider or "auxiliary")
+    fallback_model = str(kwargs.get("model") or "unknown")
+    resolved_api_mode = str(api_mode or "chat_completions")
+    route_metadata: dict[str, Any] = {}
+    if route is not None:
+        provider_name, fallback_model, route_metadata = route
+        resolved_api_mode = str(
+            route_metadata.get("api_mode") or resolved_api_mode
+        )
+
+    def _timed_callback(request: dict[str, Any]) -> Any:
+        call_id = uuid.uuid4().hex
+        token = _AUX_TIMING_CALL_ID.set(call_id)
+        _notify_aux_timing(
+            "dispatch",
+            call_id=call_id,
+            provider=provider_name,
+            model=str(request.get("model") or fallback_model),
+            api_mode=resolved_api_mode,
+        )
+        try:
+            result = callback(request)
+        except BaseException:
+            _notify_aux_timing("complete", call_id=call_id, status="failed")
+            raise
+        else:
+            _notify_aux_timing("complete", call_id=call_id, status="completed")
+            return result
+        finally:
+            _AUX_TIMING_CALL_ID.reset(token)
+
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
     if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
+        return _run_protected_sync_provider_call(_timed_callback, kwargs)
+    metadata = route_metadata
     from agent import relay_llm
 
     return relay_llm.execute_current(
         kwargs,
-        lambda request: _run_protected_sync_provider_call(callback, request),
+        lambda request: _run_protected_sync_provider_call(_timed_callback, request),
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         metadata=metadata,
@@ -8425,12 +8520,14 @@ class _ChatStreamAccumulator:
             return
         piece = getattr(delta, "content", None)
         if piece:
+            _notify_aux_meaningful_token()
             self.content_parts.append(piece)
         reasoning_piece = (
             getattr(delta, "reasoning", None)
             or getattr(delta, "reasoning_content", None)
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
+            _notify_aux_meaningful_token()
             self.reasoning_parts.append(reasoning_piece)
         for tc in (getattr(delta, "tool_calls", None) or []):
             idx = getattr(tc, "index", 0) or 0

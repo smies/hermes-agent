@@ -879,6 +879,26 @@ def run_compress_context_with_progress_timeout(
     from tools.thread_context import propagate_context_to_thread
 
     executor = _get_compress_timeout_executor()
+    _admission_started_at = time.monotonic()
+    _host_attempt_id: Optional[str] = None
+    if telemetry_agent is not None:
+        _host_attempt_id = uuid.uuid4().hex
+        try:
+            telemetry_agent._compression_attempt_id = _host_attempt_id
+            telemetry_agent._compression_pending_attempt_id = _host_attempt_id
+            telemetry_agent._compression_telemetry_emitted_attempt_id = None
+            _admitted_phase = {
+                "queue_admission_ms": None,
+                "queue_admission_status": "admitted",
+            }
+            telemetry_agent._compression_queue_phase_telemetry = _admitted_phase
+            setattr(
+                telemetry_agent.context_compressor,
+                "_compression_queue_phase_seed",
+                dict(_admitted_phase),
+            )
+        except Exception:
+            pass
     # Bounded admission (#76354 F6): refuse rather than queue when every pool
     # slot is occupied. A queued job would silently wait out its whole budget
     # without starting and stay eligible to run as a stale cancelled job when
@@ -896,9 +916,38 @@ def run_compress_context_with_progress_timeout(
         # telemetry stream as every other failed attempt, or a wedged pool
         # looks like compression simply stopped being attempted.
         if telemetry_agent is not None:
+            _saturation_attempt_id = _host_attempt_id or uuid.uuid4().hex
+            try:
+                telemetry_agent._compression_attempt_id = _saturation_attempt_id
+                telemetry_agent._compression_pending_attempt_id = None
+                telemetry_agent._compression_telemetry_emitted_attempt_id = None
+                telemetry_agent._compression_queue_phase_telemetry = {
+                    "queue_admission_ms": None,
+                    "queue_admission_status": "saturated",
+                }
+                setattr(
+                    telemetry_agent.context_compressor,
+                    "_compression_telemetry_seed",
+                    {
+                        "attempt_id": _saturation_attempt_id,
+                        "session_id": getattr(telemetry_agent, "session_id", "") or "",
+                        "trigger_source": "auto",
+                        "queue_admission_ms": None,
+                        "queue_admission_status": "saturated",
+                    },
+                )
+                _begin = getattr(
+                    telemetry_agent.context_compressor,
+                    "_begin_compression_telemetry",
+                    None,
+                )
+                if callable(_begin):
+                    _begin(current_tokens=None)
+            except Exception:
+                pass
             _emit_compression_attempt_telemetry(
                 telemetry_agent,
-                started_at=time.monotonic(),
+                started_at=_admission_started_at,
                 commit_status="aborted",
                 split_status="aborted",
                 failure_class="pool_saturated",
@@ -906,6 +955,21 @@ def run_compress_context_with_progress_timeout(
         return messages, _resolve_fallback_prompt()
 
     def _fence_gated_worker(worker_fence: CompressionCommitFence):
+        try:
+            _worker_phase = {
+                "queue_admission_ms": max(
+                    0, int((time.monotonic() - _admission_started_at) * 1000)
+                ),
+                "queue_admission_status": "worker_started",
+            }
+            telemetry_agent._compression_queue_phase_telemetry = _worker_phase
+            setattr(
+                telemetry_agent.context_compressor,
+                "_compression_queue_phase_seed",
+                dict(_worker_phase),
+            )
+        except Exception:
+            pass
         # F6: an admitted job can still start after the host stopped waiting
         # (worker slot freed late). Check the fence BEFORE any expensive
         # summary work so a stale job never burns an LLM call; its return
@@ -925,6 +989,14 @@ def run_compress_context_with_progress_timeout(
         )
     except BaseException:
         _release_compression_admission()
+        if telemetry_agent is not None:
+            _emit_compression_attempt_telemetry(
+                telemetry_agent,
+                started_at=_admission_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="pool_submit_failed",
+            )
         raise
     future.add_done_callback(_release_compression_admission)
     wait_started = time.monotonic()
@@ -1077,6 +1149,14 @@ def run_compress_context_with_progress_timeout(
             )
         # Leave the future on the shared pool: fence cancel won, so a late
         # commit cannot land (same detachment model as gateway hygiene).
+        if telemetry_agent is not None:
+            _emit_compression_attempt_telemetry(
+                telemetry_agent,
+                started_at=_admission_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="progress_timeout",
+            )
         return messages, _resolve_fallback_prompt()
     finally:
         if not handled_exit:
@@ -1085,6 +1165,14 @@ def run_compress_context_with_progress_timeout(
             # worker's durable lease via the holder-qualified hook) before
             # the host unwinds, so the detached worker can never publish.
             fence.revoke_commit_admission()
+            if telemetry_agent is not None:
+                _emit_compression_attempt_telemetry(
+                    telemetry_agent,
+                    started_at=_admission_started_at,
+                    commit_status="aborted",
+                    split_status="aborted",
+                    failure_class="host_cancelled",
+                )
 
 
 def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
@@ -1161,9 +1249,27 @@ def _emit_compression_attempt_telemetry(
         telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             telemetry = {}
+        current_attempt_id = (
+            getattr(agent, "_compression_attempt_id", "") or uuid.uuid4().hex
+        )
+        # Cancellation rollback deliberately restores the compressor's full
+        # pre-attempt telemetry state. Never reuse that prior attempt's fields
+        # in the new terminal record.
+        if telemetry.get("attempt_id") != current_attempt_id:
+            telemetry = {}
         payload = dict(telemetry)
         payload.setdefault("event", "compression_attempt")
-        payload.setdefault("attempt_id", getattr(agent, "_compression_attempt_id", "") or uuid.uuid4().hex)
+        payload["attempt_id"] = current_attempt_id
+        attempt_id = str(payload["attempt_id"])
+        if (
+            getattr(agent, "_compression_telemetry_emitted_attempt_id", None)
+            == attempt_id
+        ):
+            return
+        # Claim terminal emission before logging. If observability itself
+        # fails, compression remains safe and a later branch cannot duplicate
+        # the same attempt record.
+        agent._compression_telemetry_emitted_attempt_id = attempt_id
         payload.setdefault("session_id", getattr(agent, "session_id", "") or "")
         payload["total_duration_ms"] = int((time.monotonic() - started_at) * 1000)
         payload["commit_status"] = commit_status
@@ -1172,6 +1278,94 @@ def _emit_compression_attempt_telemetry(
             payload["failure_class"] = failure_class
         payload.setdefault("chunking", False)
         payload.setdefault("chunk_count", 0)
+        payload.setdefault("timing_schema", "compression_phase_v1")
+        payload.setdefault("queue_admission_ms", 0)
+        payload.setdefault("provider_ttft_ms", None)
+        payload.setdefault("summary_generation_ms", None)
+        payload.setdefault("database_commit_ms", None)
+        payload.setdefault("provider_total_ms", None)
+        queue_phase = getattr(agent, "_compression_queue_phase_telemetry", None)
+        if isinstance(queue_phase, dict):
+            payload["queue_admission_ms"] = queue_phase.get(
+                "queue_admission_ms"
+            )
+        provider_calls = payload.get("provider_calls")
+        if not isinstance(provider_calls, list):
+            provider_calls = []
+        # Fixed allow-list guarantees internal timestamps and any accidental
+        # adapter data can never enter the log payload.
+        safe_provider_calls = []
+        for item in provider_calls:
+            if not isinstance(item, dict):
+                continue
+            safe_provider_calls.append(
+                {
+                    key: item.get(key)
+                    for key in (
+                        "call_index",
+                        "provider",
+                        "model",
+                        "api_mode",
+                        "status",
+                        "total_ms",
+                        "ttft_ms",
+                        "summary_generation_ms",
+                        "ttft_status",
+                        "ttft_unavailable_reason",
+                        "generation_status",
+                        "generation_unavailable_reason",
+                    )
+                }
+            )
+        payload["provider_calls"] = safe_provider_calls
+        payload["provider_call_count"] = len(safe_provider_calls)
+        phase_status = payload.get("phase_status")
+        if not isinstance(phase_status, dict):
+            phase_status = {}
+        else:
+            phase_status = dict(phase_status)
+        unavailable = payload.get("phase_unavailable_reason")
+        if not isinstance(unavailable, dict):
+            unavailable = {}
+        else:
+            unavailable = dict(unavailable)
+        phase_status.setdefault(
+            "queue_admission",
+            "saturated" if failure_class == "pool_saturated" else "inline",
+        )
+        if isinstance(queue_phase, dict):
+            phase_status["queue_admission"] = str(
+                queue_phase.get("queue_admission_status") or "not_started"
+            )
+        if not safe_provider_calls:
+            phase_status["provider"] = "no_provider_call"
+            phase_status["provider_ttft"] = "unavailable"
+            phase_status["summary_generation"] = "unavailable"
+            unavailable["provider_ttft"] = "no_provider_call"
+            unavailable["summary_generation"] = "no_provider_call"
+        else:
+            phase_status.setdefault("provider", "completed")
+            phase_status.setdefault("provider_ttft", "unavailable")
+            phase_status.setdefault("summary_generation", "unavailable")
+            unavailable.setdefault(
+                "provider_ttft", "non_streaming_or_no_token_observable"
+            )
+            unavailable.setdefault(
+                "summary_generation", "non_streaming_or_no_token_observable"
+            )
+        db_status = phase_status.get("database_commit")
+        if db_status in {None, "not_started"}:
+            if getattr(agent, "_session_db", None) is None and commit_status == "committed":
+                phase_status["database_commit"] = "no_database"
+                unavailable["database_commit"] = "no_database"
+            elif commit_status == "aborted":
+                phase_status["database_commit"] = "aborted"
+                unavailable["database_commit"] = "aborted_before_commit"
+            else:
+                phase_status["database_commit"] = "not_started"
+                unavailable.setdefault("database_commit", "not_started")
+        payload["phase_status"] = phase_status
+        payload["phase_unavailable_reason"] = unavailable
         payload["fallback_used"] = bool(
             payload.get("fallback_used")
             or getattr(agent.context_compressor, "_last_summary_fallback_used", False)
@@ -2125,7 +2319,7 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
-def compress_context(
+def _compress_context_impl(
     agent: Any,
     messages: list,
     system_message: str,
@@ -2193,15 +2387,35 @@ def compress_context(
     agent._compression_skipped_due_to_lock = None
 
     _attempt_started_at = time.monotonic()
-    _attempt_id = uuid.uuid4().hex
+    _attempt_id = (
+        getattr(agent, "_compression_pending_attempt_id", None)
+        or getattr(agent, "_compression_attempt_id", None)
+        or uuid.uuid4().hex
+    )
     _trigger_source = "manual" if force else "auto"
     try:
         agent._compression_attempt_id = _attempt_id
-        setattr(agent.context_compressor, "_compression_telemetry_seed", {
+        agent._compression_pending_attempt_id = None
+        agent._compression_telemetry_emitted_attempt_id = None
+        _queue_phase_seed = getattr(
+            agent.context_compressor, "_compression_queue_phase_seed", None
+        )
+        setattr(agent.context_compressor, "_compression_queue_phase_seed", None)
+        _telemetry_seed = {
             "attempt_id": _attempt_id,
             "session_id": agent.session_id or "",
             "trigger_source": _trigger_source,
-        })
+            "queue_admission_ms": 0,
+            "queue_admission_status": "inline",
+        }
+        if isinstance(_queue_phase_seed, dict):
+            _telemetry_seed.update(_queue_phase_seed)
+        setattr(agent.context_compressor, "_compression_telemetry_seed", _telemetry_seed)
+        _begin_telemetry = getattr(
+            agent.context_compressor, "_begin_compression_telemetry", None
+        )
+        if callable(_begin_telemetry):
+            _begin_telemetry(current_tokens=approx_tokens)
     except Exception:
         pass
 
@@ -3165,6 +3379,7 @@ def compress_context(
         _session_commit_succeeded = False
         split_status = "not_applicable"
         if agent._session_db:
+            _database_commit_started_at: Optional[float] = None
             split_status = "pending"
             try:
                 # Trigger memory extraction on the current session before the
@@ -3172,6 +3387,10 @@ def compress_context(
                 # conversation's pre-compaction turns are about to be summarized
                 # away regardless of whether the id rotates).
                 agent.commit_memory_session(messages)
+                # The durable compression transaction starts after the
+                # pre-commit memory hook and immediately before the first
+                # SessionDB mutation (archive/replace or rotation pre-flush).
+                _database_commit_started_at = time.monotonic()
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
@@ -3346,6 +3565,64 @@ def compress_context(
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+            finally:
+                _record_db_timing = getattr(
+                    agent.context_compressor,
+                    "_record_database_commit_timing",
+                    None,
+                )
+                if callable(_record_db_timing):
+                    try:
+                        _record_db_timing(
+                            duration_ms=(
+                                int(
+                                    (
+                                        time.monotonic()
+                                        - _database_commit_started_at
+                                    )
+                                    * 1000
+                                )
+                                if _database_commit_started_at is not None
+                                else None
+                            ),
+                            status=(
+                                "committed"
+                                if _session_commit_succeeded
+                                else (
+                                    "rolled_back"
+                                    if _database_commit_started_at is not None
+                                    else "aborted"
+                                )
+                            ),
+                            unavailable_reason=(
+                                None
+                                if _database_commit_started_at is not None
+                                else "aborted_before_commit"
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "database commit timing instrumentation failed",
+                            exc_info=True,
+                        )
+        else:
+            _record_db_timing = getattr(
+                agent.context_compressor,
+                "_record_database_commit_timing",
+                None,
+            )
+            if callable(_record_db_timing):
+                try:
+                    _record_db_timing(
+                        duration_ms=None,
+                        status="no_database",
+                        unavailable_reason="no_database",
+                    )
+                except Exception:
+                    logger.debug(
+                        "no-database timing instrumentation failed",
+                        exc_info=True,
+                    )
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
@@ -3534,6 +3811,79 @@ def compress_context(
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
+
+
+def compress_context(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    focus_topic: Optional[str] = None,
+    force: bool = False,
+    defer_context_engine_notification: bool = False,
+    commit_fence: Optional[CompressionCommitFence] = None,
+) -> Tuple[list, str]:
+    """Emit one terminal telemetry record around the compression transaction."""
+    wrapper_started_at = time.monotonic()
+    fallback_attempt_id = (
+        getattr(agent, "_compression_pending_attempt_id", None)
+        or uuid.uuid4().hex
+    )
+    try:
+        agent._compression_attempt_id = fallback_attempt_id
+        agent._compression_telemetry_emitted_attempt_id = None
+        if getattr(agent, "_compression_pending_attempt_id", None) is None:
+            agent._compression_queue_phase_telemetry = {
+                "queue_admission_ms": 0,
+                "queue_admission_status": "inline",
+            }
+    except Exception:
+        pass
+    result: Optional[Tuple[list, str]] = None
+    failure_class: Optional[str] = None
+    try:
+        result = _compress_context_impl(
+            agent,
+            messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            defer_context_engine_notification=defer_context_engine_notification,
+            commit_fence=commit_fence,
+        )
+        return result
+    except BaseException as exc:
+        failure_class = f"exception:{type(exc).__name__}"
+        raise
+    finally:
+        attempt_id = getattr(agent, "_compression_attempt_id", None)
+        if (
+            isinstance(attempt_id, str)
+            and attempt_id
+            and getattr(agent, "_compression_telemetry_emitted_attempt_id", None)
+            != attempt_id
+        ):
+            made_progress = bool(
+                getattr(
+                    getattr(agent, "context_compressor", None),
+                    "_last_compression_made_progress",
+                    False,
+                )
+            )
+            terminal_commit = "committed" if result is not None and made_progress else "aborted"
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=wrapper_started_at,
+                commit_status=terminal_commit,
+                split_status=("not_applicable" if terminal_commit == "committed" else "aborted"),
+                failure_class=failure_class or (
+                    None if terminal_commit == "committed" else "aborted_before_commit"
+                ),
+            )
 
 
 def _compress_context_via_codex_app_server(

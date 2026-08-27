@@ -29,6 +29,7 @@ from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
     _is_connection_error,
     aux_interrupt_protection,
+    aux_timing_hook,
     call_llm,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
@@ -1409,6 +1410,32 @@ class ContextCompressor(ContextEngine):
             "chunk_count": 0,
             "total_duration_ms": None,
             "aux_call_duration_ms": None,
+            "timing_schema": "compression_phase_v1",
+            "queue_admission_ms": _safe_int(
+                seed.get("queue_admission_ms") if isinstance(seed, dict) else 0
+            ),
+            "provider_ttft_ms": None,
+            "summary_generation_ms": None,
+            "database_commit_ms": None,
+            "provider_total_ms": None,
+            "provider_call_count": 0,
+            "provider_calls": [],
+            "phase_status": {
+                "queue_admission": (
+                    seed.get("queue_admission_status", "inline")
+                    if isinstance(seed, dict)
+                    else "inline"
+                ),
+                "provider": "not_started",
+                "provider_ttft": "unavailable",
+                "summary_generation": "unavailable",
+                "database_commit": "not_started",
+            },
+            "phase_unavailable_reason": {
+                "provider_ttft": "no_provider_call",
+                "summary_generation": "no_provider_call",
+                "database_commit": "not_started",
+            },
             "fallback_used": False,
             "commit_status": "unknown",
             "split_status": "unknown",
@@ -1416,6 +1443,7 @@ class ContextCompressor(ContextEngine):
         }
         self._active_compression_telemetry = telemetry
         self._last_compression_telemetry = telemetry
+        self._compression_aux_call_states: Dict[str, Dict[str, Any]] = {}
         return telemetry
 
     def _record_compression_regions(
@@ -1464,6 +1492,142 @@ class ContextCompressor(ContextEngine):
             )
         previous = telemetry.get("aux_call_duration_ms") or 0
         telemetry["aux_call_duration_ms"] = previous + max(0, int(duration_ms))
+
+    def _record_aux_provider_timing(self, edge: Dict[str, Any]) -> None:
+        """Record content-free dispatch/token/completion edges for one wire call."""
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if not isinstance(telemetry, dict) or not isinstance(edge, dict):
+            return
+        call_id = edge.get("call_id")
+        at = edge.get("at")
+        if not isinstance(call_id, str) or not isinstance(at, (int, float)):
+            return
+        states = getattr(self, "_compression_aux_call_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._compression_aux_call_states = states
+        event = edge.get("event")
+        if event == "dispatch":
+            state = {
+                "started_at": float(at),
+                "first_token_at": None,
+                "record": {
+                    "call_index": len(states) + 1,
+                    "provider": str(edge.get("provider") or ""),
+                    "model": str(edge.get("model") or ""),
+                    "api_mode": str(edge.get("api_mode") or ""),
+                    "status": "dispatched",
+                    "total_ms": None,
+                    "ttft_ms": None,
+                    "summary_generation_ms": None,
+                    "ttft_status": "unavailable",
+                    "ttft_unavailable_reason": "non_streaming_or_no_token_observable",
+                    "generation_status": "unavailable",
+                    "generation_unavailable_reason": "non_streaming_or_no_token_observable",
+                },
+            }
+            states[call_id] = state
+            telemetry["provider_calls"].append(state["record"])
+            telemetry["provider_call_count"] = len(telemetry["provider_calls"])
+            telemetry["phase_status"]["provider"] = "dispatched"
+            return
+        state = states.get(call_id)
+        if not isinstance(state, dict):
+            return
+        record = state["record"]
+        if event == "meaningful_token" and state["first_token_at"] is None:
+            state["first_token_at"] = float(at)
+            record["ttft_ms"] = max(
+                0, int((float(at) - state["started_at"]) * 1000)
+            )
+            record["ttft_status"] = "observed"
+            record["ttft_unavailable_reason"] = None
+            telemetry["provider_ttft_ms"] = record["ttft_ms"]
+            telemetry["phase_status"]["provider_ttft"] = "observed"
+            telemetry["phase_unavailable_reason"]["provider_ttft"] = None
+            return
+        if event != "complete":
+            return
+        completed_at = float(at)
+        record["status"] = str(edge.get("status") or "completed")
+        record["total_ms"] = max(
+            0, int((completed_at - state["started_at"]) * 1000)
+        )
+        first_token_at = state.get("first_token_at")
+        if isinstance(first_token_at, (int, float)):
+            record["summary_generation_ms"] = max(
+                0, int((completed_at - float(first_token_at)) * 1000)
+            )
+            record["generation_status"] = "observed"
+            record["generation_unavailable_reason"] = None
+            telemetry["summary_generation_ms"] = record["summary_generation_ms"]
+            telemetry["phase_status"]["summary_generation"] = "observed"
+            telemetry["phase_unavailable_reason"]["summary_generation"] = None
+        telemetry["provider_total_ms"] = sum(
+            int(item.get("total_ms") or 0)
+            for item in telemetry["provider_calls"]
+        )
+        telemetry["phase_status"]["provider"] = record["status"]
+
+    def _record_unobservable_aux_call(
+        self,
+        *,
+        started_at: float,
+        completed_at: float,
+        status: str,
+        aux_provider: str,
+        aux_model: str,
+    ) -> None:
+        """Account for a logical call when its adapter exposes no token seam."""
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if not isinstance(telemetry, dict):
+            return
+        provider_calls = telemetry.get("provider_calls")
+        if not isinstance(provider_calls, list):
+            provider_calls = []
+            telemetry["provider_calls"] = provider_calls
+        record = {
+            "call_index": len(provider_calls) + 1,
+            "provider": aux_provider,
+            "model": aux_model,
+            "api_mode": "",
+            "status": status,
+            "total_ms": max(0, int((completed_at - started_at) * 1000)),
+            "ttft_ms": None,
+            "summary_generation_ms": None,
+            "ttft_status": "unavailable",
+            "ttft_unavailable_reason": "non_streaming_or_no_token_observable",
+            "generation_status": "unavailable",
+            "generation_unavailable_reason": "non_streaming_or_no_token_observable",
+        }
+        provider_calls.append(record)
+        telemetry["provider_call_count"] = len(provider_calls)
+        telemetry["provider_total_ms"] = sum(
+            int(item.get("total_ms") or 0)
+            for item in provider_calls
+            if isinstance(item, dict)
+        )
+        phase_status = telemetry.setdefault("phase_status", {})
+        unavailable = telemetry.setdefault("phase_unavailable_reason", {})
+        if not isinstance(phase_status, dict) or not isinstance(unavailable, dict):
+            return
+        phase_status["provider"] = status
+        unavailable["provider_ttft"] = (
+            "non_streaming_or_no_token_observable"
+        )
+        unavailable["summary_generation"] = (
+            "non_streaming_or_no_token_observable"
+        )
+
+    def _record_database_commit_timing(
+        self, *, duration_ms: int | None, status: str, unavailable_reason: str | None
+    ) -> None:
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if not isinstance(telemetry, dict):
+            return
+        telemetry["database_commit_ms"] = _safe_int(duration_ms)
+        telemetry["phase_status"]["database_commit"] = status
+        telemetry["phase_unavailable_reason"]["database_commit"] = unavailable_reason
 
     def _emit_init_summary_once(self) -> None:
         """Emit the informative startup line once, on first resolution.
@@ -3808,17 +3972,45 @@ This compaction should PRIORITISE preserving all information related to the focu
             # marker, losing the real handoff (#23975). Re-entrant: a main-model
             # retry (_generate_summary recursion) re-enters harmlessly.
             _aux_call_start = time.monotonic()
+            _provider_calls_before = len(
+                getattr(
+                    getattr(self, "_active_compression_telemetry", None),
+                    "get",
+                    lambda *_args: [],
+                )("provider_calls", [])
+            )
+            _aux_call_status = "failed"
             try:
-                with aux_interrupt_protection():
+                with aux_timing_hook(
+                    self._record_aux_provider_timing
+                ), aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
+                _aux_call_status = "completed"
             finally:
+                _aux_call_end = time.monotonic()
+                _active_telemetry = getattr(
+                    self, "_active_compression_telemetry", None
+                )
+                _provider_calls_after = (
+                    len(_active_telemetry.get("provider_calls", []))
+                    if isinstance(_active_telemetry, dict)
+                    else 0
+                )
+                if _provider_calls_after == _provider_calls_before:
+                    self._record_unobservable_aux_call(
+                        started_at=_aux_call_start,
+                        completed_at=_aux_call_end,
+                        status=_aux_call_status,
+                        aux_provider=_aux_provider,
+                        aux_model=_aux_model,
+                    )
                 self._record_aux_compression_call(
                     prompt_messages=call_kwargs["messages"],
                     # Current main intentionally omits max_tokens from the aux
                     # call (summary_budget is prompt-level guidance only) —
                     # use .get() so the telemetry hook never breaks the call.
                     max_tokens=call_kwargs.get("max_tokens"),
-                    duration_ms=int((time.monotonic() - _aux_call_start) * 1000),
+                    duration_ms=int((_aux_call_end - _aux_call_start) * 1000),
                     aux_provider=_aux_provider,
                     aux_model=_aux_model,
                     effective_aux_context=_aux_context,
